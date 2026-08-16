@@ -13,8 +13,8 @@
 // Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
 // conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
 use crate::ast::{
-    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, Ty, TyTab, TypeId, CHAR, DOUBLE,
-    FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
+    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, Ty, TyTab, TypeId, BOOL, CHAR,
+    DOUBLE, FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
 };
 use crate::lexer::{NumK, Tok};
 use std::collections::HashMap;
@@ -261,7 +261,13 @@ impl P<'_> {
                 | "__inline__" | "restrict" | "__restrict" | "__restrict__"
                 | "__extension__" => {}
                 "__attribute__" | "__asm__" | "__asm" => {
-                    self.skip_attrs()?;
+                    let (pk, al) = self.skip_attrs()?;
+                    if pk || al.is_some() {
+                        // "struct {...} __attribute__((packed / aligned))" hậu tố
+                        if let Some(t) = direct {
+                            self.repack(t, pk, al);
+                        }
+                    }
                     any = true;
                     continue;
                 }
@@ -319,7 +325,7 @@ impl P<'_> {
             }
             "float" => FLOAT,
             "double" => DOUBLE, // long double = double
-            "_Bool" => UCHAR,   // xấp xỉ: đủ cho 0/1; không normalize !!
+            "_Bool" => BOOL,
             _ => {
                 // họ int (kể cả không có "int" tường minh)
                 if short {
@@ -346,7 +352,7 @@ impl P<'_> {
         Ok(Some((t, storage)))
     }
     fn struct_union(&mut self, is_union: bool) -> Result<TypeId, String> {
-        self.skip_attrs()?;
+        let (packed, aligned) = self.skip_attrs()?;
         let tag = if let Some(Tok::Ident(n)) = self.toks.get(self.pos) {
             let n = n.clone();
             self.pos += 1;
@@ -448,7 +454,8 @@ impl P<'_> {
                     }
                 } else {
                     bit_size = 0;
-                    let (sz, al) = (self.tt.size(mt), self.tt.align(mt));
+                    let sz = self.tt.size(mt);
+                    let al = if packed { 1 } else { self.tt.align(mt) };
                     let o = if is_union { 0 } else { off.div_ceil(al) * al };
                     members.push((mn, mt, o));
                     off = if is_union { off.max(sz) } else { o + sz };
@@ -459,6 +466,9 @@ impl P<'_> {
                 }
             }
             self.expect(Tok::Punct(";"))?;
+        }
+        if let Some(a) = aligned {
+            mx = mx.max(a);
         }
         self.tt.structs[sidx as usize] =
             StructDef { members, size: off.div_ceil(mx) * mx, align: mx, is_union };
@@ -552,22 +562,61 @@ impl P<'_> {
         }
     }
     // nuốt __attribute__((...)) / __asm__("..") — extension, không ảnh hưởng ngữ nghĩa
-    fn skip_attrs(&mut self) -> Result<(), String> {
+    // nuốt __attribute__/__asm__; hiểu packed + aligned(n)
+    fn skip_attrs(&mut self) -> Result<(bool, Option<u32>), String> {
+        let (mut packed, mut aligned) = (false, None);
         loop {
-            if self.eat_kw("__attribute__") || self.eat_kw("__asm__") || self.eat_kw("__asm") {
+            if self.eat_kw("__attribute__") {
+                self.expect(Tok::Punct("("))?;
+                self.expect(Tok::Punct("("))?;
+                while !self.eat(&Tok::Punct(")")) {
+                    if self.eat(&Tok::Punct(",")) {
+                        continue;
+                    }
+                    let n = self.ident()?;
+                    match n.as_str() {
+                        "packed" | "__packed__" => packed = true,
+                        "aligned" | "__aligned__" => {
+                            if self.eat(&Tok::Punct("(")) {
+                                let v = self.const_expr()? as u32;
+                                self.expect(Tok::Punct(")"))?;
+                                aligned = Some(aligned.unwrap_or(0).max(v));
+                            } else {
+                                aligned = Some(16); // GCC: aligned trần = 16
+                            }
+                        }
+                        _ => {
+                            // attr lạ (có thể kèm (args)): nuốt balanced
+                            if self.eat(&Tok::Punct("(")) {
+                                let mut depth = 1u32;
+                                while depth > 0 {
+                                    match self.toks.get(self.pos) {
+                                        Some(Tok::Punct("(")) => depth += 1,
+                                        Some(Tok::Punct(")")) => depth -= 1,
+                                        None => return Err("__attribute__ không đóng".into()),
+                                        _ => {}
+                                    }
+                                    self.pos += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.expect(Tok::Punct(")"))?;
+            } else if self.eat_kw("__asm__") || self.eat_kw("__asm") {
                 self.expect(Tok::Punct("("))?;
                 let mut depth = 1u32;
                 while depth > 0 {
                     match self.toks.get(self.pos) {
                         Some(Tok::Punct("(")) => depth += 1,
                         Some(Tok::Punct(")")) => depth -= 1,
-                        None => return Err("__attribute__ không đóng".into()),
+                        None => return Err("__asm__ không đóng".into()),
                         _ => {}
                     }
                     self.pos += 1;
                 }
             } else {
-                return Ok(());
+                return Ok((packed, aligned));
             }
         }
     }
@@ -653,7 +702,7 @@ impl P<'_> {
     fn promote(&self, t: TypeId) -> TypeId {
         match self.tt.tys[t as usize] {
             Ty::Char | Ty::Short => INT,
-            Ty::UChar | Ty::UShort => INT, // cả hai lọt trong int (LP64)
+            Ty::UChar | Ty::UShort | Ty::Bool => INT, // cả ba lọt trong int (LP64)
             Ty::Float => DOUBLE,
             Ty::Bitfield(b, ..) => self.promote(b),
             _ => t,
@@ -803,7 +852,13 @@ impl P<'_> {
             Ok(self.push(Node::While(c, b), INT))
         } else if self.eat_kw("for") {
             self.expect(Tok::Punct("("))?;
-            let i = self.opt_expr(";")?;
+            // C99 (clang -std=c89 cho): "for (int i = 0; ...)" — init là declaration
+            let i = if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if self.is_type_word(n))
+            {
+                Some(self.stmt()?) // decl-stmt tự nuốt ";"
+            } else {
+                self.opt_expr(";")?
+            };
             let c = match self.opt_expr(";")? {
                 Some(c) => Some(self.truthy(c)?),
                 None => None,
@@ -1355,6 +1410,13 @@ impl P<'_> {
             return Ok(c);
         }
         let c = self.truthy(c)?;
+        // GNU elvis "a ?: b": vế giữa = chính cond, KHÔNG eval lại (codegen nhận
+        // diện tb==cond để giữ x0)
+        if self.eat(&Tok::Punct(":")) {
+            let e = self.cond_expr()?;
+            let t = self.ty(c);
+            return Ok(self.push(Node::Cond(c, c, e), t));
+        }
         let t = self.expr()?;
         self.expect(Tok::Punct(":"))?;
         let e = self.cond_expr()?;
@@ -1500,11 +1562,15 @@ impl P<'_> {
                                 }
                             }
                         }
+                        // lvalue hóa: Deref(Comma(inits, &temp)) — gán/& được như C99
                         let res = self.push(Node::Var(off), t);
-                        return Ok(match acc {
-                            Some(a) => self.push(Node::Comma(a, res), t),
-                            None => res,
-                        });
+                        let pt = self.tt.ptr_to(t);
+                        let ad = self.push(Node::Addr(res), pt);
+                        let chain = match acc {
+                            Some(a) => self.push(Node::Comma(a, ad), pt),
+                            None => ad,
+                        };
+                        return Ok(self.push(Node::Deref(chain), t));
                     }
                     let e = self.unary()?;
                     return Ok(self.cast(e, ty));
@@ -1551,6 +1617,24 @@ impl P<'_> {
             }
             let t = self.tt.ptr_to(self.ty(e));
             Ok(self.push(Node::Addr(e), t))
+        } else if self.eat_kw("_Alignof") || self.eat_kw("__alignof__") || self.eat_kw("__alignof")
+        {
+            let al = if self.peek("(")
+                && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(n)) if self.is_type_word(n))
+            {
+                self.pos += 1;
+                let t = self.typename()?;
+                self.expect(Tok::Punct(")"))?;
+                self.tt.align(t)
+            } else {
+                let save = self.nodes.len();
+                let e = self.unary()?;
+                let t = self.ty(e);
+                self.nodes.truncate(save);
+                self.types.truncate(save);
+                self.tt.align(t)
+            };
+            return Ok(self.push(Node::Num(al as i64), ULONG));
         } else if self.eat_kw("sizeof") {
             // sizeof(typename) | sizeof unary
             let sz = if self.peek("(")
@@ -1681,6 +1765,44 @@ impl P<'_> {
             self.find_member(sd, &name).ok_or(format!("không có member: {}", name))?;
         Ok(self.push(Node::Member(base, off), mt))
     }
+    // attr packed/aligned đứng SAU thân: tính lại layout tại chỗ
+    fn repack(&mut self, t: TypeId, packed: bool, aligned: Option<u32>) {
+        let Ty::Struct(si) = self.tt.tys[t as usize] else { return };
+        let sd = &self.tt.structs[si as usize];
+        if sd.is_union
+            || sd.members.iter().any(|m| matches!(self.tt.tys[m.1 as usize], Ty::Bitfield(..)))
+        {
+            return;
+        }
+        let mut members = sd.members.clone();
+        // packed: align hạ về 1 NHƯNG giữ phần aligned tường minh trước đó
+        // (sd.align vượt align tự nhiên của member ⟺ có aligned(n) đứng trước)
+        let natural =
+            sd.members.iter().map(|m| self.tt.align(m.1)).max().unwrap_or(1);
+        let mut align = if packed {
+            if sd.align > natural { sd.align } else { 1 }
+        } else {
+            sd.align
+        };
+        let mut off = 0u32;
+        if packed {
+            for m in members.iter_mut() {
+                m.2 = off;
+                off += self.tt.size(m.1);
+            }
+        } else {
+            off = sd.size;
+        }
+        if let Some(a) = aligned {
+            align = align.max(a);
+        }
+        self.tt.structs[si as usize] = StructDef {
+            members,
+            size: off.div_ceil(align) * align,
+            align,
+            is_union: false,
+        };
+    }
     // tìm member theo tên, xuyên qua anonymous struct/union (tên rỗng)
     fn find_member(&self, sd: u32, name: &str) -> Option<(TypeId, u32)> {
         for (n, t, o) in &self.tt.structs[sd as usize].members {
@@ -1703,11 +1825,21 @@ impl P<'_> {
             if self.peek("{") {
                 self.pos += 1;
                 let scope = self.locals.len();
+                let (ts, ds, es, ets) = (
+                    self.tags.clone(),
+                    self.typedefs.clone(),
+                    self.enums.clone(),
+                    self.enum_tags.clone(),
+                );
                 let mut v = Vec::new();
                 while !self.eat(&Tok::Punct("}")) {
                     v.push(self.stmt()?);
                 }
                 self.locals.truncate(scope);
+                self.tags = ts;
+                self.typedefs = ds;
+                self.enums = es;
+                self.enum_tags = ets;
                 self.expect(Tok::Punct(")"))?;
                 let t = v.last().map_or(INT, |&s| self.ty(s));
                 return Ok(self.push(Node::Block(v), t));

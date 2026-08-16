@@ -168,7 +168,7 @@ pub fn emit(ast: &Ast) -> String {
         let (sz, al) = (ast.tt.size(gl.ty), ast.tt.align(gl.ty));
         let globl = if gl.is_static { String::new() } else { format!(".globl _{}\n", gl.name) };
         match &gl.init {
-            GInit::None => {
+            GInit::None if gl.is_static => {
                 _ = writeln!(
                     g.s,
                     "{}.zerofill __DATA,__bss,_{},{},{}",
@@ -177,6 +177,10 @@ pub fn emit(ast: &Ast) -> String {
                     sz,
                     al.trailing_zeros()
                 );
+            }
+            GInit::None => {
+                // tentative definition → common symbol (nhiều TU cùng "int x;" hợp nhất)
+                _ = writeln!(g.s, ".comm _{},{},{}", gl.name, sz.max(1), al.trailing_zeros());
             }
             init => {
                 _ = writeln!(
@@ -296,6 +300,10 @@ impl Cg<'_> {
     }
     // re-canonicalize x0 theo kiểu (sau op 32-bit / thu hẹp)
     fn ext(&mut self, t: TypeId) {
+        if matches!(self.a.tt.tys[t as usize], Ty::Bool) {
+            self.s += "\tcmp x0, #0\n\tcset x0, ne\n";
+            return;
+        }
         let u = self.a.tt.is_unsigned(t);
         self.s += match (self.a.tt.size(t), u) {
             (1, false) => "\tsxtb x0, w0\n",
@@ -339,6 +347,12 @@ impl Cg<'_> {
     // store x{reg} → [x1] theo kiểu
     fn store(&mut self, reg: u32, t: TypeId) {
         match self.a.tt.tys[t as usize] {
+            Ty::Bool => {
+                _ = writeln!(
+                    self.s,
+                    "\tcmp x{reg}, #0\n\tcset x{reg}, ne\n\tstrb w{reg}, [x1]"
+                );
+            }
             Ty::Float => {
                 _ = writeln!(self.s, "\tfmov d7, x{reg}\n\tfcvt s7, d7\n\tstr s7, [x1]");
             }
@@ -390,6 +404,10 @@ impl Cg<'_> {
                 self.s += "\tfmov x0, d0\n";
             }
             (true, false) => {
+                if matches!(tt.tys[to as usize], Ty::Bool) {
+                    self.s += "\tfmov d0, x0\n\tfcmp d0, #0.0\n\tcset x0, ne\n";
+                    return;
+                }
                 self.s += "\tfmov d0, x0\n";
                 let cvt = if self.a.tt.is_unsigned(to) { "fcvtzu" } else { "fcvtzs" };
                 if self.a.tt.size(to) == 8 {
@@ -570,7 +588,9 @@ impl Cg<'_> {
             }
             Node::Deref(e) => self.expr(*e),
             // giá trị của expr kiểu struct = địa chỉ (SRet temp, compound literal...)
-            Node::SRet(..) | Node::Comma(..) | Node::Assign(..) => self.expr(id),
+            Node::SRet(..) | Node::Comma(..) | Node::Assign(..) | Node::Cond(..) => {
+                self.expr(id)
+            }
             _ => unreachable!("không phải lvalue"),
         }
     }
@@ -639,6 +659,13 @@ impl Cg<'_> {
                 let (c, tb, eb) = (*c, *tb, *eb);
                 let n = self.labels(2);
                 self.expr(c);
+                if tb == c {
+                    // elvis "a ?: b": a đã ở x0
+                    _ = writeln!(self.s, "\tcbnz x0, L{}", n + 1);
+                    self.expr(eb);
+                    _ = writeln!(self.s, "L{}:", n + 1);
+                    return;
+                }
                 _ = writeln!(self.s, "\tcbz x0, L{n}");
                 self.expr(tb);
                 _ = writeln!(self.s, "\tb L{}\nL{n}:", n + 1);

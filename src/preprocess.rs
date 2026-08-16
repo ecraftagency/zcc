@@ -20,7 +20,10 @@ type Macros = HashMap<String, Macro>;
 
 // Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
 // nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-const HEADERS: [(&str, &str); 12] = [
+const HEADERS: [(&str, &str); 15] = [
+    ("stdbool.h", include_str!("headers/stdbool.h")),
+    ("stdalign.h", include_str!("headers/stdalign.h")),
+    ("stdnoreturn.h", include_str!("headers/stdnoreturn.h")),
     ("assert.h", include_str!("headers/assert.h")),
     ("stdint.h", include_str!("headers/stdint.h")),
     ("ctype.h", include_str!("headers/ctype.h")),
@@ -57,7 +60,7 @@ pub fn preprocess(path: &str) -> Result<Vec<Tok>, String> {
 }
 
 fn synth(tok: Tok) -> PTok {
-    PTok { tok, bol: false, ws: true, line: 0 }
+    PTok { tok, bol: false, ws: true, line: 0, raw: String::new() }
 }
 
 fn err(file: &str, line: u32, msg: &str) -> String {
@@ -204,6 +207,7 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
             "include" => match d.get(1).map(|t| &t.tok) {
                 Some(Tok::Str(b)) => {
                     let name = String::from_utf8_lossy(b).into_owned();
+                    let bare = name.clone();
                     let path = if name.starts_with('/') {
                         name
                     } else {
@@ -212,6 +216,15 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                             None => name,
                         }
                     };
+                    // không có file thật → thử bảng header nhúng ("stddef.h"...)
+                    if !std::path::Path::new(&path).exists() {
+                        if let Some((_, src)) = HEADERS.iter().find(|(n, _)| *n == bare) {
+                            let hname = format!("<{}>", bare);
+                            let toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
+                            out.extend(process(&toks, &hname, macros, depth + 1)?);
+                            continue;
+                        }
+                    }
                     out.extend(pp_file(&path, macros, depth + 1)?);
                 }
                 Some(Tok::Punct("<")) => {
@@ -395,6 +408,7 @@ fn retag(body: &[PTok], at: &PTok) -> Vec<PTok> {
             bol: false,
             ws: if k == 0 { at.ws } else { b.ws },
             line: at.line,
+            raw: b.raw.clone(),
         })
         .collect()
 }
@@ -451,7 +465,13 @@ fn substitute(
         if t.tok == Tok::Punct("#") {
             let p = param_of(body.get(i + 1), params)
                 .ok_or_else(|| err(file, lno, "# phải đứng trước tham số macro"))?;
-            out.push(PTok { tok: Tok::Str(stringize(&args[p])), bol: false, ws: t.ws, line: lno });
+            out.push(PTok {
+                tok: Tok::Str(stringize(&args[p])),
+                bol: false,
+                ws: t.ws,
+                line: lno,
+                raw: String::new(),
+            });
             i += 2;
         } else if t.tok == Tok::Punct("##") {
             let r = body.get(i + 1).ok_or_else(|| err(file, lno, "## ở cuối thân macro"))?;
@@ -470,7 +490,7 @@ fn substitute(
                     .ok_or_else(|| {
                         err(file, lno, &format!("## tạo token không hợp lệ '{}'", s))
                     })?;
-                out.push(PTok { tok: one, bol: false, ws: l.ws, line: lno });
+                out.push(PTok { tok: one, bol: false, ws: l.ws, line: lno, raw: String::new() });
                 out.extend(rhs[1..].iter().cloned());
             }
             i += 2;
@@ -526,7 +546,11 @@ fn spell_seq(ts: &[PTok]) -> String {
         if k > 0 && t.ws {
             s.push(' ');
         }
-        s.push_str(&spell(&t.tok));
+        if t.raw.is_empty() {
+            s.push_str(&spell(&t.tok));
+        } else {
+            s.push_str(&t.raw); // spelling gốc: 0xff, 'a', "s\n"
+        }
     }
     s
 }

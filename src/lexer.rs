@@ -27,6 +27,7 @@ pub struct PTok {
     pub bol: bool,
     pub ws: bool,
     pub line: u32,
+    pub raw: String, // spelling gốc (Num/Str/Char) cho # stringize; rỗng = spell từ giá trị
 }
 
 // Punct dài đứng trước để match trước ("<<=" trước "<<" trước "<").
@@ -78,6 +79,16 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u8, String> {
 // Hằng số bắt đầu tại i (digit, hoặc '.' + digit). Trả token + i mới.
 fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
     let s = *i;
+    if src[s..].starts_with("0b") || src[s..].starts_with("0B") {
+        // GNU: hằng nhị phân 0b1010
+        *i += 2;
+        let d = *i;
+        while matches!(b.get(*i), Some(b'0' | b'1')) {
+            *i += 1;
+        }
+        let v = u64::from_str_radix(&src[d..*i], 2).map_err(|e| format!("{e}"))?;
+        return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
+    }
     if src[s..].starts_with("0x") || src[s..].starts_with("0X") {
         *i += 2;
         let d = *i;
@@ -216,6 +227,7 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             ws = true;
             continue;
         }
+        let tok_start = i;
         // wide literal L'x' / L"s": wchar = int, bỏ prefix (đủ cho test C89)
         let c = if c == b'L' && matches!(b.get(i + 1), Some(b'\'' | b'"')) {
             i += 1;
@@ -277,7 +289,11 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
                 None => return Err(format!("ký tự lạ '{}'", c as char)),
             }
         };
-        toks.push(PTok { tok, bol, ws, line });
+        let raw = match tok {
+            Tok::Num(..) | Tok::FNum(..) | Tok::Str(_) => src[tok_start..i].to_string(),
+            _ => String::new(),
+        };
+        toks.push(PTok { tok, bol, ws, line, raw });
         bol = false;
         ws = false;
     }

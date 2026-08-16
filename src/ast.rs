@@ -31,6 +31,7 @@ pub enum Ty {
     Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
     Func(u32),   // index vào TyTab.fns
     Bitfield(TypeId, u32, u32), // (kiểu chứa, bit offset trong đơn vị, độ rộng bit)
+    Bool, // _Bool: store/cast normalize về 0/1
 }
 pub const VOID: TypeId = 0;
 pub const CHAR: TypeId = 1;
@@ -43,6 +44,7 @@ pub const LONG: TypeId = 7;
 pub const ULONG: TypeId = 8;
 pub const FLOAT: TypeId = 9;
 pub const DOUBLE: TypeId = 10;
+pub const BOOL: TypeId = 11;
 
 pub struct StructDef {
     pub members: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset)
@@ -82,6 +84,7 @@ impl TyTab {
                 Ty::ULong,
                 Ty::Float,
                 Ty::Double,
+                Ty::Bool,
             ],
             structs: Vec::new(),
             fns: Vec::new(),
@@ -90,7 +93,7 @@ impl TyTab {
     pub fn size(&self, t: TypeId) -> u32 {
         match self.tys[t as usize] {
             Ty::Void => 1, // cho void* arith kiểu GNU; sizeof(void) C89 vốn không hợp lệ
-            Ty::Char | Ty::UChar => 1,
+            Ty::Char | Ty::UChar | Ty::Bool => 1,
             Ty::Short | Ty::UShort => 2,
             Ty::Int | Ty::UInt | Ty::Float => 4,
             Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) | Ty::Func(_) => 8,
@@ -117,7 +120,7 @@ impl TyTab {
     }
     pub fn is_unsigned(&self, t: TypeId) -> bool {
         match self.tys[t as usize] {
-            Ty::UChar | Ty::UShort | Ty::UInt | Ty::ULong | Ty::Ptr(_) => true,
+            Ty::UChar | Ty::UShort | Ty::UInt | Ty::ULong | Ty::Ptr(_) | Ty::Bool => true,
             Ty::Bitfield(b, ..) => self.is_unsigned(b),
             _ => false,
         }
@@ -134,6 +137,7 @@ impl TyTab {
                 | Ty::Long
                 | Ty::ULong
                 | Ty::Bitfield(..)
+                | Ty::Bool
         )
     }
     // HFA (AAPCS64): struct mà mọi member cùng là float hoặc cùng double, 1-4 cái
