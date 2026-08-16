@@ -17,6 +17,22 @@ enum Macro {
 }
 type Macros = HashMap<String, Macro>;
 
+// Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
+// nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
+const HEADERS: [(&str, &str); 11] = [
+    ("assert.h", include_str!("headers/assert.h")),
+    ("ctype.h", include_str!("headers/ctype.h")),
+    ("errno.h", include_str!("headers/errno.h")),
+    ("float.h", include_str!("headers/float.h")),
+    ("limits.h", include_str!("headers/limits.h")),
+    ("math.h", include_str!("headers/math.h")),
+    ("stdarg.h", include_str!("headers/stdarg.h")),
+    ("stddef.h", include_str!("headers/stddef.h")),
+    ("stdio.h", include_str!("headers/stdio.h")),
+    ("stdlib.h", include_str!("headers/stdlib.h")),
+    ("string.h", include_str!("headers/string.h")),
+];
+
 pub fn preprocess(path: &str) -> Result<Vec<Tok>, String> {
     let mut macros = Macros::new();
     macros.insert("__STDC__".into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
@@ -172,7 +188,23 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                     out.extend(pp_file(&path, macros, depth + 1)?);
                 }
                 Some(Tok::Punct("<")) => {
-                    return Err(err(file, lno, "#include <...>: chưa có search path hệ thống"));
+                    // tên = spelling các token đến '>' (lexer tách "stdio.h" = 3 token)
+                    let mut name = String::new();
+                    let mut k = 2;
+                    while k < d.len() && d[k].tok != Tok::Punct(">") {
+                        name.push_str(&spell(&d[k].tok));
+                        k += 1;
+                    }
+                    let src = HEADERS
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .map(|(_, s)| *s)
+                        .ok_or_else(|| {
+                            err(file, lno, &format!("không có header nhúng <{}>", name))
+                        })?;
+                    let hname = format!("<{}>", name);
+                    let toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
+                    out.extend(process(&toks, &hname, macros, depth + 1)?);
                 }
                 _ => return Err(err(file, lno, "#include cần \"file\"")),
             },

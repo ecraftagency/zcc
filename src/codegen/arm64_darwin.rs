@@ -551,6 +551,7 @@ impl Cg<'_> {
                 _ = writeln!(self.s, "\t{} x2, x0, x3", if op == "+" { "add" } else { "sub" });
                 self.store(2, lt);
             }
+            Node::VaArea(off) => _ = writeln!(self.s, "\tadd x0, x29, #{off}"),
             Node::Str(i) => {
                 _ = writeln!(
                     self.s,

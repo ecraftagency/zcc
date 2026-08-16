@@ -178,6 +178,7 @@ pub enum Node {
     SRet(NodeId, u32, u32), // call trả struct ≤16B: (call, offset temp local, size) — giá trị = địa chỉ temp
     Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
     FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
+    VaArea(u32), // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
     Str(u32),
 }
 

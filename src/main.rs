@@ -44,47 +44,85 @@ fn main() -> ExitCode {
         }
         i += 1;
     }
-    let [path] = inputs[..] else {
-        eprintln!("usage: zcc [-c | -S] [-o out] <in.c>");
+    if inputs.is_empty() {
+        eprintln!("usage: zcc [-c | -S] [-o out] <in.c>...");
         return ExitCode::FAILURE;
-    };
-    let asm = match preprocess::preprocess(path).and_then(|t| parser::parse(&t)) {
-        Ok(ast) => codegen::emit(&ast),
-        Err(e) => {
-            eprintln!("zcc: {}: {}", path, e);
-            return ExitCode::FAILURE;
+    }
+    if output.is_some() && mode != "ld" && inputs.len() > 1 {
+        eprintln!("zcc: -o không dùng được với nhiều input khi có -c/-S");
+        return ExitCode::FAILURE;
+    }
+    // .c → asm text; input khác (.o/.a) đi thẳng xuống linker
+    let emit_asm = |path: &str| -> Option<String> {
+        match preprocess::preprocess(path).and_then(|t| parser::parse(&t)) {
+            Ok(ast) => Some(codegen::emit(&ast)),
+            Err(e) => {
+                eprintln!("zcc: {}: {}", path, e);
+                None
+            }
         }
     };
-    // Tên output mặc định theo đúng cc: -S → <stem>.s, -c → <stem>.o, link → a.out
-    let file = path.rsplit('/').next().unwrap();
-    let stem = file.strip_suffix(".c").unwrap_or(file);
-    let default = format!("{}.{}", stem, if mode == "s" { "s" } else { "o" });
+    let stem_of = |path: &str| {
+        let file = path.rsplit('/').next().unwrap();
+        file.strip_suffix(".c").unwrap_or(file).to_string()
+    };
     let ok = match mode {
-        "s" => write_or_die(output.unwrap_or(&default), &asm),
-        "o" => {
-            let out = output.unwrap_or(&default);
-            let tmp_s = format!("{}.zcc.s", out);
-            let ok = write_or_die(&tmp_s, &asm) && run("as", &[&tmp_s, "-o", out]);
-            fs::remove_file(&tmp_s).ok();
+        "s" | "o" => {
+            let mut ok = true;
+            for path in &inputs {
+                let Some(asm) = emit_asm(path) else {
+                    ok = false;
+                    break;
+                };
+                let default = format!("{}.{}", stem_of(path), mode);
+                let out = output.unwrap_or(&default);
+                if mode == "s" {
+                    ok = write_or_die(out, &asm);
+                } else {
+                    let tmp_s = format!("{}.zcc.s", out);
+                    ok = write_or_die(&tmp_s, &asm) && run("as", &[&tmp_s, "-o", out]);
+                    fs::remove_file(&tmp_s).ok();
+                }
+                if !ok {
+                    break;
+                }
+            }
             ok
         }
         _ => {
             // Nhánh toolchain của target arm64_darwin; target mới sẽ match ở đây
             let out = output.unwrap_or("a.out");
-            let (tmp_s, tmp_o) = (format!("{}.zcc.s", out), format!("{}.zcc.o", out));
-            let sdk = Command::new("xcrun")
-                .args(["-sdk", "macosx", "--show-sdk-path"])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            let ok = write_or_die(&tmp_s, &asm)
-                && run("as", &[&tmp_s, "-o", &tmp_o])
-                && run(
-                    "ld",
-                    &[&tmp_o, "-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"],
-                );
-            fs::remove_file(&tmp_s).ok();
-            fs::remove_file(&tmp_o).ok();
+            let (mut objs, mut tmps, mut ok) = (Vec::new(), Vec::new(), true);
+            for (k, path) in inputs.iter().enumerate() {
+                if !path.ends_with(".c") {
+                    objs.push(path.to_string());
+                    continue;
+                }
+                let (tmp_s, tmp_o) = (format!("{out}.zcc{k}.s"), format!("{out}.zcc{k}.o"));
+                ok = match emit_asm(path) {
+                    Some(asm) => write_or_die(&tmp_s, &asm) && run("as", &[&tmp_s, "-o", &tmp_o]),
+                    None => false,
+                };
+                fs::remove_file(&tmp_s).ok();
+                tmps.push(tmp_o.clone());
+                objs.push(tmp_o);
+                if !ok {
+                    break;
+                }
+            }
+            if ok {
+                let sdk = Command::new("xcrun")
+                    .args(["-sdk", "macosx", "--show-sdk-path"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let mut ld: Vec<&str> = objs.iter().map(|s| s.as_str()).collect();
+                ld.extend(["-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"]);
+                ok = run("ld", &ld);
+            }
+            for t in &tmps {
+                fs::remove_file(t).ok();
+            }
             ok
         }
     };

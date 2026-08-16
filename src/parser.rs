@@ -56,6 +56,7 @@ struct P<'a> {
     enums: HashMap<String, i64>,
     switches: Vec<(Vec<(i64, NodeId)>, Option<NodeId>)>,
     fret: TypeId, // kiểu trả về của hàm đang parse
+    va_off: u32,  // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
 }
 
 type R = Result<NodeId, String>;
@@ -1327,6 +1328,10 @@ impl P<'_> {
                     Vloc::Glob(gi) => self.push(Node::GVar(gi), t),
                 });
             }
+            if n == "__va_area__" {
+                let t = self.tt.ptr_to(CHAR);
+                return Ok(self.push(Node::VaArea(self.va_off), t));
+            }
             if let Some(&v) = self.enums.get(&n) {
                 return Ok(self.push(Node::Num(v), INT));
             }
@@ -1382,6 +1387,7 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
         enums: HashMap::new(),
         switches: Vec::new(),
         fret: INT,
+        va_off: 16,
     };
     let mut funcs = Vec::new();
     while p.pos < toks.len() {
@@ -1437,6 +1443,30 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
                     let off = p.alloc_local(pn.clone(), pt);
                     params.push((off, pt));
                 }
+                // mirror bộ đếm spill của codegen: arg vô danh variadic bắt đầu
+                // ngay sau các named param tràn stack (thường là [x29+16])
+                let (mut gp, mut fp, mut nstk) = (0u32, 0u32, 0u32);
+                for &(_, pt) in &params {
+                    if matches!(p.tt.tys[pt as usize], Ty::Struct(_)) {
+                        let need = if p.tt.size(pt) > 8 { 2 } else { 1 };
+                        if gp + need <= 8 {
+                            gp += need;
+                        } else {
+                            nstk += need;
+                        }
+                    } else if p.tt.is_float(pt) {
+                        if fp < 8 {
+                            fp += 1;
+                        } else {
+                            nstk += 1;
+                        }
+                    } else if gp < 8 {
+                        gp += 1;
+                    } else {
+                        nstk += 1;
+                    }
+                }
+                p.va_off = 16 + 8 * nstk;
                 let body = p.stmt()?;
                 funcs.push(Func {
                     name,
