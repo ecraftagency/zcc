@@ -175,6 +175,8 @@ pub enum Node {
     Block(Vec<NodeId>),
     Call(String, Vec<NodeId>, u32), // gọi thẳng theo tên; nreg = số arg đầu "đặt tên"
     CallPtr(NodeId, Vec<NodeId>, u32), // gọi qua con trỏ hàm (blr)
+    SRet(NodeId, u32, u32), // call trả struct ≤16B: (call, offset temp local, size) — giá trị = địa chỉ temp
+    Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
     FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
     Str(u32),
 }
@@ -183,7 +185,9 @@ pub enum GInit {
     None,
     Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
     Str(u32),
-    Addr(String), // địa chỉ symbol khác: int *p = &g;
+    Addr(String),             // địa chỉ symbol khác: int *p = &g;
+    Bytes(Vec<u8>),           // char arr[] = "..." (đã pad đủ size)
+    List(Vec<(u32, u32, GInit)>), // initializer phẳng hóa: (offset, size, item)
 }
 
 pub struct Global {

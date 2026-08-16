@@ -49,6 +49,30 @@ pub fn emit(ast: &Ast) -> String {
         // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack caller
         let (mut gp, mut fp, mut stk) = (0u32, 0u32, 0u32);
         for &(off, t) in &f.params {
+            // struct by value ≤16B: đến trong 1-2 GPR liên tiếp (hoặc stack)
+            if matches!(ast.tt.tys[t as usize], Ty::Struct(_)) {
+                let sz = ast.tt.size(t);
+                let need = if sz > 8 { 2 } else { 1 };
+                g.lea_local("x9", off);
+                if gp + need <= 8 {
+                    _ = writeln!(g.s, "\tmov x8, x{gp}");
+                    g.store_narrow(0, sz.min(8));
+                    if sz > 8 {
+                        _ = writeln!(g.s, "\tmov x8, x{}", gp + 1);
+                        g.store_narrow(8, sz - 8);
+                    }
+                    gp += need;
+                } else {
+                    _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + 8 * stk);
+                    g.store_narrow(0, sz.min(8));
+                    if sz > 8 {
+                        _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + 8 * (stk + 1));
+                        g.store_narrow(8, sz - 8);
+                    }
+                    stk += need;
+                }
+                continue;
+            }
             let fl = ast.tt.is_float(t);
             if fl && fp < 8 {
                 g.lea_local("x9", off);
@@ -113,17 +137,7 @@ pub fn emit(ast: &Ast) -> String {
                     al.trailing_zeros(),
                     gl.name
                 );
-                _ = match init {
-                    GInit::Num(v) => match sz {
-                        1 => writeln!(g.s, "\t.byte {v}"),
-                        2 => writeln!(g.s, "\t.short {v}"),
-                        4 => writeln!(g.s, "\t.long {v}"),
-                        _ => writeln!(g.s, "\t.quad {v}"),
-                    },
-                    GInit::Str(i) => writeln!(g.s, "\t.quad l_str{i}"),
-                    GInit::Addr(n) => writeln!(g.s, "\t.quad _{n}"),
-                    GInit::None => unreachable!(),
-                };
+                g.gdata(init, sz);
             }
         }
     }
@@ -145,6 +159,61 @@ pub fn emit(ast: &Ast) -> String {
 }
 
 impl Cg<'_> {
+    // phát data cho một GInit; sz = size vùng phải phủ (List chèn .space vào lỗ hổng)
+    fn gdata(&mut self, init: &GInit, sz: u32) {
+        _ = match init {
+            GInit::Num(v) => match sz {
+                1 => writeln!(self.s, "\t.byte {v}"),
+                2 => writeln!(self.s, "\t.short {v}"),
+                4 => writeln!(self.s, "\t.long {v}"),
+                _ => writeln!(self.s, "\t.quad {v}"),
+            },
+            GInit::Str(i) => writeln!(self.s, "\t.quad l_str{i}"),
+            GInit::Addr(n) => writeln!(self.s, "\t.quad _{n}"),
+            GInit::Bytes(b) => {
+                let list: Vec<String> = b.iter().map(|x| x.to_string()).collect();
+                writeln!(self.s, "\t.byte {}", list.join(","))
+            }
+            GInit::List(items) => {
+                let mut pos = 0u32;
+                for (off, isz, it) in items {
+                    if *off > pos {
+                        _ = writeln!(self.s, "\t.space {}", off - pos);
+                    }
+                    self.gdata(it, *isz);
+                    pos = off + isz;
+                }
+                if pos < sz {
+                    _ = writeln!(self.s, "\t.space {}", sz - pos);
+                }
+                Ok(())
+            }
+            GInit::None => unreachable!(),
+        };
+    }
+    // ghi `sz` byte (≤8) thấp của x8 vào [x9, #off..] — chính xác từng mảnh,
+    // không đè slot bên cạnh (x8 bị dịch nát, x9 giữ nguyên)
+    fn store_narrow(&mut self, mut off: u32, mut sz: u32) {
+        while sz > 0 {
+            if sz >= 8 {
+                _ = writeln!(self.s, "\tstr x8, [x9, #{off}]");
+                off += 8;
+                sz -= 8;
+            } else if sz >= 4 {
+                _ = writeln!(self.s, "\tstr w8, [x9, #{off}]\n\tlsr x8, x8, #32");
+                off += 4;
+                sz -= 4;
+            } else if sz >= 2 {
+                _ = writeln!(self.s, "\tstrh w8, [x9, #{off}]\n\tlsr x8, x8, #16");
+                off += 2;
+                sz -= 2;
+            } else {
+                _ = writeln!(self.s, "\tstrb w8, [x9, #{off}]");
+                off += 1;
+                sz -= 1;
+            }
+        }
+    }
     fn labels(&mut self, k: u32) -> u32 {
         let n = self.lbl;
         self.lbl += k;
@@ -263,6 +332,14 @@ impl Cg<'_> {
                     match self.a.tt.tys[self.fret as usize] {
                         Ty::Double => self.s += "\tfmov d0, x0\n",
                         Ty::Float => self.s += "\tfmov d0, x0\n\tfcvt s0, d0\n",
+                        Ty::Struct(_) => {
+                            // trả struct ≤16B: nạp x0 (và x1) từ địa chỉ struct
+                            let sz = self.a.tt.size(self.fret);
+                            self.s += "\tmov x9, x0\n\tldr x0, [x9]\n";
+                            if sz > 8 {
+                                self.s += "\tldr x1, [x9, #8]\n";
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -387,6 +464,7 @@ impl Cg<'_> {
                 }
             }
             Node::Deref(e) => self.expr(*e),
+            Node::SRet(..) => self.expr(id), // giá trị SRet = địa chỉ temp
             _ => unreachable!("không phải lvalue"),
         }
     }
@@ -420,11 +498,24 @@ impl Cg<'_> {
             }
             Node::Assign(l, r) => {
                 let (l, r) = (*l, *r);
+                let lt = self.a.types[l as usize];
                 self.addr(l);
                 self.s += "\tstr x0, [sp, #-16]!\n";
                 self.expr(r);
                 self.s += "\tldr x1, [sp], #16\n";
-                self.store(0, self.a.types[l as usize]);
+                if matches!(self.a.tt.tys[lt as usize], Ty::Struct(_)) {
+                    // struct assign: copy từng byte src (x0) → dst (x1)
+                    let sz = self.a.tt.size(lt);
+                    let n = self.labels(1);
+                    self.s += "\tmov x4, x1\n";
+                    self.imm("x2", sz as i64);
+                    _ = writeln!(self.s, "L{n}:");
+                    self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+                    _ = writeln!(self.s, "\tb.ne L{n}");
+                    self.s += "\tmov x0, x4\n"; // giá trị = địa chỉ dst
+                } else {
+                    self.store(0, lt);
+                }
             }
             Node::Neg(e) => {
                 self.expr(*e);
@@ -468,6 +559,25 @@ impl Cg<'_> {
                 );
             }
             Node::Call(..) | Node::CallPtr(..) => self.call(id),
+            Node::SRet(call, off, sz) => {
+                let (call, off, sz) = (*call, *off, *sz);
+                self.expr(call); // struct về trong x0 (và x1 nếu >8B)
+                self.lea_local("x9", off);
+                self.s += "\tstr x0, [x9]\n";
+                if sz > 8 {
+                    self.s += "\tstr x1, [x9, #8]\n";
+                }
+                self.s += "\tmov x0, x9\n";
+            }
+            Node::Zero(l, sz) => {
+                let (l, sz) = (*l, *sz);
+                self.addr(l);
+                self.imm("x2", sz as i64);
+                let n = self.labels(1);
+                _ = writeln!(self.s, "L{n}:");
+                self.s += "\tstrb wzr, [x0], #1\n\tsubs x2, x2, #1\n";
+                _ = writeln!(self.s, "\tb.ne L{n}");
+            }
             Node::Bin(op, l, r) => {
                 let (op, l, r) = (*op, *l, *r);
                 let ct = self.a.types[l as usize]; // kiểu chung sau conversion của parser
@@ -549,13 +659,27 @@ impl Cg<'_> {
         #[derive(Clone, Copy)]
         enum Slot {
             G(u32),
-            F(u32, bool), // bool = param float 4 byte (cần fcvt s)
+            F(u32, bool),      // bool = param float 4 byte (cần fcvt s)
             S(u32),
+            St(u32, bool),     // struct → GPR: (reg đầu, chiếm 2 reg)
+            StS(u32, u32),     // struct → stack: (slot đầu, size)
         }
         let (mut gp, mut fp, mut stk) = (0u32, 0u32, 0u32);
         let mut plan = Vec::new();
         for (i, &a) in args.iter().enumerate() {
             let t = self.a.types[a as usize];
+            if matches!(self.a.tt.tys[t as usize], Ty::Struct(_)) {
+                let sz = self.a.tt.size(t);
+                let need = if sz > 8 { 2 } else { 1 };
+                if i < nreg && gp + need <= 8 {
+                    plan.push(Slot::St(gp, sz > 8));
+                    gp += need;
+                } else {
+                    plan.push(Slot::StS(stk, sz));
+                    stk += need;
+                }
+                continue;
+            }
             let fl = self.a.tt.is_float(t);
             if i < nreg && fl && fp < 8 {
                 plan.push(Slot::F(fp, self.a.tt.size(t) == 4));
@@ -573,9 +697,23 @@ impl Cg<'_> {
             self.sp_adjust("sub", pad);
         }
         for (&a, &sl) in args.iter().zip(&plan) {
-            if let Slot::S(k) = sl {
-                self.expr(a);
-                _ = writeln!(self.s, "\tstr x0, [sp, #{}]", 8 * k);
+            match sl {
+                Slot::S(k) => {
+                    self.expr(a);
+                    _ = writeln!(self.s, "\tstr x0, [sp, #{}]", 8 * k);
+                }
+                Slot::StS(k, sz) => {
+                    self.expr(a); // x0 = địa chỉ struct
+                    _ = writeln!(self.s, "\tldr x8, [x0]\n\tstr x8, [sp, #{}]", 8 * k);
+                    if sz > 8 {
+                        _ = writeln!(
+                            self.s,
+                            "\tldr x8, [x0, #8]\n\tstr x8, [sp, #{}]",
+                            8 * k + 8
+                        );
+                    }
+                }
+                _ => {}
             }
         }
         if let Some(e) = callee_expr {
@@ -585,11 +723,11 @@ impl Cg<'_> {
         let regargs: Vec<(NodeId, Slot)> = args
             .iter()
             .zip(&plan)
-            .filter(|(_, sl)| !matches!(sl, Slot::S(_)))
+            .filter(|(_, sl)| !matches!(sl, Slot::S(_) | Slot::StS(..)))
             .map(|(&a, &sl)| (a, sl))
             .collect();
         for &(a, _) in &regargs {
-            self.expr(a);
+            self.expr(a); // struct: x0 = địa chỉ (nạp vào reg lúc pop)
             self.s += "\tstr x0, [sp, #-16]!\n";
         }
         for &(_, sl) in regargs.iter().rev() {
@@ -601,7 +739,13 @@ impl Cg<'_> {
                         _ = writeln!(self.s, "\tfcvt s{i}, d{i}");
                     }
                 }
-                Slot::S(_) => unreachable!(),
+                Slot::St(i, two) => {
+                    _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tldr x{i}, [x9]");
+                    if two {
+                        _ = writeln!(self.s, "\tldr x{}, [x9, #8]", i + 1);
+                    }
+                }
+                Slot::S(_) | Slot::StS(..) => unreachable!(),
             }
         }
         match callee_name {
@@ -617,6 +761,7 @@ impl Cg<'_> {
             Ty::Void => {}
             Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
             Ty::Double => self.s += "\tfmov x0, d0\n",
+            Ty::Struct(_) => {} // x0/x1 thô — SRet bên trên hạ xuống temp
             _ => self.ext(rt),
         }
     }

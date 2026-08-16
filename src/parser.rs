@@ -33,6 +33,13 @@ enum Vloc {
     Glob(u32),
 }
 
+// cây initializer: expr / danh sách {..} / string literal
+enum Init {
+    E(NodeId),
+    L(Vec<Init>),
+    S(Vec<u8>),
+}
+
 struct P<'a> {
     toks: &'a [Tok],
     pos: usize,
@@ -711,7 +718,7 @@ impl P<'_> {
             let mut stmts = Vec::new();
             if !self.eat(&Tok::Punct(";")) {
                 loop {
-                    let (name, t) = self.declarator(bt, true)?;
+                    let (name, mut t) = self.declarator(bt, true)?;
                     match storage {
                         Storage::Typedef => {
                             self.typedefs.insert(name, t);
@@ -721,7 +728,7 @@ impl P<'_> {
                         }
                         Storage::Static => {
                             let g = format!("{}.{}", name, self.globals.len());
-                            let init = self.ginit(t)?;
+                            let init = self.ginit(&mut t)?;
                             self.globals.push(Global {
                                 name: g,
                                 ty: t,
@@ -750,11 +757,25 @@ impl P<'_> {
                             ));
                         }
                         _ => {
-                            let off = self.alloc_local(name, t);
                             if self.eat(&Tok::Punct("=")) {
+                                // parse init TRƯỚC khi cấp slot: int b[] = {..} cần size
+                                let init = self.parse_init()?;
+                                t = self.infer_len(t, &init);
+                                let off = self.alloc_local(name, t);
                                 let v = self.push(Node::Var(off), t);
-                                let e = self.assign()?;
-                                stmts.push(self.mkassign(v, e)?);
+                                // aggregate {..}/"..": zero-fill trước (partial init)
+                                if matches!(&init, Init::L(_) | Init::S(_))
+                                    && matches!(
+                                        self.tt.tys[t as usize],
+                                        Ty::Array(..) | Ty::Struct(_)
+                                    )
+                                {
+                                    let sz = self.tt.size(t);
+                                    stmts.push(self.push(Node::Zero(v, sz), VOID));
+                                }
+                                self.apply_init(v, t, init, &mut stmts)?;
+                            } else {
+                                self.alloc_local(name, t);
                             }
                         }
                     }
@@ -779,25 +800,184 @@ impl P<'_> {
         self.expect(Tok::Punct(end))?;
         Ok(Some(e))
     }
-    // init hằng cho global/static (scalar; {..} là vòng 2c)
-    fn ginit(&mut self, t: TypeId) -> Result<GInit, String> {
-        if !self.eat(&Tok::Punct("=")) {
-            return Ok(GInit::None);
+    // ---- initializer ----
+    // Cây init parse trước, chốt size mảng [], rồi mới hạ xuống assign (local)
+    // hoặc phẳng hóa thành (offset, size, item) (global/static).
+    fn parse_init(&mut self) -> Result<Init, String> {
+        if self.eat(&Tok::Punct("{")) {
+            let mut v = Vec::new();
+            if !self.eat(&Tok::Punct("}")) {
+                loop {
+                    v.push(self.parse_init()?);
+                    if !self.eat(&Tok::Punct(",")) {
+                        break;
+                    }
+                    if self.peek("}") {
+                        break; // trailing comma
+                    }
+                }
+                self.expect(Tok::Punct("}"))?;
+            }
+            return Ok(Init::L(v));
         }
-        if let Some(Tok::Str(bytes)) = self.toks.get(self.pos) {
-            self.strs.push(bytes.clone());
+        if let Some(Tok::Str(b)) = self.toks.get(self.pos) {
+            let mut b = b.clone();
             self.pos += 1;
-            return Ok(GInit::Str((self.strs.len() - 1) as u32));
+            while let Some(Tok::Str(m)) = self.toks.get(self.pos) {
+                b.extend_from_slice(m);
+                self.pos += 1;
+            }
+            return Ok(Init::S(b));
         }
-        // &sym hoặc tên mảng/hàm → địa chỉ
-        if self.peek("&") {
-            if let Some(Tok::Ident(n)) = self.toks.get(self.pos + 1) {
-                let n = n.clone();
-                self.pos += 2;
-                return Ok(GInit::Addr(n));
+        Ok(Init::E(self.assign()?))
+    }
+    // mảng T x[] — suy size từ init
+    fn infer_len(&mut self, t: TypeId, init: &Init) -> TypeId {
+        if let Ty::Array(e, 0) = self.tt.tys[t as usize] {
+            let n = match init {
+                Init::L(v) => v.len() as u32,
+                Init::S(b) => b.len() as u32 + 1,
+                _ => 1,
+            };
+            return self.tt.add(Ty::Array(e, n));
+        }
+        t
+    }
+    // hạ init xuống chuỗi assign trên lvalue (local)
+    fn apply_init(
+        &mut self,
+        lval: NodeId,
+        t: TypeId,
+        init: Init,
+        stmts: &mut Vec<NodeId>,
+    ) -> Result<(), String> {
+        match (init, self.tt.tys[t as usize]) {
+            (Init::S(b), Ty::Array(e, n)) if self.tt.size(e) == 1 => {
+                for i in 0..((b.len() as u32 + 1).min(n)) {
+                    let v = *b.get(i as usize).map(|x| x).unwrap_or(&0);
+                    let idx = self.push(Node::Num(i as i64), LONG);
+                    let sum = self.mkbin("+", lval, idx)?;
+                    let el = self.push(Node::Deref(sum), e);
+                    let num = self.push(Node::Num(v as i64), INT);
+                    let a = self.mkassign(el, num)?;
+                    stmts.push(a);
+                }
+                Ok(())
+            }
+            (Init::L(v), Ty::Array(e, _)) => {
+                for (i, it) in v.into_iter().enumerate() {
+                    let idx = self.push(Node::Num(i as i64), LONG);
+                    let sum = self.mkbin("+", lval, idx)?;
+                    let el = self.push(Node::Deref(sum), e);
+                    self.apply_init(el, e, it, stmts)?;
+                }
+                Ok(())
+            }
+            (Init::L(v), Ty::Struct(si)) => {
+                let members: Vec<(TypeId, u32)> = self.tt.structs[si as usize]
+                    .members
+                    .iter()
+                    .map(|&(_, t, o)| (t, o))
+                    .collect();
+                for (it, (mt, off)) in v.into_iter().zip(members) {
+                    let m = self.push(Node::Member(lval, off), mt);
+                    self.apply_init(m, mt, it, stmts)?;
+                }
+                Ok(())
+            }
+            (Init::L(v), _) => {
+                // scalar = {expr}
+                let it = v.into_iter().next().ok_or("initializer rỗng")?;
+                self.apply_init(lval, t, it, stmts)
+            }
+            (Init::S(b), _) => {
+                // char *p = "str"
+                self.strs.push(b);
+                let i = (self.strs.len() - 1) as u32;
+                let n = self.strs[i as usize].len() as u32 + 1;
+                let st = self.tt.add(Ty::Array(CHAR, n));
+                let sn = self.push(Node::Str(i), st);
+                let a = self.mkassign(lval, sn)?;
+                stmts.push(a);
+                Ok(())
+            }
+            (Init::E(e), _) => {
+                let a = self.mkassign(lval, e)?;
+                stmts.push(a);
+                Ok(())
             }
         }
-        let e = self.cond_expr()?;
+    }
+    // phẳng hóa init hằng cho global/static
+    fn gflatten(
+        &mut self,
+        t: TypeId,
+        init: Init,
+        base: u32,
+        out: &mut Vec<(u32, u32, GInit)>,
+    ) -> Result<(), String> {
+        match (init, self.tt.tys[t as usize]) {
+            (Init::S(mut b), Ty::Array(e, n)) if self.tt.size(e) == 1 => {
+                b.push(0);
+                b.resize(n as usize, 0);
+                out.push((base, n, GInit::Bytes(b)));
+                Ok(())
+            }
+            (Init::L(v), Ty::Array(e, _)) => {
+                let esz = self.tt.size(e);
+                for (i, it) in v.into_iter().enumerate() {
+                    self.gflatten(e, it, base + i as u32 * esz, out)?;
+                }
+                Ok(())
+            }
+            (Init::L(v), Ty::Struct(si)) => {
+                let members: Vec<(TypeId, u32)> = self.tt.structs[si as usize]
+                    .members
+                    .iter()
+                    .map(|&(_, t, o)| (t, o))
+                    .collect();
+                for (it, (mt, off)) in v.into_iter().zip(members) {
+                    self.gflatten(mt, it, base + off, out)?;
+                }
+                Ok(())
+            }
+            (Init::L(v), _) => {
+                let it = v.into_iter().next().ok_or("initializer rỗng")?;
+                self.gflatten(t, it, base, out)
+            }
+            (Init::S(b), _) => {
+                self.strs.push(b);
+                out.push((base, 8, GInit::Str((self.strs.len() - 1) as u32)));
+                Ok(())
+            }
+            (Init::E(e), _) => {
+                let item = self.gitem(e, t)?;
+                out.push((base, self.tt.size(t), item));
+                Ok(())
+            }
+        }
+    }
+    // một item hằng: số / bits float / địa chỉ symbol / string
+    fn gitem(&mut self, mut e: NodeId, t: TypeId) -> Result<GInit, String> {
+        while let Node::Cast(inner) = self.nodes[e as usize] {
+            e = inner;
+        }
+        match &self.nodes[e as usize] {
+            Node::Str(i) => return Ok(GInit::Str(*i)),
+            Node::FunAddr(n) => return Ok(GInit::Addr(n.clone())),
+            Node::GVar(gi) => {
+                let g = &self.globals[*gi as usize];
+                if matches!(self.tt.tys[g.ty as usize], Ty::Array(..)) {
+                    return Ok(GInit::Addr(g.name.clone())); // array decay
+                }
+            }
+            Node::Addr(inner) => {
+                if let Node::GVar(gi) = self.nodes[*inner as usize] {
+                    return Ok(GInit::Addr(self.globals[gi as usize].name.clone()));
+                }
+            }
+            _ => {}
+        }
         if self.tt.is_float(t) {
             let v = self.fold_f(e)?;
             let bits =
@@ -805,6 +985,17 @@ impl P<'_> {
             return Ok(GInit::Num(bits));
         }
         Ok(GInit::Num(self.fold(e)?))
+    }
+    // init global/static: trả về GInit + chốt size mảng []
+    fn ginit(&mut self, t: &mut TypeId) -> Result<GInit, String> {
+        if !self.eat(&Tok::Punct("=")) {
+            return Ok(GInit::None);
+        }
+        let init = self.parse_init()?;
+        *t = self.infer_len(*t, &init);
+        let mut list = Vec::new();
+        self.gflatten(*t, init, 0, &mut list)?;
+        Ok(GInit::List(list))
     }
 
     // ---- expression ----
@@ -1022,11 +1213,30 @@ impl P<'_> {
             }
         }
         let nreg = if variadic { params.len() as u32 } else { args.len() as u32 };
-        if let Node::FunAddr(name) = &self.nodes[callee as usize] {
-            let name = name.clone();
-            return Ok(self.push(Node::Call(name, args, nreg), ret));
+        for a in &args {
+            let t = self.ty(*a);
+            if matches!(self.tt.tys[t as usize], Ty::Struct(_)) && self.tt.size(t) > 16 {
+                return Err("struct >16 byte by value: chưa hỗ trợ".into());
+            }
         }
-        Ok(self.push(Node::CallPtr(callee, args, nreg), ret))
+        let call = if let Node::FunAddr(name) = &self.nodes[callee as usize] {
+            let name = name.clone();
+            self.push(Node::Call(name, args, nreg), ret)
+        } else {
+            self.push(Node::CallPtr(callee, args, nreg), ret)
+        };
+        // trả struct ≤16B: hạ x0/x1 xuống temp local ẩn, giá trị = địa chỉ temp
+        if matches!(self.tt.tys[ret as usize], Ty::Struct(_)) {
+            let sz = self.tt.size(ret);
+            if sz > 16 {
+                return Err("hàm trả struct >16 byte: chưa hỗ trợ".into());
+            }
+            // temp 16 byte (đệm đủ để codegen str x0/x1 nguyên 8-byte không đè slot khác)
+            let pad = self.tt.add(Ty::Array(CHAR, 16));
+            let off = self.alloc_local(String::new(), pad);
+            return Ok(self.push(Node::SRet(call, off, sz), ret));
+        }
+        Ok(call)
     }
     fn postfix(&mut self) -> R {
         let mut e = self.primary()?;
@@ -1221,6 +1431,9 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
                     } else {
                         sig.params[i]
                     };
+                    if matches!(p.tt.tys[pt as usize], Ty::Struct(_)) && p.tt.size(pt) > 16 {
+                        return Err("param struct >16 byte by value: chưa hỗ trợ".into());
+                    }
                     let off = p.alloc_local(pn.clone(), pt);
                     params.push((off, pt));
                 }
@@ -1240,14 +1453,14 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
         // không phải funcdef: chuỗi declarator "a, *b, c[2];" — cái đầu đã parse
         let mut cur = (name, t);
         loop {
-            let (name, t) = cur;
+            let (name, mut t) = cur;
             if storage == Storage::Typedef {
                 p.typedefs.insert(name, t);
                 p.eat(&Tok::Punct("=")); // typedef không init; phòng hờ
             } else if matches!(p.tt.tys[t as usize], Ty::Func(_)) {
                 p.fns.insert(name, t); // prototype
             } else {
-                let init = p.ginit(t)?;
+                let init = p.ginit(&mut t)?;
                 let is_extern = storage == Storage::Extern && matches!(init, GInit::None);
                 p.globals.push(Global {
                     name,
