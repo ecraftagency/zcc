@@ -4,22 +4,44 @@
 // Node tham chiếu nhau bằng NodeId(u32) vào arena Vec<Node>, không Box/reference.
 // Layout (size/align) đặt ở đây vì zcc lock họ ABI LP64 (arm64 lẫn x86_64:
 // int=4, char=1, long=ptr=8); mai này cần target ILP32 thì tham số hóa TyTab.
+//
+// Quy ước giá trị runtime (hợp đồng parser ↔ codegen): mọi giá trị scalar sống
+// trong thanh ghi 64-bit "canonical" — số nguyên sign/zero-extend đúng theo kiểu,
+// float/double giữ BIT PATTERN f64 (float được nâng lên double ngay khi load).
+// Nhờ vậy default argument promotion (char/short→int, float→double) là no-op.
 
 pub type NodeId = u32;
 pub type TypeId = u32;
 
 #[derive(Clone, Copy)]
 pub enum Ty {
+    Void,
+    Char, // signed trên Darwin; "signed char" cũng map vào đây
+    UChar,
+    Short,
+    UShort,
     Int,
-    Char,
+    UInt,
     Long,
+    ULong,
+    Float,
+    Double, // long double = double trên arm64 Darwin
     Ptr(TypeId),
     Array(TypeId, u32),
     Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
+    Func(u32),   // index vào TyTab.fns
 }
-pub const INT: TypeId = 0;
+pub const VOID: TypeId = 0;
 pub const CHAR: TypeId = 1;
-pub const LONG: TypeId = 2;
+pub const UCHAR: TypeId = 2;
+pub const SHORT: TypeId = 3;
+pub const USHORT: TypeId = 4;
+pub const INT: TypeId = 5;
+pub const UINT: TypeId = 6;
+pub const LONG: TypeId = 7;
+pub const ULONG: TypeId = 8;
+pub const FLOAT: TypeId = 9;
+pub const DOUBLE: TypeId = 10;
 
 pub struct StructDef {
     pub members: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset)
@@ -27,21 +49,49 @@ pub struct StructDef {
     pub align: u32,
 }
 
+#[derive(Clone)]
+pub struct FnSig {
+    pub ret: TypeId,
+    pub params: Vec<TypeId>,
+    pub pnames: Vec<String>, // tên param (rỗng nếu abstract); old-style: chỉ có tên
+    pub variadic: bool,
+    pub oldstyle: bool, // "()" hoặc ident-list: gọi không kiểm tra, arg đều "đặt tên"
+}
+
 pub struct TyTab {
     pub tys: Vec<Ty>,
     pub structs: Vec<StructDef>,
+    pub fns: Vec<FnSig>,
 }
 
 impl TyTab {
     pub fn new() -> Self {
-        // 3 slot đầu cố định khớp INT/CHAR/LONG
-        TyTab { tys: vec![Ty::Int, Ty::Char, Ty::Long], structs: Vec::new() }
+        TyTab {
+            // thứ tự khớp các hằng VOID..DOUBLE phía trên
+            tys: vec![
+                Ty::Void,
+                Ty::Char,
+                Ty::UChar,
+                Ty::Short,
+                Ty::UShort,
+                Ty::Int,
+                Ty::UInt,
+                Ty::Long,
+                Ty::ULong,
+                Ty::Float,
+                Ty::Double,
+            ],
+            structs: Vec::new(),
+            fns: Vec::new(),
+        }
     }
     pub fn size(&self, t: TypeId) -> u32 {
         match self.tys[t as usize] {
-            Ty::Int => 4,
-            Ty::Char => 1,
-            Ty::Long | Ty::Ptr(_) => 8,
+            Ty::Void => 1, // cho void* arith kiểu GNU; sizeof(void) C89 vốn không hợp lệ
+            Ty::Char | Ty::UChar => 1,
+            Ty::Short | Ty::UShort => 2,
+            Ty::Int | Ty::UInt | Ty::Float => 4,
+            Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) | Ty::Func(_) => 8,
             Ty::Array(e, n) => self.size(e) * n,
             Ty::Struct(s) => self.structs[s as usize].size,
         }
@@ -59,6 +109,32 @@ impl TyTab {
             _ => None,
         }
     }
+    pub fn is_float(&self, t: TypeId) -> bool {
+        matches!(self.tys[t as usize], Ty::Float | Ty::Double)
+    }
+    pub fn is_unsigned(&self, t: TypeId) -> bool {
+        matches!(
+            self.tys[t as usize],
+            Ty::UChar | Ty::UShort | Ty::UInt | Ty::ULong | Ty::Ptr(_)
+        )
+    }
+    pub fn is_integer(&self, t: TypeId) -> bool {
+        matches!(
+            self.tys[t as usize],
+            Ty::Char | Ty::UChar | Ty::Short | Ty::UShort | Ty::Int | Ty::UInt | Ty::Long | Ty::ULong
+        )
+    }
+    // FnSig của một giá trị gọi được: hàm hoặc con trỏ hàm
+    pub fn fnsig(&self, t: TypeId) -> Option<&FnSig> {
+        match self.tys[t as usize] {
+            Ty::Func(i) => Some(&self.fns[i as usize]),
+            Ty::Ptr(p) => match self.tys[p as usize] {
+                Ty::Func(i) => Some(&self.fns[i as usize]),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     pub fn add(&mut self, ty: Ty) -> TypeId {
         self.tys.push(ty);
         (self.tys.len() - 1) as TypeId
@@ -70,6 +146,7 @@ impl TyTab {
 
 pub enum Node {
     Num(i64),
+    FNum(f64),
     Var(u32),               // offset local dưới frame pointer
     GVar(u32),              // index vào Ast.globals
     Member(NodeId, u32),    // địa chỉ base + offset; kiểu = kiểu member
@@ -77,11 +154,12 @@ pub enum Node {
     Addr(NodeId),
     Deref(NodeId),
     Neg(NodeId),
+    Cast(NodeId), // kiểu đích = kiểu của chính node này trong Ast.types
     Bin(&'static str, NodeId, NodeId), // op = chính punct: "+" "<=" ...
     Cond(NodeId, NodeId, NodeId),      // ?: — && || ! cũng desugar về đây/Bin
     Comma(NodeId, NodeId),
     Post(&'static str, NodeId, i64), // x++/x--: op "+"/"-", lvalue, delta (1 | sizeof pointee)
-    Ret(NodeId),
+    Ret(Option<NodeId>),
     If(NodeId, NodeId, Option<NodeId>),
     While(NodeId, NodeId),
     For(Option<NodeId>, Option<NodeId>, Option<NodeId>, NodeId),
@@ -95,27 +173,35 @@ pub enum Node {
     Goto(String),
     Label(String, NodeId),
     Block(Vec<NodeId>),
-    Call(String, Vec<NodeId>, u32), // nreg: số arg đầu đi thanh ghi; phần sau (arg vô danh
-    Str(u32),                       // của hàm variadic) đi theo luật variadic của target
+    Call(String, Vec<NodeId>, u32), // gọi thẳng theo tên; nreg = số arg đầu "đặt tên"
+    CallPtr(NodeId, Vec<NodeId>, u32), // gọi qua con trỏ hàm (blr)
+    FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
+    Str(u32),
 }
 
 pub enum GInit {
     None,
-    Num(i64),
+    Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
     Str(u32),
+    Addr(String), // địa chỉ symbol khác: int *p = &g;
 }
 
 pub struct Global {
     pub name: String,
     pub ty: TypeId,
     pub init: GInit,
+    pub is_static: bool,
+    pub is_extern: bool, // chỉ khai báo — không phát storage
 }
 
 pub struct Func {
     pub name: String,
-    pub params: Vec<(u32, u32)>, // (offset, size) để spill thanh ghi arg vào slot
-    pub frame: u32,              // đã tròn 16
+    pub params: Vec<(u32, TypeId)>, // (offset, kiểu) để spill thanh ghi arg vào slot
+    pub frame: u32,                 // đã tròn 16
     pub body: NodeId,
+    pub ret: TypeId,
+    pub is_static: bool,
+    pub variadic: bool,
 }
 
 pub struct Ast {

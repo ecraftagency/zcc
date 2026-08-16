@@ -1,26 +1,37 @@
-// Parser: &[Tok] → AST arena (Vec<Node> + NodeId u32) + type arena (TyTab: Vec<Ty> +
-// TypeId u32, struct/union member ở bảng structs riêng vì Ty phải Copy).
-// Grammar hiện tại (M0–M7 + 2a):
-//   program    = ("typedef" typespec declarator ";" | typespec ";" | typespec "*"* ident
-//                 ("(" params ")" (";" | block) | ("[" const "]")? ("=" hằng)? ";"))*
-//   typespec   = "int" | "char" | "long" | tên typedef
-//              | ("struct" | "union") tag? ("{" (typespec declarator ";")* "}")?
-//              | "enum" tag? ("{" ident ("=" const)? ("," ...)* "}")?
-//   stmt       = "return" expr ";" | if/while/for/do-while/switch/case/default
-//              | break/continue/goto/label | "{" stmt* "}" (mở scope)
-//              | typespec declarator ("=" assign)? ";" | ";" | expr ";"
-//   expr       = assign ("," assign)*
-//   assign     = cond (("=" | "+=" | "-=" | ... ) assign)?   (vế trái lvalue)
-//   cond       = lor ("?" expr ":" cond)?
-//   lor/land   = || && — desugar thành Cond lồng nhau (short-circuit + chuẩn hóa 0/1)
-//   bitor..and = "|" "^" "&" từng tầng; equality → relational → shift → add → mul
-//   unary      = ("-" "+" "*" "&" "!" "~" "++" "--" "sizeof") unary | postfix
-//   postfix    = primary ("[" expr "]" | "." id | "->" id | "++" | "--")*
-//   primary    = num | string | ident | call | "(" expr ")"
-// Tên hàm trong call KHÔNG kiểm chứng — codegen phát `bl _name`, ld64 lo phần còn lại.
-use crate::ast::{Ast, Func, GInit, Global, Node, NodeId, StructDef, Ty, TyTab, TypeId, CHAR, INT, LONG};
+// Parser: &[Tok] → AST arena (Vec<Node> + NodeId u32) + type arena (TyTab).
+// Grammar C89 (thiếu: initializer {..}, bitfield, struct by value — các vòng sau):
+//   decl       = decl_specs (declarator ("=" init)? ("," declarator ...)*)? ";"
+//              | decl_specs declarator [old-style decls] block   (funcdef)
+//   decl_specs = (storage | qualifier | void/char/short/int/long/signed/unsigned/
+//                 float/double | struct/union/enum spec | typedef-name)+
+//   declarator = "*" quals* declarator | direct ("[" const? "]" | "(" params ")")*
+//   direct     = ident | "(" declarator ")"
+//   expr       = assign ("," assign)* ; assign = cond (assign-op assign)?
+//   cond → lor → land → bitor → bitxor → bitand → eq → rel → shift → add → mul
+//        → cast-expr = "(" typename ")" cast-expr | unary
+//   postfix    = primary ("[" e "]" | "." id | "->" id | "(" args ")" | "++" | "--")*
+// Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
+// conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
+use crate::ast::{
+    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, Ty, TyTab, TypeId, CHAR, DOUBLE,
+    FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
+};
 use crate::lexer::{NumK, Tok};
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Storage {
+    None,
+    Typedef,
+    Static,
+    Extern,
+}
+
+#[derive(Clone, Copy)]
+enum Vloc {
+    Stack(u32),
+    Glob(u32),
+}
 
 struct P<'a> {
     toks: &'a [Tok],
@@ -28,15 +39,16 @@ struct P<'a> {
     nodes: Vec<Node>,
     types: Vec<TypeId>,
     tt: TyTab,
-    locals: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset); scope = truncate khi đóng block
+    locals: Vec<(String, TypeId, Vloc)>, // scope = truncate khi đóng block
     cur_off: u32,
     globals: Vec<Global>,
     strs: Vec<Vec<u8>>,
-    fns: HashMap<String, (u32, bool)>, // tên → (số param đặt tên, variadic?)
-    tags: HashMap<String, TypeId>,     // tag struct/union
+    fns: HashMap<String, TypeId>, // tên hàm → TypeId (Ty::Func)
+    tags: HashMap<String, TypeId>,
     typedefs: HashMap<String, TypeId>,
-    enums: HashMap<String, i64>,                       // hằng enum
-    switches: Vec<(Vec<(i64, NodeId)>, Option<NodeId>)>, // stack switch đang mở
+    enums: HashMap<String, i64>,
+    switches: Vec<(Vec<(i64, NodeId)>, Option<NodeId>)>,
+    fret: TypeId, // kiểu trả về của hàm đang parse
 }
 
 type R = Result<NodeId, String>;
@@ -55,6 +67,11 @@ const ASSIGN_OPS: [(&str, &str); 11] = [
     ("^=", "^"),
 ];
 
+const TYPE_WORDS: [&str; 14] = [
+    "void", "char", "short", "int", "long", "signed", "unsigned", "float", "double", "struct",
+    "union", "enum", "const", "volatile",
+];
+
 impl P<'_> {
     fn push(&mut self, n: Node, t: TypeId) -> NodeId {
         self.nodes.push(n);
@@ -68,6 +85,9 @@ impl P<'_> {
         let hit = self.toks.get(self.pos) == Some(want);
         self.pos += hit as usize;
         hit
+    }
+    fn peek(&self, p: &'static str) -> bool {
+        self.toks.get(self.pos) == Some(&Tok::Punct(p))
     }
     fn eat_kw(&mut self, kw: &str) -> bool {
         let hit = matches!(self.toks.get(self.pos), Some(Tok::Ident(t)) if t == kw);
@@ -89,7 +109,13 @@ impl P<'_> {
             Err(format!("cần tên, gặp {:?}", self.toks.get(self.pos)))
         }
     }
-    // constant-expression: parse như cond rồi fold — node xây dở thành rác arena
+    fn is_type_word(&self, n: &str) -> bool {
+        TYPE_WORDS.contains(&n)
+            || self.typedefs.contains_key(n)
+            || ["typedef", "static", "extern", "auto", "register"].contains(&n)
+    }
+
+    // ---- hằng ----
     fn const_expr(&mut self) -> Result<i64, String> {
         let e = self.cond_expr()?;
         self.fold(e)
@@ -98,6 +124,20 @@ impl P<'_> {
         match &self.nodes[id as usize] {
             Node::Num(v) => Ok(*v),
             Node::Neg(e) => Ok(self.fold(*e)?.wrapping_neg()),
+            Node::Cast(e) => {
+                // thu hẹp theo kiểu đích để (char)300 v.v. đúng
+                let v = self.fold(*e)?;
+                let t = self.ty(id);
+                Ok(match self.tt.size(t) {
+                    1 if self.tt.is_unsigned(t) => v as u8 as i64,
+                    1 => v as i8 as i64,
+                    2 if self.tt.is_unsigned(t) => v as u16 as i64,
+                    2 => v as i16 as i64,
+                    4 if self.tt.is_unsigned(t) => v as u32 as i64,
+                    4 => v as i32 as i64,
+                    _ => v,
+                })
+            }
             Node::Cond(c, t, e) => {
                 if self.fold(*c)? != 0 {
                     self.fold(*t)
@@ -107,24 +147,34 @@ impl P<'_> {
             }
             Node::Comma(_, r) => self.fold(*r),
             Node::Bin(op, l, r) => {
+                let u = self.tt.is_unsigned(self.ty(id))
+                    || self.tt.is_unsigned(self.ty(*l))
+                    || self.tt.is_unsigned(self.ty(*r));
                 let (l, r) = (self.fold(*l)?, self.fold(*r)?);
                 Ok(match *op {
                     "+" => l.wrapping_add(r),
                     "-" => l.wrapping_sub(r),
                     "*" => l.wrapping_mul(r),
                     "/" | "%" if r == 0 => return Err("chia 0 trong hằng".into()),
+                    "/" if u => (l as u64 / r as u64) as i64,
                     "/" => l.wrapping_div(r),
+                    "%" if u => (l as u64 % r as u64) as i64,
                     "%" => l.wrapping_rem(r),
                     "&" => l & r,
                     "|" => l | r,
                     "^" => l ^ r,
                     "<<" => l.wrapping_shl(r as u32),
+                    ">>" if u => ((l as u64).wrapping_shr(r as u32)) as i64,
                     ">>" => l.wrapping_shr(r as u32),
                     "==" => (l == r) as i64,
                     "!=" => (l != r) as i64,
+                    "<" if u => ((l as u64) < r as u64) as i64,
                     "<" => (l < r) as i64,
+                    "<=" if u => ((l as u64) <= r as u64) as i64,
                     "<=" => (l <= r) as i64,
+                    ">" if u => ((l as u64) > r as u64) as i64,
                     ">" => (l > r) as i64,
+                    ">=" if u => ((l as u64) >= r as u64) as i64,
                     ">=" => (l >= r) as i64,
                     _ => return Err("op không dùng được trong hằng".into()),
                 })
@@ -132,28 +182,118 @@ impl P<'_> {
             _ => Err("cần biểu thức hằng".into()),
         }
     }
-    // None = token hiện tại không mở đầu một kiểu (→ caller thử hướng khác)
-    fn typespec(&mut self) -> Result<Option<TypeId>, String> {
-        for (kw, t) in [("int", INT), ("char", CHAR), ("long", LONG)] {
-            if self.eat_kw(kw) {
-                return Ok(Some(t));
+    // hằng thực cho global init kiểu float
+    fn fold_f(&self, id: NodeId) -> Result<f64, String> {
+        match &self.nodes[id as usize] {
+            Node::FNum(v) => Ok(*v),
+            Node::Num(v) => Ok(*v as f64),
+            Node::Neg(e) => Ok(-self.fold_f(*e)?),
+            Node::Cast(e) => self.fold_f(*e),
+            Node::Bin(op, l, r) => {
+                let (l, r) = (self.fold_f(*l)?, self.fold_f(*r)?);
+                Ok(match *op {
+                    "+" => l + r,
+                    "-" => l - r,
+                    "*" => l * r,
+                    "/" => l / r,
+                    _ => return Err("op không dùng được trong hằng thực".into()),
+                })
             }
+            _ => Err("cần hằng thực".into()),
         }
-        for (kw, is_union) in [("struct", false), ("union", true)] {
-            if self.eat_kw(kw) {
-                return self.struct_union(is_union).map(Some);
+    }
+
+    // ---- kiểu ----
+    // None = token hiện tại không mở đầu một declaration
+    fn decl_specs(&mut self) -> Result<Option<(TypeId, Storage)>, String> {
+        let mut storage = Storage::None;
+        let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
+        let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
+        loop {
+            let n = match self.toks.get(self.pos) {
+                Some(Tok::Ident(n)) => n.as_str(),
+                _ => break,
+            };
+            match n {
+                "const" | "volatile" | "auto" | "register" => {}
+                "typedef" => storage = Storage::Typedef,
+                "static" => storage = Storage::Static,
+                "extern" => storage = Storage::Extern,
+                "void" | "char" | "int" | "float" | "double" => base = Some(n),
+                "short" => short = true,
+                "long" => longs += 1,
+                "signed" => sgn = true,
+                "unsigned" => uns = true,
+                "struct" | "union" => {
+                    self.pos += 1;
+                    direct = Some(self.struct_union(n == "union")?);
+                    any = true;
+                    continue;
+                }
+                "enum" => {
+                    self.pos += 1;
+                    direct = Some(self.enum_spec()?);
+                    any = true;
+                    continue;
+                }
+                _ => {
+                    // typedef-name: chỉ khi chưa có kiểu nào khác
+                    if base.is_none() && direct.is_none() && !uns && !sgn && !short && longs == 0 {
+                        if let Some(&t) = self.typedefs.get(n) {
+                            self.pos += 1;
+                            direct = Some(t);
+                            any = true;
+                            continue;
+                        }
+                    }
+                    break;
+                }
             }
+            self.pos += 1;
+            any = true;
         }
-        if self.eat_kw("enum") {
-            return self.enum_spec().map(Some);
+        let n = n_hack(base); // tránh borrow; xem dưới
+        if !any {
+            return Ok(None);
         }
-        if let Some(Tok::Ident(n)) = self.toks.get(self.pos) {
-            if let Some(&t) = self.typedefs.get(n) {
-                self.pos += 1;
-                return Ok(Some(t));
+        if let Some(t) = direct {
+            return Ok(Some((t, storage)));
+        }
+        let t = match n {
+            "void" => VOID,
+            "char" => {
+                if uns {
+                    UCHAR
+                } else {
+                    CHAR
+                }
             }
-        }
-        Ok(None)
+            "float" => FLOAT,
+            "double" => DOUBLE, // long double = double
+            _ => {
+                // họ int (kể cả không có "int" tường minh)
+                if short {
+                    if uns {
+                        USHORT
+                    } else {
+                        SHORT
+                    }
+                } else if longs > 0 {
+                    if uns {
+                        ULONG
+                    } else {
+                        LONG
+                    }
+                } else {
+                    if uns {
+                        UINT
+                    } else {
+                        INT
+                    }
+                }
+            }
+        };
+        Ok(Some((t, storage)))
     }
     fn struct_union(&mut self, is_union: bool) -> Result<TypeId, String> {
         let tag = if let Some(Tok::Ident(n)) = self.toks.get(self.pos) {
@@ -165,31 +305,56 @@ impl P<'_> {
         };
         if !self.eat(&Tok::Punct("{")) {
             let tag = tag.ok_or("struct/union cần tag hoặc thân")?;
-            return self.tags.get(&tag).copied().ok_or(format!("tag chưa định nghĩa: {}", tag));
+            // forward reference: tạo placeholder incomplete, định nghĩa sau ghi đè
+            if let Some(&t) = self.tags.get(&tag) {
+                return Ok(t);
+            }
+            self.tt.structs.push(StructDef { members: Vec::new(), size: 0, align: 1 });
+            let t = self.tt.add(Ty::Struct(self.tt.structs.len() as u32 - 1));
+            self.tags.insert(tag, t);
+            return Ok(t);
         }
+        // có thân: tag đã có placeholder thì định nghĩa vào đúng slot (tự tham chiếu được)
+        let t = match tag.as_ref().and_then(|g| self.tags.get(g)).copied() {
+            Some(t) => t,
+            None => {
+                self.tt.structs.push(StructDef { members: Vec::new(), size: 0, align: 1 });
+                let t = self.tt.add(Ty::Struct(self.tt.structs.len() as u32 - 1));
+                if let Some(tag) = tag {
+                    self.tags.insert(tag, t);
+                }
+                t
+            }
+        };
+        let Ty::Struct(sidx) = self.tt.tys[t as usize] else { unreachable!() };
         let mut members = Vec::new();
         let (mut off, mut mx) = (0u32, 1u32);
         while !self.eat(&Tok::Punct("}")) {
-            let bt = self.typespec()?.ok_or("cần kiểu member")?;
-            let (mn, mt) = self.declarator(bt)?;
-            let (sz, al) = (self.tt.size(mt), self.tt.align(mt));
-            let o = if is_union { 0 } else { off.div_ceil(al) * al };
-            members.push((mn, mt, o));
-            off = if is_union { off.max(sz) } else { o + sz };
-            mx = mx.max(al);
+            let (bt, _) = self.decl_specs()?.ok_or("cần kiểu member")?;
+            loop {
+                let (mn, mt) = self.declarator(bt, true)?;
+                let (sz, al) = (self.tt.size(mt), self.tt.align(mt));
+                let o = if is_union { 0 } else { off.div_ceil(al) * al };
+                members.push((mn, mt, o));
+                off = if is_union { off.max(sz) } else { o + sz };
+                mx = mx.max(al);
+                if !self.eat(&Tok::Punct(",")) {
+                    break;
+                }
+            }
             self.expect(Tok::Punct(";"))?;
         }
-        self.tt.structs.push(StructDef { members, size: off.div_ceil(mx) * mx, align: mx });
-        let t = self.tt.add(Ty::Struct(self.tt.structs.len() as u32 - 1));
-        if let Some(tag) = tag {
-            self.tags.insert(tag, t);
-        }
+        self.tt.structs[sidx as usize] =
+            StructDef { members, size: off.div_ceil(mx) * mx, align: mx };
         Ok(t)
     }
-    // enum = int; thân chỉ sinh hằng vào bảng enums
     fn enum_spec(&mut self) -> Result<TypeId, String> {
-        if let Some(Tok::Ident(_)) = self.toks.get(self.pos) {
-            self.pos += 1; // tag: nuốt, không cần bảng riêng
+        if let Some(Tok::Ident(n)) = self.toks.get(self.pos) {
+            if !self.is_type_word(n) && self.toks.get(self.pos + 1) != Some(&Tok::Punct("{"))
+                || self.toks.get(self.pos + 1) == Some(&Tok::Punct("{"))
+            {
+                self.pos += 1; // tag: nuốt, enum = int nên không cần bảng riêng
+            }
         }
         if self.eat(&Tok::Punct("{")) {
             let mut val = 0i64;
@@ -208,23 +373,229 @@ impl P<'_> {
         }
         Ok(INT)
     }
-    fn declarator(&mut self, mut t: TypeId) -> Result<(String, TypeId), String> {
+    // declarator đầy đủ C: con trỏ, nested "(...)", suffix mảng/hàm.
+    // need_name=false cho abstract declarator (cast, sizeof, param không tên).
+    fn declarator(&mut self, mut t: TypeId, need_name: bool) -> Result<(String, TypeId), String> {
         while self.eat(&Tok::Punct("*")) {
             t = self.tt.ptr_to(t);
+            while self.eat_kw("const") || self.eat_kw("volatile") {}
         }
-        let name = self.ident()?;
-        if self.eat(&Tok::Punct("[")) {
-            let n = self.const_expr()?;
-            self.expect(Tok::Punct("]"))?;
-            t = self.tt.add(Ty::Array(t, n as u32));
+        if self.nested_ahead() {
+            self.pos += 1; // '('
+            let save = self.pos;
+            self.declarator(VOID, false)?; // parse nháp tìm ')' — type tạo ra là rác arena
+            self.expect(Tok::Punct(")"))?;
+            let outer = self.suffixes(t)?; // suffix NGOÀI áp trước (luật inside-out)
+            let end = self.pos;
+            self.pos = save;
+            let res = self.declarator(outer, need_name)?;
+            self.pos = end;
+            return Ok(res);
         }
+        let name = match self.toks.get(self.pos) {
+            Some(Tok::Ident(n)) if !self.is_type_word(n) => {
+                let n = n.clone();
+                self.pos += 1;
+                n
+            }
+            _ if need_name => {
+                return Err(format!("cần tên trong declarator, gặp {:?}", self.toks.get(self.pos)))
+            }
+            _ => String::new(),
+        };
+        let t = self.suffixes(t)?;
         Ok((name, t))
     }
-    // Cấp slot trên stack: offset đi xuống từ x29, thẳng hàng theo align của kiểu
+    fn nested_ahead(&self) -> bool {
+        if !self.peek("(") {
+            return false;
+        }
+        match self.toks.get(self.pos + 1) {
+            Some(Tok::Punct("*") | Tok::Punct("(")) => true,
+            Some(Tok::Ident(n)) => !self.is_type_word(n),
+            _ => false,
+        }
+    }
+    fn suffixes(&mut self, t: TypeId) -> Result<TypeId, String> {
+        if self.eat(&Tok::Punct("[")) {
+            let n = if self.peek("]") { 0 } else { self.const_expr()? as u32 };
+            self.expect(Tok::Punct("]"))?;
+            let inner = self.suffixes(t)?; // đa chiều: int a[2][3] = array 2 của array 3
+            return Ok(self.tt.add(Ty::Array(inner, n)));
+        }
+        if self.eat(&Tok::Punct("(")) {
+            let sig = self.param_list(t)?;
+            self.tt.fns.push(sig);
+            return Ok(self.tt.add(Ty::Func(self.tt.fns.len() as u32 - 1)));
+        }
+        Ok(t)
+    }
+    fn param_list(&mut self, ret: TypeId) -> Result<FnSig, String> {
+        let empty = FnSig {
+            ret,
+            params: Vec::new(),
+            pnames: Vec::new(),
+            variadic: false,
+            oldstyle: false,
+        };
+        if self.eat(&Tok::Punct(")")) {
+            return Ok(FnSig { oldstyle: true, ..empty }); // () — không thông tin
+        }
+        if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "void")
+            && self.toks.get(self.pos + 1) == Some(&Tok::Punct(")"))
+        {
+            self.pos += 2;
+            return Ok(empty); // (void)
+        }
+        // old-style ident list: f(a, b)
+        if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if !self.is_type_word(n)) {
+            let mut pnames = Vec::new();
+            loop {
+                pnames.push(self.ident()?);
+                if !self.eat(&Tok::Punct(",")) {
+                    break;
+                }
+            }
+            self.expect(Tok::Punct(")"))?;
+            return Ok(FnSig { pnames, oldstyle: true, ..empty });
+        }
+        let (mut params, mut pnames, mut variadic) = (Vec::new(), Vec::new(), false);
+        loop {
+            if self.eat(&Tok::Punct("...")) {
+                variadic = true;
+                break;
+            }
+            let (bt, _) = self.decl_specs()?.ok_or("cần kiểu tham số")?;
+            let (nm, pt) = self.declarator(bt, false)?;
+            // điều chỉnh kiểu param: mảng → con trỏ, hàm → con trỏ hàm
+            let pt = match self.tt.tys[pt as usize] {
+                Ty::Array(e, _) => self.tt.ptr_to(e),
+                Ty::Func(_) => self.tt.ptr_to(pt),
+                _ => pt,
+            };
+            params.push(pt);
+            pnames.push(nm);
+            if !self.eat(&Tok::Punct(",")) {
+                break;
+            }
+        }
+        self.expect(Tok::Punct(")"))?;
+        Ok(FnSig { ret, params, pnames, variadic, oldstyle: false })
+    }
+    fn typename(&mut self) -> Result<TypeId, String> {
+        let (bt, _) = self.decl_specs()?.ok_or("cần tên kiểu")?;
+        let (_, t) = self.declarator(bt, false)?;
+        Ok(t)
+    }
+
+    // ---- chuyển đổi kiểu ----
+    fn cast(&mut self, e: NodeId, to: TypeId) -> NodeId {
+        if self.ty(e) == to {
+            return e;
+        }
+        self.push(Node::Cast(e), to)
+    }
+    fn promote(&self, t: TypeId) -> TypeId {
+        match self.tt.tys[t as usize] {
+            Ty::Char | Ty::Short => INT,
+            Ty::UChar | Ty::UShort => INT, // cả hai lọt trong int (LP64)
+            Ty::Float => DOUBLE,
+            _ => t,
+        }
+    }
+    fn common_ty(&self, lt: TypeId, rt: TypeId) -> TypeId {
+        if self.tt.is_float(lt) || self.tt.is_float(rt) {
+            return DOUBLE; // tính trong double — C89 cho phép dư precision
+        }
+        if !self.tt.is_integer(lt) || !self.tt.is_integer(rt) {
+            return ULONG; // con trỏ v.v.: so sánh/số học 64-bit không dấu
+        }
+        let (l, r) = (self.promote(lt), self.promote(rt));
+        if l == r {
+            return l;
+        }
+        let (ls, rs) = (self.tt.size(l), self.tt.size(r));
+        let big = ls.max(rs);
+        let uns = if ls == rs {
+            self.tt.is_unsigned(l) || self.tt.is_unsigned(r)
+        } else if ls > rs {
+            self.tt.is_unsigned(l)
+        } else {
+            self.tt.is_unsigned(r)
+        };
+        match (big, uns) {
+            (8, true) => ULONG,
+            (8, false) => LONG,
+            (_, true) => UINT,
+            _ => INT,
+        }
+    }
+    fn scalar(&self, t: TypeId) -> bool {
+        !matches!(self.tt.tys[t as usize], Ty::Struct(_) | Ty::Array(..))
+    }
+    fn mkassign(&mut self, l: NodeId, r: NodeId) -> R {
+        self.check_lval(l)?;
+        let lt = self.ty(l);
+        let r = if self.scalar(lt) { self.cast(r, lt) } else { r };
+        Ok(self.push(Node::Assign(l, r), lt))
+    }
+    // điều kiện: float phải so != 0.0 (cbz nhìn bit pattern sẽ sai với -0.0)
+    fn truthy(&mut self, e: NodeId) -> R {
+        if self.tt.is_float(self.ty(e)) {
+            let z = self.push(Node::FNum(0.0), DOUBLE);
+            self.mkbin("!=", e, z)
+        } else {
+            Ok(e)
+        }
+    }
+    // Dựng node binary op kèm chèn conversion + scale con trỏ
+    fn mkbin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
+        let (lp, rp) = (self.tt.pointee(self.ty(l)), self.tt.pointee(self.ty(r)));
+        match (op, lp, rp) {
+            ("+", None, Some(_)) => self.mkbin("+", r, l), // int + ptr: giao hoán
+            ("+" | "-", Some(e), None) => {
+                let r = self.cast(r, LONG);
+                let sz = self.push(Node::Num(self.tt.size(e) as i64), LONG);
+                let r = self.push(Node::Bin("*", r, sz), LONG);
+                let t = self.tt.ptr_to(e);
+                Ok(self.push(Node::Bin(op, l, r), t))
+            }
+            ("-", Some(e), Some(_)) => {
+                let d = self.push(Node::Bin("-", l, r), LONG);
+                let sz = self.push(Node::Num(self.tt.size(e) as i64), LONG);
+                Ok(self.push(Node::Bin("/", d, sz), LONG))
+            }
+            _ => match op {
+                "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+                    let ct = self.common_ty(self.ty(l), self.ty(r));
+                    let (l, r) = (self.cast(l, ct), self.cast(r, ct));
+                    Ok(self.push(Node::Bin(op, l, r), INT))
+                }
+                "<<" | ">>" => {
+                    let lt = self.promote(self.ty(l));
+                    if self.tt.is_float(lt) {
+                        return Err("shift trên số thực".into());
+                    }
+                    let l = self.cast(l, lt);
+                    Ok(self.push(Node::Bin(op, l, r), lt))
+                }
+                _ => {
+                    let ct = self.common_ty(self.ty(l), self.ty(r));
+                    if self.tt.is_float(ct) && matches!(op, "%" | "&" | "|" | "^") {
+                        return Err(format!("op '{}' trên số thực", op));
+                    }
+                    let (l, r) = (self.cast(l, ct), self.cast(r, ct));
+                    Ok(self.push(Node::Bin(op, l, r), ct))
+                }
+            },
+        }
+    }
+
+    // ---- local/scope ----
     fn alloc_local(&mut self, name: String, t: TypeId) -> u32 {
         let (sz, al) = (self.tt.size(t), self.tt.align(t));
         self.cur_off = (self.cur_off + sz).div_ceil(al) * al;
-        self.locals.push((name, t, self.cur_off));
+        self.locals.push((name, t, Vloc::Stack(self.cur_off)));
         self.cur_off
     }
     fn check_lval(&self, l: NodeId) -> Result<(), String> {
@@ -237,12 +608,13 @@ impl P<'_> {
             Err("cần lvalue".into())
         }
     }
+
+    // ---- statement ----
     fn stmt(&mut self) -> R {
-        // label: ident ":" — phải bắt trước expr; case/default đã ăn bởi eat_kw phía dưới
         if let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
             (self.toks.get(self.pos), self.toks.get(self.pos + 1))
         {
-            if !["case", "default"].contains(&n.as_str()) && !self.typedefs.contains_key(n) {
+            if !["case", "default"].contains(&n.as_str()) && !self.is_type_word(n) {
                 let n = n.clone();
                 self.pos += 2;
                 let st = self.stmt()?;
@@ -250,12 +622,17 @@ impl P<'_> {
             }
         }
         if self.eat_kw("return") {
+            if self.eat(&Tok::Punct(";")) {
+                return Ok(self.push(Node::Ret(None), INT));
+            }
             let e = self.expr()?;
+            let e = if self.fret == VOID { e } else { self.cast(e, self.fret) };
             self.expect(Tok::Punct(";"))?;
-            Ok(self.push(Node::Ret(e), INT))
+            Ok(self.push(Node::Ret(Some(e)), INT))
         } else if self.eat_kw("if") {
             self.expect(Tok::Punct("("))?;
             let c = self.expr()?;
+            let c = self.truthy(c)?;
             self.expect(Tok::Punct(")"))?;
             let t = self.stmt()?;
             let e = if self.eat_kw("else") { Some(self.stmt()?) } else { None };
@@ -263,13 +640,17 @@ impl P<'_> {
         } else if self.eat_kw("while") {
             self.expect(Tok::Punct("("))?;
             let c = self.expr()?;
+            let c = self.truthy(c)?;
             self.expect(Tok::Punct(")"))?;
             let b = self.stmt()?;
             Ok(self.push(Node::While(c, b), INT))
         } else if self.eat_kw("for") {
             self.expect(Tok::Punct("("))?;
             let i = self.opt_expr(";")?;
-            let c = self.opt_expr(";")?;
+            let c = match self.opt_expr(";")? {
+                Some(c) => Some(self.truthy(c)?),
+                None => None,
+            };
             let n = self.opt_expr(")")?;
             let b = self.stmt()?;
             Ok(self.push(Node::For(i, c, n, b), INT))
@@ -280,6 +661,7 @@ impl P<'_> {
             }
             self.expect(Tok::Punct("("))?;
             let c = self.expr()?;
+            let c = self.truthy(c)?;
             self.expect(Tok::Punct(")"))?;
             self.expect(Tok::Punct(";"))?;
             Ok(self.push(Node::Do(b, c), INT))
@@ -324,25 +706,71 @@ impl P<'_> {
             }
             self.locals.truncate(scope);
             Ok(self.push(Node::Block(v), INT))
-        } else if let Some(bt) = self.typespec()? {
-            let (name, t) = self.declarator(bt)?;
-            let off = self.alloc_local(name, t);
-            let s = if self.eat(&Tok::Punct("=")) {
-                let v = self.push(Node::Var(off), t);
-                let e = self.assign()?;
-                self.push(Node::Assign(v, e), t)
-            } else {
-                self.push(Node::Block(Vec::new()), INT) // khai báo trần: không sinh code
-            };
-            self.expect(Tok::Punct(";"))?;
-            Ok(s)
+        } else if let Some((bt, storage)) = self.decl_specs()? {
+            // khai báo local (nhiều declarator, có init); typedef/static/extern xử lý riêng
+            let mut stmts = Vec::new();
+            if !self.eat(&Tok::Punct(";")) {
+                loop {
+                    let (name, t) = self.declarator(bt, true)?;
+                    match storage {
+                        Storage::Typedef => {
+                            self.typedefs.insert(name, t);
+                        }
+                        _ if matches!(self.tt.tys[t as usize], Ty::Func(_)) => {
+                            self.fns.insert(name, t); // prototype trong hàm
+                        }
+                        Storage::Static => {
+                            let g = format!("{}.{}", name, self.globals.len());
+                            let init = self.ginit(t)?;
+                            self.globals.push(Global {
+                                name: g,
+                                ty: t,
+                                init,
+                                is_static: true,
+                                is_extern: false,
+                            });
+                            self.locals.push((
+                                name,
+                                t,
+                                Vloc::Glob(self.globals.len() as u32 - 1),
+                            ));
+                        }
+                        Storage::Extern => {
+                            self.globals.push(Global {
+                                name: name.clone(),
+                                ty: t,
+                                init: GInit::None,
+                                is_static: false,
+                                is_extern: true,
+                            });
+                            self.locals.push((
+                                name,
+                                t,
+                                Vloc::Glob(self.globals.len() as u32 - 1),
+                            ));
+                        }
+                        _ => {
+                            let off = self.alloc_local(name, t);
+                            if self.eat(&Tok::Punct("=")) {
+                                let v = self.push(Node::Var(off), t);
+                                let e = self.assign()?;
+                                stmts.push(self.mkassign(v, e)?);
+                            }
+                        }
+                    }
+                    if !self.eat(&Tok::Punct(",")) {
+                        break;
+                    }
+                }
+                self.expect(Tok::Punct(";"))?;
+            }
+            Ok(self.push(Node::Block(stmts), INT))
         } else {
             let e = self.expr()?;
             self.expect(Tok::Punct(";"))?;
             Ok(e)
         }
     }
-    // expr? kết thúc bằng `end` (cho 3 khoang của for), nuốt luôn `end`
     fn opt_expr(&mut self, end: &'static str) -> Result<Option<NodeId>, String> {
         if self.eat(&Tok::Punct(end)) {
             return Ok(None);
@@ -351,33 +779,35 @@ impl P<'_> {
         self.expect(Tok::Punct(end))?;
         Ok(Some(e))
     }
-    // Dựng node binary op kèm typing + scale con trỏ (p±n → p±n*sizeof(elem), p-p → /sizeof)
-    fn mkbin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> NodeId {
-        let (lp, rp) = (self.tt.pointee(self.ty(l)), self.tt.pointee(self.ty(r)));
-        match (op, lp, rp) {
-            ("+", None, Some(_)) => self.mkbin("+", r, l), // int + ptr: giao hoán
-            ("+" | "-", Some(e), None) => {
-                let sz = self.push(Node::Num(self.tt.size(e) as i64), LONG);
-                let r = self.push(Node::Bin("*", r, sz), LONG);
-                let t = self.tt.ptr_to(e);
-                self.push(Node::Bin(op, l, r), t)
-            }
-            ("-", Some(e), Some(_)) => {
-                let d = self.push(Node::Bin("-", l, r), LONG);
-                let sz = self.push(Node::Num(self.tt.size(e) as i64), LONG);
-                self.push(Node::Bin("/", d, sz), LONG)
-            }
-            _ => {
-                let t = match op {
-                    "==" | "!=" | "<" | "<=" | ">" | ">=" => INT,
-                    "<<" | ">>" => self.ty(l), // kiểu = vế trái (promoted)
-                    _ if self.tt.size(self.ty(l)).max(self.tt.size(self.ty(r))) == 8 => LONG,
-                    _ => INT,
-                };
-                self.push(Node::Bin(op, l, r), t)
+    // init hằng cho global/static (scalar; {..} là vòng 2c)
+    fn ginit(&mut self, t: TypeId) -> Result<GInit, String> {
+        if !self.eat(&Tok::Punct("=")) {
+            return Ok(GInit::None);
+        }
+        if let Some(Tok::Str(bytes)) = self.toks.get(self.pos) {
+            self.strs.push(bytes.clone());
+            self.pos += 1;
+            return Ok(GInit::Str((self.strs.len() - 1) as u32));
+        }
+        // &sym hoặc tên mảng/hàm → địa chỉ
+        if self.peek("&") {
+            if let Some(Tok::Ident(n)) = self.toks.get(self.pos + 1) {
+                let n = n.clone();
+                self.pos += 2;
+                return Ok(GInit::Addr(n));
             }
         }
+        let e = self.cond_expr()?;
+        if self.tt.is_float(t) {
+            let v = self.fold_f(e)?;
+            let bits =
+                if self.tt.size(t) == 4 { (v as f32).to_bits() as i64 } else { v.to_bits() as i64 };
+            return Ok(GInit::Num(bits));
+        }
+        Ok(GInit::Num(self.fold(e)?))
     }
+
+    // ---- expression ----
     fn expr(&mut self) -> R {
         let mut l = self.assign()?;
         while self.eat(&Tok::Punct(",")) {
@@ -392,10 +822,9 @@ impl P<'_> {
         for (tok, bop) in ASSIGN_OPS {
             if self.eat(&Tok::Punct(tok)) {
                 self.check_lval(l)?;
-                let r = self.assign()?; // kết hợp phải
-                let r = if bop.is_empty() { r } else { self.mkbin(bop, l, r) };
-                let t = self.ty(l);
-                return Ok(self.push(Node::Assign(l, r), t));
+                let r = self.assign()?;
+                let r = if bop.is_empty() { r } else { self.mkbin(bop, l, r)? };
+                return self.mkassign(l, r);
             }
         }
         Ok(l)
@@ -405,47 +834,53 @@ impl P<'_> {
         if !self.eat(&Tok::Punct("?")) {
             return Ok(c);
         }
+        let c = self.truthy(c)?;
         let t = self.expr()?;
         self.expect(Tok::Punct(":"))?;
         let e = self.cond_expr()?;
-        let ty = if self.tt.size(self.ty(t)) >= self.tt.size(self.ty(e)) {
-            self.ty(t)
+        // hai vế hội tụ về kiểu chung (scalar); struct/ptr giữ vế trái
+        let (tt_, te) = (self.ty(t), self.ty(e));
+        if self.scalar(tt_) && self.scalar(te) && self.tt.is_integer(tt_) | self.tt.is_float(tt_) {
+            let ct = self.common_ty(tt_, te);
+            let (t, e) = (self.cast(t, ct), self.cast(e, ct));
+            Ok(self.push(Node::Cond(c, t, e), ct))
         } else {
-            self.ty(e)
-        };
-        Ok(self.push(Node::Cond(c, t, e), ty))
+            Ok(self.push(Node::Cond(c, t, e), tt_))
+        }
     }
-    // a || b → a ? 1 : (b ? 1 : 0); a && b → a ? (b ? 1 : 0) : 0 — short-circuit + 0/1
     fn lor(&mut self) -> R {
         let mut l = self.land()?;
         while self.eat(&Tok::Punct("||")) {
+            let l2 = self.truthy(l)?;
             let r = self.land()?;
+            let r = self.truthy(r)?;
             let one = self.push(Node::Num(1), INT);
             let zero = self.push(Node::Num(0), INT);
             let rb = self.push(Node::Cond(r, one, zero), INT);
-            l = self.push(Node::Cond(l, one, rb), INT);
+            l = self.push(Node::Cond(l2, one, rb), INT);
         }
         Ok(l)
     }
     fn land(&mut self) -> R {
         let mut l = self.bitor()?;
         while self.eat(&Tok::Punct("&&")) {
+            let l2 = self.truthy(l)?;
             let r = self.bitor()?;
+            let r = self.truthy(r)?;
             let one = self.push(Node::Num(1), INT);
             let zero = self.push(Node::Num(0), INT);
             let rb = self.push(Node::Cond(r, one, zero), INT);
-            l = self.push(Node::Cond(l, rb, zero), INT);
+            l = self.push(Node::Cond(l2, rb, zero), INT);
         }
         Ok(l)
     }
-    // Một tầng binary op trái-kết-hợp: next (op next)*
     fn bin(&mut self, ops: &[&'static str], next: fn(&mut Self) -> R) -> R {
         let mut l = next(self)?;
         'again: loop {
             for &op in ops {
                 if self.eat(&Tok::Punct(op)) {
                     let r = next(self)?;
-                    l = self.mkbin(op, l, r);
+                    l = self.mkbin(op, l, r)?;
                     continue 'again;
                 }
             }
@@ -476,46 +911,80 @@ impl P<'_> {
     fn mul(&mut self) -> R {
         self.bin(&["*", "/", "%"], Self::unary)
     }
-    // ++x → x = x + 1 (mkbin tự scale con trỏ)
     fn incdec_pre(&mut self, op: &'static str) -> R {
         let e = self.unary()?;
         self.check_lval(e)?;
         let one = self.push(Node::Num(1), INT);
-        let v = self.mkbin(op, e, one);
-        let t = self.ty(e);
-        Ok(self.push(Node::Assign(e, v), t))
+        let v = self.mkbin(op, e, one)?;
+        self.mkassign(e, v)
     }
     fn unary(&mut self) -> R {
+        // cast: "(" typename ")"
+        if self.peek("(") {
+            if let Some(Tok::Ident(n)) = self.toks.get(self.pos + 1) {
+                if self.is_type_word(n) {
+                    self.pos += 1;
+                    let ty = self.typename()?;
+                    self.expect(Tok::Punct(")"))?;
+                    let e = self.unary()?;
+                    return Ok(self.cast(e, ty));
+                }
+            }
+        }
         if self.eat(&Tok::Punct("-")) {
             let e = self.unary()?;
             let t = self.ty(e);
+            let t = if self.tt.is_float(t) { t } else { self.promote(t) };
+            let e = if self.tt.is_float(t) { e } else { self.cast(e, t) };
             Ok(self.push(Node::Neg(e), t))
         } else if self.eat(&Tok::Punct("+")) {
             self.unary()
         } else if self.eat(&Tok::Punct("!")) {
             let e = self.unary()?;
-            let z = self.push(Node::Num(0), INT);
-            Ok(self.mkbin("==", e, z))
+            if self.tt.is_float(self.ty(e)) {
+                let z = self.push(Node::FNum(0.0), DOUBLE);
+                self.mkbin("==", e, z)
+            } else {
+                let z = self.push(Node::Num(0), INT);
+                self.mkbin("==", e, z)
+            }
         } else if self.eat(&Tok::Punct("~")) {
             let e = self.unary()?;
             let m = self.push(Node::Num(-1), INT);
-            Ok(self.mkbin("^", e, m))
+            self.mkbin("^", e, m)
         } else if self.eat(&Tok::Punct("++")) {
             self.incdec_pre("+")
         } else if self.eat(&Tok::Punct("--")) {
             self.incdec_pre("-")
         } else if self.eat(&Tok::Punct("*")) {
             let e = self.unary()?;
-            let t = self.tt.pointee(self.ty(e)).ok_or("deref thứ không phải con trỏ")?;
+            let t = match self.tt.tys[self.ty(e) as usize] {
+                Ty::Ptr(p) | Ty::Array(p, _) => p,
+                Ty::Func(_) => self.ty(e), // *f trên hàm = chính nó
+                _ => return Err("deref thứ không phải con trỏ".into()),
+            };
             Ok(self.push(Node::Deref(e), t))
         } else if self.eat(&Tok::Punct("&")) {
             let e = self.unary()?;
+            if matches!(self.nodes[e as usize], Node::FunAddr(_)) {
+                return Ok(e); // &f = f với hàm
+            }
             let t = self.tt.ptr_to(self.ty(e));
             Ok(self.push(Node::Addr(e), t))
         } else if self.eat_kw("sizeof") {
-            let e = self.unary()?; // node toán hạng thành rác trong arena, chấp nhận
-            let sz = self.tt.size(self.ty(e));
-            Ok(self.push(Node::Num(sz as i64), LONG))
+            // sizeof(typename) | sizeof unary
+            let sz = if self.peek("(")
+                && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(n)) if self.is_type_word(n))
+            {
+                self.pos += 1;
+                let t = self.typename()?;
+                self.expect(Tok::Punct(")"))?;
+                self.tt.size(t)
+            } else {
+                let e = self.unary()?; // node toán hạng thành rác arena, chấp nhận
+                self.tt.size(self.ty(e))
+            };
+            Ok(self.push(Node::Num(sz as i64), ULONG))
         } else {
             self.postfix()
         }
@@ -523,8 +992,41 @@ impl P<'_> {
     fn post_incdec(&mut self, op: &'static str, e: NodeId) -> R {
         self.check_lval(e)?;
         let t = self.ty(e);
+        if self.tt.is_float(t) {
+            // hiếm: desugar (x op= 1) op⁻¹ 1 — chấp nhận lệch rounding lý thuyết
+            let one = self.push(Node::FNum(1.0), DOUBLE);
+            let v = self.mkbin(op, e, one)?;
+            let a = self.mkassign(e, v)?;
+            let one2 = self.push(Node::FNum(1.0), DOUBLE);
+            return self.mkbin(if op == "+" { "-" } else { "+" }, a, one2);
+        }
         let delta = self.tt.pointee(t).map_or(1, |p| self.tt.size(p) as i64);
         Ok(self.push(Node::Post(op, e, delta), t))
+    }
+    // hoàn thiện một lời gọi: chèn cast theo prototype + default promotion
+    fn finish_call(&mut self, callee: NodeId, mut args: Vec<NodeId>) -> R {
+        let sig = self
+            .tt
+            .fnsig(self.ty(callee))
+            .map(|s| (s.ret, s.params.clone(), s.variadic, s.oldstyle));
+        let (ret, params, variadic, oldstyle) =
+            sig.ok_or("gọi thứ không phải hàm/con trỏ hàm")?;
+        for (i, a) in args.iter_mut().enumerate() {
+            if i < params.len() && !oldstyle {
+                *a = self.cast(*a, params[i]);
+            } else {
+                // default argument promotions
+                let t = self.ty(*a);
+                let pt = if self.tt.is_float(t) { DOUBLE } else { self.promote(t) };
+                *a = self.cast(*a, pt);
+            }
+        }
+        let nreg = if variadic { params.len() as u32 } else { args.len() as u32 };
+        if let Node::FunAddr(name) = &self.nodes[callee as usize] {
+            let name = name.clone();
+            return Ok(self.push(Node::Call(name, args, nreg), ret));
+        }
+        Ok(self.push(Node::CallPtr(callee, args, nreg), ret))
     }
     fn postfix(&mut self) -> R {
         let mut e = self.primary()?;
@@ -532,10 +1034,22 @@ impl P<'_> {
             if self.eat(&Tok::Punct("[")) {
                 let i = self.expr()?;
                 self.expect(Tok::Punct("]"))?;
-                let sum = self.mkbin("+", e, i);
+                let sum = self.mkbin("+", e, i)?;
                 let t =
                     self.tt.pointee(self.ty(sum)).ok_or("index thứ không phải mảng/con trỏ")?;
                 e = self.push(Node::Deref(sum), t);
+            } else if self.eat(&Tok::Punct("(")) {
+                let mut args = Vec::new();
+                if !self.eat(&Tok::Punct(")")) {
+                    loop {
+                        args.push(self.assign()?);
+                        if !self.eat(&Tok::Punct(",")) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::Punct(")"))?;
+                }
+                e = self.finish_call(e, args)?;
             } else if self.eat(&Tok::Punct(".")) {
                 e = self.member(e)?;
             } else if self.eat(&Tok::Punct("->")) {
@@ -572,16 +1086,21 @@ impl P<'_> {
         } else if let Some(&Tok::Num(v, k)) = self.toks.get(self.pos) {
             self.pos += 1;
             let t = match k {
-                NumK::I | NumK::U => INT,
-                NumK::L | NumK::UL => LONG,
+                NumK::I => INT,
+                NumK::U => UINT,
+                NumK::L => LONG,
+                NumK::UL => ULONG,
             };
             Ok(self.push(Node::Num(v), t))
+        } else if let Some(&Tok::FNum(v, dbl)) = self.toks.get(self.pos) {
+            self.pos += 1;
+            let v = if dbl { v } else { v as f32 as f64 };
+            Ok(self.push(Node::FNum(v), if dbl { DOUBLE } else { FLOAT }))
         } else if let Some(Tok::Str(bytes)) = self.toks.get(self.pos) {
             let mut bytes = bytes.clone();
             self.pos += 1;
-            // phase 6: string literal liền kề nối lại
             while let Some(Tok::Str(more)) = self.toks.get(self.pos) {
-                bytes.extend_from_slice(more);
+                bytes.extend_from_slice(more); // phase 6: nối string liền kề
                 self.pos += 1;
             }
             self.strs.push(bytes);
@@ -590,28 +1109,13 @@ impl P<'_> {
             Ok(self.push(Node::Str(i), t))
         } else if let Some(Tok::Ident(_)) = self.toks.get(self.pos) {
             let n = self.ident()?;
-            if self.eat(&Tok::Punct("(")) {
-                let mut args = Vec::new();
-                if !self.eat(&Tok::Punct(")")) {
-                    loop {
-                        args.push(self.assign()?);
-                        if !self.eat(&Tok::Punct(",")) {
-                            break;
-                        }
-                    }
-                    self.expect(Tok::Punct(")"))?;
-                }
-                // variadic: chỉ số param đặt tên đi thanh ghi; hàm chưa khai báo coi như thường
-                let nreg = match self.fns.get(&n) {
-                    Some(&(nnamed, true)) => nnamed,
-                    _ => args.len() as u32,
-                };
-                return Ok(self.push(Node::Call(n, args, nreg), INT)); // hàm trả int (đến 2b)
-            }
-            if let Some((t, off)) =
+            if let Some((t, loc)) =
                 self.locals.iter().rev().find(|(l, ..)| *l == n).map(|&(_, t, o)| (t, o))
             {
-                return Ok(self.push(Node::Var(off), t));
+                return Ok(match loc {
+                    Vloc::Stack(off) => self.push(Node::Var(off), t),
+                    Vloc::Glob(gi) => self.push(Node::GVar(gi), t),
+                });
             }
             if let Some(&v) = self.enums.get(&n) {
                 return Ok(self.push(Node::Num(v), INT));
@@ -620,11 +1124,35 @@ impl P<'_> {
                 let t = self.globals[gi].ty;
                 return Ok(self.push(Node::GVar(gi as u32), t));
             }
+            if let Some(&t) = self.fns.get(&n) {
+                let pt = self.tt.ptr_to(t); // function designator decay
+                return Ok(self.push(Node::FunAddr(n), pt));
+            }
+            if self.peek("(") {
+                // gọi hàm chưa khai báo: implicit int, old-style
+                let sig = FnSig {
+                    ret: INT,
+                    params: Vec::new(),
+                    pnames: Vec::new(),
+                    variadic: false,
+                    oldstyle: true,
+                };
+                self.tt.fns.push(sig);
+                let ft = self.tt.add(Ty::Func(self.tt.fns.len() as u32 - 1));
+                self.fns.insert(n.clone(), ft);
+                let pt = self.tt.ptr_to(ft);
+                return Ok(self.push(Node::FunAddr(n), pt));
+            }
             Err(format!("biến chưa khai báo: {}", n))
         } else {
             Err(format!("cần expr, gặp {:?}", self.toks.get(self.pos)))
         }
     }
+}
+
+// workaround borrow: decl_specs giữ &str từ token — copy ra ngoài vòng đời
+fn n_hack(base: Option<&str>) -> &str {
+    base.unwrap_or("")
 }
 
 pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
@@ -643,73 +1171,98 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
         typedefs: HashMap::new(),
         enums: HashMap::new(),
         switches: Vec::new(),
+        fret: INT,
     };
     let mut funcs = Vec::new();
     while p.pos < toks.len() {
-        if p.eat_kw("typedef") {
-            let bt = p.typespec()?.ok_or("cần kiểu sau typedef")?;
-            let (name, t) = p.declarator(bt)?;
-            p.typedefs.insert(name, t);
-            p.expect(Tok::Punct(";"))?;
-            continue;
-        }
-        let bt = p.typespec()?.ok_or("cần kiểu")?;
+        let (bt, storage) = match p.decl_specs()? {
+            Some(x) => x,
+            None => (INT, Storage::None), // implicit int: main() {...}
+        };
         if p.eat(&Tok::Punct(";")) {
             continue; // định nghĩa struct/union/enum thuần
         }
-        let mut t = bt;
-        while p.eat(&Tok::Punct("*")) {
-            t = p.tt.ptr_to(t);
+        let (name, t) = p.declarator(bt, true)?;
+        // funcdef: declarator ra kiểu Func và theo sau là "{" hoặc old-style decl list
+        if let Ty::Func(fidx) = p.tt.tys[t as usize] {
+            let is_def = p.peek("{")
+                || matches!(p.toks.get(p.pos), Some(Tok::Ident(n)) if p.is_type_word(n) && n != "typedef");
+            if is_def {
+                p.fns.insert(name.clone(), t);
+                let sig = p.tt.fns[fidx as usize].clone();
+                p.locals.clear();
+                p.cur_off = 0;
+                p.fret = sig.ret;
+                // old-style: parse decl list gán kiểu cho từng tên param
+                let mut ptypes: HashMap<String, TypeId> = HashMap::new();
+                if sig.oldstyle {
+                    while !p.peek("{") {
+                        let (dbt, _) = p.decl_specs()?.ok_or("cần kiểu param old-style")?;
+                        loop {
+                            let (dn, dt) = p.declarator(dbt, true)?;
+                            let dt = match p.tt.tys[dt as usize] {
+                                Ty::Array(e, _) => p.tt.ptr_to(e),
+                                Ty::Func(_) => p.tt.ptr_to(dt),
+                                Ty::Float => DOUBLE, // old-style promotion
+                                _ => dt,
+                            };
+                            ptypes.insert(dn, dt);
+                            if !p.eat(&Tok::Punct(",")) {
+                                break;
+                            }
+                        }
+                        p.expect(Tok::Punct(";"))?;
+                    }
+                }
+                let mut params = Vec::new();
+                for (i, pn) in sig.pnames.iter().enumerate() {
+                    let pt = if sig.oldstyle {
+                        ptypes.get(pn).copied().unwrap_or(INT)
+                    } else {
+                        sig.params[i]
+                    };
+                    let off = p.alloc_local(pn.clone(), pt);
+                    params.push((off, pt));
+                }
+                let body = p.stmt()?;
+                funcs.push(Func {
+                    name,
+                    params,
+                    frame: (p.cur_off + 15) & !15,
+                    body,
+                    ret: sig.ret,
+                    is_static: storage == Storage::Static,
+                    variadic: sig.variadic,
+                });
+                continue;
+            }
         }
-        let name = p.ident()?;
-        if p.eat(&Tok::Punct("(")) {
-            // funcdef hoặc prototype; t = kiểu trả về, chưa dùng đến
-            p.locals.clear();
-            p.cur_off = 0;
-            let (mut params, mut variadic) = (Vec::new(), false);
-            if !p.eat(&Tok::Punct(")")) {
-                loop {
-                    let pbt = p.typespec()?.ok_or("cần kiểu tham số")?;
-                    let (pn, pt) = p.declarator(pbt)?;
-                    let off = p.alloc_local(pn, pt);
-                    params.push((off, p.tt.size(pt)));
-                    if !p.eat(&Tok::Punct(",")) {
-                        break;
-                    }
-                    if p.eat(&Tok::Punct("...")) {
-                        variadic = true;
-                        break;
-                    }
-                }
-                p.expect(Tok::Punct(")"))?;
-            }
-            p.fns.insert(name.clone(), (params.len() as u32, variadic));
-            if p.eat(&Tok::Punct(";")) {
-                continue; // prototype thuần: chỉ ghi sổ
-            }
-            let body = p.stmt()?;
-            funcs.push(Func { name, params, frame: (p.cur_off + 15) & !15, body });
-        } else {
-            // biến global; init chỉ nhận hằng (const expr / chuỗi)
-            if p.eat(&Tok::Punct("[")) {
-                let n = p.const_expr()?;
-                p.expect(Tok::Punct("]"))?;
-                t = p.tt.add(Ty::Array(t, n as u32));
-            }
-            let init = if p.eat(&Tok::Punct("=")) {
-                if let Some(Tok::Str(bytes)) = p.toks.get(p.pos) {
-                    p.strs.push(bytes.clone());
-                    p.pos += 1;
-                    GInit::Str((p.strs.len() - 1) as u32)
-                } else {
-                    GInit::Num(p.const_expr()?)
-                }
+        // không phải funcdef: chuỗi declarator "a, *b, c[2];" — cái đầu đã parse
+        let mut cur = (name, t);
+        loop {
+            let (name, t) = cur;
+            if storage == Storage::Typedef {
+                p.typedefs.insert(name, t);
+                p.eat(&Tok::Punct("=")); // typedef không init; phòng hờ
+            } else if matches!(p.tt.tys[t as usize], Ty::Func(_)) {
+                p.fns.insert(name, t); // prototype
             } else {
-                GInit::None
-            };
-            p.expect(Tok::Punct(";"))?;
-            p.globals.push(Global { name, ty: t, init });
+                let init = p.ginit(t)?;
+                let is_extern = storage == Storage::Extern && matches!(init, GInit::None);
+                p.globals.push(Global {
+                    name,
+                    ty: t,
+                    init,
+                    is_static: storage == Storage::Static,
+                    is_extern,
+                });
+            }
+            if !p.eat(&Tok::Punct(",")) {
+                break;
+            }
+            cur = p.declarator(bt, true)?;
         }
+        p.expect(Tok::Punct(";"))?;
     }
     Ok(Ast {
         nodes: p.nodes,
