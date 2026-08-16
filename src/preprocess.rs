@@ -11,16 +11,18 @@ use crate::lexer::{lex, NumK, PTok, Tok};
 use std::collections::HashMap;
 use std::fs;
 
+#[derive(Clone)]
 enum Macro {
     Obj(Vec<PTok>),
-    Fun(Vec<String>, Vec<PTok>),
+    Fun(Vec<String>, bool, Vec<PTok>), // bool = variadic (... → __VA_ARGS__)
 }
 type Macros = HashMap<String, Macro>;
 
 // Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
 // nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-const HEADERS: [(&str, &str); 11] = [
+const HEADERS: [(&str, &str); 12] = [
     ("assert.h", include_str!("headers/assert.h")),
+    ("stdint.h", include_str!("headers/stdint.h")),
     ("ctype.h", include_str!("headers/ctype.h")),
     ("errno.h", include_str!("headers/errno.h")),
     ("float.h", include_str!("headers/float.h")),
@@ -35,7 +37,22 @@ const HEADERS: [(&str, &str); 11] = [
 
 pub fn preprocess(path: &str) -> Result<Vec<Tok>, String> {
     let mut macros = Macros::new();
-    macros.insert("__STDC__".into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
+    for m in ["__STDC__", "__LP64__", "__APPLE__", "__MACH__", "__arm64__", "__aarch64__"] {
+        macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
+    }
+    // builtin GCC hay gặp: __builtin_expect(e, c) → (e)
+    macros.insert(
+        "__builtin_expect".into(),
+        Macro::Fun(
+            vec!["e".into(), "c".into()],
+            false,
+            vec![
+                synth(Tok::Punct("(")),
+                synth(Tok::Ident("e".into())),
+                synth(Tok::Punct(")")),
+            ],
+        ),
+    );
     Ok(pp_file(path, &mut macros, 0)?.into_iter().map(|t| t.tok).collect())
 }
 
@@ -75,12 +92,15 @@ struct Cond {
 fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result<Vec<PTok>, String> {
     let (mut out, mut i) = (Vec::new(), 0);
     let mut conds: Vec<Cond> = Vec::new();
+    let mut delta: i64 = 0; // #line n → __LINE__ báo n tại dòng kế
+    let mut saved: HashMap<String, Vec<Option<Macro>>> = HashMap::new(); // push_macro
+
     while i < toks.len() {
         let active = conds.last().map_or(true, |c| c.active);
         let t = &toks[i];
         if !(t.bol && t.tok == Tok::Punct("#")) {
             if active {
-                i = expand_at(toks, i, macros, &Vec::new(), file, &mut out)?;
+                i = expand_at(toks, i, macros, &Vec::new(), file, delta, &mut out)?;
             } else {
                 i += 1;
             }
@@ -109,7 +129,7 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                 conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
             }
             "if" => {
-                let v = active && eval_if(&d[1..], macros, file, lno)?;
+                let v = active && eval_if(&d[1..], macros, file, delta, lno)?;
                 conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
             }
             "elif" => {
@@ -120,7 +140,7 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                     }
                     c.parent && !c.taken
                 };
-                let v = need && eval_if(&d[1..], macros, file, lno)?;
+                let v = need && eval_if(&d[1..], macros, file, delta, lno)?;
                 let c = conds.last_mut().unwrap();
                 c.active = v;
                 c.taken = c.taken || v;
@@ -144,17 +164,24 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                     .to_string();
                 // Function-like ⟺ '(' dính SÁT tên (không whitespace) — luật C.
                 let m = if matches!(d.get(2), Some(p) if p.tok == Tok::Punct("(") && !p.ws) {
-                    let (mut params, mut k) = (Vec::new(), 3);
+                    let (mut params, mut k, mut va) = (Vec::new(), 3, false);
                     if matches!(d.get(k).map(|t| &t.tok), Some(Tok::Punct(")"))) {
                         k += 1;
                     } else {
                         loop {
-                            let p = ident_of(d.get(k))
-                                .ok_or_else(|| err(file, lno, "tham số macro phải là ident"))?;
-                            params.push(p.to_string());
-                            k += 1;
+                            // "..." (C99, clang chấp nhận): phần dư → __VA_ARGS__
+                            if matches!(d.get(k).map(|t| &t.tok), Some(Tok::Punct("..."))) {
+                                params.push("__VA_ARGS__".to_string());
+                                va = true;
+                                k += 1;
+                            } else {
+                                let p = ident_of(d.get(k))
+                                    .ok_or_else(|| err(file, lno, "tham số macro phải là ident"))?;
+                                params.push(p.to_string());
+                                k += 1;
+                            }
                             match d.get(k).map(|t| &t.tok) {
-                                Some(Tok::Punct(",")) => k += 1,
+                                Some(Tok::Punct(",")) if !va => k += 1,
                                 Some(Tok::Punct(")")) => {
                                     k += 1;
                                     break;
@@ -163,7 +190,7 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                             }
                         }
                     }
-                    Macro::Fun(params, d[k..].to_vec())
+                    Macro::Fun(params, va, d[k..].to_vec())
                 } else {
                     Macro::Obj(d.get(2..).unwrap_or(&[]).to_vec())
                 };
@@ -209,7 +236,30 @@ fn process(toks: &[PTok], file: &str, macros: &mut Macros, depth: u32) -> Result
                 _ => return Err(err(file, lno, "#include cần \"file\"")),
             },
             "error" => return Err(err(file, lno, &format!("#error {}", spell_seq(&d[1..])))),
-            "line" | "pragma" => {}
+            "line" => {
+                let ex = expand_seq(&d[1..], macros, &Vec::new(), file, delta)?;
+                if let Some(Tok::Num(n, _)) = ex.first().map(|t| &t.tok) {
+                    delta = n - (lno as i64 + 1); // dòng KẾ TIẾP directive mang số n
+                }
+            }
+            "pragma" => {
+                // #pragma push_macro("x") / pop_macro("x") — clang/gcc extension
+                if let (Some(Tok::Ident(p)), Some(Tok::Str(b))) =
+                    (d.get(1).map(|t| &t.tok), d.get(3).map(|t| &t.tok))
+                {
+                    let name = String::from_utf8_lossy(b).into_owned();
+                    if p == "push_macro" {
+                        saved.entry(name.clone()).or_default().push(macros.get(&name).cloned());
+                    } else if p == "pop_macro" {
+                        if let Some(m) = saved.get_mut(&name).and_then(|v| v.pop()) {
+                            match m {
+                                Some(m) => drop(macros.insert(name, m)),
+                                None => drop(macros.remove(&name)),
+                            }
+                        }
+                    }
+                }
+            }
             _ => return Err(err(file, lno, &format!("directive lạ #{}", kw))),
         }
     }
@@ -226,10 +276,11 @@ fn expand_seq(
     macros: &Macros,
     hide: &Vec<String>,
     file: &str,
+    delta: i64,
 ) -> Result<Vec<PTok>, String> {
     let (mut out, mut i) = (Vec::new(), 0);
     while i < toks.len() {
-        i = expand_at(toks, i, macros, hide, file, &mut out)?;
+        i = expand_at(toks, i, macros, hide, file, delta, &mut out)?;
     }
     Ok(out)
 }
@@ -240,6 +291,7 @@ fn expand_at(
     macros: &Macros,
     hide: &Vec<String>,
     file: &str,
+    delta: i64, // #line dịch số dòng báo ra (chỉ ảnh hưởng __LINE__)
     out: &mut Vec<PTok>,
 ) -> Result<usize, String> {
     let t = &toks[i];
@@ -251,7 +303,7 @@ fn expand_at(
         }
     };
     if name == "__LINE__" {
-        out.push(PTok { tok: Tok::Num(t.line as i64, NumK::I), ..t.clone() });
+        out.push(PTok { tok: Tok::Num(t.line as i64 + delta, NumK::I), ..t.clone() });
         return Ok(i + 1);
     }
     if name == "__FILE__" {
@@ -262,19 +314,19 @@ fn expand_at(
         out.push(t.clone());
         return Ok(i + 1);
     }
-    match macros.get(&name) {
+    let mut next = match macros.get(&name) {
         None => {
             out.push(t.clone());
-            Ok(i + 1)
+            return Ok(i + 1);
         }
         Some(Macro::Obj(body)) => {
             let body = retag(body, t);
             let mut h = hide.clone();
             h.push(name);
-            out.extend(expand_seq(&body, macros, &h, file)?);
-            Ok(i + 1)
+            out.extend(expand_seq(&body, macros, &h, file, delta)?);
+            i + 1
         }
-        Some(Macro::Fun(params, body)) => {
+        Some(Macro::Fun(params, va, body)) => {
             // Tên macro hàm không có '(' theo sau: là ident thường.
             if !matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("("))) {
                 out.push(t.clone());
@@ -284,6 +336,19 @@ fn expand_at(
             if params.is_empty() && args.len() == 1 && args[0].is_empty() {
                 args.clear(); // F() = 0 đối số
             }
+            if *va {
+                if args.len() < params.len() {
+                    args.push(Vec::new()); // F(a) với (a, ...): __VA_ARGS__ rỗng
+                }
+                // arg dư gộp lại thành __VA_ARGS__ (nối lại dấu phẩy đã tách)
+                let extra = args.split_off(params.len().min(args.len()));
+                if let Some(last) = args.last_mut() {
+                    for e in extra {
+                        last.push(synth(Tok::Punct(",")));
+                        last.extend(e);
+                    }
+                }
+            }
             if args.len() != params.len() {
                 return Err(err(
                     file,
@@ -291,14 +356,33 @@ fn expand_at(
                     &format!("macro {} cần {} đối số, nhận {}", name, params.len(), args.len()),
                 ));
             }
-            let sub = substitute(body, params, &args, macros, hide, file, t.line)?;
+            let sub = substitute(body, params, &args, macros, hide, file, delta, t.line)?;
             let sub = retag(&sub, t);
             let mut h = hide.clone();
             h.push(name);
-            out.extend(expand_seq(&sub, macros, &h, file)?);
-            Ok(next)
+            out.extend(expand_seq(&sub, macros, &h, file, delta)?);
+            next
         }
+    };
+    // Rescan QUA RANH GIỚI (C89 6.8.3.4): kết quả expand đuôi là tên macro hàm
+    // mà '(' nằm ở stream gốc phía sau → ghép lại và expand tiếp.
+    loop {
+        let is_fun = match out.last().map(|l| &l.tok) {
+            Some(Tok::Ident(n)) => {
+                !hide.contains(n) && matches!(macros.get(n), Some(Macro::Fun(..)))
+            }
+            _ => false,
+        };
+        if !is_fun || !matches!(toks.get(next).map(|t| &t.tok), Some(Tok::Punct("("))) {
+            break;
+        }
+        let head = out.pop().unwrap();
+        let mut stream = vec![head];
+        stream.extend_from_slice(&toks[next..]);
+        let used = expand_at(&stream, 0, macros, hide, file, delta, out)?;
+        next += used - 1;
     }
+    Ok(next)
 }
 
 // Token thân macro mang line của CHỖ GỌI (đúng luật __LINE__), ws token đầu
@@ -358,6 +442,7 @@ fn substitute(
     macros: &Macros,
     hide: &Vec<String>,
     file: &str,
+    delta: i64,
     lno: u32,
 ) -> Result<Vec<PTok>, String> {
     let (mut out, mut i) = (Vec::<PTok>::new(), 0);
@@ -392,7 +477,7 @@ fn substitute(
         } else if let Some(p) = param_of(Some(t), params) {
             let raw = matches!(body.get(i + 1).map(|n| &n.tok), Some(Tok::Punct("##")));
             let mut rep =
-                if raw { args[p].clone() } else { expand_seq(&args[p], macros, hide, file)? };
+                if raw { args[p].clone() } else { expand_seq(&args[p], macros, hide, file, delta)? };
             if let Some(first) = rep.first_mut() {
                 first.ws = t.ws;
                 first.bol = false;
@@ -452,7 +537,7 @@ fn stringize(arg: &[PTok]) -> Vec<u8> {
 
 // ---- #if constexpr: defined trước, expand, ident sót → 0, rồi eval i64 ----
 
-fn eval_if(d: &[PTok], macros: &Macros, file: &str, lno: u32) -> Result<bool, String> {
+fn eval_if(d: &[PTok], macros: &Macros, file: &str, delta: i64, lno: u32) -> Result<bool, String> {
     let (mut pre, mut i) = (Vec::new(), 0);
     while i < d.len() {
         if matches!(&d[i].tok, Tok::Ident(n) if n == "defined") {
@@ -473,7 +558,7 @@ fn eval_if(d: &[PTok], macros: &Macros, file: &str, lno: u32) -> Result<bool, St
             i += 1;
         }
     }
-    let ex = expand_seq(&pre, macros, &Vec::new(), file)?;
+    let ex = expand_seq(&pre, macros, &Vec::new(), file, delta)?;
     let ts: Vec<Tok> = ex
         .into_iter()
         .map(|t| match t.tok {
@@ -555,7 +640,8 @@ fn binlv(ts: &[Tok], p: &mut usize, lv: usize) -> Result<i64, String> {
             "+" => l.wrapping_add(r),
             "-" => l.wrapping_sub(r),
             "*" => l.wrapping_mul(r),
-            "/" | "%" if r == 0 => return Err("chia 0 trong #if".into()),
+            // chia 0 trong nhánh chết của && || phải vô hại (eval eager) → cho 0
+            "/" | "%" if r == 0 => 0,
             "/" => l.wrapping_div(r),
             "%" => l.wrapping_rem(r),
             _ => unreachable!(),

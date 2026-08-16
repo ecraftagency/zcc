@@ -30,6 +30,7 @@ pub enum Ty {
     Array(TypeId, u32),
     Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
     Func(u32),   // index vào TyTab.fns
+    Bitfield(TypeId, u32, u32), // (kiểu chứa, bit offset trong đơn vị, độ rộng bit)
 }
 pub const VOID: TypeId = 0;
 pub const CHAR: TypeId = 1;
@@ -47,6 +48,7 @@ pub struct StructDef {
     pub members: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset)
     pub size: u32,
     pub align: u32,
+    pub is_union: bool,
 }
 
 #[derive(Clone)]
@@ -94,6 +96,7 @@ impl TyTab {
             Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) | Ty::Func(_) => 8,
             Ty::Array(e, n) => self.size(e) * n,
             Ty::Struct(s) => self.structs[s as usize].size,
+            Ty::Bitfield(b, ..) => self.size(b),
         }
     }
     pub fn align(&self, t: TypeId) -> u32 {
@@ -113,16 +116,43 @@ impl TyTab {
         matches!(self.tys[t as usize], Ty::Float | Ty::Double)
     }
     pub fn is_unsigned(&self, t: TypeId) -> bool {
-        matches!(
-            self.tys[t as usize],
-            Ty::UChar | Ty::UShort | Ty::UInt | Ty::ULong | Ty::Ptr(_)
-        )
+        match self.tys[t as usize] {
+            Ty::UChar | Ty::UShort | Ty::UInt | Ty::ULong | Ty::Ptr(_) => true,
+            Ty::Bitfield(b, ..) => self.is_unsigned(b),
+            _ => false,
+        }
     }
     pub fn is_integer(&self, t: TypeId) -> bool {
         matches!(
             self.tys[t as usize],
-            Ty::Char | Ty::UChar | Ty::Short | Ty::UShort | Ty::Int | Ty::UInt | Ty::Long | Ty::ULong
+            Ty::Char
+                | Ty::UChar
+                | Ty::Short
+                | Ty::UShort
+                | Ty::Int
+                | Ty::UInt
+                | Ty::Long
+                | Ty::ULong
+                | Ty::Bitfield(..)
         )
+    }
+    // HFA (AAPCS64): struct mà mọi member cùng là float hoặc cùng double, 1-4 cái
+    // → đi/về bằng v0-v7 thay vì GPR/gián tiếp. Trả (là double, số member).
+    pub fn hfa(&self, t: TypeId) -> Option<(bool, u32)> {
+        let Ty::Struct(si) = self.tys[t as usize] else { return None };
+        let sd = &self.structs[si as usize];
+        if sd.is_union || sd.members.is_empty() || sd.members.len() > 4 {
+            return None;
+        }
+        let dbl = matches!(self.tys[sd.members[0].1 as usize], Ty::Double);
+        for &(_, mt, _) in &sd.members {
+            match self.tys[mt as usize] {
+                Ty::Float if !dbl => {}
+                Ty::Double if dbl => {}
+                _ => return None,
+            }
+        }
+        Some((dbl, sd.members.len() as u32))
     }
     // FnSig của một giá trị gọi được: hàm hoặc con trỏ hàm
     pub fn fnsig(&self, t: TypeId) -> Option<&FnSig> {
@@ -182,6 +212,7 @@ pub enum Node {
     Str(u32),
 }
 
+#[derive(Clone)]
 pub enum GInit {
     None,
     Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
@@ -207,6 +238,7 @@ pub struct Func {
     pub ret: TypeId,
     pub is_static: bool,
     pub variadic: bool,
+    pub sret: u32, // ≠0: slot giấu con trỏ x8 (trả struct >16B gián tiếp)
 }
 
 pub struct Ast {

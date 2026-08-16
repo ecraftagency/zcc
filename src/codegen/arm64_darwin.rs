@@ -24,6 +24,7 @@ struct Cg<'a> {
     conts: Vec<u32>,
     fname: String,
     fret: TypeId,
+    fsret: u32, // ≠0: slot chứa con trỏ x8 (hàm trả struct >16B)
 }
 
 pub fn emit(ast: &Ast) -> String {
@@ -35,10 +36,12 @@ pub fn emit(ast: &Ast) -> String {
         conts: Vec::new(),
         fname: String::new(),
         fret: VOID,
+        fsret: 0,
     };
     for f in &ast.funcs {
         g.fname = f.name.clone();
         g.fret = f.ret;
+        g.fsret = f.sret;
         if !f.is_static {
             _ = writeln!(g.s, ".globl _{}", f.name);
         }
@@ -46,12 +49,58 @@ pub fn emit(ast: &Ast) -> String {
         if f.frame > 0 {
             g.sp_adjust("sub", f.frame);
         }
+        if f.sret != 0 {
+            g.lea_local("x9", f.sret);
+            g.s += "\tstr x8, [x9]\n";
+        }
         // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack caller
         let (mut gp, mut fp, mut stk) = (0u32, 0u32, 0u32);
         for &(off, t) in &f.params {
             // struct by value ≤16B: đến trong 1-2 GPR liên tiếp (hoặc stack)
+            if let Some((dbl, n)) = ast.tt.hfa(t) {
+                if fp + n <= 8 {
+                    g.lea_local("x9", off);
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(g.s, "\tstr d{}, [x9, #{}]", fp + j, 8 * j);
+                        } else {
+                            _ = writeln!(g.s, "\tstr s{}, [x9, #{}]", fp + j, 4 * j);
+                        }
+                    }
+                    fp += n;
+                } else {
+                    fp = 8; // AAPCS C.3: HFA tràn khóa v-reg còn lại
+                    let sz = ast.tt.size(t);
+                    _ = writeln!(g.s, "\tadd x11, x29, #{}", 16 + 8 * stk);
+                    g.lea_local("x9", off);
+                    g.imm("x12", sz as i64);
+                    let n2 = g.labels(1);
+                    _ = writeln!(g.s, "L{n2}:");
+                    g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
+                    _ = writeln!(g.s, "\tb.ne L{n2}");
+                    stk += sz.div_ceil(8);
+                }
+                continue;
+            }
             if matches!(ast.tt.tys[t as usize], Ty::Struct(_)) {
                 let sz = ast.tt.size(t);
+                if sz > 16 {
+                    // >16B: đến dưới dạng CON TRỎ (1 GPR / 1 slot) — copy về slot local
+                    if gp < 8 {
+                        _ = writeln!(g.s, "\tmov x11, x{gp}");
+                        gp += 1;
+                    } else {
+                        _ = writeln!(g.s, "\tldr x11, [x29, #{}]", 16 + 8 * stk);
+                        stk += 1;
+                    }
+                    g.lea_local("x9", off);
+                    g.imm("x12", sz as i64);
+                    let n = g.labels(1);
+                    _ = writeln!(g.s, "L{n}:");
+                    g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
+                    _ = writeln!(g.s, "\tb.ne L{n}");
+                    continue;
+                }
                 let need = if sz > 8 { 2 } else { 1 };
                 g.lea_local("x9", off);
                 if gp + need <= 8 {
@@ -261,6 +310,18 @@ impl Cg<'_> {
     fn load(&mut self, t: TypeId) {
         match self.a.tt.tys[t as usize] {
             Ty::Float => self.s += "\tldr s0, [x0]\n\tfcvt d0, s0\n\tfmov x0, d0\n",
+            Ty::Bitfield(b, boff, w) => {
+                // nạp nguyên đơn vị chứa (unsigned) rồi lắc trái/phải cắt đúng field
+                self.s += match self.a.tt.size(b) {
+                    1 => "\tldrb w0, [x0]\n",
+                    2 => "\tldrh w0, [x0]\n",
+                    4 => "\tldr w0, [x0]\n",
+                    _ => "\tldr x0, [x0]\n",
+                };
+                _ = writeln!(self.s, "\tlsl x0, x0, #{}", 64 - boff - w);
+                let sh = if self.a.tt.is_unsigned(b) { "lsr" } else { "asr" };
+                _ = writeln!(self.s, "\t{sh} x0, x0, #{}", 64 - w);
+            }
             _ => {
                 let u = self.a.tt.is_unsigned(t);
                 self.s += match (self.a.tt.size(t), u) {
@@ -280,6 +341,27 @@ impl Cg<'_> {
         match self.a.tt.tys[t as usize] {
             Ty::Float => {
                 _ = writeln!(self.s, "\tfmov d7, x{reg}\n\tfcvt s7, d7\n\tstr s7, [x1]");
+            }
+            Ty::Bitfield(b, boff, w) => {
+                // read-modify-write đơn vị chứa
+                let usz = self.a.tt.size(b);
+                self.s += match usz {
+                    1 => "\tldrb w3, [x1]\n",
+                    2 => "\tldrh w3, [x1]\n",
+                    4 => "\tldr w3, [x1]\n",
+                    _ => "\tldr x3, [x1]\n",
+                };
+                let mask = ((!0u64 >> (64 - w)) << boff) as i64;
+                self.imm("x4", mask);
+                self.s += "\tbic x3, x3, x4\n";
+                _ = writeln!(self.s, "\tlsl x5, x{reg}, #{boff}");
+                self.s += "\tand x5, x5, x4\n\torr x3, x3, x5\n";
+                self.s += match usz {
+                    1 => "\tstrb w3, [x1]\n",
+                    2 => "\tstrh w3, [x1]\n",
+                    4 => "\tstr w3, [x1]\n",
+                    _ => "\tstr x3, [x1]\n",
+                };
             }
             _ => {
                 _ = match self.a.tt.size(t) {
@@ -333,11 +415,34 @@ impl Cg<'_> {
                         Ty::Double => self.s += "\tfmov d0, x0\n",
                         Ty::Float => self.s += "\tfmov d0, x0\n\tfcvt s0, d0\n",
                         Ty::Struct(_) => {
-                            // trả struct ≤16B: nạp x0 (và x1) từ địa chỉ struct
                             let sz = self.a.tt.size(self.fret);
-                            self.s += "\tmov x9, x0\n\tldr x0, [x9]\n";
-                            if sz > 8 {
-                                self.s += "\tldr x1, [x9, #8]\n";
+                            if let Some((dbl, n)) = self.a.tt.hfa(self.fret) {
+                                // HFA về bằng v0-v3
+                                self.s += "\tmov x9, x0\n";
+                                for j in 0..n {
+                                    if dbl {
+                                        _ = writeln!(self.s, "\tldr d{j}, [x9, #{}]", 8 * j);
+                                    } else {
+                                        _ = writeln!(self.s, "\tldr s{j}, [x9, #{}]", 4 * j);
+                                    }
+                                }
+                            } else if sz > 16 {
+                                // >16B: copy struct (địa chỉ trong x0) về đích x8 đã giấu
+                                let fs = self.fsret;
+                                self.lea_local("x9", fs);
+                                self.s += "\tldr x1, [x9]\n";
+                                self.imm("x2", sz as i64);
+                                let n = self.labels(1);
+                                _ = writeln!(self.s, "L{n}:");
+                                self.s +=
+                                    "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+                                _ = writeln!(self.s, "\tb.ne L{n}");
+                            } else {
+                                // ≤16B: nạp x0 (và x1) từ địa chỉ struct
+                                self.s += "\tmov x9, x0\n\tldr x0, [x9]\n";
+                                if sz > 8 {
+                                    self.s += "\tldr x1, [x9, #8]\n";
+                                }
                             }
                         }
                         _ => {}
@@ -464,7 +569,8 @@ impl Cg<'_> {
                 }
             }
             Node::Deref(e) => self.expr(*e),
-            Node::SRet(..) => self.expr(id), // giá trị SRet = địa chỉ temp
+            // giá trị của expr kiểu struct = địa chỉ (SRet temp, compound literal...)
+            Node::SRet(..) | Node::Comma(..) | Node::Assign(..) => self.expr(id),
             _ => unreachable!("không phải lvalue"),
         }
     }
@@ -506,12 +612,15 @@ impl Cg<'_> {
                 if matches!(self.a.tt.tys[lt as usize], Ty::Struct(_)) {
                     // struct assign: copy từng byte src (x0) → dst (x1)
                     let sz = self.a.tt.size(lt);
-                    let n = self.labels(1);
                     self.s += "\tmov x4, x1\n";
-                    self.imm("x2", sz as i64);
-                    _ = writeln!(self.s, "L{n}:");
-                    self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
-                    _ = writeln!(self.s, "\tb.ne L{n}");
+                    if sz > 0 {
+                        let n = self.labels(1);
+                        self.imm("x2", sz as i64);
+                        _ = writeln!(self.s, "L{n}:");
+                        self.s +=
+                            "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+                        _ = writeln!(self.s, "\tb.ne L{n}");
+                    }
                     self.s += "\tmov x0, x4\n"; // giá trị = địa chỉ dst
                 } else {
                     self.store(0, lt);
@@ -559,20 +668,46 @@ impl Cg<'_> {
                     i
                 );
             }
-            Node::Call(..) | Node::CallPtr(..) => self.call(id),
+            Node::Call(..) | Node::CallPtr(..) => self.call(id, None),
+            Node::Block(v) => {
+                // statement expression: x0 sau stmt cuối là giá trị
+                for &c in &v.clone() {
+                    self.stmt(c);
+                }
+            }
             Node::SRet(call, off, sz) => {
                 let (call, off, sz) = (*call, *off, *sz);
-                self.expr(call); // struct về trong x0 (và x1 nếu >8B)
-                self.lea_local("x9", off);
-                self.s += "\tstr x0, [x9]\n";
-                if sz > 8 {
-                    self.s += "\tstr x1, [x9, #8]\n";
+                if let Some((dbl, n)) = self.a.tt.hfa(t) {
+                    self.expr(call); // kết quả trong v0..v3
+                    self.lea_local("x9", off);
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(self.s, "\tstr d{j}, [x9, #{}]", 8 * j);
+                        } else {
+                            _ = writeln!(self.s, "\tstr s{j}, [x9, #{}]", 4 * j);
+                        }
+                    }
+                    self.s += "\tmov x0, x9\n";
+                } else if sz > 16 {
+                    // callee tự ghi vào temp qua x8; giá trị = địa chỉ temp
+                    self.call(call, Some(off));
+                    self.lea_local("x0", off);
+                } else {
+                    self.expr(call); // struct về trong x0 (và x1 nếu >8B)
+                    self.lea_local("x9", off);
+                    self.s += "\tstr x0, [x9]\n";
+                    if sz > 8 {
+                        self.s += "\tstr x1, [x9, #8]\n";
+                    }
+                    self.s += "\tmov x0, x9\n";
                 }
-                self.s += "\tmov x0, x9\n";
             }
             Node::Zero(l, sz) => {
                 let (l, sz) = (*l, *sz);
                 self.addr(l);
+                if sz == 0 {
+                    return;
+                }
                 self.imm("x2", sz as i64);
                 let n = self.labels(1);
                 _ = writeln!(self.s, "L{n}:");
@@ -649,7 +784,7 @@ impl Cg<'_> {
             _ => unreachable!("statement node không lọt vào expr"),
         }
     }
-    fn call(&mut self, id: NodeId) {
+    fn call(&mut self, id: NodeId, sret: Option<u32>) {
         let (callee_name, callee_expr, args, nreg) = match &self.a.nodes[id as usize] {
             Node::Call(n, a, r) => (Some(n.clone()), None, a.clone(), *r as usize),
             Node::CallPtr(e, a, r) => (None, Some(*e), a.clone(), *r as usize),
@@ -664,6 +799,7 @@ impl Cg<'_> {
             S(u32),
             St(u32, bool),     // struct → GPR: (reg đầu, chiếm 2 reg)
             StS(u32, u32),     // struct → stack: (slot đầu, size)
+            H(u32, u32, bool), // HFA → v-reg: (reg đầu, số member, là double)
         }
         let (mut gp, mut fp, mut stk) = (0u32, 0u32, 0u32);
         let mut plan = Vec::new();
@@ -671,13 +807,22 @@ impl Cg<'_> {
             let t = self.a.types[a as usize];
             if matches!(self.a.tt.tys[t as usize], Ty::Struct(_)) {
                 let sz = self.a.tt.size(t);
+                let hfa = self.a.tt.hfa(t);
+                if let (Some((dbl, n)), true) = (hfa, (i as u32) < nreg as u32) {
+                    if fp + n <= 8 {
+                        plan.push(Slot::H(fp, n, dbl));
+                        fp += n;
+                        continue;
+                    }
+                    fp = 8; // AAPCS C.3
+                }
                 let need = if sz > 8 { 2 } else { 1 };
-                if i < nreg && gp + need <= 8 {
+                if i < nreg && hfa.is_none() && gp + need <= 8 {
                     plan.push(Slot::St(gp, sz > 8));
                     gp += need;
                 } else {
                     plan.push(Slot::StS(stk, sz));
-                    stk += need;
+                    stk += sz.div_ceil(8);
                 }
                 continue;
             }
@@ -705,13 +850,14 @@ impl Cg<'_> {
                 }
                 Slot::StS(k, sz) => {
                     self.expr(a); // x0 = địa chỉ struct
-                    _ = writeln!(self.s, "\tldr x8, [x0]\n\tstr x8, [sp, #{}]", 8 * k);
-                    if sz > 8 {
+                    let mut o = 0;
+                    while o < sz {
                         _ = writeln!(
                             self.s,
-                            "\tldr x8, [x0, #8]\n\tstr x8, [sp, #{}]",
-                            8 * k + 8
+                            "\tldr x8, [x0, #{o}]\n\tstr x8, [sp, #{}]",
+                            8 * k + o
                         );
+                        o += 8;
                     }
                 }
                 _ => {}
@@ -746,8 +892,21 @@ impl Cg<'_> {
                         _ = writeln!(self.s, "\tldr x{}, [x9, #8]", i + 1);
                     }
                 }
+                Slot::H(f0, n, dbl) => {
+                    self.s += "\tldr x9, [sp], #16\n";
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(self.s, "\tldr d{}, [x9, #{}]", f0 + j, 8 * j);
+                        } else {
+                            _ = writeln!(self.s, "\tldr s{}, [x9, #{}]", f0 + j, 4 * j);
+                        }
+                    }
+                }
                 Slot::S(_) | Slot::StS(..) => unreachable!(),
             }
+        }
+        if let Some(off) = sret {
+            self.lea_local("x8", off); // đích cho callee ghi struct trả về
         }
         match callee_name {
             Some(n) => _ = writeln!(self.s, "\tbl _{n}"),

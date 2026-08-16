@@ -132,7 +132,13 @@ fn suffix_kind(b: &[u8], i: &mut usize, v: u64, oct_hex: bool) -> Result<NumK, S
     loop {
         match b.get(*i) {
             Some(b'u' | b'U') if !u => u = true,
-            Some(b'l' | b'L') if !l => l = true,
+            Some(b'l' | b'L') if !l => {
+                l = true;
+                // "ll"/"LL" (long long = long trên LP64): nuốt chữ l thứ hai
+                if matches!(b.get(*i + 1), Some(b'l' | b'L')) {
+                    *i += 1;
+                }
+            }
             _ => break,
         }
         *i += 1;
@@ -202,6 +208,21 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             i += end + 4;
             continue;
         }
+        // "//" (C99/extension, clang chấp nhận cả trong -std=c89): đến hết dòng
+        if src[i..].starts_with("//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            ws = true;
+            continue;
+        }
+        // wide literal L'x' / L"s": wchar = int, bỏ prefix (đủ cho test C89)
+        let c = if c == b'L' && matches!(b.get(i + 1), Some(b'\'' | b'"')) {
+            i += 1;
+            b[i]
+        } else {
+            c
+        };
         let tok = if c.is_ascii_digit()
             || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
         {
