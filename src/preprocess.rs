@@ -7,7 +7,7 @@
 // Macro sẵn: __LINE__ __FILE__ __STDC__. Chưa có: #include <...> (cần search
 // path hệ thống — để dành khi test/M8 đòi), macro variadic (C89 không có).
 
-use crate::lexer::{lex, PTok, Tok};
+use crate::lexer::{lex, NumK, PTok, Tok};
 use std::collections::HashMap;
 use std::fs;
 
@@ -19,7 +19,7 @@ type Macros = HashMap<String, Macro>;
 
 pub fn preprocess(path: &str) -> Result<Vec<Tok>, String> {
     let mut macros = Macros::new();
-    macros.insert("__STDC__".into(), Macro::Obj(vec![synth(Tok::Num(1))]));
+    macros.insert("__STDC__".into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
     Ok(pp_file(path, &mut macros, 0)?.into_iter().map(|t| t.tok).collect())
 }
 
@@ -219,7 +219,7 @@ fn expand_at(
         }
     };
     if name == "__LINE__" {
-        out.push(PTok { tok: Tok::Num(t.line as i64), ..t.clone() });
+        out.push(PTok { tok: Tok::Num(t.line as i64, NumK::I), ..t.clone() });
         return Ok(i + 1);
     }
     if name == "__FILE__" {
@@ -379,7 +379,9 @@ fn substitute(
 
 fn spell(t: &Tok) -> String {
     match t {
-        Tok::Num(n) => n.to_string(),
+        Tok::Num(n, NumK::U | NumK::UL) => (*n as u64).to_string(),
+        Tok::Num(n, _) => n.to_string(),
+        Tok::FNum(v, _) => format!("{v:?}"),
         Tok::Ident(s) => s.clone(),
         Tok::Punct(p) => p.to_string(),
         Tok::Str(b) => {
@@ -426,7 +428,7 @@ fn eval_if(d: &[PTok], macros: &Macros, file: &str, lno: u32) -> Result<bool, St
             let at = if paren { i + 2 } else { i + 1 };
             let name =
                 ident_of(d.get(at)).ok_or_else(|| err(file, lno, "defined cần tên macro"))?;
-            pre.push(synth(Tok::Num(macros.contains_key(name) as i64)));
+            pre.push(synth(Tok::Num(macros.contains_key(name) as i64, NumK::I)));
             i = at + 1;
             if paren {
                 if !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(")"))) {
@@ -443,7 +445,7 @@ fn eval_if(d: &[PTok], macros: &Macros, file: &str, lno: u32) -> Result<bool, St
     let ts: Vec<Tok> = ex
         .into_iter()
         .map(|t| match t.tok {
-            Tok::Ident(_) => Tok::Num(0), // ident không phải macro → 0 (luật C)
+            Tok::Ident(_) => Tok::Num(0, NumK::I), // ident không phải macro → 0 (luật C)
             tok => tok,
         })
         .collect();
@@ -544,9 +546,9 @@ fn unary(ts: &[Tok], p: &mut usize) -> Result<i64, String> {
             return Err("thiếu ')' trong #if".into());
         }
         Ok(v)
-    } else if let Some(Tok::Num(n)) = ts.get(*p) {
+    } else if let Some(&Tok::Num(n, _)) = ts.get(*p) {
         *p += 1;
-        Ok(*n)
+        Ok(n)
     } else {
         Err("biểu thức #if hỏng".into())
     }

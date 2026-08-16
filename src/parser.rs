@@ -1,27 +1,25 @@
 // Parser: &[Tok] → AST arena (Vec<Node> + NodeId u32) + type arena (TyTab: Vec<Ty> +
 // TypeId u32, struct/union member ở bảng structs riêng vì Ty phải Copy).
-// Grammar hiện tại (M0–M6):
+// Grammar hiện tại (M0–M7 + 2a):
 //   program    = ("typedef" typespec declarator ";" | typespec ";" | typespec "*"* ident
-//                 ("(" params ")" (";" | block) | ("[" num "]")? ("=" hằng)? ";"))*
+//                 ("(" params ")" (";" | block) | ("[" const "]")? ("=" hằng)? ";"))*
 //   typespec   = "int" | "char" | "long" | tên typedef
 //              | ("struct" | "union") tag? ("{" (typespec declarator ";")* "}")?
-//              | "enum" tag? ("{" ident ("=" num)? ("," ...)* "}")?
-//   declarator = "*"* ident ("[" num "]")?
-//   stmt       = "return" expr ";" | "if" "(" expr ")" stmt ("else" stmt)?
-//              | "while" "(" expr ")" stmt | "for" "(" expr? ";" expr? ";" expr? ")" stmt
-//              | "{" stmt* "}" | typespec declarator ("=" expr)? ";" | expr ";"
-//   expr       = equality ("=" expr)?        (vế trái phải là lvalue)
-//   equality   = relational (("==" | "!=") relational)*
-//   relational = add (("<" | "<=" | ">" | ">=") add)*
-//   add        = mul (("+" | "-") mul)*      (con trỏ ± int: parser tự chèn *sizeof(elem))
-//   mul        = unary (("*" | "/" | "%") unary)*
-//   unary      = ("-" | "+" | "*" | "&" | "sizeof") unary | postfix
-//   postfix    = primary ("[" expr "]" | "." ident | "->" ident)*
-//   primary    = num | string | ident | ident "(" (expr ("," expr)*)? ")" | "(" expr ")"
-// Tên hàm trong call KHÔNG kiểm chứng — codegen phát `bl _name`, ld64 lo phần còn lại
-// (nhờ vậy gọi được hàm định nghĩa sau và libc miễn phí).
+//              | "enum" tag? ("{" ident ("=" const)? ("," ...)* "}")?
+//   stmt       = "return" expr ";" | if/while/for/do-while/switch/case/default
+//              | break/continue/goto/label | "{" stmt* "}" (mở scope)
+//              | typespec declarator ("=" assign)? ";" | ";" | expr ";"
+//   expr       = assign ("," assign)*
+//   assign     = cond (("=" | "+=" | "-=" | ... ) assign)?   (vế trái lvalue)
+//   cond       = lor ("?" expr ":" cond)?
+//   lor/land   = || && — desugar thành Cond lồng nhau (short-circuit + chuẩn hóa 0/1)
+//   bitor..and = "|" "^" "&" từng tầng; equality → relational → shift → add → mul
+//   unary      = ("-" "+" "*" "&" "!" "~" "++" "--" "sizeof") unary | postfix
+//   postfix    = primary ("[" expr "]" | "." id | "->" id | "++" | "--")*
+//   primary    = num | string | ident | call | "(" expr ")"
+// Tên hàm trong call KHÔNG kiểm chứng — codegen phát `bl _name`, ld64 lo phần còn lại.
 use crate::ast::{Ast, Func, GInit, Global, Node, NodeId, StructDef, Ty, TyTab, TypeId, CHAR, INT, LONG};
-use crate::lexer::Tok;
+use crate::lexer::{NumK, Tok};
 use std::collections::HashMap;
 
 struct P<'a> {
@@ -30,17 +28,32 @@ struct P<'a> {
     nodes: Vec<Node>,
     types: Vec<TypeId>,
     tt: TyTab,
-    locals: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset)
+    locals: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset); scope = truncate khi đóng block
     cur_off: u32,
     globals: Vec<Global>,
     strs: Vec<Vec<u8>>,
-    fns: HashMap<String, (u32, bool)>,  // tên → (số param đặt tên, variadic?)
-    tags: HashMap<String, TypeId>,      // tag struct/union
+    fns: HashMap<String, (u32, bool)>, // tên → (số param đặt tên, variadic?)
+    tags: HashMap<String, TypeId>,     // tag struct/union
     typedefs: HashMap<String, TypeId>,
-    enums: HashMap<String, i64>,        // hằng enum
+    enums: HashMap<String, i64>,                       // hằng enum
+    switches: Vec<(Vec<(i64, NodeId)>, Option<NodeId>)>, // stack switch đang mở
 }
 
 type R = Result<NodeId, String>;
+
+const ASSIGN_OPS: [(&str, &str); 11] = [
+    ("=", ""),
+    ("+=", "+"),
+    ("-=", "-"),
+    ("*=", "*"),
+    ("/=", "/"),
+    ("%=", "%"),
+    ("<<=", "<<"),
+    (">>=", ">>"),
+    ("&=", "&"),
+    ("|=", "|"),
+    ("^=", "^"),
+];
 
 impl P<'_> {
     fn push(&mut self, n: Node, t: TypeId) -> NodeId {
@@ -76,12 +89,47 @@ impl P<'_> {
             Err(format!("cần tên, gặp {:?}", self.toks.get(self.pos)))
         }
     }
-    fn num(&mut self) -> Result<i64, String> {
-        if let Some(&Tok::Num(v)) = self.toks.get(self.pos) {
-            self.pos += 1;
-            Ok(v)
-        } else {
-            Err(format!("cần hằng số, gặp {:?}", self.toks.get(self.pos)))
+    // constant-expression: parse như cond rồi fold — node xây dở thành rác arena
+    fn const_expr(&mut self) -> Result<i64, String> {
+        let e = self.cond_expr()?;
+        self.fold(e)
+    }
+    fn fold(&self, id: NodeId) -> Result<i64, String> {
+        match &self.nodes[id as usize] {
+            Node::Num(v) => Ok(*v),
+            Node::Neg(e) => Ok(self.fold(*e)?.wrapping_neg()),
+            Node::Cond(c, t, e) => {
+                if self.fold(*c)? != 0 {
+                    self.fold(*t)
+                } else {
+                    self.fold(*e)
+                }
+            }
+            Node::Comma(_, r) => self.fold(*r),
+            Node::Bin(op, l, r) => {
+                let (l, r) = (self.fold(*l)?, self.fold(*r)?);
+                Ok(match *op {
+                    "+" => l.wrapping_add(r),
+                    "-" => l.wrapping_sub(r),
+                    "*" => l.wrapping_mul(r),
+                    "/" | "%" if r == 0 => return Err("chia 0 trong hằng".into()),
+                    "/" => l.wrapping_div(r),
+                    "%" => l.wrapping_rem(r),
+                    "&" => l & r,
+                    "|" => l | r,
+                    "^" => l ^ r,
+                    "<<" => l.wrapping_shl(r as u32),
+                    ">>" => l.wrapping_shr(r as u32),
+                    "==" => (l == r) as i64,
+                    "!=" => (l != r) as i64,
+                    "<" => (l < r) as i64,
+                    "<=" => (l <= r) as i64,
+                    ">" => (l > r) as i64,
+                    ">=" => (l >= r) as i64,
+                    _ => return Err("op không dùng được trong hằng".into()),
+                })
+            }
+            _ => Err("cần biểu thức hằng".into()),
         }
     }
     // None = token hiện tại không mở đầu một kiểu (→ caller thử hướng khác)
@@ -148,7 +196,7 @@ impl P<'_> {
             while !self.eat(&Tok::Punct("}")) {
                 let name = self.ident()?;
                 if self.eat(&Tok::Punct("=")) {
-                    val = self.num()?;
+                    val = self.const_expr()?;
                 }
                 self.enums.insert(name, val);
                 val += 1;
@@ -166,7 +214,7 @@ impl P<'_> {
         }
         let name = self.ident()?;
         if self.eat(&Tok::Punct("[")) {
-            let n = self.num()?;
+            let n = self.const_expr()?;
             self.expect(Tok::Punct("]"))?;
             t = self.tt.add(Ty::Array(t, n as u32));
         }
@@ -179,7 +227,28 @@ impl P<'_> {
         self.locals.push((name, t, self.cur_off));
         self.cur_off
     }
+    fn check_lval(&self, l: NodeId) -> Result<(), String> {
+        if matches!(
+            self.nodes[l as usize],
+            Node::Var(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..)
+        ) {
+            Ok(())
+        } else {
+            Err("cần lvalue".into())
+        }
+    }
     fn stmt(&mut self) -> R {
+        // label: ident ":" — phải bắt trước expr; case/default đã ăn bởi eat_kw phía dưới
+        if let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
+            (self.toks.get(self.pos), self.toks.get(self.pos + 1))
+        {
+            if !["case", "default"].contains(&n.as_str()) && !self.typedefs.contains_key(n) {
+                let n = n.clone();
+                self.pos += 2;
+                let st = self.stmt()?;
+                return Ok(self.push(Node::Label(n, st), INT));
+            }
+        }
         if self.eat_kw("return") {
             let e = self.expr()?;
             self.expect(Tok::Punct(";"))?;
@@ -204,18 +273,63 @@ impl P<'_> {
             let n = self.opt_expr(")")?;
             let b = self.stmt()?;
             Ok(self.push(Node::For(i, c, n, b), INT))
+        } else if self.eat_kw("do") {
+            let b = self.stmt()?;
+            if !self.eat_kw("while") {
+                return Err("do cần while".into());
+            }
+            self.expect(Tok::Punct("("))?;
+            let c = self.expr()?;
+            self.expect(Tok::Punct(")"))?;
+            self.expect(Tok::Punct(";"))?;
+            Ok(self.push(Node::Do(b, c), INT))
+        } else if self.eat_kw("switch") {
+            self.expect(Tok::Punct("("))?;
+            let c = self.expr()?;
+            self.expect(Tok::Punct(")"))?;
+            self.switches.push((Vec::new(), None));
+            let b = self.stmt()?;
+            let (cases, def) = self.switches.pop().unwrap();
+            Ok(self.push(Node::Switch(c, b, cases, def), INT))
+        } else if self.eat_kw("case") {
+            let v = self.const_expr()?;
+            self.expect(Tok::Punct(":"))?;
+            let st = self.stmt()?;
+            let id = self.push(Node::Case(st), INT);
+            self.switches.last_mut().ok_or("case ngoài switch")?.0.push((v, id));
+            Ok(id)
+        } else if self.eat_kw("default") {
+            self.expect(Tok::Punct(":"))?;
+            let st = self.stmt()?;
+            let id = self.push(Node::Case(st), INT);
+            self.switches.last_mut().ok_or("default ngoài switch")?.1 = Some(id);
+            Ok(id)
+        } else if self.eat_kw("break") {
+            self.expect(Tok::Punct(";"))?;
+            Ok(self.push(Node::Break, INT))
+        } else if self.eat_kw("continue") {
+            self.expect(Tok::Punct(";"))?;
+            Ok(self.push(Node::Continue, INT))
+        } else if self.eat_kw("goto") {
+            let n = self.ident()?;
+            self.expect(Tok::Punct(";"))?;
+            Ok(self.push(Node::Goto(n), INT))
+        } else if self.eat(&Tok::Punct(";")) {
+            Ok(self.push(Node::Block(Vec::new()), INT))
         } else if self.eat(&Tok::Punct("{")) {
+            let scope = self.locals.len();
             let mut v = Vec::new();
             while !self.eat(&Tok::Punct("}")) {
                 v.push(self.stmt()?);
             }
+            self.locals.truncate(scope);
             Ok(self.push(Node::Block(v), INT))
         } else if let Some(bt) = self.typespec()? {
             let (name, t) = self.declarator(bt)?;
             let off = self.alloc_local(name, t);
             let s = if self.eat(&Tok::Punct("=")) {
                 let v = self.push(Node::Var(off), t);
-                let e = self.expr()?;
+                let e = self.assign()?;
                 self.push(Node::Assign(v, e), t)
             } else {
                 self.push(Node::Block(Vec::new()), INT) // khai báo trần: không sinh code
@@ -256,6 +370,7 @@ impl P<'_> {
             _ => {
                 let t = match op {
                     "==" | "!=" | "<" | "<=" | ">" | ">=" => INT,
+                    "<<" | ">>" => self.ty(l), // kiểu = vế trái (promoted)
                     _ if self.tt.size(self.ty(l)).max(self.tt.size(self.ty(r))) == 8 => LONG,
                     _ => INT,
                 };
@@ -264,17 +379,62 @@ impl P<'_> {
         }
     }
     fn expr(&mut self) -> R {
-        let l = self.equality()?;
-        if self.eat(&Tok::Punct("=")) {
-            if !matches!(
-                self.nodes[l as usize],
-                Node::Var(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..)
-            ) {
-                return Err("vế trái '=' không phải lvalue".into());
+        let mut l = self.assign()?;
+        while self.eat(&Tok::Punct(",")) {
+            let r = self.assign()?;
+            let t = self.ty(r);
+            l = self.push(Node::Comma(l, r), t);
+        }
+        Ok(l)
+    }
+    fn assign(&mut self) -> R {
+        let l = self.cond_expr()?;
+        for (tok, bop) in ASSIGN_OPS {
+            if self.eat(&Tok::Punct(tok)) {
+                self.check_lval(l)?;
+                let r = self.assign()?; // kết hợp phải
+                let r = if bop.is_empty() { r } else { self.mkbin(bop, l, r) };
+                let t = self.ty(l);
+                return Ok(self.push(Node::Assign(l, r), t));
             }
-            let r = self.expr()?; // '=' kết hợp phải
-            let t = self.ty(l);
-            return Ok(self.push(Node::Assign(l, r), t));
+        }
+        Ok(l)
+    }
+    fn cond_expr(&mut self) -> R {
+        let c = self.lor()?;
+        if !self.eat(&Tok::Punct("?")) {
+            return Ok(c);
+        }
+        let t = self.expr()?;
+        self.expect(Tok::Punct(":"))?;
+        let e = self.cond_expr()?;
+        let ty = if self.tt.size(self.ty(t)) >= self.tt.size(self.ty(e)) {
+            self.ty(t)
+        } else {
+            self.ty(e)
+        };
+        Ok(self.push(Node::Cond(c, t, e), ty))
+    }
+    // a || b → a ? 1 : (b ? 1 : 0); a && b → a ? (b ? 1 : 0) : 0 — short-circuit + 0/1
+    fn lor(&mut self) -> R {
+        let mut l = self.land()?;
+        while self.eat(&Tok::Punct("||")) {
+            let r = self.land()?;
+            let one = self.push(Node::Num(1), INT);
+            let zero = self.push(Node::Num(0), INT);
+            let rb = self.push(Node::Cond(r, one, zero), INT);
+            l = self.push(Node::Cond(l, one, rb), INT);
+        }
+        Ok(l)
+    }
+    fn land(&mut self) -> R {
+        let mut l = self.bitor()?;
+        while self.eat(&Tok::Punct("&&")) {
+            let r = self.bitor()?;
+            let one = self.push(Node::Num(1), INT);
+            let zero = self.push(Node::Num(0), INT);
+            let rb = self.push(Node::Cond(r, one, zero), INT);
+            l = self.push(Node::Cond(l, rb, zero), INT);
         }
         Ok(l)
     }
@@ -292,17 +452,38 @@ impl P<'_> {
             return Ok(l);
         }
     }
+    fn bitor(&mut self) -> R {
+        self.bin(&["|"], Self::bitxor)
+    }
+    fn bitxor(&mut self) -> R {
+        self.bin(&["^"], Self::bitand)
+    }
+    fn bitand(&mut self) -> R {
+        self.bin(&["&"], Self::equality)
+    }
     fn equality(&mut self) -> R {
         self.bin(&["==", "!="], Self::relational)
     }
     fn relational(&mut self) -> R {
-        self.bin(&["<", "<=", ">", ">="], Self::add)
+        self.bin(&["<", "<=", ">", ">="], Self::shift)
+    }
+    fn shift(&mut self) -> R {
+        self.bin(&["<<", ">>"], Self::add)
     }
     fn add(&mut self) -> R {
         self.bin(&["+", "-"], Self::mul)
     }
     fn mul(&mut self) -> R {
         self.bin(&["*", "/", "%"], Self::unary)
+    }
+    // ++x → x = x + 1 (mkbin tự scale con trỏ)
+    fn incdec_pre(&mut self, op: &'static str) -> R {
+        let e = self.unary()?;
+        self.check_lval(e)?;
+        let one = self.push(Node::Num(1), INT);
+        let v = self.mkbin(op, e, one);
+        let t = self.ty(e);
+        Ok(self.push(Node::Assign(e, v), t))
     }
     fn unary(&mut self) -> R {
         if self.eat(&Tok::Punct("-")) {
@@ -311,6 +492,18 @@ impl P<'_> {
             Ok(self.push(Node::Neg(e), t))
         } else if self.eat(&Tok::Punct("+")) {
             self.unary()
+        } else if self.eat(&Tok::Punct("!")) {
+            let e = self.unary()?;
+            let z = self.push(Node::Num(0), INT);
+            Ok(self.mkbin("==", e, z))
+        } else if self.eat(&Tok::Punct("~")) {
+            let e = self.unary()?;
+            let m = self.push(Node::Num(-1), INT);
+            Ok(self.mkbin("^", e, m))
+        } else if self.eat(&Tok::Punct("++")) {
+            self.incdec_pre("+")
+        } else if self.eat(&Tok::Punct("--")) {
+            self.incdec_pre("-")
         } else if self.eat(&Tok::Punct("*")) {
             let e = self.unary()?;
             let t = self.tt.pointee(self.ty(e)).ok_or("deref thứ không phải con trỏ")?;
@@ -326,6 +519,12 @@ impl P<'_> {
         } else {
             self.postfix()
         }
+    }
+    fn post_incdec(&mut self, op: &'static str, e: NodeId) -> R {
+        self.check_lval(e)?;
+        let t = self.ty(e);
+        let delta = self.tt.pointee(t).map_or(1, |p| self.tt.size(p) as i64);
+        Ok(self.push(Node::Post(op, e, delta), t))
     }
     fn postfix(&mut self) -> R {
         let mut e = self.primary()?;
@@ -343,6 +542,10 @@ impl P<'_> {
                 let t = self.tt.pointee(self.ty(e)).ok_or("-> trên thứ không phải con trỏ")?;
                 let d = self.push(Node::Deref(e), t);
                 e = self.member(d)?;
+            } else if self.eat(&Tok::Punct("++")) {
+                e = self.post_incdec("+", e)?;
+            } else if self.eat(&Tok::Punct("--")) {
+                e = self.post_incdec("-", e)?;
             } else {
                 return Ok(e);
             }
@@ -366,13 +569,23 @@ impl P<'_> {
             let e = self.expr()?;
             self.expect(Tok::Punct(")"))?;
             Ok(e)
-        } else if let Some(&Tok::Num(v)) = self.toks.get(self.pos) {
+        } else if let Some(&Tok::Num(v, k)) = self.toks.get(self.pos) {
             self.pos += 1;
-            Ok(self.push(Node::Num(v), INT))
+            let t = match k {
+                NumK::I | NumK::U => INT,
+                NumK::L | NumK::UL => LONG,
+            };
+            Ok(self.push(Node::Num(v), t))
         } else if let Some(Tok::Str(bytes)) = self.toks.get(self.pos) {
-            self.strs.push(bytes.clone());
-            let i = (self.strs.len() - 1) as u32;
+            let mut bytes = bytes.clone();
             self.pos += 1;
+            // phase 6: string literal liền kề nối lại
+            while let Some(Tok::Str(more)) = self.toks.get(self.pos) {
+                bytes.extend_from_slice(more);
+                self.pos += 1;
+            }
+            self.strs.push(bytes);
+            let i = (self.strs.len() - 1) as u32;
             let t = self.tt.add(Ty::Array(CHAR, self.strs[i as usize].len() as u32 + 1));
             Ok(self.push(Node::Str(i), t))
         } else if let Some(Tok::Ident(_)) = self.toks.get(self.pos) {
@@ -381,7 +594,7 @@ impl P<'_> {
                 let mut args = Vec::new();
                 if !self.eat(&Tok::Punct(")")) {
                     loop {
-                        args.push(self.expr()?);
+                        args.push(self.assign()?);
                         if !self.eat(&Tok::Punct(",")) {
                             break;
                         }
@@ -393,7 +606,7 @@ impl P<'_> {
                     Some(&(nnamed, true)) => nnamed,
                     _ => args.len() as u32,
                 };
-                return Ok(self.push(Node::Call(n, args, nreg), INT)); // hàm trả int (đủ tới M6)
+                return Ok(self.push(Node::Call(n, args, nreg), INT)); // hàm trả int (đến 2b)
             }
             if let Some((t, off)) =
                 self.locals.iter().rev().find(|(l, ..)| *l == n).map(|&(_, t, o)| (t, o))
@@ -429,6 +642,7 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
         tags: HashMap::new(),
         typedefs: HashMap::new(),
         enums: HashMap::new(),
+        switches: Vec::new(),
     };
     let mut funcs = Vec::new();
     while p.pos < toks.len() {
@@ -476,9 +690,9 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
             let body = p.stmt()?;
             funcs.push(Func { name, params, frame: (p.cur_off + 15) & !15, body });
         } else {
-            // biến global; init chỉ nhận hằng (num / chuỗi)
+            // biến global; init chỉ nhận hằng (const expr / chuỗi)
             if p.eat(&Tok::Punct("[")) {
-                let n = p.num()?;
+                let n = p.const_expr()?;
                 p.expect(Tok::Punct("]"))?;
                 t = p.tt.add(Ty::Array(t, n as u32));
             }
@@ -488,9 +702,7 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
                     p.pos += 1;
                     GInit::Str((p.strs.len() - 1) as u32)
                 } else {
-                    let neg = p.eat(&Tok::Punct("-"));
-                    let v = p.num()?;
-                    GInit::Num(if neg { -v } else { v })
+                    GInit::Num(p.const_expr()?)
                 }
             } else {
                 GInit::None

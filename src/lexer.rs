@@ -1,11 +1,21 @@
-// Lexer: nguồn C → Vec<PTok>. Chỉ nhận token mà test case hiện có đòi hỏi.
-// PTok = Tok + metadata cho preprocessor: bol (token đầu tiên của logical line,
-// để nhận directive '#'), ws (có whitespace/comment ngay trước, để stringize),
-// line (số dòng vật lý, cho __LINE__ và báo lỗi).
+// Lexer: nguồn C → Vec<PTok>. PTok = Tok + metadata cho preprocessor: bol
+// (token đầu logical line, nhận directive '#'), ws (có whitespace/comment ngay
+// trước, cho stringize), line (dòng vật lý, cho __LINE__ và báo lỗi).
+
+// Kiểu của hằng nguyên theo C89 (suffix + độ lớn + cơ số); LP64 nên chỉ cần
+// phân biệt signed/unsigned × int/long.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NumK {
+    I,
+    U,
+    L,
+    UL,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
-    Num(i64),
+    Num(i64, NumK),
+    FNum(f64, bool), // hằng thực; bool = double (không suffix f/F)
     Ident(String),
     Punct(&'static str),
     Str(Vec<u8>), // bytes đã xử lý escape, chưa gồm NUL cuối
@@ -19,12 +29,143 @@ pub struct PTok {
     pub line: u32,
 }
 
-// Punct nhiều ký tự đứng trước để match trước ("<=" trước "<").
-const PUNCTS: [&str; 36] = [
-    "...", "->", "==", "!=", "<=", ">=", "<<", ">>", "&&", "||", "##", "<", ">", "=", "+", "-",
-    "*", "/", "%", "(", ")", "{", "}", ";", ",", "&", "[", "]", ".", "!", "|", "^", "~", "?",
-    ":", "#",
+// Punct dài đứng trước để match trước ("<<=" trước "<<" trước "<").
+const PUNCTS: [&str; 48] = [
+    "...", "<<=", ">>=", "->", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "==",
+    "!=", "<=", ">=", "<<", ">>", "&&", "||", "##", "<", ">", "=", "+", "-", "*", "/", "%", "(",
+    ")", "{", "}", ";", ",", "&", "[", "]", ".", "!", "|", "^", "~", "?", ":", "#",
 ];
+
+// Escape C89 đầy đủ: \n \t \r \a \b \f \v \\ \' \" \? \ooo \xhh.
+// Vào: i trỏ ngay SAU dấu '\', ra: byte giá trị + i đã nhảy qua escape.
+fn escape(b: &[u8], i: &mut usize) -> Result<u8, String> {
+    let c = *b.get(*i).ok_or("escape cụt")?;
+    *i += 1;
+    Ok(match c {
+        b'n' => 10,
+        b't' => 9,
+        b'r' => 13,
+        b'a' => 7,
+        b'b' => 8,
+        b'f' => 12,
+        b'v' => 11,
+        b'\\' | b'\'' | b'"' | b'?' => c,
+        b'x' => {
+            let mut v = 0u32;
+            while let Some(d) = b.get(*i).and_then(|c| (*c as char).to_digit(16)) {
+                v = v * 16 + d;
+                *i += 1;
+            }
+            v as u8
+        }
+        b'0'..=b'7' => {
+            let mut v = (c - b'0') as u32;
+            for _ in 0..2 {
+                match b.get(*i) {
+                    Some(&d @ b'0'..=b'7') => {
+                        v = v * 8 + (d - b'0') as u32;
+                        *i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            v as u8
+        }
+        _ => return Err(format!("escape lạ '\\{}'", c as char)),
+    })
+}
+
+// Hằng số bắt đầu tại i (digit, hoặc '.' + digit). Trả token + i mới.
+fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
+    let s = *i;
+    if src[s..].starts_with("0x") || src[s..].starts_with("0X") {
+        *i += 2;
+        let d = *i;
+        while b.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
+            *i += 1;
+        }
+        let v = u64::from_str_radix(&src[d..*i], 16).map_err(|e| format!("{e}"))?;
+        return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
+    }
+    while b.get(*i).is_some_and(|c| c.is_ascii_digit()) {
+        *i += 1;
+    }
+    // thực: có '.' hoặc mũ e/E (hằng hex-float không tồn tại trong C89)
+    let dot = b.get(*i) == Some(&b'.');
+    let exp = matches!(b.get(*i), Some(b'e' | b'E'));
+    if dot || exp {
+        if dot {
+            *i += 1;
+            while b.get(*i).is_some_and(|c| c.is_ascii_digit()) {
+                *i += 1;
+            }
+        }
+        if matches!(b.get(*i), Some(b'e' | b'E')) {
+            *i += 1;
+            if matches!(b.get(*i), Some(b'+' | b'-')) {
+                *i += 1;
+            }
+            while b.get(*i).is_some_and(|c| c.is_ascii_digit()) {
+                *i += 1;
+            }
+        }
+        let v: f64 = src[s..*i].parse().map_err(|e| format!("{e}"))?;
+        let mut dbl = true;
+        if matches!(b.get(*i), Some(b'f' | b'F')) {
+            *i += 1;
+            dbl = false;
+        } else if matches!(b.get(*i), Some(b'l' | b'L')) {
+            *i += 1; // long double = double trên arm64 Darwin
+        }
+        return Ok(Tok::FNum(v, dbl));
+    }
+    let octal = b[s] == b'0' && *i > s + 1;
+    let v = u64::from_str_radix(&src[s..*i], if octal { 8 } else { 10 })
+        .map_err(|e| format!("{e}"))?;
+    Ok(Tok::Num(v as i64, suffix_kind(b, i, v, octal)?))
+}
+
+// Nuốt suffix u/U/l/L rồi chọn kiểu C89: decimal không suffix đi int→long;
+// octal/hex chen thêm unsigned (int→uint→long→ulong).
+fn suffix_kind(b: &[u8], i: &mut usize, v: u64, oct_hex: bool) -> Result<NumK, String> {
+    let (mut u, mut l) = (false, false);
+    loop {
+        match b.get(*i) {
+            Some(b'u' | b'U') if !u => u = true,
+            Some(b'l' | b'L') if !l => l = true,
+            _ => break,
+        }
+        *i += 1;
+    }
+    Ok(match (u, l) {
+        (true, true) => NumK::UL,
+        (true, false) => {
+            if v <= u32::MAX as u64 {
+                NumK::U
+            } else {
+                NumK::UL
+            }
+        }
+        (false, true) => {
+            if v <= i64::MAX as u64 {
+                NumK::L
+            } else {
+                NumK::UL
+            }
+        }
+        (false, false) => {
+            if v <= i32::MAX as u64 {
+                NumK::I
+            } else if oct_hex && v <= u32::MAX as u64 {
+                NumK::U
+            } else if v <= i64::MAX as u64 {
+                NumK::L
+            } else {
+                NumK::UL
+            }
+        }
+    })
+}
 
 pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
     let b = src.as_bytes();
@@ -44,8 +185,8 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             i += 1;
             continue;
         }
-        // Nối dòng bằng backslash-newline (phase 2): không reset bol —
-        // dòng logic tiếp tục, nhưng vẫn đếm dòng vật lý cho __LINE__.
+        // Nối dòng backslash-newline (phase 2): không reset bol — dòng logic
+        // tiếp tục, nhưng vẫn đếm dòng vật lý cho __LINE__.
         if c == b'\\' && b.get(i + 1) == Some(&b'\n') {
             line += 1;
             ws = true;
@@ -61,12 +202,27 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             i += end + 4;
             continue;
         }
-        let tok = if c.is_ascii_digit() {
-            let s = i;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
+        let tok = if c.is_ascii_digit()
+            || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
+        {
+            number(src, b, &mut i)?
+        } else if c == b'\'' {
+            i += 1;
+            let v = match *b.get(i).ok_or("hằng ký tự không đóng")? {
+                b'\\' => {
+                    i += 1;
+                    escape(b, &mut i)? as i8 as i64 // char signed trên Darwin
+                }
+                e => {
+                    i += 1;
+                    e as i64
+                }
+            };
+            if b.get(i) != Some(&b'\'') {
+                return Err("hằng ký tự không đóng".into());
             }
-            Tok::Num(src[s..i].parse().map_err(|e| format!("{e}"))?)
+            i += 1;
+            Tok::Num(v, NumK::I)
         } else if c == b'"' {
             i += 1;
             let mut bytes = Vec::new();
@@ -74,14 +230,8 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
                 match *b.get(i).ok_or("string không đóng")? {
                     b'"' => break,
                     b'\\' => {
-                        bytes.push(match b.get(i + 1) {
-                            Some(b'n') => 10,
-                            Some(b't') => 9,
-                            Some(b'0') => 0,
-                            Some(&e @ (b'\\' | b'"' | b'\'')) => e,
-                            e => return Err(format!("escape lạ {:?}", e)),
-                        });
-                        i += 2;
+                        i += 1;
+                        bytes.push(escape(b, &mut i)?);
                     }
                     e => {
                         bytes.push(e);

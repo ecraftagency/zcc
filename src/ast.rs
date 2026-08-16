@@ -78,10 +78,22 @@ pub enum Node {
     Deref(NodeId),
     Neg(NodeId),
     Bin(&'static str, NodeId, NodeId), // op = chính punct: "+" "<=" ...
+    Cond(NodeId, NodeId, NodeId),      // ?: — && || ! cũng desugar về đây/Bin
+    Comma(NodeId, NodeId),
+    Post(&'static str, NodeId, i64), // x++/x--: op "+"/"-", lvalue, delta (1 | sizeof pointee)
     Ret(NodeId),
     If(NodeId, NodeId, Option<NodeId>),
     While(NodeId, NodeId),
     For(Option<NodeId>, Option<NodeId>, Option<NodeId>, NodeId),
+    Do(NodeId, NodeId), // body, cond
+    // cond, body, (giá trị case → NodeId của Case), Case default. Label đích
+    // của case = "LC{node id của Case}" — id arena duy nhất nên khỏi cấp phát.
+    Switch(NodeId, NodeId, Vec<(i64, NodeId)>, Option<NodeId>),
+    Case(NodeId),
+    Break,
+    Continue,
+    Goto(String),
+    Label(String, NodeId),
     Block(Vec<NodeId>),
     Call(String, Vec<NodeId>, u32), // nreg: số arg đầu đi thanh ghi; phần sau (arg vô danh
     Str(u32),                       // của hàm variadic) đi theo luật variadic của target
