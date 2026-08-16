@@ -74,6 +74,8 @@ struct P<'a> {
     fret: TypeId, // kiểu trả về của hàm đang parse
     va_off: u32,  // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
     in_fn: bool,  // đang trong body hàm (compound literal: local vs global ẩn)
+    attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
+    fname: String, // tên hàm đang parse (label symbol cho &&label trong static init)
 }
 
 type R = Result<NodeId, String>;
@@ -248,6 +250,7 @@ impl P<'_> {
     // ---- kiểu ----
     // None = token hiện tại không mở đầu một declaration
     fn decl_specs(&mut self) -> Result<Option<(TypeId, Storage)>, String> {
+        self.attr_aligned = None; // của declaration trước, không lây
         let mut storage = Storage::None;
         let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
         let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
@@ -266,6 +269,10 @@ impl P<'_> {
                         // "struct {...} __attribute__((packed / aligned))" hậu tố
                         if let Some(t) = direct {
                             self.repack(t, pk, al);
+                        } else if let Some(a) = al {
+                            // "int __attribute__((aligned(8))) x" — treo lại cho
+                            // declarator/member dùng (pr23467)
+                            self.attr_aligned = Some(self.attr_aligned.unwrap_or(1).max(a));
                         }
                     }
                     any = true;
@@ -407,6 +414,7 @@ impl P<'_> {
         let (mut bit_unit, mut bit_used, mut bit_size) = (0u32, 0u32, 0u32);
         while !self.eat(&Tok::Punct("}")) {
             let (bt, _) = self.decl_specs()?.ok_or("cần kiểu member")?;
+            let attr_al = self.attr_aligned.take().unwrap_or(1);
             // không có declarator: anonymous struct/union (C11, clang cho) → trải
             // member con lên tầng này; kiểu khác (định nghĩa tag) → bỏ qua
             if self.peek(";") {
@@ -455,7 +463,7 @@ impl P<'_> {
                 } else {
                     bit_size = 0;
                     let sz = self.tt.size(mt);
-                    let al = if packed { 1 } else { self.tt.align(mt) };
+                    let al = if packed { 1 } else { self.tt.align(mt).max(attr_al) };
                     let o = if is_union { 0 } else { off.div_ceil(al) * al };
                     members.push((mn, mt, o));
                     off = if is_union { off.max(sz) } else { o + sz };
@@ -517,6 +525,7 @@ impl P<'_> {
         while self.eat(&Tok::Punct("*")) {
             t = self.tt.ptr_to(t);
             while self.eat_kw("const") || self.eat_kw("volatile") {}
+            self.skip_attrs()?; // "void *__attribute__((noinline)) f(...)"
         }
         if self.nested_ahead() {
             self.pos += 1; // '('
@@ -704,13 +713,28 @@ impl P<'_> {
             Ty::Char | Ty::Short => INT,
             Ty::UChar | Ty::UShort | Ty::Bool => INT, // cả ba lọt trong int (LP64)
             Ty::Float => DOUBLE,
-            Ty::Bitfield(b, ..) => self.promote(b),
+            // Bitfield: lên int nếu range lọt int, unsigned int nếu lọt uint,
+            // rộng hơn 32 bit thì theo base (ANSI không định nghĩa, theo gcc)
+            Ty::Bitfield(b, _, w) => {
+                if w < 32 || (w == 32 && !self.tt.is_unsigned(b)) {
+                    INT
+                } else if w == 32 {
+                    UINT
+                } else {
+                    self.promote(b)
+                }
+            }
             _ => t,
         }
     }
     fn common_ty(&self, lt: TypeId, rt: TypeId) -> TypeId {
         if self.tt.is_float(lt) || self.tt.is_float(rt) {
-            return DOUBLE; // tính trong double — C89 cho phép dư precision
+            // float+float / float+int → FLOAT (operand phải TRÒN về f32 —
+            // 16777217L != (float)16777217e0 phân biệt được); còn lại double.
+            // Số học chạy trong double (C89 cho phép dư precision).
+            let fl = |t: TypeId| matches!(self.tt.tys[t as usize], Ty::Double)
+                || !self.tt.is_integer(t) && !matches!(self.tt.tys[t as usize], Ty::Float);
+            return if fl(lt) || fl(rt) { DOUBLE } else { FLOAT };
         }
         if !self.tt.is_integer(lt) || !self.tt.is_integer(rt) {
             return ULONG; // con trỏ v.v.: so sánh/số học 64-bit không dấu
@@ -737,6 +761,32 @@ impl P<'_> {
     }
     fn scalar(&self, t: TypeId) -> bool {
         !matches!(self.tt.tys[t as usize], Ty::Struct(_) | Ty::Array(..))
+    }
+    // L op= R (và ++L/--L): L xuất hiện 2 lần trong cây (load + store) — nếu
+    // địa chỉ có side effect (a[*s++] |= 1) phải giữ vào temp, eval đúng 1 lần:
+    // (tmp = &L, *tmp = *tmp op R)
+    fn opassign(&mut self, l: NodeId, bop: &'static str, r: NodeId) -> R {
+        match self.nodes[l as usize] {
+            Node::Var(_) | Node::GVar(_) => {
+                // địa chỉ tĩnh, khỏi temp
+                let r = self.mkbin(bop, l, r)?;
+                self.mkassign(l, r)
+            }
+            _ => {
+                let lt = self.ty(l);
+                let pt = self.tt.ptr_to(lt);
+                let off = self.alloc_local(String::new(), pt);
+                let tmp = self.push(Node::Var(off), pt);
+                let ad = self.push(Node::Addr(l), pt);
+                let sav = self.push(Node::Assign(tmp, ad), pt);
+                let tmp2 = self.push(Node::Var(off), pt);
+                let ld = self.push(Node::Deref(tmp2), lt);
+                let r = self.mkbin(bop, ld, r)?;
+                let asn = self.mkassign(ld, r)?;
+                let t = self.ty(asn);
+                Ok(self.push(Node::Comma(sav, asn), t))
+            }
+        }
     }
     fn mkassign(&mut self, l: NodeId, r: NodeId) -> R {
         self.check_lval(l)?;
@@ -827,6 +877,34 @@ impl P<'_> {
                 return Ok(self.push(Node::Label(n, st), INT));
             }
         }
+        if self.eat_kw("asm") || self.eat_kw("__asm__") || self.eat_kw("__asm") {
+            // GNU asm statement: nuốt (template rỗng + constraint = barrier, no-op ở -O0)
+            while self.eat_kw("volatile") || self.eat_kw("__volatile__") {}
+            self.expect(Tok::Punct("("))?;
+            match self.toks.get(self.pos) {
+                Some(Tok::Str(s)) if s.is_empty() => {}
+                _ => return Err("asm chỉ hỗ trợ template rỗng (barrier)".into()),
+            }
+            let mut depth = 1;
+            while depth > 0 {
+                match self.toks.get(self.pos) {
+                    Some(Tok::Punct("(")) => depth += 1,
+                    Some(Tok::Punct(")")) => depth -= 1,
+                    None => return Err("asm không đóng".into()),
+                    _ => {}
+                }
+                self.pos += 1;
+            }
+            self.expect(Tok::Punct(";"))?;
+            return Ok(self.push(Node::Block(Vec::new()), INT));
+        }
+        if self.eat_kw("__label__") {
+            // GNU local label declaration — label của mình vốn function-scope, nuốt
+            while !self.eat(&Tok::Punct(";")) {
+                self.pos += 1;
+            }
+            return Ok(self.push(Node::Block(Vec::new()), INT));
+        }
         if self.eat_kw("return") {
             if self.eat(&Tok::Punct(";")) {
                 return Ok(self.push(Node::Ret(None), INT));
@@ -905,6 +983,12 @@ impl P<'_> {
             self.expect(Tok::Punct(";"))?;
             Ok(self.push(Node::Continue, INT))
         } else if self.eat_kw("goto") {
+            if self.eat(&Tok::Punct("*")) {
+                // GNU computed goto
+                let e = self.expr()?;
+                self.expect(Tok::Punct(";"))?;
+                return Ok(self.push(Node::GotoPtr(e), INT));
+            }
             let n = self.ident()?;
             self.expect(Tok::Punct(";"))?;
             Ok(self.push(Node::Goto(n), INT))
@@ -1287,13 +1371,54 @@ impl P<'_> {
         Ok((flat, agg))
     }
     // một item hằng: số / bits float / địa chỉ symbol / string
-    fn gitem(&mut self, mut e: NodeId, t: TypeId) -> Result<GInit, String> {
+    // nhận diện (&&a - &&b) — kể cả dạng ((a-b)/1) do ptr-diff — trả cặp symbol
+    fn label_diff(&self, mut e: NodeId) -> Option<(String, String)> {
+        loop {
+            match &self.nodes[e as usize] {
+                Node::Cast(i) => e = *i,
+                Node::Bin("/", x, d) if matches!(self.nodes[*d as usize], Node::Num(1)) => {
+                    e = *x;
+                }
+                _ => break,
+            }
+        }
+        let Node::Bin("-", l, r) = self.nodes[e as usize] else { return None };
+        let strip = |mut n: NodeId| {
+            while let Node::Cast(i) = self.nodes[n as usize] {
+                n = i;
+            }
+            n
+        };
+        let (l, r) = (strip(l), strip(r));
+        if let (Node::LabelAddr(a), Node::LabelAddr(b)) =
+            (&self.nodes[l as usize], &self.nodes[r as usize])
+        {
+            let f = &self.fname;
+            return Some((format!("lg_{f}_{a}"), format!("lg_{f}_{b}")));
+        }
+        None
+    }
+    fn gitem(&mut self, e0: NodeId, t: TypeId) -> Result<GInit, String> {
+        // lột cast CHỈ để nhận diện pattern địa chỉ (str/&g/decay); fold số
+        // phải dùng node gốc kẻo mất truncation của (unsigned int)-4 (pr39240)
+        let mut e = e0;
         while let Node::Cast(inner) = self.nodes[e as usize] {
             e = inner;
         }
         match &self.nodes[e as usize] {
             Node::Str(i) => return Ok(GInit::Str(*i)),
             Node::FunAddr(n) => return Ok(GInit::Addr(n.clone())),
+            Node::LabelAddr(n) => {
+                // symbol khớp quy ước label của codegen (không gạch dưới đầu)
+                return Ok(GInit::Addr(format!("\x01lg_{}_{}", self.fname, n)));
+            }
+            // &&a - &&b: hiệu 2 label (GNU jump table tĩnh); ptr-diff void*
+            // bị mkbin bọc "/1" nên phải bóc
+            Node::Bin("/" | "-", ..) => {
+                if let Some((a, b)) = self.label_diff(e) {
+                    return Ok(GInit::Diff(a, b));
+                }
+            }
             Node::GVar(gi) => {
                 let g = &self.globals[*gi as usize];
                 if matches!(self.tt.tys[g.ty as usize], Ty::Array(..)) {
@@ -1308,12 +1433,18 @@ impl P<'_> {
             _ => {}
         }
         if self.tt.is_float(t) {
-            let v = self.fold_f(e)?;
+            let v = self.fold_f(e0)?;
             let bits =
                 if self.tt.size(t) == 4 { (v as f32).to_bits() as i64 } else { v.to_bits() as i64 };
             return Ok(GInit::Num(bits));
         }
-        Ok(GInit::Num(self.fold(e)?))
+        // hằng nguyên từ biểu thức thực: (int)1.9 v.v. — fold_f rồi truncate
+        if self.tt.is_float(self.ty(e0)) || self.tt.is_float(self.ty(e)) {
+            if let Ok(v) = self.fold_f(e) {
+                return Ok(GInit::Num(v as i64));
+            }
+        }
+        Ok(GInit::Num(self.fold(e0)?))
     }
     // init global/static: trả về GInit + chốt size mảng []
     fn ginit(&mut self, t: &mut TypeId) -> Result<GInit, String> {
@@ -1398,8 +1529,10 @@ impl P<'_> {
             if self.eat(&Tok::Punct(tok)) {
                 self.check_lval(l)?;
                 let r = self.assign()?;
-                let r = if bop.is_empty() { r } else { self.mkbin(bop, l, r)? };
-                return self.mkassign(l, r);
+                if bop.is_empty() {
+                    return self.mkassign(l, r);
+                }
+                return self.opassign(l, bop, r);
             }
         }
         Ok(l)
@@ -1497,8 +1630,7 @@ impl P<'_> {
         let e = self.unary()?;
         self.check_lval(e)?;
         let one = self.push(Node::Num(1), INT);
-        let v = self.mkbin(op, e, one)?;
-        self.mkassign(e, v)
+        self.opassign(e, op, one)
     }
     fn unary(&mut self) -> R {
         // cast: "(" typename ")"
@@ -1610,6 +1742,11 @@ impl P<'_> {
                 _ => return Err("deref thứ không phải con trỏ".into()),
             };
             Ok(self.push(Node::Deref(e), t))
+        } else if self.eat(&Tok::Punct("&&")) {
+            // GNU "&&label": && ở vị trí prefix không thể là logical-and
+            let n = self.ident()?;
+            let t = self.tt.ptr_to(VOID);
+            Ok(self.push(Node::LabelAddr(n), t))
         } else if self.eat(&Tok::Punct("&")) {
             let e = self.unary()?;
             if matches!(self.nodes[e as usize], Node::FunAddr(_)) {
@@ -1897,6 +2034,12 @@ impl P<'_> {
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
             if self.peek("(") {
+                // __builtin_abort... → abort (GCC builtin đổ về libc)
+                let n = n.strip_prefix("__builtin_").map(str::to_string).unwrap_or(n);
+                if let Some(&t) = self.fns.get(&n) {
+                    let pt = self.tt.ptr_to(t);
+                    return Ok(self.push(Node::FunAddr(n), pt));
+                }
                 // gọi hàm chưa khai báo: implicit int, old-style
                 let sig = FnSig {
                     ret: INT,
@@ -1943,6 +2086,8 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
         fret: INT,
         va_off: 16,
         in_fn: false,
+        attr_aligned: None,
+        fname: String::new(),
     };
     let mut funcs = Vec::new();
     while p.pos < toks.len() {
@@ -1964,6 +2109,7 @@ pub fn parse(toks: &[Tok]) -> Result<Ast, String> {
                 p.locals.clear();
                 p.cur_off = 0;
                 p.fret = sig.ret;
+                p.fname = name.clone();
                 // old-style: parse decl list gán kiểu cho từng tên param
                 let mut ptypes: HashMap<String, TypeId> = HashMap::new();
                 if sig.oldstyle {

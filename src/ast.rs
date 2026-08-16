@@ -205,6 +205,8 @@ pub enum Node {
     Break,
     Continue,
     Goto(String),
+    GotoPtr(NodeId),   // GNU "goto *e" — br qua giá trị
+    LabelAddr(String), // GNU "&&label" — địa chỉ label trong hàm hiện tại
     Label(String, NodeId),
     Block(Vec<NodeId>),
     Call(String, Vec<NodeId>, u32), // gọi thẳng theo tên; nreg = số arg đầu "đặt tên"
@@ -221,7 +223,8 @@ pub enum GInit {
     None,
     Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
     Str(u32),
-    Addr(String),             // địa chỉ symbol khác: int *p = &g;
+    Addr(String),             // địa chỉ symbol khác: int *p = &g; (prefix \x01 = tên đủ, không thêm _)
+    Diff(String, String),     // hiệu 2 symbol: &&a - &&b (GNU, static jump table)
     Bytes(Vec<u8>),           // char arr[] = "..." (đã pad đủ size)
     List(Vec<(u32, u32, GInit)>), // initializer phẳng hóa: (offset, size, item)
 }

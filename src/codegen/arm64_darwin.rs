@@ -195,8 +195,14 @@ pub fn emit(ast: &Ast) -> String {
         }
     }
     if !ast.strs.is_empty() {
-        g.s += ".section __TEXT,__cstring\n";
         for (i, bytes) in ast.strs.iter().enumerate() {
+            // __cstring bị linker dedup theo nội-dung-đến-NUL — string chứa
+            // NUL nhúng ("\0abc") phải qua __const kẻo bị merge nhầm
+            g.s += if bytes.contains(&0) {
+                ".section __TEXT,__const\n"
+            } else {
+                ".section __TEXT,__cstring\n"
+            };
             _ = write!(g.s, "l_str{}:\n\t.asciz \"", i);
             for &b in bytes {
                 match b {
@@ -216,13 +222,21 @@ impl Cg<'_> {
     fn gdata(&mut self, init: &GInit, sz: u32) {
         _ = match init {
             GInit::Num(v) => match sz {
-                1 => writeln!(self.s, "\t.byte {v}"),
-                2 => writeln!(self.s, "\t.short {v}"),
-                4 => writeln!(self.s, "\t.long {v}"),
+                1 => writeln!(self.s, "\t.byte {}", *v as u8),
+                2 => writeln!(self.s, "\t.short {}", *v as u16),
+                4 => writeln!(self.s, "\t.long {}", *v as u32),
                 _ => writeln!(self.s, "\t.quad {v}"),
             },
             GInit::Str(i) => writeln!(self.s, "\t.quad l_str{i}"),
-            GInit::Addr(n) => writeln!(self.s, "\t.quad _{n}"),
+            // prefix \x01 = symbol nội bộ đã đủ tên (label &&), không thêm gạch dưới
+            GInit::Addr(n) => match n.strip_prefix('\x01') {
+                Some(raw) => writeln!(self.s, "\t.quad {raw}"),
+                None => writeln!(self.s, "\t.quad _{n}"),
+            },
+            GInit::Diff(a, b) => match sz {
+                4 => writeln!(self.s, "\t.long {a} - {b}"),
+                _ => writeln!(self.s, "\t.quad {a} - {b}"),
+            },
             GInit::Bytes(b) => {
                 let list: Vec<String> = b.iter().map(|x| x.to_string()).collect();
                 writeln!(self.s, "\t.byte {}", list.join(","))
@@ -302,6 +316,14 @@ impl Cg<'_> {
     fn ext(&mut self, t: TypeId) {
         if matches!(self.a.tt.tys[t as usize], Ty::Bool) {
             self.s += "\tcmp x0, #0\n\tcset x0, ne\n";
+            return;
+        }
+        // Bitfield: cắt về w bit theo dấu của base — giá trị của (l.m = v)
+        // là v SAU truncate (921016-1)
+        if let Ty::Bitfield(b, _, w) = self.a.tt.tys[t as usize] {
+            let sh = 64 - w;
+            let op = if self.a.tt.is_unsigned(b) { "lsr" } else { "asr" };
+            _ = writeln!(self.s, "\tlsl x0, x0, #{sh}\n\t{op} x0, x0, #{sh}");
             return;
         }
         let u = self.a.tt.is_unsigned(t);
@@ -551,9 +573,13 @@ impl Cg<'_> {
             }
             Node::Break => _ = writeln!(self.s, "\tb L{}", self.brks.last().unwrap()),
             Node::Continue => _ = writeln!(self.s, "\tb L{}", self.conts.last().unwrap()),
-            Node::Goto(name) => _ = writeln!(self.s, "\tb L_{}_{}", self.fname, name),
+            Node::Goto(name) => _ = writeln!(self.s, "\tb lg_{}_{}", self.fname, name),
+            Node::GotoPtr(e) => {
+                self.expr(*e);
+                self.s += "\tbr x0\n";
+            }
             Node::Label(name, st) => {
-                _ = writeln!(self.s, "L_{}_{}:", self.fname, name);
+                _ = writeln!(self.s, "lg_{}_{}:", self.fname, name);
                 self.stmt(*st);
             }
             _ => self.expr(id),
@@ -615,6 +641,13 @@ impl Cg<'_> {
                     self.s,
                     "\tadrp x0, _{0}@GOTPAGE\n\tldr x0, [x0, _{0}@GOTPAGEOFF]",
                     name
+                );
+            }
+            Node::LabelAddr(name) => {
+                _ = writeln!(
+                    self.s,
+                    "\tadrp x0, lg_{0}_{1}@PAGE\n\tadd x0, x0, lg_{0}_{1}@PAGEOFF",
+                    self.fname, name
                 );
             }
             Node::Cast(e) => {

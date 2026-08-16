@@ -8,6 +8,6 @@ typedef char *va_list;
 #define va_arg(ap, t) (*(t *)(sizeof(t) > 16 \
     ? *(char **)(((ap) += 8) - 8) \
     : (((ap) += ((sizeof(t) + 7) & ~7UL)) - ((sizeof(t) + 7) & ~7UL))))
-#define va_end(ap) ((void)0)
+#define va_end(ap) ((void)(ap)) /* arg phai duoc eval — side effect (va-arg-21) */
 #define va_copy(d, s) ((d) = (s))
 #endif

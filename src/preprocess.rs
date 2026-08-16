@@ -43,6 +43,56 @@ pub fn preprocess(path: &str) -> Result<Vec<Tok>, String> {
     for m in ["__STDC__", "__LP64__", "__APPLE__", "__MACH__", "__arm64__", "__aarch64__"] {
         macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
     }
+    for (m, v) in [
+        ("__CHAR_BIT__", "8"),
+        ("__SCHAR_MAX__", "127"),
+        ("__SHRT_MAX__", "32767"),
+        ("__INT_MAX__", "2147483647"),
+        ("__LONG_MAX__", "9223372036854775807L"),
+        ("__LONG_LONG_MAX__", "9223372036854775807L"),
+        ("__SIZEOF_SHORT__", "2"),
+        ("__SIZEOF_INT__", "4"),
+        ("__SIZEOF_LONG__", "8"),
+        ("__SIZEOF_LONG_LONG__", "8"),
+        ("__SIZEOF_POINTER__", "8"),
+        ("__SIZEOF_SIZE_T__", "8"),
+        ("__SIZEOF_PTRDIFF_T__", "8"),
+        ("__SIZEOF_DOUBLE__", "8"),
+        ("__SIZEOF_FLOAT__", "4"),
+    ] {
+        let toks = lex(v).map_err(|e| e.to_string())?;
+        macros.insert(m.into(), Macro::Obj(toks));
+    }
+    for (m, v) in [
+        ("__SIZE_TYPE__", "unsigned long"),
+        ("__PTRDIFF_TYPE__", "long"),
+        ("__WCHAR_TYPE__", "int"),
+        ("__INTPTR_TYPE__", "long"),
+        ("__UINTPTR_TYPE__", "unsigned long"),
+    ] {
+        let toks = lex(v).map_err(|e| e.to_string())?;
+        macros.insert(m.into(), Macro::Obj(toks));
+    }
+    // __builtin_va_*: bản sao stdarg.h cho code gọi thẳng builtin (torture)
+    macros.insert(
+        "__builtin_va_list".into(),
+        Macro::Obj(lex("char *").map_err(|e| e.to_string())?),
+    );
+    for (m, ps, body) in [
+        ("__builtin_va_start", vec!["ap", "last"], "((ap) = (char *)__va_area__)"),
+        (
+            "__builtin_va_arg",
+            vec!["ap", "t"],
+            "(*(t *)(sizeof(t) > 16 ? *(char **)(((ap) += 8) - 8) \
+             : (((ap) += ((sizeof(t) + 7) & ~7UL)) - ((sizeof(t) + 7) & ~7UL))))",
+        ),
+        ("__builtin_va_end", vec!["ap"], "((void)(ap))"),
+        ("__builtin_va_copy", vec!["d", "s"], "((d) = (s))"),
+    ] {
+        let toks = lex(body).map_err(|e| e.to_string())?;
+        let ps = ps.into_iter().map(String::from).collect();
+        macros.insert(m.into(), Macro::Fun(ps, false, toks));
+    }
     // builtin GCC hay gặp: __builtin_expect(e, c) → (e)
     macros.insert(
         "__builtin_expect".into(),
@@ -78,7 +128,8 @@ fn pp_file(path: &str, macros: &mut Macros, depth: u32) -> Result<Vec<PTok>, Str
     if depth > 32 {
         return Err(format!("{}: include lồng quá sâu", path));
     }
-    let src = fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    let bytes = fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
+    let src = String::from_utf8_lossy(&bytes).into_owned();
     let toks = lex(&src).map_err(|e| format!("{}: {}", path, e))?;
     process(&toks, path, macros, depth)
 }
