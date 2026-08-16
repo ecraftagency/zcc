@@ -9,9 +9,10 @@ pass=0 fail=0
 for c in cases/*.c; do
   n=$(basename "$c" .c)
   cc -std=c89 -w -O0 "$c" -o "out/$n.ref" 2>/dev/null || { echo "SKIP $n (cc từ chối case)"; continue; }
-  "./out/$n.ref" > "out/$n.ref.txt"; want=$?
+  in=/dev/null; [ -f "cases/$n.in" ] && in="cases/$n.in"
+  "./out/$n.ref" < "$in" > "out/$n.ref.txt"; want=$?
   if "$ZCC" "$c" -o "out/$n.bin"; then
-    "./out/$n.bin" > "out/$n.bin.txt"; got=$?
+    "./out/$n.bin" < "$in" > "out/$n.bin.txt"; got=$?
     if [ "$want" = "$got" ] && cmp -s "out/$n.ref.txt" "out/$n.bin.txt"; then
       pass=$((pass + 1)); echo "PASS $n"
     else

@@ -1,0 +1,10 @@
+int main(void) {
+    int i;
+    for (i = 0; i < 10; i++) {
+        if (i % 2 == 0) continue;
+        while (i > 100) break;
+    }
+    return 0;
+}
+double d; char c; const int k = 5;
+if if if else
