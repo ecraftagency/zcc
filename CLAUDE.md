@@ -1,0 +1,54 @@
+# zcc — hiến chương dự án
+
+C89 compiler viết bằng Rust. Tác giả: Vu (xưng hô "mày/tao", trả lời tiếng Việt, thuật ngữ kỹ thuật giữ tiếng Anh).
+
+## 2 yêu cầu tối thượng (mọi quyết định quy về đây)
+
+1. **Strict compliance C89** — hỗ trợ đầy đủ ngôn ngữ C89, ngữ nghĩa đúng spec. Target DUY NHẤT: executable AArch64 trên macOS Apple Silicon (Mach-O). Không x86, không Linux, không Windows.
+2. **Ít LOC nhất có thể** — không optimization pass (ngữ nghĩa -O0), không tính năng nào được viết trước khi có một file `.c` test đòi hỏi nó, không abstraction đón đầu, **zero external crate** (dependency cũng là LOC).
+
+Khi 2 yêu cầu xung đột: compliance thắng LOC.
+
+Mục tiêu xa: dùng `zcc` phối hợp qemu để viết một hệ điều hành đơn giản. Hệ quả thiết kế: sau này cần mode freestanding (không libc, có thể cần assembler directive kiểu ELF cho bare-metal) — KHÔNG thiết kế trước cho việc đó, chỉ cần giữ codegen tách riêng một file để thay được.
+
+## Kiến trúc
+
+```
+main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), KHÔNG Box/reference chằng chịt) → codegen/<target> → .s text
+
+- **Boundary frontend/backend = `src/ast.rs`** (AST + TyTab). Frontend (lexer, parser) DỰNG, backend (codegen/*) chỉ ĐỌC; hai tầng không được import lẫn nhau, mọi trao đổi qua ast.rs. Layout size/align nằm trong TyTab vì lock họ ABI LP64 (arm64 lẫn x86_64 đều int=4 char=1 long=ptr=8); cần ILP32 thì tham số hóa TyTab.
+- Tầng backend: `src/codegen/mod.rs` là cửa duy nhất (`codegen::emit(&Ast) -> String` = .s text), mỗi target một file con (`codegen/arm64_darwin.rs`; tương lai: elf x86_64, arm64 freestanding…). ABI/section/asm syntax nằm trọn trong file target. Thêm target = thêm file + nhánh match trong mod.rs + nhánh toolchain (as/ld) bên driver.
+```
+
+- zcc sinh .s text nội bộ rồi tự phối hợp toolchain hệ thống TRỰC TIẾP (không cc driver): `as tmp.s -o tmp.o` → `ld tmp.o -o out -lSystem -syslibroot $(xcrun -sdk macosx --show-sdk-path) -arch arm64`. Không cần crt0.o (dynamic executable entry qua LC_MAIN trong libSystem); ld64 arm64 tự ad-hoc codesign.
+- CLI tương thích `cc` để drop-in (`CC=zcc`): `zcc [-c | -S] [-o out] <in.c>` → executable `a.out` mặc định; `-c` dừng ở `<stem>.o`, `-S` ở `<stem>.s`; flag cc khác (`-O` `-g` `-W*` `-std=*`…) nuốt im lặng.
+- Single crate, không workspace.
+
+## Đặc sản ABI Darwin/AArch64 (sai là crash khó hiểu — đọc trước khi codegen)
+
+- Symbol C có gạch dưới: `main` → `_main`, gọi libc: `bl _printf`.
+- KHÔNG địa chỉ tuyệt đối. Global/string literal truy cập qua: `adrp x0, sym@PAGE` + `add x0, x0, sym@PAGEOFF`.
+- **Variadic (printf...): tham số vô danh đi LÊN STACK** (đặc sản Apple, ngược Linux ARM64). Named args vẫn x0–x7.
+- Calling convention AAPCS64: args x0–x7, return x0, float v0–v7, stack thẳng hàng 16 byte trước `bl`.
+- Sections Mach-O: `.section __TEXT,__text`, string vào `.section __TEXT,__cstring`, globals `.section __DATA,__data`.
+- Prologue/epilogue chuẩn: `stp x29, x30, [sp, #-16]!` / `ldp x29, x30, [sp], #16`.
+- `char` mặc định signed trên Darwin.
+- Đối chiếu đáp án mẫu bất cứ lúc nào bằng: `clang -S -O0 -std=c89 foo.c`.
+
+## Thang milestone (đi tuần tự, không nhảy cóc)
+
+- **M0**: `int main() { return N; }` → .s → `cc` link → exit code đúng. Chứng minh toàn pipeline.
+- **M1**: biểu thức `+ - * / %`, ngoặc, unary, so sánh — vẫn chỉ trong return.
+- **M2**: biến local (stack slot), `=`, `if/else`, `while`, `for`, block.
+- **M3**: định nghĩa + gọi hàm nhiều tham số, đệ quy (fib chạy được).
+- **M4**: con trỏ, `&` `*`, mảng, pointer arithmetic, `int`/`char`/`long` + sizeof.
+- **M5**: string literal, `char *`, gọi `printf` (nhớ luật varargs-lên-stack). Từ đây test diff được stdout.
+- **M6**: struct/union, typedef, enum, global variables, initializer.
+- **M7**: preprocessor C89 đầy đủ (`#include #define #if...` — macro expansion/rescan là boss thật của cả dự án).
+- **M8** (cúp): compile được `chibicc` hoặc `tcc`, binary sinh ra compile được hello world (kiểm chứng bắc cầu — thay cho self-hosting vì Rust không self-host được).
+
+## Vòng lặp phát triển & test
+
+- Test harness: `tests/run.sh` — mỗi case `tests/cases/*.c` compile bằng cả `cc -std=c89 -O0` (trọng tài) lẫn zcc, chạy hai binary, diff exit code (sau M5: diff cả stdout).
+- Compile chương trình test TRƯỚC, chạy, vỡ ở construct nào thì mới implement construct đó — đây là cơ chế ép LOC tối thiểu.
+- Quy tắc của Vu: mọi con số/quyết định phải suy ra được từ tiền đề đã tuyên bố, không magic number không nguồn gốc.
