@@ -7,15 +7,37 @@ ghi ở đây kèm cách dựng lại**. Không có tài sản mồ côi.
 
 | # | Lớp | Nền tảng | Không gian | Gate |
 |---|-----|----------|-----------|------|
-| 1 | Lexer | ngôn ngữ chính quy, maximal munch | hữu hạn | gián tiếp qua mọi suite |
+| 1 | Lexer | ngôn ngữ chính quy, maximal munch, bảng phân loại literal 3.1.3.2 | bảng hữu hạn | `shape.sh lex` |
 | 2 | Preprocessor | hệ viết lại hạng (terminating nhờ sơn xanh 3.8.3.4) | luật hữu hạn, hạng vô hạn | `cpp.sh` |
-| 3 | Parser → AST | văn phạm phi ngữ cảnh + typedef context | vô hạn | differential (`run.sh` + suite ngoài) |
-| 4 | Kiểu + UAC + const-eval | semilattice hữu hạn (3.2.1.5) | **hữu hạn — vét cạn được** | `alg.sh` |
-| 5 | Codegen -O0 | simulation per-node (mỗi node → mẫu lệnh cố định) | compositional | torture + đối chiếu `clang -S -O0` |
-| 6 | ABI + system | automaton hữu hạn + hợp đồng toolchain | **hữu hạn — vét cạn được** | `abi.sh` + m9/m11/m13/m14 |
+| 3 | Parser → AST | văn phạm phi ngữ cảnh + typedef context; cây declarator sâu ≤k hữu hạn | declarator vét được, còn lại vô hạn | `shape.sh decl` + differential (`run.sh`, suite ngoài) |
+| 4 | Kiểu + UAC + const-eval | semilattice hữu hạn (3.2.1.5) | kiểu/op hữu hạn | `alg.sh` |
+| 5 | Codegen -O0 | simulation per-node (mỗi node → mẫu lệnh cố định); layout = hàm đệ quy hữu hạn | layout vét được, codegen compositional | `shape.sh layout` + torture + đối chiếu `clang -S -O0` |
+| 6 | ABI + system | automaton hữu hạn + hợp đồng toolchain | trạng thái hữu hạn | `abi.sh` + m9/m11/m13/m14 |
 
-Lớp 4 và 6 có **proof bằng liệt kê** (vét cạn = chứng minh, không phải test
-mẫu). Lớp 2, 3, 5 chỉ có differential + cấu trúc — đừng ảo tưởng đã "proof".
+## Giới hạn trung thực (đọc trước khi tự hào)
+
+"Vét cạn" ở đây LUÔN nghĩa là: vét cạn **không gian cấu trúc** (kiểu × op ×
+trạng thái ABI × hình dạng declarator/struct), còn **không gian giá trị**
+(2^64 mỗi toán hạng) chỉ lấy MẪU BIÊN (0, ±1, min, max, pattern giữa). Đó là
+proof-by-enumeration cho phần cấu trúc + boundary testing cho phần giá trị —
+KHÔNG phải chứng minh toàn phần. Nói "proof" trước công chúng thì phải kèm
+câu này.
+
+Mọi phép RÚT GỌN coverage phải kèm lý do soundness đọc được từ code:
+- `abi.sh` chỉ quét đủ 0..8 cho counter LIÊN QUAN của kiểu (GPR cho int-kind,
+  FPR cho float-kind), counter kia lấy {0, 8} — hợp lệ vì nhánh code
+  placement của int-kind không đọc counter FPR và ngược lại (xem `call()`:
+  hai nhánh if tách bạch theo `is_float`/`hfa`). Nếu mai này code trộn hai
+  counter, PHẢI nâng lên tích đầy đủ 9×9.
+- `alg.sh` bỏ `long long`: LP64 nó cùng biểu diễn/cùng đường codegen với
+  `long` (TyTab map cùng size/align) — không thêm điểm mới vào không gian.
+- `cpp.sh` họ mech không sinh tổ hợp tự động mà liệt kê TAY theo các điểm
+  quyết định của thuật toán expansion — đủ dùng nhưng là chỗ yếu nhất của
+  bộ gate; muốn nâng: sinh tổ hợp (định nghĩa × ngữ cảnh dùng) tự động.
+- Trọng tài `cc` cũng có thể sai. Xác suất hai compiler độc lập sai GIỐNG
+  NHAU tại cùng một điểm là nhỏ nhưng khác 0 — mọi diff bất thường phải
+  đối chiếu spec trước khi kết luận zcc sai (đã có tiền lệ: generator sai
+  chứ không phải compiler nào sai).
 
 ## Gate trong repo (tất cả là script, chạy từ repo root)
 
@@ -27,11 +49,20 @@ mẫu). Lớp 2, 3, 5 chỉ có differential + cấu trúc — đừng ảo tư�
 
 ### Gate khoa học (vét cạn không gian hữu hạn — chạy khi đụng vùng tương ứng)
 - `abi.sh` + `gen_abi.py` — **lớp 6**. ABI mô hình hoá automaton: trạng thái
-  (GPR 0..8, FPR 0..8, offset stack); 278 case = 14 kiểu × quét trạng thái +
-  sentinel bắt lệch counter + cặp stack kề + variadic. Link **CHÉO cc↔zcc cả
-  hai chiều** + 2 control: lỗi ABI cùng-compiler hai đầu tự triệt tiêu, chỉ
-  link chéo mới phơi. Thành tích: bắt 2 bug tàng hình suốt M8→M14
-  (packed-stack-args, HFA-tràn-khóa-nhầm-C.11) trong 1 lần chạy đầu.
+  (GPR 0..8, FPR 0..8, offset stack); 292 case = 14 kiểu × quét trạng thái +
+  sentinel bắt lệch counter + cặp stack kề + variadic + quét RETURN (x0,
+  cặp x0/x1, HFA v0..v3, sret x8). Mỗi call kiểm CẢ trực tiếp (bl) lẫn qua
+  function pointer (blr). Link **CHÉO cc↔zcc cả hai chiều** + 2 control:
+  lỗi ABI cùng-compiler hai đầu tự triệt tiêu, chỉ link chéo mới phơi.
+  Thành tích: bắt 2 bug tàng hình suốt M8→M14 (packed-stack-args,
+  HFA-tràn-khóa-nhầm-C.11) trong 1 lần chạy đầu.
+- `shape.sh` (+`gen_lex.py`, `gen_decl.py`, `gen_layout.py`) — **lớp 1, 3, 5**:
+  bảng phân loại integer literal (base × suffix × giá trị biên) + escape +
+  maximal munch; đại số declarator sâu ≤3 (ptr/mảng/fn-ptr, có GỌI thật qua
+  fn-ptr); layout struct/union/bitfield vét tổ hợp member ≤3 + offset từng
+  member. Thành tích lần chạy đầu: bắt zcc từ chối multi-char constant 'ab'
+  (3.1.3.4) + bitfield xen member thường layout lệch clang (12 vs 4 byte —
+  đã viết lại theo ABI Itanium).
 - `alg.sh` + `gen_alg.py` — **lớp 4**. Vét cạn (op × kiểu × kiểu × corner²):
   ~31k điểm runtime + 21k điểm fold. UB lọc TẠI GENERATOR (signed overflow,
   chia 0, INT_MIN/-1, shift tràn, float→int ngoài miền) vì tại điểm UB hai

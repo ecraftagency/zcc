@@ -478,9 +478,12 @@ impl P<'_> {
         };
         let Ty::Struct(sidx) = self.tt.tys[t as usize] else { unreachable!() };
         let mut members = Vec::new();
-        let (mut off, mut mx) = (0u32, 1u32);
-        // trạng thái đơn vị bitfield đang mở (bit_size=0 → không có)
-        let (mut bit_unit, mut bit_used, mut bit_size) = (0u32, 0u32, 0u32);
+        // layout theo ABI Itanium (khoá clang Darwin — bitfield là impl-def C89
+        // nhưng interop SDK bắt buộc khớp platform): cursor cấp phát theo BIT;
+        // bitfield nhét vào bit trống kế trừ khi vắt qua biên container kiểu
+        // khai báo; member thường đặt ở byte trống kế aligned. Bug unit-per-run
+        // cũ (sizeof 12 vs 4 khi bitfield xen member thường) bắt bởi shape.sh.
+        let (mut bits, mut mx) = (0u32, 1u32);
         while !self.eat(&Tok::Punct("}")) {
             let (bt, _) = self.decl_specs()?.ok_or("cần kiểu member")?;
             let attr_al = self.attr_aligned.take().unwrap_or(1);
@@ -491,11 +494,10 @@ impl P<'_> {
                     // member ĐƠN tên rỗng (giữ cursor init đúng); truy cập
                     // xuyên qua bằng find_member đệ quy
                     let (sz, al) = (self.tt.size(bt), self.tt.align(bt));
-                    let o = if is_union { 0 } else { off.div_ceil(al) * al };
+                    let o = if is_union { 0 } else { bits.div_ceil(8).div_ceil(al) * al };
                     members.push((String::new(), bt, o));
-                    off = if is_union { off.max(sz) } else { o + sz };
+                    bits = if is_union { bits.max(sz * 8) } else { (o + sz) * 8 };
                     mx = mx.max(al);
-                    bit_size = 0;
                 }
                 self.expect(Tok::Punct(";"))?;
                 continue;
@@ -508,34 +510,36 @@ impl P<'_> {
                     self.declarator(bt, true)?
                 };
                 if self.eat(&Tok::Punct(":")) {
-                    // bitfield: gói vào "đơn vị chứa" size của kiểu khai báo
                     let w = self.const_expr()? as u32;
                     let (s, al) = (self.tt.size(mt), self.tt.align(mt));
-                    if w == 0 || bit_size != s * 8 || bit_used + w > bit_size {
-                        bit_size = 0; // đóng đơn vị hiện tại
-                    }
-                    if w > 0 {
-                        if bit_size == 0 {
-                            let o = if is_union { 0 } else { off.div_ceil(al) * al };
-                            bit_unit = o;
-                            off = if is_union { off.max(s) } else { o + s };
-                            bit_used = 0;
-                            bit_size = s * 8;
+                    let cb = s * 8; // container theo kiểu khai báo
+                    if w == 0 {
+                        // :0 — đẩy cursor tới biên container kế (3.5.2.1)
+                        if !is_union {
+                            bits = bits.div_ceil(cb) * cb;
                         }
+                    } else {
+                        // vắt qua biên container thì dời lên biên kế
+                        let b = if is_union {
+                            0
+                        } else if bits % cb + w <= cb {
+                            bits
+                        } else {
+                            bits.div_ceil(cb) * cb
+                        };
                         if !mn.is_empty() {
-                            let ft = self.tt.add(Ty::Bitfield(mt, bit_used, w));
-                            members.push((mn, ft, bit_unit));
+                            let ft = self.tt.add(Ty::Bitfield(mt, b % cb, w));
+                            members.push((mn, ft, b / cb * s));
+                            mx = mx.max(al); // unnamed KHÔNG ảnh hưởng align (Itanium)
                         }
-                        bit_used += w;
-                        mx = mx.max(al);
+                        bits = if is_union { bits.max(cb) } else { b + w };
                     }
                 } else {
-                    bit_size = 0;
                     let sz = self.tt.size(mt);
                     let al = if packed { 1 } else { self.tt.align(mt).max(attr_al) };
-                    let o = if is_union { 0 } else { off.div_ceil(al) * al };
+                    let o = if is_union { 0 } else { bits.div_ceil(8).div_ceil(al) * al };
                     members.push((mn, mt, o));
-                    off = if is_union { off.max(sz) } else { o + sz };
+                    bits = if is_union { bits.max(sz * 8) } else { (o + sz) * 8 };
                     mx = mx.max(al);
                 }
                 if !self.eat(&Tok::Punct(",")) {
@@ -548,7 +552,7 @@ impl P<'_> {
             mx = mx.max(a);
         }
         self.tt.structs[sidx as usize] =
-            StructDef { members, size: off.div_ceil(mx) * mx, align: mx, is_union };
+            StructDef { members, size: bits.div_ceil(8).div_ceil(mx) * mx, align: mx, is_union };
         Ok(t)
     }
     fn enum_spec(&mut self) -> Result<TypeId, String> {

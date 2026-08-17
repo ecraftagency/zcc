@@ -163,11 +163,53 @@ def cast_cases():
                 out.append((src, v, dst))
     return out
 
+def unary_cases():
+    """(t, v, op, rt) — unary trên int: kết quả trong kiểu promote(t)."""
+    out = []
+    for t, _, _ in ITYPES:
+        p = promote(t)
+        for v in icorners(t):
+            pv = wrap(p, v)
+            for op in ("-", "~", "!"):
+                if op == "-" and IINFO[p][1] and pv == -(1 << (IINFO[p][0] - 1)):
+                    continue  # -MIN = UB
+                out.append((t, v, op, "int" if op == "!" else p))
+    return out
+
+def compound_cases():
+    """a op= b ≡ a = (T1)((UAC) a op (UAC) b) — đường parse/codegen RIÊNG so
+    với binary thường (đọc-sửa-ghi + convert ngược về T1, narrowing khoá LP64)."""
+    out = []
+    for t1, _, _ in ITYPES:
+        for t2, _, _ in ITYPES:
+            rt = uac(t1, t2)
+            for op in ARITH + BITS:
+                for v1 in icorners(t1):
+                    for v2 in icorners(t2):
+                        if ieval(op, rt, wrap(rt, v1), wrap(rt, v2)) is None:
+                            continue
+                        out.append((t1, v1, t2, v2, op))
+    return out
+
+def incdec_cases():
+    """++/-- tiền/hậu tố: giá trị mới + giá trị biểu thức phải cùng đúng."""
+    out = []
+    for t, w, s in ITYPES:
+        for v in icorners(t):
+            if not (s and v == (1 << (w - 1)) - 1):
+                out.append((t, v, "++"))  # tránh tràn signed = UB
+            if not (s and v == -(1 << (w - 1))):
+                out.append((t, v, "--"))
+    return out
+
 def main(outdir):
     bins = enum_cases()
     flts = float_cases()
     shs = shift_cases()
     csts = cast_cases()
+    uns = unary_cases()
+    cps = compound_cases()
+    ids = incdec_cases()
 
     # ---- họ run_*.c: mọi case qua biến ----
     blocks = []
@@ -180,9 +222,31 @@ def main(outdir):
         fmt, cast = prfmt(dst)
         blocks.append("{ %s a = %s; %s r = (%s)a; printf(\"%s\\n\", %sr); }"
                       % (src, clit(src, v), dst, dst, fmt, cast))
+    for t, v, op, rt in uns:
+        fmt, cast = prfmt(rt)
+        blocks.append("{ %s a = %s; %s r = %s a; printf(\"%s\\n\", %sr); }"
+                      % (t, clit(t, v), rt, op, fmt, cast))
+    for t in FTYPES:  # unary float: - và ! (không ~)
+        for v in FCORNERS[t]:
+            blocks.append("{ %s a = %s; %s r = -a; printf(\"%%a\\n\", (double)r); }"
+                          % (t, clit(t, v), t))
+            blocks.append("{ %s a = %s; int r = !a; printf(\"%%ld\\n\", (long)r); }"
+                          % (t, clit(t, v)))
+    for t1, v1, t2, v2, op in cps:
+        fmt, cast = prfmt(t1)
+        blocks.append("{ %s a = %s; %s b = %s; a %s= b; printf(\"%s\\n\", %sa); }"
+                      % (t1, clit(t1, v1), t2, clit(t2, v2), op, fmt, cast))
+    for t, v, op in ids:
+        fmt, cast = prfmt(t)
+        blocks.append(
+            "{ %s a = %s; %s p = a%s; printf(\"%s %s\\n\", %sa, %sp); }"
+            % (t, clit(t, v), t, op, fmt, fmt, cast, cast))
+        blocks.append(
+            "{ %s a = %s; %s p = %sa; printf(\"%s %s\\n\", %sa, %sp); }"
+            % (t, clit(t, v), t, op, fmt, fmt, cast, cast))
     write_prog(outdir, "run", blocks)
 
-    # ---- họ fold_*.c + fri_*.c: chỉ int×int (miền const-expr C89) ----
+    # ---- họ fold_*.c + fri_*.c: chỉ int (miền const-expr C89), binary + unary ----
     folds, fris = [], []
     for t1, v1, t2, v2, op, rt in bins:
         k = len(folds)
@@ -190,6 +254,12 @@ def main(outdir):
                       "printf(\"%%d\\n\", E%d);" % k))
         fris.append("{ %s a = %s; %s b = %s; int r = (int)(a %s b); printf(\"%%d\\n\", r); }"
                     % (t1, clit(t1, v1), t2, clit(t2, v2), op))
+    for t, v, op, rt in uns:
+        k = len(folds)
+        folds.append(("enum { E%d = (int)(%s (%s)) };" % (k, op, clit(t, v)),
+                      "printf(\"%%d\\n\", E%d);" % k))
+        fris.append("{ %s a = %s; int r = (int)(%s a); printf(\"%%d\\n\", r); }"
+                    % (t, clit(t, v), op))
     write_fold(outdir, folds)
     write_prog(outdir, "fri", fris)
     print("run=%d fold=%d" % (len(blocks), len(folds)))

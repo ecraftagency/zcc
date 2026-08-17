@@ -244,20 +244,27 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             number(src, b, &mut i)?
         } else if c == b'\'' {
             i += 1;
-            let v = match *b.get(i).ok_or("hằng ký tự không đóng")? {
-                b'\\' => {
-                    let e;
-                    i += 1;
-                    e = escape(b, &mut i)?;
-                    if wide { e as i64 } else { e as u8 as i8 as i64 } // char signed trên Darwin
-                }
-                e => {
-                    i += 1;
-                    e as i64
-                }
-            };
-            if b.get(i) != Some(&b'\'') {
-                return Err("hằng ký tự không đóng".into());
+            // multi-char constant 'ab' hợp lệ C89 (3.1.3.4, giá trị impl-def) —
+            // khoá theo clang: dồn byte về phía thấp, ký tự đầu ở byte cao
+            let (mut v, mut n) = (0i64, 0);
+            loop {
+                let e = match *b.get(i).ok_or("hằng ký tự không đóng")? {
+                    b'\'' => break,
+                    b'\\' => {
+                        i += 1;
+                        let e = escape(b, &mut i)?;
+                        if wide { e as i64 } else { e as u8 as i8 as i64 } // char signed trên Darwin
+                    }
+                    e => {
+                        i += 1;
+                        e as i64
+                    }
+                };
+                v = if n == 0 { e } else { (v << 8) | (e & 0xff) };
+                n += 1;
+            }
+            if n == 0 {
+                return Err("hằng ký tự rỗng".into());
             }
             i += 1;
             Tok::Num(v, NumK::I)

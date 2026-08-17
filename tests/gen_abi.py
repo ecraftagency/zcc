@@ -62,9 +62,17 @@ def emit_case(c, callee, caller):
             argv.append(n + "_v")
         else:
             argv.append("(%s)%d" % (t, vals[0]))
-    caller.append("    {\n%s\n        if (%s(%s) != %s) { printf(\"FAIL %s\\n\"); bad++; }\n    }"
-                  % ("\n".join(setup) if setup else "", c.name, ", ".join(argv),
-                     repr(c.expected), c.name))
+    # gọi CẢ trực tiếp (bl) lẫn qua function pointer (blr) — ABI phải đồng
+    # nhất hai đường; fn-ptr chéo compiler là đúng chỗ nginx hay segfault
+    sigt = ", ".join(ctype(t) for t, _, _ in c.params)
+    args = ", ".join(argv)
+    caller.append(
+        "    {\n%s\n        double (*fp)(%s) = %s;\n"
+        "        if (%s(%s) != %s) { printf(\"FAIL %s\\n\"); bad++; }\n"
+        "        if (fp(%s) != %s) { printf(\"FAIL fp:%s\\n\"); bad++; }\n    }"
+        % ("\n".join(setup) if setup else "", sigt, c.name,
+           c.name, args, repr(c.expected), c.name,
+           args, repr(c.expected), c.name))
 
 def main(outdir):
     callee, caller, decls = [], [], []
@@ -101,6 +109,38 @@ def main(outdir):
         sig = ", ".join(ctype(t) for t, _, _ in c.params)
         decls.append("double %s(%s);" % (c.name, sig))
 
+    # quét RETURN: mỗi kiểu một lần — phủ trả x0, cặp x0/x1, HFA v0..v3,
+    # sret qua x8 (>16B) — và trả CẢ qua function pointer (blr)
+    nret = 0
+    for t in ALL:
+        name = "r_%s" % t
+        leaves = STRUCTS[t] if t in STRUCTS else [(t, None)]
+        vals = [5 * i + 3 for i in range(len(leaves))]
+        exp = sum(float(v) * float(1 << i) for i, v in enumerate(vals))
+        if t in STRUCTS:
+            body = "    struct %s x;\n" % t + "".join(
+                "    x.%s = %d;\n" % (m, v) for (_, m), v in zip(leaves, vals))
+            callee.append("struct %s %s(void) {\n%s    return x;\n}" % (t, name, body))
+            probe = " + ".join("(double)r.%s * %d.0" % (m, 1 << i)
+                               for i, (_, m) in enumerate(leaves))
+            caller.append(
+                "    {\n        struct %s (*rp)(void) = %s;\n"
+                "        struct %s r = %s(); struct %s r2 = rp();\n"
+                "        if (%s != %s) { printf(\"FAIL %s\\n\"); bad++; }\n"
+                "        r = r2;\n"
+                "        if (%s != %s) { printf(\"FAIL rp:%s\\n\"); bad++; }\n    }"
+                % (t, name, t, name, t, probe, repr(exp), name, probe, repr(exp), name))
+            decls.append("struct %s %s(void);" % (t, name))
+        else:
+            callee.append("%s %s(void) {\n    return (%s)%d;\n}" % (t, name, t, vals[0]))
+            caller.append(
+                "    {\n        %s (*rp)(void) = %s;\n"
+                "        if ((double)%s() != %d.0 || (double)rp() != %d.0)"
+                " { printf(\"FAIL %s\\n\"); bad++; }\n    }"
+                % (t, name, name, vals[0], vals[0], name))
+            decls.append("%s %s(void);" % (t, name))
+        nret += 1
+
     # variadic: named prefix g long + int n, rồi 3 arg vô danh kiểu T (mỗi arg
     # một slot 8 — va_arg bước 8); T char/short/float đến dạng promoted
     va_callee, va_caller = [], []
@@ -134,7 +174,8 @@ def main(outdir):
         fp.write('#include <stdio.h>\n#include "abi_defs.h"\n\n'
                  "int main(void) {\n    int bad = 0;\n"
                  + "\n".join(caller + va_caller)
-                 + "\n    printf(\"%d case, %d fail\\n\", " + str(len(cases) + len(va_caller))
+                 + "\n    printf(\"%d case, %d fail\\n\", "
+                 + str(len(cases) + len(va_caller) + nret)
                  + ", bad);\n    return bad != 0;\n}\n")
 
 main(sys.argv[1])
