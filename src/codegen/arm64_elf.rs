@@ -1,4 +1,12 @@
-// Codegen AArch64 Mach-O (Darwin). Ngữ nghĩa -O0, máy tính biểu thức kiểu chibicc:
+// Codegen AArch64 ELF (Linux). Sinh từ arm64_darwin.rs — `diff` hai file chính là
+// tài liệu "Mach-O vs ELF khác gì" (giữ cấu trúc song song CÓ CHỦ ĐÍCH, đừng
+// refactor lệch). Khác biệt: không prefix `_`, section ELF (.text/.data/.bss/
+// .rodata/.tdata/.tbss), reloc :lo12:/:got: thay @PAGE/@GOTPAGE, TLS local-exec
+// (mrs tpidr_el0 + :tprel_*) thay descriptor @TLVPPAGE, .weak thay
+// .weak_definition, KHÔNG .subsections_via_symbols, variadic vô danh vào
+// x0-x7/v0-v7 như named (AAPCS chuẩn — bỏ đặc sản Apple stack-only), stack arg
+// scalar slot 8 tròn (bỏ packing natural-align). Ngữ nghĩa -O0, máy tính biểu
+// thức kiểu chibicc:
 // kết quả luôn ở x0; binary op sinh vế phải trước, push xuống stack (16 byte giữ
 // alignment), sinh vế trái, pop vế phải vào x1 rồi `x0 = x0 op x1`.
 //
@@ -9,7 +17,7 @@
 // Sau op 32-bit phải re-canonicalize (sxtw/mov w) để giữ ngữ nghĩa wrap của int.
 //
 // ABI: args int x0-x7, float v0-v7 (2 counter riêng), quá thì stack 8-byte/slot;
-// arg VÔ DANH của variadic LUÔN lên stack (đặc sản Apple). Return: x0 / d0.
+// vô danh variadic đi reg như named (AAPCS chuẩn). Return: x0 / d0.
 // Label: "L{n}" tuần tự; "LC{id}" đích case; "lg_{fn}.{tên}" label goto.
 use crate::ast::{Ast, GInit, Node, NodeId, SyncOp, Ty, TypeId, VOID};
 use std::fmt::Write;
@@ -25,13 +33,15 @@ struct Cg<'a> {
     fname: String,
     fret: TypeId,
     fsret: u32, // ≠0: slot chứa con trỏ x8 (hàm trả struct >16B)
+    // hàm variadic hiện tại (cho VaStart): named đã ăn (gp, fp), byte stack
+    // named, frame — save area 192B nằm NGAY DƯỚI frame: [x29-frame-192, x29-frame)
+    // = VR 128B rồi GP 64B; gr_top = x29-frame, vr_top = x29-frame-64
+    va: (u32, u32, u32, u32),
 }
 
 pub fn emit(ast: &Ast) -> String {
     let mut g = Cg {
-        // subsections_via_symbols: mỗi symbol một atom — bắt buộc để ld
-        // coalesce .weak_definition (inline gnu89) thay vì báo duplicate
-        s: String::from(".subsections_via_symbols\n.section __TEXT,__text\n"),
+        s: String::from(".text\n"),
         a: ast,
         lbl: 0,
         brks: Vec::new(),
@@ -39,30 +49,43 @@ pub fn emit(ast: &Ast) -> String {
         fname: String::new(),
         fret: VOID,
         fsret: 0,
+        va: (0, 0, 0, 0),
     };
     for f in &ast.funcs {
         g.fname = f.name.clone();
         g.fret = f.ret;
         g.fsret = f.sret;
         if !f.is_static {
-            _ = writeln!(g.s, ".globl _{}", f.name);
+            _ = writeln!(g.s, ".globl {}", f.name);
             if f.is_inline {
-                _ = writeln!(g.s, ".weak_definition _{}", f.name);
+                _ = writeln!(g.s, ".weak {}", f.name);
             }
         }
-        _ = write!(g.s, ".p2align 2\n_{}:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n", f.name);
+        _ = write!(g.s, ".p2align 2\n{}:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n", f.name);
         if f.frame > 0 {
             g.sp_adjust("sub", f.frame);
+        }
+        if f.variadic {
+            // register-save area AAPCS: đổ NGUYÊN 8 q-reg + 8 x-reg (kể cả phần
+            // named — thừa vô hại, đỡ phân nhánh); phải trước spill (đọc reg gốc)
+            g.sp_adjust("sub", 192);
+            g.imm("x9", (f.frame + 192) as i64);
+            g.s += "\tsub x9, x29, x9\n";
+            for i in 0..4u32 {
+                _ = writeln!(g.s, "\tstp q{}, q{}, [x9, #{}]", 2 * i, 2 * i + 1, 32 * i);
+            }
+            for i in 0..4u32 {
+                _ = writeln!(g.s, "\tstp x{}, x{}, [x9, #{}]", 2 * i, 2 * i + 1, 128 + 16 * i);
+            }
         }
         if f.sret != 0 {
             g.lea_local("x9", f.sret);
             g.s += "\tstr x8, [x9]\n";
         }
         // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack
-        // caller tại [x29 + 16 + boff]. Layout stack args ĐẶC SẢN Apple (khác
-        // AAPCS 8-byte slot): scalar PACK theo natural alignment, composite
-        // align max(8,align) size tròn 8, composite tràn khóa gp=8 (C.11).
-        // Thuật toán offset PHẢI khớp từng byte với call() và va_off (parser).
+        // caller tại [x29 + 16 + boff]. AAPCS chuẩn: scalar tràn mỗi cái một
+        // slot 8 tròn, composite align max(8,align) size tròn 8, composite
+        // tràn khóa gp=8 (C.11). PHẢI khớp từng byte với call() và va_off.
         let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
         let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
         for &(off, t) in &f.params {
@@ -155,11 +178,11 @@ pub fn emit(ast: &Ast) -> String {
                 };
                 gp += 1;
             } else {
-                // scalar trên stack caller: PACKED tại [x29 + 16 + boff] — load
-                // đúng width (đọc x8 nguyên 8 byte sẽ nuốt lấn arg kế bên)
+                // scalar trên stack caller: slot 8 tròn tại [x29 + 16 + boff]
+                // (AAPCS chuẩn); load đúng width — giá trị nằm low bytes slot
                 let sz = ast.tt.size(t);
-                let o = alup(boff, sz);
-                boff = o + sz;
+                let o = alup(boff, 8);
+                boff = o + 8;
                 let src = 16 + o;
                 g.lea_local("x9", off);
                 if fl && sz == 4 {
@@ -174,6 +197,7 @@ pub fn emit(ast: &Ast) -> String {
                 }
             }
         }
+        g.va = (gp.min(8) as u32, fp.min(8) as u32, boff, f.frame);
         g.stmt(f.body);
         g.s += "\tmov x0, #0\n";
         g.s += EPILOGUE;
@@ -183,57 +207,47 @@ pub fn emit(ast: &Ast) -> String {
             continue;
         }
         let (sz, al) = (ast.tt.size(gl.ty), ast.tt.align(gl.ty));
-        let globl = if gl.is_static { String::new() } else { format!(".globl _{}\n", gl.name) };
+        let globl = if gl.is_static { String::new() } else { format!(".globl {}\n", gl.name) };
         if gl.is_tls {
-            // TLS Mach-O: bản init per-thread ở __thread_data (hoặc .tbss nếu
-            // zero), symbol chính = descriptor 3 quad (__tlv_bootstrap, 0,
-            // &init) ở __thread_vars — dyld đổi quad đầu thành tlv_get_addr
+            // TLS ELF: symbol chính LÀ label trong .tdata/.tbss ("awT" = TLS),
+            // không descriptor — access qua tpidr_el0 + :tprel (xem addr())
             match &gl.init {
                 GInit::None => {
                     _ = writeln!(
                         g.s,
-                        ".tbss _{}$tlv$init, {}, {}",
+                        ".section .tbss,\"awT\",@nobits\n{}.p2align {}\n{}:\n\t.space {}",
+                        globl,
+                        al.trailing_zeros(),
                         gl.name,
-                        sz.max(1),
-                        al.trailing_zeros()
+                        sz.max(1)
                     );
                 }
                 init => {
                     _ = writeln!(
                         g.s,
-                        ".section __DATA,__thread_data,thread_local_regular\n.p2align {}\n_{}$tlv$init:",
+                        ".section .tdata,\"awT\",@progbits\n{}.p2align {}\n{}:",
+                        globl,
                         al.trailing_zeros(),
                         gl.name
                     );
                     g.gdata(init, sz);
                 }
             }
-            _ = writeln!(
-                g.s,
-                ".section __DATA,__thread_vars,thread_local_variables\n{}_{1}:\n\t.quad __tlv_bootstrap\n\t.quad 0\n\t.quad _{1}$tlv$init",
-                globl, gl.name
-            );
             continue;
         }
         match &gl.init {
             GInit::None if gl.is_static => {
-                _ = writeln!(
-                    g.s,
-                    "{}.zerofill __DATA,__bss,_{},{},{}",
-                    globl,
-                    gl.name,
-                    sz,
-                    al.trailing_zeros()
-                );
+                // GNU .comm: alignment tính BYTE (Darwin tính log2)
+                _ = writeln!(g.s, ".local {0}\n.comm {0},{1},{2}", gl.name, sz.max(1), al);
             }
             GInit::None => {
                 // tentative definition → common symbol (nhiều TU cùng "int x;" hợp nhất)
-                _ = writeln!(g.s, ".comm _{},{},{}", gl.name, sz.max(1), al.trailing_zeros());
+                _ = writeln!(g.s, ".comm {},{},{}", gl.name, sz.max(1), al);
             }
             init => {
                 _ = writeln!(
                     g.s,
-                    ".section __DATA,__data\n{}.p2align {}\n_{}:",
+                    ".data\n{}.p2align {}\n{}:",
                     globl,
                     al.trailing_zeros(),
                     gl.name
@@ -246,11 +260,8 @@ pub fn emit(ast: &Ast) -> String {
         for (i, bytes) in ast.strs.iter().enumerate() {
             // __cstring bị linker dedup theo nội-dung-đến-NUL — string chứa
             // NUL nhúng ("\0abc") phải qua __const kẻo bị merge nhầm
-            g.s += if bytes.contains(&0) {
-                ".section __TEXT,__const\n"
-            } else {
-                ".section __TEXT,__cstring\n"
-            };
+            // ELF: .rodata trơn cho mọi string (không có mergeable-dedup phải né)
+            g.s += if bytes.contains(&0) { ".section .rodata\n" } else { ".section .rodata\n" };
             _ = write!(g.s, "l_str{}:\n\t.asciz \"", i);
             for &b in bytes {
                 match b {
@@ -277,11 +288,11 @@ impl Cg<'_> {
             },
             GInit::Str(i) => writeln!(self.s, "\t.quad l_str{i}"),
             GInit::StrOff(i, k) => writeln!(self.s, "\t.quad l_str{i} + {k}"),
-            // prefix \x01 = symbol nội bộ đã đủ tên (label &&), không thêm gạch dưới
+            // prefix \x01 = symbol nội bộ đã đủ tên (label &&); ELF không prefix
             GInit::Addr(n, k) => {
                 let sym = match n.strip_prefix('\x01') {
                     Some(raw) => raw.to_string(),
-                    None => format!("_{n}"),
+                    None => n.to_string(),
                 };
                 if *k == 0 {
                     writeln!(self.s, "\t.quad {sym}")
@@ -648,26 +659,24 @@ impl Cg<'_> {
             Node::GVar(i) => {
                 let gl = &self.a.globals[*i as usize];
                 if gl.is_tls {
-                    // gọi qua descriptor (extern hay không cùng một đường —
-                    // linker tự indirect); tlv_get_addr của dyld bảo toàn mọi
-                    // thanh ghi trừ x0/x16/x17 nên trung gian trên stack/reg
-                    // khác sống qua blr; x30 đã save ở prologue vô điều kiện
+                    // local-exec: đọc thẳng thread pointer — hợp lệ trong
+                    // executable; TLS trong .so cần model khác = NỢ ai đòi thì trả
                     _ = writeln!(
                         self.s,
-                        "\tadrp x0, _{0}@TLVPPAGE\n\tldr x0, [x0, _{0}@TLVPPAGEOFF]\n\tldr x16, [x0]\n\tblr x16",
+                        "\tmrs x0, tpidr_el0\n\tadd x0, x0, #:tprel_hi12:{0}, lsl #12\n\tadd x0, x0, #:tprel_lo12_nc:{0}",
                         gl.name
                     );
                 } else if gl.is_extern {
                     // symbol từ dylib (stdout...): bắt buộc qua GOT
                     _ = writeln!(
                         self.s,
-                        "\tadrp x0, _{0}@GOTPAGE\n\tldr x0, [x0, _{0}@GOTPAGEOFF]",
+                        "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
                         gl.name
                     );
                 } else {
                     _ = writeln!(
                         self.s,
-                        "\tadrp x0, _{0}@PAGE\n\tadd x0, x0, _{0}@PAGEOFF",
+                        "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}",
                         gl.name
                     );
                 }
@@ -710,7 +719,7 @@ impl Cg<'_> {
                 let sy = sym(name);
                 _ = writeln!(
                     self.s,
-                    "\tadrp x0, {0}@GOTPAGE\n\tldr x0, [x0, {0}@GOTPAGEOFF]",
+                    "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
                     sy
                 );
             }
@@ -721,7 +730,7 @@ impl Cg<'_> {
             Node::LabelAddr(name) => {
                 _ = writeln!(
                     self.s,
-                    "\tadrp x0, lg_{0}.{1}@PAGE\n\tadd x0, x0, lg_{0}.{1}@PAGEOFF",
+                    "\tadrp x0, lg_{0}.{1}\n\tadd x0, x0, :lo12:lg_{0}.{1}",
                     self.fname, name
                 );
             }
@@ -812,8 +821,53 @@ impl Cg<'_> {
                 self.store(2, lt);
             }
             Node::VaArea(off) => _ = writeln!(self.s, "\tadd x0, x29, #{off}"),
-            // Darwin: stdarg đi đường macro char* — hai node này chỉ ELF sinh ra
-            Node::VaStart(_) | Node::VaArg(..) => unreachable!("va builtin: chỉ ELF"),
+            Node::VaStart(ap) => {
+                let ap = *ap;
+                // điền va_list AAPCS từ trạng thái prologue (va = gp,fp,stk,frame)
+                let (gp, fp, stk, frame) = self.va;
+                self.addr(ap); // x0 = &ap
+                self.imm("x9", (16 + stk) as i64);
+                self.s += "\tadd x9, x29, x9\n\tstr x9, [x0]\n"; // __stack
+                self.imm("x9", frame as i64);
+                self.s += "\tsub x9, x29, x9\n\tstr x9, [x0, #8]\n"; // __gr_top
+                self.s += "\tsub x9, x9, #64\n\tstr x9, [x0, #16]\n"; // __vr_top
+                _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #24]", (gp as i64 - 8) * 8);
+                _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #28]", (fp as i64 - 8) * 16);
+            }
+            Node::VaArg(ap, t) => {
+                let (ap, t) = (*ap, *t);
+                // chọn vùng: offs âm → còn reg trong save area, ≥0 → stack caller.
+                // Scalar khớp chính xác AAPCS; composite ≤16 đi block GP (đủ cho
+                // trường hợp không vắt ngang reg/stack), >16 gián tiếp qua con trỏ.
+                let st = matches!(self.a.tt.tys[t as usize], Ty::Struct(_));
+                let sz = self.a.tt.size(t);
+                let fl = self.a.tt.is_float(t);
+                let (offs, top, step) = if fl {
+                    (28, 16, 16)
+                } else if st && sz <= 16 {
+                    (24, 8, sz.div_ceil(8) * 8)
+                } else {
+                    (24, 8, 8)
+                };
+                // stack caller: mọi scalar slot 8 (kể cả double — 16 chỉ là bước
+                // VR save area), composite ≤16 theo size tròn 8, >16 = 1 slot con trỏ
+                let stk_step = if st && sz <= 16 { sz.div_ceil(8) * 8 } else { 8 };
+                self.addr(ap); // x0 = &ap
+                let l = self.labels(2);
+                _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]\n\ttbnz w9, #31, L{l}");
+                self.s += "\tldr x10, [x0]\n\tadd x11, x10, #";
+                _ = writeln!(self.s, "{}\n\tstr x11, [x0]\n\tb L{}", stk_step, l + 1);
+                _ = writeln!(self.s, "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw");
+                _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
+                _ = writeln!(self.s, "L{}:\n\tmov x0, x10", l + 1);
+                if st {
+                    if sz > 16 {
+                        self.s += "\tldr x0, [x0]\n"; // >16B: slot chứa CON TRỎ
+                    } // struct: giá trị = địa chỉ (quy ước struct-expr của zcc)
+                } else {
+                    self.load(t);
+                }
+            }
             // EXT(gcc): inline asm subset — operand %k gán cứng x{9+k} (an toàn
             // vì -O0 không giữ giá trị sống trong thanh ghi qua statement);
             // %xk/%wk ép độ rộng, %k trần theo size kiểu operand (8→x, khác→w)
@@ -965,7 +1019,7 @@ impl Cg<'_> {
             Node::Str(i) => {
                 _ = writeln!(
                     self.s,
-                    "\tadrp x0, l_str{0}@PAGE\n\tadd x0, x0, l_str{0}@PAGEOFF",
+                    "\tadrp x0, l_str{0}\n\tadd x0, x0, :lo12:l_str{0}",
                     i
                 );
             }
@@ -1091,17 +1145,16 @@ impl Cg<'_> {
             Node::CallPtr(e, a, r) => (None, Some(*e), a.clone(), *r as usize),
             _ => unreachable!(),
         };
-        // phân slot: named float → d0-7, named int → x0-7. Stack args ĐẶC SẢN
-        // Apple: scalar named PACK theo natural alignment (char 1 byte, float 4
-        // — khác AAPCS 8-byte slot); composite align max(8,align) size tròn 8;
-        // arg vô danh variadic mỗi cái một slot 8 (va_arg bước 8). Composite
-        // tràn stack thì khóa NGRN=8 (AAPCS C.11) — arg int sau cũng đi stack.
+        // phân slot AAPCS CHUẨN: variadic vô danh đi reg NHƯ NAMED (khác Apple),
+        // float → d0-7, int → x0-7; tràn thì stack mỗi scalar một slot 8 tròn
+        // (khác Apple pack natural-align); composite align max(8,align) size
+        // tròn 8; composite tràn stack khóa NGRN=8 (C.11), HFA tràn (C.3) không.
+        let _ = nreg; // AAPCS không phân biệt named/vô danh khi phát call
         #[derive(Clone, Copy)]
         enum Slot {
             G(u32),
             F(u32, bool),      // bool = param float 4 byte (cần fcvt s)
-            S(u32, u32, bool), // scalar named → stack packed: (offset, size, float)
-            Sv(u32),           // vô danh variadic → stack: offset (slot 8, canonical)
+            S(u32, u32, bool), // scalar → stack slot 8: (offset, size, float)
             St(u32, bool),     // struct → GPR: (reg đầu, chiếm 2 reg)
             StS(u32, u32),     // struct → stack: (offset, size)
             H(u32, u32, bool), // HFA → v-reg: (reg đầu, số member, là double)
@@ -1109,12 +1162,12 @@ impl Cg<'_> {
         let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
         let (mut gp, mut fp, mut off) = (0u32, 0u32, 0u32);
         let mut plan = Vec::new();
-        for (i, &a) in args.iter().enumerate() {
+        for &a in args.iter() {
             let t = self.a.types[a as usize];
             if matches!(self.a.tt.tys[t as usize], Ty::Struct(_)) {
                 let sz = self.a.tt.size(t);
                 let hfa = self.a.tt.hfa(t);
-                if let (Some((dbl, n)), true) = (hfa, (i as u32) < nreg as u32) {
+                if let Some((dbl, n)) = hfa {
                     if fp + n <= 8 {
                         plan.push(Slot::H(fp, n, dbl));
                         fp += n;
@@ -1123,7 +1176,7 @@ impl Cg<'_> {
                     fp = 8; // AAPCS C.3
                 }
                 let need = if sz > 8 { 2 } else { 1 };
-                if i < nreg && hfa.is_none() && gp + need <= 8 {
+                if hfa.is_none() && gp + need <= 8 {
                     plan.push(Slot::St(gp, sz > 8));
                     gp += need;
                 } else {
@@ -1138,19 +1191,15 @@ impl Cg<'_> {
             }
             let fl = self.a.tt.is_float(t);
             let szt = self.a.tt.size(t);
-            if i < nreg && fl && fp < 8 {
+            if fl && fp < 8 {
                 plan.push(Slot::F(fp, szt == 4));
                 fp += 1;
-            } else if i < nreg && !fl && gp < 8 {
+            } else if !fl && gp < 8 {
                 plan.push(Slot::G(gp));
                 gp += 1;
-            } else if i < nreg {
-                let o = alup(off, szt);
-                plan.push(Slot::S(o, szt, fl));
-                off = o + szt;
             } else {
                 let o = alup(off, 8);
-                plan.push(Slot::Sv(o));
+                plan.push(Slot::S(o, szt, fl));
                 off = o + 8;
             }
         }
@@ -1160,10 +1209,6 @@ impl Cg<'_> {
         }
         for (&a, &sl) in args.iter().zip(&plan) {
             match sl {
-                Slot::Sv(o) => {
-                    self.expr(a);
-                    _ = writeln!(self.s, "\tstr x0, [sp, #{o}]");
-                }
                 Slot::S(o, sz, fl) => {
                     self.expr(a);
                     if fl && sz == 4 {
@@ -1199,7 +1244,7 @@ impl Cg<'_> {
         let regargs: Vec<(NodeId, Slot)> = args
             .iter()
             .zip(&plan)
-            .filter(|(_, sl)| !matches!(sl, Slot::S(..) | Slot::Sv(_) | Slot::StS(..)))
+            .filter(|(_, sl)| !matches!(sl, Slot::S(..) | Slot::StS(..)))
             .map(|(&a, &sl)| (a, sl))
             .collect();
         for &(a, _) in &regargs {
@@ -1231,7 +1276,7 @@ impl Cg<'_> {
                         }
                     }
                 }
-                Slot::S(..) | Slot::Sv(_) | Slot::StS(..) => unreachable!(),
+                Slot::S(..) | Slot::StS(..) => unreachable!(),
             }
         }
         if let Some(off) = sret {
@@ -1256,10 +1301,10 @@ impl Cg<'_> {
     }
 }
 
-// EXT(gcc): symbol emit — prefix \x01 (asm-label/label &&) = đã đủ tên, còn lại thêm '_'
+// EXT(gcc): symbol emit — prefix \x01 (asm-label/label &&) = đã đủ tên; ELF không prefix '_'
 fn sym(n: &str) -> String {
     match n.strip_prefix('\x01') {
         Some(raw) => raw.to_string(),
-        None => format!("_{n}"),
+        None => n.to_string(),
     }
 }

@@ -13,7 +13,8 @@
 // Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
 // conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
 use crate::ast::{
-    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, SyncOp, Ty, TyTab, TypeId, BOOL,
+    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, SyncOp, Target, Ty, TyTab, TypeId,
+    BOOL,
     CHAR, DOUBLE, FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
 };
 use crate::lexer::{NumK, Tok};
@@ -57,6 +58,7 @@ enum FlatItem {
 type ItInit = std::iter::Peekable<std::vec::IntoIter<(Desig, Init)>>;
 
 struct P<'a> {
+    tgt: Target, // char signedness (plain char unsigned trên Linux arm64)
     toks: &'a [Tok],
     pos: usize,
     nodes: Vec<Node>,
@@ -396,7 +398,9 @@ impl P<'_> {
         let t = match n {
             "void" => VOID,
             "char" => {
-                if uns {
+                // plain char: signed trên Darwin, UNSIGNED trên Linux arm64
+                // (AAPCS64); "signed char" tường minh vẫn là CHAR ở cả hai
+                if uns || (self.tgt == Target::Arm64Elf && !sgn) {
                     UCHAR
                 } else {
                     CHAR
@@ -2481,6 +2485,26 @@ impl P<'_> {
                 let t = self.tt.ptr_to(CHAR);
                 return Ok(self.push(Node::VaArea(self.va_off), t));
             }
+            // ELF: stdarg.h nhánh AAPCS đổ về 2 builtin thật (Darwin: macro che tên)
+            if n == "__builtin_va_start" {
+                self.expect(Tok::Punct("("))?;
+                let ap = self.assign()?;
+                self.expect(Tok::Punct(","))?;
+                let mark = self.nodes.len();
+                let _ = self.assign()?; // last: chỉ cần tên, không eval
+                self.nodes.truncate(mark);
+                self.types.truncate(mark);
+                self.expect(Tok::Punct(")"))?;
+                return Ok(self.push(Node::VaStart(ap), VOID));
+            }
+            if n == "__builtin_va_arg" {
+                self.expect(Tok::Punct("("))?;
+                let ap = self.assign()?;
+                self.expect(Tok::Punct(","))?;
+                let ty = self.typename()?;
+                self.expect(Tok::Punct(")"))?;
+                return Ok(self.push(Node::VaArg(ap, ty), ty));
+            }
             if n == "__func__" || n == "__FUNCTION__" || n == "__PRETTY_FUNCTION__" {
                 let bytes = self.fname.clone().into_bytes();
                 let ln = bytes.len() as u32;
@@ -2890,8 +2914,14 @@ fn n_hack(base: Option<&str>) -> &str {
     base.unwrap_or("")
 }
 
-pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast, String> {
+pub fn parse(
+    toks: &[Tok],
+    locs: &[(u32, u32)],
+    files: &[String],
+    tgt: Target,
+) -> Result<Ast, String> {
     let mut p = P {
+        tgt,
         toks,
         pos: 0,
         nodes: Vec::new(),
@@ -2996,6 +3026,7 @@ pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast,
         }
     })?;
     Ok(Ast {
+        tgt: p.tgt,
         nodes: p.nodes,
         types: p.types,
         tt: p.tt,

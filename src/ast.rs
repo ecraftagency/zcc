@@ -238,6 +238,10 @@ pub enum Node {
     Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
     FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
     VaArea(u32), // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
+    // ELF/AAPCS: va_list = struct 32 byte, không phải char* — hai builtin thật
+    // (Darwin không sinh: stdarg.h nhánh Apple vẫn đi đường macro + VaArea)
+    VaStart(NodeId),        // __builtin_va_start(ap, last): điền 5 field từ prologue
+    VaArg(NodeId, TypeId),  // __builtin_va_arg(ap, T): chọn vùng GP/VR/stack theo T
     Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
     // EXT(gcc): inline asm subset (xxhash/M14 đòi): template, outputs (là "+r"?,
     // lvalue), inputs "r". Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
@@ -284,6 +288,14 @@ pub struct Func {
     pub sret: u32, // ≠0: slot giấu con trỏ x8 (trả struct >16B gián tiếp)
 }
 
+// Target đi qua boundary: driver chọn, frontend dùng (char signedness, va_off,
+// predefine), backend dispatch file codegen. LP64 cả hai — TyTab không đổi.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Target {
+    Arm64Darwin,
+    Arm64Elf,
+}
+
 pub struct Ast {
     pub nodes: Vec<Node>,
     pub types: Vec<TypeId>, // song song với nodes
@@ -291,4 +303,5 @@ pub struct Ast {
     pub funcs: Vec<Func>,
     pub globals: Vec<Global>,
     pub strs: Vec<Vec<u8>>, // string literal, backend tự chọn section/label
+    pub tgt: Target,
 }

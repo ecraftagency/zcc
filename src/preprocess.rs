@@ -8,6 +8,7 @@
 // tra bảng header nhúng trước, rồi các thư mục -I (filesystem). Mỗi token mang
 // (file, line, hideset) — hideset theo luật chuẩn để macro không expand lặp.
 
+use crate::ast::Target;
 use crate::lexer::{lex, NumK, PTok, Tok};
 use std::collections::HashMap;
 use std::fs;
@@ -21,7 +22,7 @@ type Macros = HashMap<String, Macro>;
 
 // Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
 // nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-const HEADERS: [(&str, &str); 17] = [
+const HEADERS: [(&str, &str); 18] = [
     ("wchar.h", include_str!("headers/wchar.h")),
     ("inttypes.h", include_str!("headers/inttypes.h")),
     ("sys/mman.h", include_str!("headers/sys/mman.h")),
@@ -39,6 +40,7 @@ const HEADERS: [(&str, &str); 17] = [
     ("stdio.h", include_str!("headers/stdio.h")),
     ("stdlib.h", include_str!("headers/stdlib.h")),
     ("string.h", include_str!("headers/string.h")),
+    ("limits.h", include_str!("headers/limits.h")),
 ];
 
 pub fn preprocess(
@@ -46,18 +48,41 @@ pub fn preprocess(
     defs: &[String],
     undefs: &[String],
     incs: &[String],
+    tgt: Target,
 ) -> Result<(Vec<Tok>, Vec<(u32, u32)>, Vec<String>), String> {
     let mut macros = Macros::new();
-    for m in [
-        "__STDC__",
-        "__LP64__",
-        "__APPLE__",
-        "__MACH__",
-        "__arm64__",
-        "__aarch64__",
-        "__LITTLE_ENDIAN__", // EXT(apple): OSByteOrder.h chọn nhánh endian bằng nó
-    ] {
+    // predefine chung mọi target (arm64 LP64 little-endian)
+    let mut ones = vec!["__STDC__", "__LP64__", "__arm64__", "__aarch64__"];
+    match tgt {
+        Target::Arm64Darwin => ones.extend([
+            "__APPLE__",
+            "__MACH__",
+            "__LITTLE_ENDIAN__", // EXT(apple): OSByteOrder.h chọn nhánh endian bằng nó
+        ]),
+        Target::Arm64Elf => ones.extend([
+            "__linux__",
+            "__gnu_linux__",
+            "__unix__",
+            "__ELF__",
+            "__CHAR_UNSIGNED__", // plain char unsigned trên Linux arm64 (AAPCS)
+        ]),
+    }
+    for m in ones {
         macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
+    }
+    if tgt == Target::Arm64Darwin {
+        for (m, v) in [
+            // EXT(apple): TargetConditionals.h chọn nhánh GNUC bằng
+            // defined(__GNUC__) && defined(__APPLE_CC__) — giá trị 6000 như clang
+            ("__APPLE_CC__", "6000"),
+            // EXT(apple): AvailabilityMacros.h suy __MAC_OS_X_VERSION_MAX_ALLOWED
+            // từ macro này (redis config.h dò MAC_OS_10_6 → dùng stat thường thay
+            // struct stat64 ẩn). 110000 = macOS 11, OS đầu tiên của Apple Silicon.
+            ("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "110000"),
+        ] {
+            let toks = lex(v).map_err(|e| e.to_string())?;
+            macros.insert(m.into(), Macro::Obj(toks));
+        }
     }
     for (m, v) in [
         // EXT(gcc): SDK Darwin CHỈ viết nhánh arm64 dưới #ifdef __GNUC__ (nhánh
@@ -66,13 +91,6 @@ pub fn preprocess(
         ("__GNUC__", "4"),
         ("__GNUC_MINOR__", "2"),
         ("__GNUC_PATCHLEVEL__", "1"),
-        // EXT(apple): TargetConditionals.h chọn nhánh GNUC bằng
-        // defined(__GNUC__) && defined(__APPLE_CC__) — giá trị 6000 như clang
-        ("__APPLE_CC__", "6000"),
-        // EXT(apple): AvailabilityMacros.h suy __MAC_OS_X_VERSION_MAX_ALLOWED
-        // từ macro này (redis config.h dò MAC_OS_10_6 → dùng stat thường thay
-        // struct stat64 ẩn). 110000 = macOS 11, OS đầu tiên của Apple Silicon.
-        ("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "110000"),
         ("__CHAR_BIT__", "8"),
         ("__SCHAR_MAX__", "127"),
         ("__SHRT_MAX__", "32767"),
@@ -114,19 +132,40 @@ pub fn preprocess(
         let toks = lex(v).map_err(|e| e.to_string())?;
         macros.insert(m.into(), Macro::Obj(toks));
     }
-    // __builtin_va_*: bản sao stdarg.h cho code gọi thẳng builtin (torture)
-    macros.insert(
-        "__builtin_va_list".into(),
-        Macro::Obj(lex("char *").map_err(|e| e.to_string())?),
-    );
+    // __builtin_va_*: bản sao stdarg.h cho code gọi thẳng builtin (torture).
+    // Darwin: va_list = char*, va_start/va_arg là macro số học con trỏ;
+    // ELF: va_list = struct AAPCS (stdarg.h định nghĩa), va_start/va_arg KHÔNG
+    // macro — để nguyên tên cho parser hạ xuống Node::VaStart/VaArg
+    match tgt {
+        Target::Arm64Darwin => {
+            macros.insert(
+                "__builtin_va_list".into(),
+                Macro::Obj(lex("char *").map_err(|e| e.to_string())?),
+            );
+            for (m, ps, body) in [
+                ("__builtin_va_start", vec!["ap", "last"], "((ap) = (char *)__va_area__)"),
+                (
+                    "__builtin_va_arg",
+                    vec!["ap", "t"],
+                    "(*(t *)(sizeof(t) > 16 ? *(char **)(((ap) += 8) - 8) \
+                     : (((ap) += ((sizeof(t) + 7) & ~7UL)) - ((sizeof(t) + 7) & ~7UL))))",
+                ),
+            ] {
+                let toks = lex(body).map_err(|e| e.to_string())?;
+                let ps = ps.into_iter().map(String::from).collect();
+                macros.insert(m.into(), Macro::Fun(ps, false, toks));
+            }
+        }
+        Target::Arm64Elf => {
+            macros.insert(
+                "__builtin_va_list".into(),
+                // typedef qua tên struct trần: hợp lệ cả khi incomplete
+                // (glibc __va_list.h typedef trước khi ai include stdarg.h)
+                Macro::Obj(lex("struct __zcc_va_list").map_err(|e| e.to_string())?),
+            );
+        }
+    }
     for (m, ps, body) in [
-        ("__builtin_va_start", vec!["ap", "last"], "((ap) = (char *)__va_area__)"),
-        (
-            "__builtin_va_arg",
-            vec!["ap", "t"],
-            "(*(t *)(sizeof(t) > 16 ? *(char **)(((ap) += 8) - 8) \
-             : (((ap) += ((sizeof(t) + 7) & ~7UL)) - ((sizeof(t) + 7) & ~7UL))))",
-        ),
         ("__builtin_va_end", vec!["ap"], "((void)(ap))"),
         ("__builtin_va_copy", vec!["d", "s"], "((d) = (s))"),
         ("__builtin_constant_p", vec!["e"], "0"), // 0 luôn hợp lệ theo GCC doc
@@ -383,7 +422,12 @@ fn process(
                     ident_of(d.get(1)).ok_or_else(|| err(file, lno, "thiếu tên sau #undef"))?;
                 macros.remove(name);
             }
-            "include" => {
+            // EXT(gcc): #include_next — subset: như #include <..> nhưng BỎ bảng
+            // nhúng (đủ cho vai trò duy nhất: header nhúng của zcc đóng vai
+            // "header của compiler" rồi chuyển tiếp xuống libc thật, như clang;
+            // include_next của glibc không bao giờ nổ vì guard _GCC_LIMITS_H_)
+            "include" | "include_next" => {
+                let skip_embedded = kw == "include_next";
                 // #include MACRO (computed include, C89 §3.8.2): không khớp hai
                 // dạng chuẩn thì expand macro rồi mới dispatch (rax.c redis)
                 let nd: Vec<PTok>;
@@ -410,8 +454,9 @@ fn process(
                     // không có file thật → thử bảng header nhúng ("stddef.h"...)
                     let mut path = path;
                     if !std::path::Path::new(&path).exists() {
-                        if let Some((_, src)) =
-                            HEADERS.iter().find(|(n, _)| *n == bare && !no_stdinc(incs))
+                        if let Some((_, src)) = HEADERS
+                            .iter()
+                            .find(|(n, _)| *n == bare && !no_stdinc(incs) && !skip_embedded)
                         {
                             let hname = format!("<{}>", bare);
                             let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
@@ -440,7 +485,7 @@ fn process(
                     // header nhúng thắng (libc stub của zcc); không có thì tra -I
                     match HEADERS
                         .iter()
-                        .find(|(n, _)| *n == name && !no_stdinc(incs))
+                        .find(|(n, _)| *n == name && !no_stdinc(incs) && !skip_embedded)
                         .map(|(_, s)| *s)
                     {
                         Some(src) => {

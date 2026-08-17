@@ -77,6 +77,26 @@ Mọi phép RÚT GỌN coverage phải kèm lý do soundness đọc được t�
   (undefined/unspecified của C89): đọc đầu `gen_cpp.py`. Thành tích: bắt bug
   evaluator #if bỏ dấu unsigned (`-1L < 0xFF..UL` ra sai) ngay lần chạy đầu.
 
+### Cross-target proof (M15 — arm64 ELF Linux, 2026-08-17)
+
+Ba gate khoa học + hai suite nền chạy NGUYÊN XI trong box Debian 13 (gcc 14.2 /
+binutils / glibc 2.41 làm trọng tài thay cc), zcc là binary Linux static
+(cross-compile `aarch64-unknown-linux-musl`) đóng vai native compiler:
+
+```
+docker run --rm -v "$PWD":/repo:ro \
+  -v "$PWD/target/aarch64-unknown-linux-musl/release/zcc":/usr/local/bin/zcc:ro \
+  zcc-box bash -c 'cd /repo && ZCC=/usr/local/bin/zcc sh tests/abi.sh'   # (alg.sh, cpp.sh tương tự)
+```
+
+- abi.sh: **292 case × 4 hướng link chéo zcc↔gcc — 0 fail** (proof AAPCS chuẩn,
+  gồm variadic-đi-reg + va_list struct 32B).
+- alg.sh: **43036 điểm runtime + 21552 fold — PASS** (4 phép so, trọng tài gcc).
+- cpp.sh: **mech 37 dòng + 1425 điểm #if — PASS**.
+- cases 64/65 (fail duy nhất `float_h`: lệch chuẩn CÓ CHỦ ĐÍCH long double =
+  double, gcc in LDBL quad); ext 14/14 (kể cả TLS 4-thread `tpidr_el0` +
+  `__sync_*` LL/SC với pthread glibc thật).
+
 ### Gate milestone (integration — mỗi cái tự clone sạch, tự kiểm chứng)
 - `m8.sh` — zcc compile tcc (amalgam) → tcc compile tcc → compile hello
   (kiểm chứng bắc cầu, thay self-hosting).

@@ -4,8 +4,11 @@
 # Lỗi ABI cùng-compiler tự triệt tiêu — chỉ link chéo mới phơi ra.
 set -e
 cd "$(dirname "$0")/.."
-cargo build --quiet 2>/dev/null || cargo build
-ZCC=target/debug/zcc
+# ZCC đặt sẵn từ env (chạy trong box Linux, không cargo) — không thì tự build
+if [ -z "$ZCC" ]; then
+    cargo build --quiet 2>/dev/null || cargo build
+    ZCC=target/debug/zcc
+fi
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 

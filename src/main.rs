@@ -11,7 +11,15 @@ mod ext;
 mod lexer;
 mod parser;
 mod preprocess;
+use ast::Target;
 use std::{env, fs, process::Command, process::ExitCode};
+
+// Mặc định target = OS đang chạy zcc (binary cross-compile sang Linux tự thành
+// native compiler ELF — drop-in CC=zcc trong box không cần flag); --target đè.
+#[cfg(target_os = "linux")]
+const HOST_TGT: Target = Target::Arm64Elf;
+#[cfg(not(target_os = "linux"))]
+const HOST_TGT: Target = Target::Arm64Darwin;
 
 fn run(cmd: &str, args: &[&str]) -> bool {
     match Command::new(cmd).args(args).status() {
@@ -36,9 +44,20 @@ fn main() -> ExitCode {
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
     let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
     let (mut nostdinc, mut bundle) = (false, false);
+    let mut tgt = HOST_TGT;
+    let set_tgt = |v: &str, tgt: &mut Target| {
+        *tgt = if v.contains("linux") { Target::Arm64Elf } else { Target::Arm64Darwin };
+    };
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--target" | "-target" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    set_tgt(v, &mut tgt);
+                }
+            }
+            s if s.starts_with("--target=") => set_tgt(&s[9..], &mut tgt),
             "-o" => {
                 i += 1;
                 output = args.get(i).map(|s| s.as_str());
@@ -100,24 +119,31 @@ fn main() -> ExitCode {
         eprintln!("zcc: -o không dùng được với nhiều input khi có -c/-S");
         return ExitCode::FAILURE;
     }
-    let sdk = Command::new("xcrun")
-        .args(["-sdk", "macosx", "--show-sdk-path"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let sdk = match tgt {
+        Target::Arm64Darwin => Command::new("xcrun")
+            .args(["-sdk", "macosx", "--show-sdk-path"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default(),
+        Target::Arm64Elf => String::new(),
+    };
     // M11: header không phải nhúng và không thấy ở -I → tra SDK thật (ưu tiên CUỐI,
     // sau mọi -I của user; header nhúng vẫn thắng cho 25 tên libc cơ bản).
+    // ELF: thay SDK bằng glibc include của box (đường Debian/Ubuntu multiarch).
     // -nostdinc (chuẩn cc): sentinel \x01 đầu incs tắt bảng nhúng, không thêm SDK.
     if nostdinc {
         incs.insert(0, "\u{1}nostdinc".to_string());
+    } else if tgt == Target::Arm64Elf {
+        incs.push("/usr/include/aarch64-linux-gnu".to_string());
+        incs.push("/usr/include".to_string());
     } else if !sdk.is_empty() {
         incs.push(format!("{}/usr/include", sdk));
     }
     // .c → (asm text, danh sách file thật đã đọc — cho -MMD); .o/.a đi thẳng linker
     let emit_asm = |path: &str| -> Option<(String, Vec<String>)> {
-        match preprocess::preprocess(path, &defs, &undefs, &incs).and_then(|(t, locs, files)| {
-            parser::parse(&t, &locs, &files).map(|ast| (ast, files))
-        }) {
+        match preprocess::preprocess(path, &defs, &undefs, &incs, tgt).and_then(
+            |(t, locs, files)| parser::parse(&t, &locs, &files, tgt).map(|ast| (ast, files)),
+        ) {
             Ok((ast, files)) => Some((codegen::emit(&ast), files)),
             Err(e) => {
                 eprintln!("zcc: {}: {}", path, e);
@@ -147,7 +173,7 @@ fn main() -> ExitCode {
             // dump token đã preprocess (debug); mỗi token cách 1 space, xuống dòng theo line gốc
             let mut ok = true;
             for path in &inputs {
-                match preprocess::preprocess(path, &defs, &undefs, &incs) {
+                match preprocess::preprocess(path, &defs, &undefs, &incs, tgt) {
                     Ok((toks, locs, _)) => {
                         let mut cur = (u32::MAX, u32::MAX);
                         let mut s = String::new();
@@ -219,14 +245,45 @@ fn main() -> ExitCode {
                 }
             }
             if ok {
-                let mut ld: Vec<&str> = objs.iter().map(|s| s.as_str()).collect();
-                ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L theo thứ tự CLI
-                ld.extend(["-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"]);
-                if shared {
-                    ld.push("-dylib"); // dynamic library: không cần entry _main
+                let mut ld: Vec<&str> = Vec::new();
+                // ELF executable: entry qua crt1.o (_start → __libc_start_main → main),
+                // ctor/dtor qua crti/crtn — khác Darwin (LC_MAIN, không cần crt).
+                let crt = "/usr/lib/aarch64-linux-gnu";
+                let (crt1, crti, crtn) = (
+                    format!("{crt}/crt1.o"),
+                    format!("{crt}/crti.o"),
+                    format!("{crt}/crtn.o"),
+                );
+                if tgt == Target::Arm64Elf && !shared && !bundle {
+                    ld.extend([crt1.as_str(), crti.as_str()]);
                 }
-                if bundle {
-                    ld.push("-bundle");
+                ld.extend(objs.iter().map(|s| s.as_str()));
+                ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L theo thứ tự CLI
+                match tgt {
+                    Target::Arm64Darwin => {
+                        ld.extend([
+                            "-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64",
+                        ]);
+                        if shared {
+                            ld.push("-dylib"); // dynamic library: không cần entry _main
+                        }
+                        if bundle {
+                            ld.push("-bundle");
+                        }
+                    }
+                    Target::Arm64Elf => {
+                        if shared || bundle {
+                            ld.push("-shared");
+                        } else {
+                            ld.push(&crtn);
+                            ld.extend([
+                                "-dynamic-linker",
+                                "/lib/ld-linux-aarch64.so.1",
+                            ]);
+                        }
+                        // -lm tách riêng trên glibc (Darwin gộp hết vào libSystem)
+                        ld.extend(["-o", out, "-lc", "-lm", "-L", crt]);
+                    }
                 }
                 ok = run("ld", &ld);
             }
