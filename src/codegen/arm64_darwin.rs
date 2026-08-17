@@ -58,8 +58,13 @@ pub fn emit(ast: &Ast) -> String {
             g.lea_local("x9", f.sret);
             g.s += "\tstr x8, [x9]\n";
         }
-        // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack caller
-        let (mut gp, mut fp, mut stk) = (0u32, 0u32, 0u32);
+        // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack
+        // caller tại [x29 + 16 + boff]. Layout stack args ĐẶC SẢN Apple (khác
+        // AAPCS 8-byte slot): scalar PACK theo natural alignment, composite
+        // align max(8,align) size tròn 8, composite tràn khóa gp=8 (C.11).
+        // Thuật toán offset PHẢI khớp từng byte với call() và va_off (parser).
+        let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
+        let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
         for &(off, t) in &f.params {
             // struct by value ≤16B: đến trong 1-2 GPR liên tiếp (hoặc stack)
             if let Some((dbl, n)) = ast.tt.hfa(t) {
@@ -76,14 +81,15 @@ pub fn emit(ast: &Ast) -> String {
                 } else {
                     fp = 8; // AAPCS C.3: HFA tràn khóa v-reg còn lại
                     let sz = ast.tt.size(t);
-                    _ = writeln!(g.s, "\tadd x11, x29, #{}", 16 + 8 * stk);
+                    let o = alup(boff, ast.tt.align(t).max(8));
+                    boff = o + sz.div_ceil(8) * 8;
+                    _ = writeln!(g.s, "\tadd x11, x29, #{}", 16 + o);
                     g.lea_local("x9", off);
                     g.imm("x12", sz as i64);
                     let n2 = g.labels(1);
                     _ = writeln!(g.s, "L{n2}:");
                     g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
                     _ = writeln!(g.s, "\tb.ne L{n2}");
-                    stk += sz.div_ceil(8);
                 }
                 continue;
             }
@@ -95,8 +101,9 @@ pub fn emit(ast: &Ast) -> String {
                         _ = writeln!(g.s, "\tmov x11, x{gp}");
                         gp += 1;
                     } else {
-                        _ = writeln!(g.s, "\tldr x11, [x29, #{}]", 16 + 8 * stk);
-                        stk += 1;
+                        let o = alup(boff, 8); // con trỏ = scalar 8 byte
+                        boff = o + 8;
+                        _ = writeln!(g.s, "\tldr x11, [x29, #{}]", 16 + o);
                     }
                     g.lea_local("x9", off);
                     g.imm("x12", sz as i64);
@@ -117,13 +124,15 @@ pub fn emit(ast: &Ast) -> String {
                     }
                     gp += need;
                 } else {
-                    _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + 8 * stk);
+                    let o = alup(boff, ast.tt.align(t).max(8));
+                    boff = o + 8 * need;
+                    gp = 8; // AAPCS C.11: composite tràn stack khóa NGRN
+                    _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o);
                     g.store_narrow(0, sz.min(8));
                     if sz > 8 {
-                        _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + 8 * (stk + 1));
+                        _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o + 8);
                         g.store_narrow(8, sz - 8);
                     }
-                    stk += need;
                 }
                 continue;
             }
@@ -146,20 +155,23 @@ pub fn emit(ast: &Ast) -> String {
                 };
                 gp += 1;
             } else {
-                // param trên stack của caller: [x29 + 16 + 8*stk], slot 8 byte canonical
-                _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + 8 * stk);
+                // scalar trên stack caller: PACKED tại [x29 + 16 + boff] — load
+                // đúng width (đọc x8 nguyên 8 byte sẽ nuốt lấn arg kế bên)
+                let sz = ast.tt.size(t);
+                let o = alup(boff, sz);
+                boff = o + sz;
+                let src = 16 + o;
                 g.lea_local("x9", off);
-                if fl && ast.tt.size(t) == 4 {
-                    g.s += "\tfmov d7, x8\n\tfcvt s7, d7\n\tstr s7, [x9]\n";
+                if fl && sz == 4 {
+                    _ = writeln!(g.s, "\tldr s7, [x29, #{src}]\n\tstr s7, [x9]");
                 } else {
-                    _ = match ast.tt.size(t) {
-                        1 => writeln!(g.s, "\tstrb w8, [x9]"),
-                        2 => writeln!(g.s, "\tstrh w8, [x9]"),
-                        4 => writeln!(g.s, "\tstr w8, [x9]"),
-                        _ => writeln!(g.s, "\tstr x8, [x9]"),
+                    _ = match sz {
+                        1 => writeln!(g.s, "\tldrb w8, [x29, #{src}]\n\tstrb w8, [x9]"),
+                        2 => writeln!(g.s, "\tldrh w8, [x29, #{src}]\n\tstrh w8, [x9]"),
+                        4 => writeln!(g.s, "\tldr w8, [x29, #{src}]\n\tstr w8, [x9]"),
+                        _ => writeln!(g.s, "\tldr x8, [x29, #{src}]\n\tstr x8, [x9]"),
                     };
                 }
-                stk += 1;
             }
         }
         g.stmt(f.body);
@@ -1036,18 +1048,23 @@ impl Cg<'_> {
             Node::CallPtr(e, a, r) => (None, Some(*e), a.clone(), *r as usize),
             _ => unreachable!(),
         };
-        // phân slot: named float → d0-7, named int → x0-7, còn lại (kể cả mọi
-        // arg vô danh variadic) → stack 8-byte theo thứ tự
+        // phân slot: named float → d0-7, named int → x0-7. Stack args ĐẶC SẢN
+        // Apple: scalar named PACK theo natural alignment (char 1 byte, float 4
+        // — khác AAPCS 8-byte slot); composite align max(8,align) size tròn 8;
+        // arg vô danh variadic mỗi cái một slot 8 (va_arg bước 8). Composite
+        // tràn stack thì khóa NGRN=8 (AAPCS C.11) — arg int sau cũng đi stack.
         #[derive(Clone, Copy)]
         enum Slot {
             G(u32),
             F(u32, bool),      // bool = param float 4 byte (cần fcvt s)
-            S(u32),
+            S(u32, u32, bool), // scalar named → stack packed: (offset, size, float)
+            Sv(u32),           // vô danh variadic → stack: offset (slot 8, canonical)
             St(u32, bool),     // struct → GPR: (reg đầu, chiếm 2 reg)
-            StS(u32, u32),     // struct → stack: (slot đầu, size)
+            StS(u32, u32),     // struct → stack: (offset, size)
             H(u32, u32, bool), // HFA → v-reg: (reg đầu, số member, là double)
         }
-        let (mut gp, mut fp, mut stk) = (0u32, 0u32, 0u32);
+        let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
+        let (mut gp, mut fp, mut off) = (0u32, 0u32, 0u32);
         let mut plan = Vec::new();
         for (i, &a) in args.iter().enumerate() {
             let t = self.a.types[a as usize];
@@ -1067,43 +1084,66 @@ impl Cg<'_> {
                     plan.push(Slot::St(gp, sz > 8));
                     gp += need;
                 } else {
-                    plan.push(Slot::StS(stk, sz));
-                    stk += sz.div_ceil(8);
+                    let o = alup(off, self.a.tt.align(t).max(8));
+                    plan.push(Slot::StS(o, sz));
+                    off = o + sz.div_ceil(8) * 8;
+                    if hfa.is_none() {
+                        gp = 8; // AAPCS C.11 — chỉ composite thường; HFA tràn (C.3) KHÔNG khóa NGRN
+                    }
                 }
                 continue;
             }
             let fl = self.a.tt.is_float(t);
+            let szt = self.a.tt.size(t);
             if i < nreg && fl && fp < 8 {
-                plan.push(Slot::F(fp, self.a.tt.size(t) == 4));
+                plan.push(Slot::F(fp, szt == 4));
                 fp += 1;
             } else if i < nreg && !fl && gp < 8 {
                 plan.push(Slot::G(gp));
                 gp += 1;
+            } else if i < nreg {
+                let o = alup(off, szt);
+                plan.push(Slot::S(o, szt, fl));
+                off = o + szt;
             } else {
-                plan.push(Slot::S(stk));
-                stk += 1;
+                let o = alup(off, 8);
+                plan.push(Slot::Sv(o));
+                off = o + 8;
             }
         }
-        let pad = (8 * stk + 15) & !15;
+        let pad = (off + 15) & !15;
         if pad > 0 {
             self.sp_adjust("sub", pad);
         }
         for (&a, &sl) in args.iter().zip(&plan) {
             match sl {
-                Slot::S(k) => {
+                Slot::Sv(o) => {
                     self.expr(a);
-                    _ = writeln!(self.s, "\tstr x0, [sp, #{}]", 8 * k);
+                    _ = writeln!(self.s, "\tstr x0, [sp, #{o}]");
                 }
-                Slot::StS(k, sz) => {
+                Slot::S(o, sz, fl) => {
+                    self.expr(a);
+                    if fl && sz == 4 {
+                        _ = writeln!(self.s, "\tfmov d7, x0\n\tfcvt s7, d7\n\tstr s7, [sp, #{o}]");
+                    } else {
+                        _ = match sz {
+                            1 => writeln!(self.s, "\tstrb w0, [sp, #{o}]"),
+                            2 => writeln!(self.s, "\tstrh w0, [sp, #{o}]"),
+                            4 => writeln!(self.s, "\tstr w0, [sp, #{o}]"),
+                            _ => writeln!(self.s, "\tstr x0, [sp, #{o}]"),
+                        };
+                    }
+                }
+                Slot::StS(o, sz) => {
                     self.expr(a); // x0 = địa chỉ struct
-                    let mut o = 0;
-                    while o < sz {
+                    let mut k = 0;
+                    while k < sz {
                         _ = writeln!(
                             self.s,
-                            "\tldr x8, [x0, #{o}]\n\tstr x8, [sp, #{}]",
-                            8 * k + o
+                            "\tldr x8, [x0, #{k}]\n\tstr x8, [sp, #{}]",
+                            o + k
                         );
-                        o += 8;
+                        k += 8;
                     }
                 }
                 _ => {}
@@ -1116,7 +1156,7 @@ impl Cg<'_> {
         let regargs: Vec<(NodeId, Slot)> = args
             .iter()
             .zip(&plan)
-            .filter(|(_, sl)| !matches!(sl, Slot::S(_) | Slot::StS(..)))
+            .filter(|(_, sl)| !matches!(sl, Slot::S(..) | Slot::Sv(_) | Slot::StS(..)))
             .map(|(&a, &sl)| (a, sl))
             .collect();
         for &(a, _) in &regargs {
@@ -1148,7 +1188,7 @@ impl Cg<'_> {
                         }
                     }
                 }
-                Slot::S(_) | Slot::StS(..) => unreachable!(),
+                Slot::S(..) | Slot::Sv(_) | Slot::StS(..) => unreachable!(),
             }
         }
         if let Some(off) = sret {

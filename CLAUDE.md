@@ -75,5 +75,9 @@ Ngân sách LOC suy từ hiện trạng 5281 (2026-08-17): M9 ~150, M10 ~350, M1
 ## Vòng lặp phát triển & test
 
 - Test harness: `tests/run.sh` — mỗi case `tests/cases/*.c` compile bằng cả `cc -std=c89 -O0` (trọng tài) lẫn zcc, chạy hai binary, diff exit code (sau M5: diff cả stdout).
+- **Gate khoa học (vét cạn không gian hữu hạn — chạy khi đụng codegen/ABI/const-eval):**
+  - `tests/abi.sh` (+`gen_abi.py`) — ABI như automaton hữu hạn: 278 case (14 kiểu × trạng thái GPR/FPR 0..8 + sentinel + variadic), link CHÉO cc↔zcc cả 2 chiều. Cùng-compiler hai đầu thì lỗi ABI tự triệt tiêu — chỉ link chéo mới phơi ra (bằng chứng: bug packed-stack-args + bug HFA-tràn-khóa-nhầm-C.11 đều tàng hình suốt M8→M14, abi.sh bắt trong 1 lần chạy).
+  - `tests/alg.sh` (+`gen_alg.py`) — vét cạn UAC 3.2.1.5: ~31k điểm (op × kiểu × kiểu × corner), UB lọc ở generator (tại điểm UB diff vô nghĩa), 4 phép so: run/fold zcc↔cc + biểu đồ giao hoán fold↔runtime nội bộ zcc.
+  - Đặc sản Apple đã xác nhận bằng probe: scalar named arg trên stack PACK theo natural alignment (khác AAPCS slot 8); composite align max(8,align) size tròn 8, tràn khóa NGRN=8 (C.11) — NHƯNG HFA tràn (C.3) KHÔNG khóa NGRN; variadic vô danh luôn slot 8. Thuật toán offset sống ở 3 nơi PHẢI khớp từng byte: codegen call(), codegen spill prologue, parser va_off.
 - Compile chương trình test TRƯỚC, chạy, vỡ ở construct nào thì mới implement construct đó — đây là cơ chế ép LOC tối thiểu.
 - Quy tắc của Vu: mọi con số/quyết định phải suy ra được từ tiền đề đã tuyên bố, không magic number không nguồn gốc.

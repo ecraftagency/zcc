@@ -2655,43 +2655,52 @@ impl P<'_> {
                         let off = self.alloc_local(pn.clone(), pt);
                         params.push((off, pt));
                     }
-                    // mirror bộ đếm spill của codegen: arg vô danh variadic bắt đầu
-                    // ngay sau các named param tràn stack (thường là [x29+16])
-                    let (mut gp, mut fp, mut nstk) = (0u32, 0u32, 0u32);
+                    // mirror thuật toán spill của codegen (PHẢI khớp từng byte):
+                    // stack args pack kiểu Apple — scalar theo natural alignment,
+                    // composite align max(8,align) size tròn 8, tràn khóa gp=8
+                    // (C.11). Vùng arg vô danh variadic bắt đầu sau named, tròn 8.
+                    let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
+                    let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
                     for &(_, pt) in &params {
                         if let Some((_, n)) = self.tt.hfa(pt) {
                             if fp + n <= 8 {
                                 fp += n;
                             } else {
                                 fp = 8; // AAPCS: HFA tràn thì khóa luôn v-reg còn lại
-                                nstk += self.tt.size(pt).div_ceil(8);
+                                let o = alup(boff, self.tt.align(pt).max(8));
+                                boff = o + self.tt.size(pt).div_ceil(8) * 8;
                             }
                         } else if matches!(self.tt.tys[pt as usize], Ty::Struct(_)) {
-                            let need = if self.tt.size(pt) > 16 {
-                                1 // >16B: nhận CON TRỎ
-                            } else if self.tt.size(pt) > 8 {
-                                2
+                            let sz = self.tt.size(pt);
+                            if sz > 16 {
+                                // >16B: nhận CON TRỎ (scalar 8 byte)
+                                if gp < 8 {
+                                    gp += 1;
+                                } else {
+                                    boff = alup(boff, 8) + 8;
+                                }
                             } else {
-                                1
-                            };
-                            if gp + need <= 8 {
-                                gp += need;
-                            } else {
-                                nstk += need;
+                                let need = if sz > 8 { 2 } else { 1 };
+                                if gp + need <= 8 {
+                                    gp += need;
+                                } else {
+                                    let o = alup(boff, self.tt.align(pt).max(8));
+                                    boff = o + 8 * need;
+                                    gp = 8; // AAPCS C.11
+                                }
                             }
-                        } else if self.tt.is_float(pt) {
-                            if fp < 8 {
-                                fp += 1;
-                            } else {
-                                nstk += 1;
-                            }
-                        } else if gp < 8 {
-                            gp += 1;
                         } else {
-                            nstk += 1;
+                            let (fl, sz) = (self.tt.is_float(pt), self.tt.size(pt));
+                            if fl && fp < 8 {
+                                fp += 1;
+                            } else if !fl && gp < 8 {
+                                gp += 1;
+                            } else {
+                                boff = alup(boff, sz) + sz;
+                            }
                         }
                     }
-                    self.va_off = 16 + 8 * nstk;
+                    self.va_off = 16 + ((boff + 7) & !7);
                     // trả struct >16B: giấu con trỏ đích (x8 lúc vào hàm) trong slot riêng
                     let sret = if matches!(self.tt.tys[sig.ret as usize], Ty::Struct(_))
                         && self.tt.size(sig.ret) > 16
