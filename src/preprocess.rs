@@ -52,6 +52,7 @@ const HEADERS: [(&str, &str); 25] = [
 pub fn preprocess(
     path: &str,
     defs: &[String],
+    undefs: &[String],
     incs: &[String],
 ) -> Result<(Vec<Tok>, Vec<(u32, u32)>, Vec<String>), String> {
     let mut macros = Macros::new();
@@ -149,11 +150,14 @@ pub fn preprocess(
             ],
         ),
     );
-    // -Dname[=val] từ CLI (mặc định =1, như cc)
+    // -Dname[=val] từ CLI (mặc định =1, như cc); -Uname xóa (kể cả builtin)
     for d in defs {
         let (n, v) = d.split_once('=').unwrap_or((d, "1"));
         let toks = lex(v).map_err(|e| e.to_string())?;
         macros.insert(n.into(), Macro::Obj(toks));
+    }
+    for u in undefs {
+        macros.remove(u.as_str());
     }
     let mut files = Vec::new();
     let pts = pp_file(path, &mut macros, 0, incs, &mut files)?;
@@ -307,6 +311,12 @@ fn process(
                                     .ok_or_else(|| err(file, lno, "tham số macro phải là ident"))?;
                                 params.push(p.to_string());
                                 k += 1;
+                                // EXT(gcc): named variadic "#define F(args...)" —
+                                // param cuối tự hứng phần dư như __VA_ARGS__
+                                if matches!(d.get(k).map(|t| &t.tok), Some(Tok::Punct("..."))) {
+                                    va = true;
+                                    k += 1;
+                                }
                             }
                             match d.get(k).map(|t| &t.tok) {
                                 Some(Tok::Punct(",")) if !va => k += 1,
@@ -392,6 +402,8 @@ fn process(
                 _ => return Err(err(file, lno, "#include cần \"file\"")),
             },
             "error" => return Err(err(file, lno, &format!("#error {}", spell_seq(&d[1..])))),
+            // EXT(gcc): #warning — báo rồi đi tiếp (không có trong C89)
+            "warning" => eprintln!("{}", err(file, lno, &format!("#warning {}", spell_seq(&d[1..])))),
             "line" => {
                 let ex = expand_seq(&d[1..], macros, &Vec::new(), file, delta)?;
                 if let Some(Tok::Num(n, _)) = ex.first().map(|t| &t.tok) {
@@ -640,6 +652,19 @@ fn substitute(
             i += 2;
         } else if t.tok == Tok::Punct("##") {
             let r = body.get(i + 1).ok_or_else(|| err(file, lno, "## ở cuối thân macro"))?;
+            // EXT(gcc): ", ## __VA_ARGS__" — arg rỗng thì XÓA dấu phẩy, có arg
+            // thì giữ nguyên phẩy + args (không paste thật; rescan expand sau)
+            if let Some(p) = param_of(Some(r), params) {
+                if matches!(out.last().map(|x| &x.tok), Some(Tok::Punct(","))) {
+                    if args[p].is_empty() {
+                        out.pop();
+                    } else {
+                        out.extend(args[p].iter().cloned());
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
             let rhs = match param_of(Some(r), params) {
                 Some(p) => args[p].clone(),
                 None => vec![r.clone()],

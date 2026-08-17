@@ -29,13 +29,15 @@ cat > "$WORK/hello.c" <<'EOF'
 int main(void) { printf("hello via zcc->tcc\n"); return 42; }
 EOF
 ./tcc -B. -L"$SDK/usr/lib" "$WORK/hello.c" -o "$WORK/hello"
-out=$("$WORK/hello"; echo "exit=$?")
-echo "$out"
-echo "$out" | grep -q 'hello via zcc->tcc' && echo "$out" | grep -q 'exit=42'
+rc=0
+"$WORK/hello" > "$WORK/hello.out" || rc=$?
+cat "$WORK/hello.out"; echo "exit=$rc"
+grep -q 'hello via zcc->tcc' "$WORK/hello.out" && [ "$rc" -eq 42 ]
 
 # 4. vòng mạnh hơn: tcc tự compile tcc, tcc mới compile hello lần nữa
 ./tcc -B. -L"$SDK/usr/lib" -DONE_SOURCE=1 tcc.c -o "$WORK/tcc2"
 "$WORK/tcc2" -B. -L"$SDK/usr/lib" "$WORK/hello.c" -o "$WORK/hello2"
-out2=$("$WORK/hello2"; echo "exit=$?")
-echo "$out2" | grep -q 'exit=42'
+rc2=0
+"$WORK/hello2" > /dev/null || rc2=$?
+[ "$rc2" -eq 42 ]
 echo "M8 PASS: zcc -> tcc -> tcc -> hello (stdout + exit code đúng)"

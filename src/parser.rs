@@ -109,10 +109,10 @@ const ASSIGN_OPS: [(&str, &str); 11] = [
     ("^=", "^"),
 ];
 
-const TYPE_WORDS: [&str; 19] = [
+const TYPE_WORDS: [&str; 21] = [
     "void", "char", "short", "int", "long", "signed", "unsigned", "float", "double", "struct",
     "union", "enum", "const", "volatile", "_Bool", "__const", "__volatile", "__signed",
-    "__signed__",
+    "__signed__", "__typeof__", "__typeof", // EXT(gcc): typeof trần KHÔNG nhận (va tên biến C89)
 ];
 
 impl P<'_> {
@@ -322,6 +322,22 @@ impl P<'_> {
                 "enum" => {
                     self.pos += 1;
                     direct = Some(self.enum_spec()?);
+                    any = true;
+                    continue;
+                }
+                // EXT(gcc): __typeof__(expr | typename) đứng như type-specifier
+                "__typeof__" | "__typeof" => {
+                    self.pos += 1;
+                    self.expect(Tok::Punct("("))?;
+                    let t = if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if self.is_type_word(n))
+                    {
+                        self.typename()?
+                    } else {
+                        let e = self.expr()?; // node thành rác arena, như sizeof
+                        self.ty(e)
+                    };
+                    self.expect(Tok::Punct(")"))?;
+                    direct = Some(t);
                     any = true;
                     continue;
                 }
