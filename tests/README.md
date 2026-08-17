@@ -179,6 +179,19 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
     crash report — block `REDIS BUG REPORT` từ unit đó là hành vi đúng; grep
     đếm err phải bóc mã màu ANSI trước (`sed 's/\x1b\[[0-9;]*m//g'`).
 
+## Rổ M17 — probe theo coverage-per-LOC (2026-08-17, sau khi redis đóng sổ)
+
+- **sqlite 3.50.4 amalgamation** (`sqlite-amalgamation-3500400`, cache
+  `~/.cache/zcc-suites/sqlite`): `zcc -c sqlite3.c` (262 899 dòng) compile
+  SẠCH ngay nhát đầu, 4.3s, **zero error, zero LOC phát sinh** — dự báo
+  zero-cost nghiệm đúng. CLI `sqlite3` (sqlite3.c + shell.c) build + chạy:
+  CREATE/INSERT/INDEX/aggregate/LIKE/PRAGMA integrity_check = ok.
+  **Differential vs cc-built cùng source**: workload CTE đệ quy 5000 dòng +
+  JOIN + window function + JSON + view + trigger + UPDATE/DELETE + VACUUM +
+  integrity_check → **31 dòng output khớp từng byte**. Suite chính chủ TCL
+  (make test/testfixture): CHƯA chạy được trên mac — không có tcl dev
+  (tclConfig.sh); đường trả nợ: box Linux + apt tcl + zcc-ELF (ghi sổ nợ).
+
 ## Bẫy đã trả học phí (đọc trước khi debug "ma")
 
 - **Lỗi ABI cùng-compiler tự triệt tiêu** — nginx/redis chạy ngon suốt vẫn
