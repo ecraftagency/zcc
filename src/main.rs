@@ -87,6 +87,16 @@ fn main() -> ExitCode {
         eprintln!("zcc: -o không dùng được với nhiều input khi có -c/-S");
         return ExitCode::FAILURE;
     }
+    let sdk = Command::new("xcrun")
+        .args(["-sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    // M11: header không phải nhúng và không thấy ở -I → tra SDK thật (ưu tiên CUỐI,
+    // sau mọi -I của user; header nhúng vẫn thắng cho 25 tên libc cơ bản)
+    if !sdk.is_empty() {
+        incs.push(format!("{}/usr/include", sdk));
+    }
     // .c → (asm text, danh sách file thật đã đọc — cho -MMD); .o/.a đi thẳng linker
     let emit_asm = |path: &str| -> Option<(String, Vec<String>)> {
         match preprocess::preprocess(path, &defs, &undefs, &incs).and_then(|(t, locs, files)| {
@@ -193,11 +203,6 @@ fn main() -> ExitCode {
                 }
             }
             if ok {
-                let sdk = Command::new("xcrun")
-                    .args(["-sdk", "macosx", "--show-sdk-path"])
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_default();
                 let mut ld: Vec<&str> = objs.iter().map(|s| s.as_str()).collect();
                 ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L theo thứ tự CLI
                 ld.extend(["-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"]);

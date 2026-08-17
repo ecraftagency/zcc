@@ -60,6 +60,12 @@ pub fn preprocess(
         macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
     }
     for (m, v) in [
+        // EXT(gcc): SDK Darwin CHỈ viết nhánh arm64 dưới #ifdef __GNUC__ (nhánh
+        // non-GNUC là x86-only, thiếu cả _OSSwapInt16) → phải xưng GNUC dialect
+        // như clang vẫn xưng (4.2.1). KHÔNG xưng __clang__ (né feature riêng).
+        ("__GNUC__", "4"),
+        ("__GNUC_MINOR__", "2"),
+        ("__GNUC_PATCHLEVEL__", "1"),
         ("__CHAR_BIT__", "8"),
         ("__SCHAR_MAX__", "127"),
         ("__SHRT_MAX__", "32767"),
@@ -161,8 +167,22 @@ pub fn preprocess(
     }
     let mut files = Vec::new();
     let pts = pp_file(path, &mut macros, 0, incs, &mut files)?;
-    let locs = pts.iter().map(|t| (t.file, t.line)).collect();
-    Ok((pts.into_iter().map(|t| t.tok).collect(), locs, files))
+    // EXT(c99): _Pragma("...") operator — nuốt như #pragma (SDK dùng trong macro)
+    let (mut out, mut i) = (Vec::with_capacity(pts.len()), 0);
+    while i < pts.len() {
+        if matches!(&pts[i].tok, Tok::Ident(n) if n == "_Pragma")
+            && matches!(pts.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("(")))
+            && matches!(pts.get(i + 2).map(|t| &t.tok), Some(Tok::Str(..)))
+            && matches!(pts.get(i + 3).map(|t| &t.tok), Some(Tok::Punct(")")))
+        {
+            i += 4;
+        } else {
+            out.push(pts[i].clone());
+            i += 1;
+        }
+    }
+    let locs = out.iter().map(|t| (t.file, t.line)).collect();
+    Ok((out.into_iter().map(|t| t.tok).collect(), locs, files))
 }
 
 fn inc_find(incs: &[String], name: &str) -> Option<String> {
@@ -256,12 +276,13 @@ fn process(
                 let v = active && {
                     let name = ident_of(d.get(1))
                         .ok_or_else(|| err(file, lno, "thiếu tên sau #ifdef/#ifndef"))?;
-                    macros.contains_key(name) == (kw == "ifdef")
+                    // EXT(clang): __has_include "defined" sẵn (SDK dò #ifndef để fallback)
+                    (macros.contains_key(name) || name == "__has_include") == (kw == "ifdef")
                 };
                 conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
             }
             "if" => {
-                let v = active && eval_if(&d[1..], macros, file, delta, lno)?;
+                let v = active && eval_if(&d[1..], macros, file, delta, lno, incs)?;
                 conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
             }
             "elif" => {
@@ -272,7 +293,7 @@ fn process(
                     }
                     c.parent && !c.taken
                 };
-                let v = need && eval_if(&d[1..], macros, file, delta, lno)?;
+                let v = need && eval_if(&d[1..], macros, file, delta, lno, incs)?;
                 let c = conds.last_mut().unwrap();
                 c.active = v;
                 c.taken = c.taken || v;
@@ -751,28 +772,18 @@ fn stringize(arg: &[PTok]) -> Vec<u8> {
 
 // ---- #if constexpr: defined trước, expand, ident sót → 0, rồi eval i64 ----
 
-fn eval_if(d: &[PTok], macros: &Macros, file: &str, delta: i64, lno: u32) -> Result<bool, String> {
-    let (mut pre, mut i) = (Vec::new(), 0);
-    while i < d.len() {
-        if matches!(&d[i].tok, Tok::Ident(n) if n == "defined") {
-            let paren = matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("(")));
-            let at = if paren { i + 2 } else { i + 1 };
-            let name =
-                ident_of(d.get(at)).ok_or_else(|| err(file, lno, "defined cần tên macro"))?;
-            pre.push(synth(Tok::Num(macros.contains_key(name) as i64, NumK::I)));
-            i = at + 1;
-            if paren {
-                if !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(")"))) {
-                    return Err(err(file, lno, "defined( thiếu ')'"));
-                }
-                i += 1;
-            }
-        } else {
-            pre.push(d[i].clone());
-            i += 1;
-        }
-    }
+fn eval_if(
+    d: &[PTok],
+    macros: &Macros,
+    file: &str,
+    delta: i64,
+    lno: u32,
+    incs: &[String],
+) -> Result<bool, String> {
+    let pre = if_resolve(d, macros, file, lno, incs)?;
     let ex = expand_seq(&pre, macros, &Vec::new(), file, delta)?;
+    // macro có thể expand RA defined(...)/__has_include (SDK pthread.h) → resolve lần 2
+    let ex = if_resolve(&ex, macros, file, lno, incs)?;
     let ts: Vec<Tok> = ex
         .into_iter()
         .map(|t| match t.tok {
@@ -786,6 +797,72 @@ fn eval_if(d: &[PTok], macros: &Macros, file: &str, delta: i64, lno: u32) -> Res
         return Err(err(file, lno, "token thừa trong biểu thức #if"));
     }
     Ok(v != 0)
+}
+
+// resolve defined(X) / __has_include(...) thành 0|1 trong biểu thức #if
+fn if_resolve(
+    d: &[PTok],
+    macros: &Macros,
+    file: &str,
+    lno: u32,
+    incs: &[String],
+) -> Result<Vec<PTok>, String> {
+    let (mut pre, mut i) = (Vec::new(), 0);
+    while i < d.len() {
+        if matches!(&d[i].tok, Tok::Ident(n) if n == "defined") {
+            let paren = matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("(")));
+            let at = if paren { i + 2 } else { i + 1 };
+            let name =
+                ident_of(d.get(at)).ok_or_else(|| err(file, lno, "defined cần tên macro"))?;
+            // EXT(clang): __has_include là operator builtin — "defined" với nó = 1
+            let def = macros.contains_key(name) || name == "__has_include";
+            pre.push(synth(Tok::Num(def as i64, NumK::I)));
+            i = at + 1;
+            if paren {
+                if !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(")"))) {
+                    return Err(err(file, lno, "defined( thiếu ')'"));
+                }
+                i += 1;
+            }
+        } else if matches!(&d[i].tok, Tok::Ident(n) if n == "__has_include" || n == "__has_include_next")
+        {
+            // EXT(clang): __has_include(<h> | "h") — eval TRƯỚC expand (tên header
+            // không phải macro); __has_include_next luôn 0 (không có include stack)
+            let next = matches!(&d[i].tok, Tok::Ident(n) if n == "__has_include_next");
+            if !matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("("))) {
+                return Err(err(file, lno, "__has_include cần '('"));
+            }
+            i += 2;
+            let name = match d.get(i).map(|t| &t.tok) {
+                Some(Tok::Str(b, _)) => {
+                    i += 1;
+                    String::from_utf8_lossy(b).into_owned()
+                }
+                Some(Tok::Punct("<")) => {
+                    i += 1;
+                    let mut s = String::new();
+                    while !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(">")) | None) {
+                        s.push_str(&spell(&d[i].tok));
+                        i += 1;
+                    }
+                    i += 1; // '>'
+                    s
+                }
+                _ => return Err(err(file, lno, "__has_include cần <h> hoặc \"h\"")),
+            };
+            if !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(")"))) {
+                return Err(err(file, lno, "__has_include( thiếu ')'"));
+            }
+            i += 1;
+            let found = !next
+                && (HEADERS.iter().any(|(n, _)| *n == name) || inc_find(incs, &name).is_some());
+            pre.push(synth(Tok::Num(found as i64, NumK::I)));
+        } else {
+            pre.push(d[i].clone());
+            i += 1;
+        }
+    }
+    Ok(pre)
 }
 
 fn eat(ts: &[Tok], p: &mut usize, op: &str) -> bool {

@@ -649,10 +649,11 @@ impl Cg<'_> {
             }
             Node::Addr(e) => self.addr(*e),
             Node::FunAddr(name) => {
+                let sy = sym(name);
                 _ = writeln!(
                     self.s,
-                    "\tadrp x0, _{0}@GOTPAGE\n\tldr x0, [x0, _{0}@GOTPAGEOFF]",
-                    name
+                    "\tadrp x0, {0}@GOTPAGE\n\tldr x0, [x0, {0}@GOTPAGEOFF]",
+                    sy
                 );
             }
             Node::Alloca(e) => {
@@ -1001,7 +1002,7 @@ impl Cg<'_> {
             self.lea_local("x8", off); // đích cho callee ghi struct trả về
         }
         match callee_name {
-            Some(n) => _ = writeln!(self.s, "\tbl _{n}"),
+            Some(n) => _ = writeln!(self.s, "\tbl {}", sym(&n)),
             None => self.s += "\tldr x9, [sp], #16\n\tblr x9\n",
         }
         if pad > 0 {
@@ -1016,5 +1017,13 @@ impl Cg<'_> {
             Ty::Struct(_) => {} // x0/x1 thô — SRet bên trên hạ xuống temp
             _ => self.ext(rt),
         }
+    }
+}
+
+// EXT(gcc): symbol emit — prefix \x01 (asm-label/label &&) = đã đủ tên, còn lại thêm '_'
+fn sym(n: &str) -> String {
+    match n.strip_prefix('\x01') {
+        Some(raw) => raw.to_string(),
+        None => format!("_{n}"),
     }
 }

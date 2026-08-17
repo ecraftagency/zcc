@@ -78,6 +78,8 @@ struct P<'a> {
     in_fn: bool,  // đang trong body hàm (compound literal: local vs global ẩn)
     attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
     fname: String, // tên hàm đang parse (label symbol cho &&label trong static init)
+    asm_label: Option<String>, // EXT(gcc): __asm("_sym") vừa nuốt trong skip_attrs
+    renames: HashMap<String, String>, // EXT(gcc): tên C → symbol __asm (SDK versioning)
 }
 
 type R = Result<NodeId, String>;
@@ -290,6 +292,8 @@ impl P<'_> {
                 | "__inline__" | "restrict" | "__restrict" | "__restrict__"
                 | "__extension__" | "__volatile" | "__volatile__" | "__const" | "__const__"
                 | "_Noreturn" => {}
+                // EXT(clang): nullability — no-op về ngữ nghĩa
+                "_Nullable" | "_Nonnull" | "_Null_unspecified" => {}
                 "__attribute__" | "__asm__" | "__asm" => {
                     let (pk, al) = self.skip_attrs()?;
                     if pk || al.is_some() {
@@ -574,6 +578,10 @@ impl P<'_> {
                 || self.eat_kw("restrict")
                 || self.eat_kw("__restrict")
                 || self.eat_kw("__restrict__")
+                // EXT(clang): nullability qualifier — SDK dùng trần trong FILE...
+                || self.eat_kw("_Nullable")
+                || self.eat_kw("_Nonnull")
+                || self.eat_kw("_Null_unspecified")
             {}
             self.skip_attrs()?; // "void *__attribute__((noinline)) f(...)"
         }
@@ -607,8 +615,22 @@ impl P<'_> {
             _ => String::new(),
         };
         let t = self.suffixes(t)?;
+        self.asm_label = None;
         self.skip_attrs()?;
+        // EXT(gcc): asm-label sau declarator → symbol thật khi emit (Call/FunAddr)
+        if let Some(l) = self.asm_label.take() {
+            if !name.is_empty() {
+                self.renames.insert(name.clone(), l);
+            }
+        }
         Ok((name, t))
+    }
+    // EXT(gcc): tên C → symbol emit; prefix \x01 = đã đủ tên, codegen không thêm '_'
+    fn funref(&self, n: String) -> String {
+        match self.renames.get(&n) {
+            Some(l) => format!("\x01{}", l),
+            None => n,
+        }
     }
     fn nested_ahead(&self) -> bool {
         if !self.peek("(") {
@@ -664,6 +686,17 @@ impl P<'_> {
                 self.expect(Tok::Punct(")"))?;
             } else if self.eat_kw("__asm__") || self.eat_kw("__asm") {
                 self.expect(Tok::Punct("("))?;
+                // EXT(gcc): asm-label — "(chuỗi)" thuần là symbol thay thế cho
+                // declarator (SDK versioning: __asm("_open")); còn lại nuốt bỏ
+                let mut label = String::new();
+                while let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
+                    label.push_str(&String::from_utf8_lossy(b)); // "_" "open" ghép
+                    self.pos += 1;
+                }
+                if !label.is_empty() && self.eat(&Tok::Punct(")")) {
+                    self.asm_label = Some(label);
+                    continue;
+                }
                 let mut depth = 1u32;
                 while depth > 0 {
                     match self.toks.get(self.pos) {
@@ -2350,6 +2383,7 @@ impl P<'_> {
             }
             if let Some(&t) = self.fns.get(&n) {
                 let pt = self.tt.ptr_to(t); // function designator decay
+                let n = self.funref(n); // EXT(gcc): asm-label rename
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
             if self.peek("(") {
@@ -2365,6 +2399,7 @@ impl P<'_> {
                 }
                 if let Some(&t) = self.fns.get(&n) {
                     let pt = self.tt.ptr_to(t);
+                    let n = self.funref(n); // EXT(gcc): asm-label rename
                     return Ok(self.push(Node::FunAddr(n), pt));
                 }
                 // gọi hàm chưa khai báo: implicit int, old-style
@@ -2577,8 +2612,23 @@ pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast,
         va_off: 16,
         in_fn: false,
         attr_aligned: None,
+        asm_label: None,
+        renames: HashMap::new(),
         fname: String::new(),
     };
+    // EXT(gcc): __uint128_t/__int128_t — CHỈ storage 16 byte align 16 (SDK mach
+    // NEON state trong mcontext cần layout đúng); arithmetic không hỗ trợ.
+    {
+        p.tt.structs.push(crate::ast::StructDef {
+            members: vec![("__lo".into(), ULONG, 0), ("__hi".into(), ULONG, 8)],
+            size: 16,
+            align: 16,
+            is_union: false,
+        });
+        let t = p.tt.add(Ty::Struct(p.tt.structs.len() as u32 - 1));
+        p.typedefs.insert("__uint128_t".into(), t);
+        p.typedefs.insert("__int128_t".into(), t);
+    }
     // libc trả con trỏ: gọi không prototype (torture hay thế) mà để implicit
     // int thì sxtw cắt nửa cao địa chỉ heap → seed sẵn kiểu trả về đúng.
     {
