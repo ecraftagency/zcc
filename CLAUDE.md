@@ -4,7 +4,7 @@ C89+ compiler viết bằng Rust. Tác giả: Vu (xưng hô "mày/tao", trả l�
 
 ## 2 yêu cầu tối thượng (mọi quyết định quy về đây)
 
-1. **Strict compliance C89** — ngữ nghĩa đúng spec; phần mở rộng C89+ (C99/C11/vendor) chỉ tồn tại khi có phần mềm thật đòi. Target đã đạt: AArch64 macOS Mach-O; đang mở: ELF Linux arm64 → x86_64.
+1. **Strict compliance C89** — ngữ nghĩa đúng spec; phần mở rộng C89+ (C99/C11/vendor) chỉ tồn tại khi có phần mềm thật đòi. Target đã đạt: AArch64 macOS Mach-O + AArch64 ELF Linux; x86_64 HOÃN.
 2. **Ít LOC nhất có thể** — không optimization pass (ngữ nghĩa -O0), không tính năng viết trước khi có file `.c` thật đòi, không abstraction đón đầu, zero external crate. Trần cứng: **10k LOC**.
 
 Khi 2 yêu cầu xung đột: compliance thắng LOC.
