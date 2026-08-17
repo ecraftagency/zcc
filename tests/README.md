@@ -165,6 +165,9 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
     lệch chuẩn long double=double; trên ELF còn né ABI fp128 glibc) + ext test
     `c99_ldbl_mathl.c`. Rerun sau fix: unit/type/list **295 ok/0 err**,
     slot-stats **73 ok/0 err**.
+  - Run 3 ĐÓNG SỔ (--clients 8, sau fix ceill): **156/156 unit, 7274 ok /
+    0 err / 0 exception — "All tests passed without errors!"** Suite chính
+    chủ redis PASS TUYỆT ĐỐI, không cần baseline.
   - Suite này tổng cộng bắt 2 bug thật: float.h thiếu `DBL_MANT_DIG` (Lua
     double2ll trả 0, fix 3f67a0e) + ceill trên. Bài học kit: socket path phải
     ngắn (`sun_path` 104 trên macOS — chạy từ `/tmp/zr.*`), test modules phải
