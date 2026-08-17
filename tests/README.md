@@ -106,6 +106,7 @@ nhau là nghẽn (đã trả học phí).
 | `nora.sh` | nlsandler/writing-a-c-compiler-tests | 555 pass, 137 skip, 0 fail | skip = referee c89 từ chối (chương ngoài C89) |
 | `chibicc.sh` | rui314/chibicc | 14 pass, 24 skip, 3 fail | string = C11 `u""`; typeof trần = TỪ CHỐI CÓ CHỦ ĐÍCH (va tên biến C89 — xem parser.rs); vla ngoài subset; skip gồm cả test referee tự fail trên arm64 (oracle vô hiệu) |
 | `kr.sh` | caisah/K-and-R-exercises-and-examples | 87 pass, 30 skip, 11 fail | fail = UB của CHÍNH bài tập (scanf fail → đọc biến chưa init, itoa off-by-one, fsize đọc directory) — rác stack đổi theo run nên baseline so THEO TÊN, hội tụ sau vài lần chạy; mọi entrant mới phải triage tay trước khi thêm |
+| `tcc.sh` | TinyCC/tinycc (tests2 chạy trên tcc DO ZCC BUILD — bắc cầu mức suite) | 108 pass, 31 skip, 0 fail | trọng tài kép: tcc(cc) không tái tạo được .expect (case cần args/stdin của Makefile tcc, hoặc tự segfault trên arm64) → skip; baseline rỗng ngay lần chạy đầu |
 
 Nguyên tắc baseline: mỗi dòng known-fail phải có lời giải thích trong bảng
 trên (hoặc commit message thêm nó). Baseline KHÔNG phải thùng rác giấu bug —
@@ -113,9 +114,22 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
 
 ## Suite chính chủ nginx/redis (trụ 3 — phần mềm thật tự kiểm chứng chính nó)
 
-- **nginx-tests** (nginx.org/tests): 493 file / 2491 test PASS (2026-08-17).
-  Nợ đã ghi: log cụt mất số skip + binary build TRƯỚC 3 bug fix cùng ngày →
-  phải rerun full-log bằng zcc hiện hành (nợ giai đoạn 3, xem CLAUDE.md).
+- **nginx-tests** (github.com/nginx/nginx-tests, 2026-08-17, zcc hiện hành,
+  log full lưu `~/.cache/zcc-suites/nginx-tests-prove-*.log` — nợ rerun ĐÃ TRẢ):
+  - Build minimal (M13: without rewrite/gzip): **493 file / 1136 test, All
+    tests successful, 73s** (`prove -j4`); 397 file skip vì thiếu module.
+  - Build FULL (`--with-http_ssl_module --with-http_v2_module --with-stream
+    --with-stream_ssl_module --with-mail --with-mail_ssl_module
+    --with-http_realip_module --with-http_sub_module`, link pcre2 + openssl@3
+    homebrew — zcc nuốt trọn header openssl/pcre2, cấm khẩu không cần vá gì):
+    **493 file / 5346 test**, fail chỉ gom trong nhóm SSL; triage bằng trọng
+    tài nginx-cc CÙNG config chạy CÙNG danh sách file: **tập fail-chỉ-zcc =
+    RỖNG** — 19 file fail giống hệt cả hai binary (openssl 3.6.1 lệch kỳ vọng
+    suite: session reuse, chacha prio, stapling…), phần còn lại là flake tạo
+    cert của harness khi không có tty (`openssl req` "Inappropriate ioctl",
+    đổi nạn nhân ngẫu nhiên theo run) + 2 file `*_ssl_conf_command.t` treo
+    với CẢ cc. Bài học: `prove -j4` làm flake cert nặng thêm — triage SSL
+    phải chạy tuần tự.
 - **redis tests** (`./runtest` chính chủ, lịch 156 unit, --clients 4,
   2026-08-17): chạy tới unit 147+/156 thì crash + TIMEOUT tại các unit bật
   `io-threads ≥ 2` (`unit/networking:232`, `unit/introspection:1114`) — tái
