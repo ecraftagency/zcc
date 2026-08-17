@@ -17,7 +17,7 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), không Box c
 
 - **Boundary frontend/backend = `src/ast.rs`** (AST + TyTab). Frontend DỰNG, backend chỉ ĐỌC; hai tầng không import lẫn nhau. Layout size/align nằm trong TyTab (lock LP64; cần khác thì tham số hóa TyTab, không rải điều kiện).
 - **Mỗi target một file** dưới `src/codegen/`; `codegen/mod.rs` là cửa duy nhất (`emit(&Ast) -> String`). ABI/section/asm syntax nằm TRỌN trong file target. Thêm target = thêm file + nhánh match + nhánh toolchain bên driver.
-- Driver phối hợp toolchain hệ thống TRỰC TIẾP (as → ld, không qua cc); CLI tương thích `cc` để drop-in `CC=zcc`; flag lạ nuốt im lặng nhưng không nuốt nhầm flag có tham số.
+- **Luật driver drop-in**: `CC=zcc` phải cắm vào build system thật (configure/make/cmake) của phần mềm mục tiêu mà KHÔNG sửa một dòng build file. Driver phối hợp toolchain host TRỰC TIẾP (as → ld, không qua cc driver). Bề mặt flag mua theo test-first: flag được implement khi build system thật dùng nó và nuốt sẽ làm sai; còn lại nuốt im lặng — nhưng TUYỆT ĐỐI không nuốt nhầm flag có tham số đi kèm (lệch một cái là ăn nhầm input file). Diagnostic format `file:line:` chuẩn + exit code đúng (configure grep stderr).
 - Single crate, không workspace.
 
 ## Luật decouple extension (sư phạm: ranh giới ISO C / phương ngữ vendor phải nhìn được)
