@@ -239,6 +239,9 @@ pub enum Node {
     FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
     VaArea(u32), // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
     Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
+    // EXT(gcc): inline asm subset (xxhash/M14 đòi): template, outputs (là "+r"?,
+    // lvalue), inputs "r". Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
+    Asm(String, Vec<(bool, NodeId)>, Vec<NodeId>),
     Alloca(NodeId), // cấp phát động trên stack; epilogue mov sp,x29 tự thu hồi
     Str(u32),
 }
@@ -270,6 +273,10 @@ pub struct Func {
     pub body: NodeId,
     pub ret: TypeId,
     pub is_static: bool,
+    // EXT(gcc): định nghĩa inline (không có declaration trần C99 6.7.4p7):
+    // DCE khi không ai dùng (như clang); non-static thì phát external weak
+    // để nhiều TU cùng phát vẫn coalesce, không duplicate
+    pub is_inline: bool,
     pub variadic: bool,
     pub sret: u32, // ≠0: slot giấu con trỏ x8 (trả struct >16B gián tiếp)
 }

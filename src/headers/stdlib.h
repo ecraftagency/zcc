@@ -36,6 +36,8 @@ div_t div(int, int);
 ldiv_t ldiv(long, long);
 int system(const char *);
 char *getenv(const char *);
+const char *getprogname(void); /* Darwin; thiếu → implicit int cắt pointer 32-bit */
+void setprogname(const char *);
 void qsort(void *, size_t, size_t, int (*)(const void *, const void *));
 void *bsearch(const void *, const void *, size_t, size_t,
               int (*)(const void *, const void *));

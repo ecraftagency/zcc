@@ -269,7 +269,13 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
                     b'"' => break,
                     b'\\' => {
                         i += 1;
-                        bytes.push(escape(b, &mut i)? as u8);
+                        // phase 2 cả TRONG string: \<newline> nối dòng, không ra byte
+                        if b.get(i) == Some(&b'\n') {
+                            line += 1;
+                            i += 1;
+                        } else {
+                            bytes.push(escape(b, &mut i)? as u8);
+                        }
                     }
                     e => {
                         bytes.push(e);

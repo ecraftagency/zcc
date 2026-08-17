@@ -21,13 +21,9 @@ type Macros = HashMap<String, Macro>;
 
 // Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
 // nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-const HEADERS: [(&str, &str); 20] = [
+const HEADERS: [(&str, &str); 17] = [
     ("wchar.h", include_str!("headers/wchar.h")),
     ("inttypes.h", include_str!("headers/inttypes.h")),
-
-
-
-    ("dlfcn.h", include_str!("headers/dlfcn.h")),
     ("sys/mman.h", include_str!("headers/sys/mman.h")),
     ("libkern/OSCacheControl.h", include_str!("headers/libkern/OSCacheControl.h")),
     ("setjmp.h", include_str!("headers/setjmp.h")),
@@ -35,11 +31,8 @@ const HEADERS: [(&str, &str); 20] = [
     ("stdalign.h", include_str!("headers/stdalign.h")),
     ("stdnoreturn.h", include_str!("headers/stdnoreturn.h")),
     ("assert.h", include_str!("headers/assert.h")),
-    ("stdint.h", include_str!("headers/stdint.h")),
     ("ctype.h", include_str!("headers/ctype.h")),
-
     ("float.h", include_str!("headers/float.h")),
-    ("limits.h", include_str!("headers/limits.h")),
     ("math.h", include_str!("headers/math.h")),
     ("stdarg.h", include_str!("headers/stdarg.h")),
     ("stddef.h", include_str!("headers/stddef.h")),
@@ -55,7 +48,15 @@ pub fn preprocess(
     incs: &[String],
 ) -> Result<(Vec<Tok>, Vec<(u32, u32)>, Vec<String>), String> {
     let mut macros = Macros::new();
-    for m in ["__STDC__", "__LP64__", "__APPLE__", "__MACH__", "__arm64__", "__aarch64__"] {
+    for m in [
+        "__STDC__",
+        "__LP64__",
+        "__APPLE__",
+        "__MACH__",
+        "__arm64__",
+        "__aarch64__",
+        "__LITTLE_ENDIAN__", // EXT(apple): OSByteOrder.h chọn nhánh endian bằng nó
+    ] {
         macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
     }
     for (m, v) in [
@@ -68,6 +69,10 @@ pub fn preprocess(
         // EXT(apple): TargetConditionals.h chọn nhánh GNUC bằng
         // defined(__GNUC__) && defined(__APPLE_CC__) — giá trị 6000 như clang
         ("__APPLE_CC__", "6000"),
+        // EXT(apple): AvailabilityMacros.h suy __MAC_OS_X_VERSION_MAX_ALLOWED
+        // từ macro này (redis config.h dò MAC_OS_10_6 → dùng stat thường thay
+        // struct stat64 ẩn). 110000 = macOS 11, OS đầu tiên của Apple Silicon.
+        ("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "110000"),
         ("__CHAR_BIT__", "8"),
         ("__SCHAR_MAX__", "127"),
         ("__SHRT_MAX__", "32767"),
@@ -158,6 +163,15 @@ pub fn preprocess(
             ],
         ),
     );
+    // EXT(gcc): họ __atomic_* → macro đổ về __sync_*; builtin bit-manip (ext.rs)
+    for (m, ps, body) in crate::ext::ATOMIC_MACROS.iter().chain(crate::ext::BIT_MACROS) {
+        let toks = lex(body).map_err(|e| e.to_string())?;
+        let ps = ps.iter().map(|s| s.to_string()).collect();
+        macros.insert((*m).into(), Macro::Fun(ps, false, toks));
+    }
+    for (i, m) in crate::ext::ATOMIC_ORDERS.iter().enumerate() {
+        macros.insert((*m).into(), Macro::Obj(vec![synth(Tok::Num(i as i64, NumK::I))]));
+    }
     // -Dname[=val] từ CLI (mặc định =1, như cc); -Uname xóa (kể cả builtin)
     for d in defs {
         let (n, v) = d.split_once('=').unwrap_or((d, "1"));
@@ -365,7 +379,19 @@ fn process(
                     ident_of(d.get(1)).ok_or_else(|| err(file, lno, "thiếu tên sau #undef"))?;
                 macros.remove(name);
             }
-            "include" => match d.get(1).map(|t| &t.tok) {
+            "include" => {
+                // #include MACRO (computed include, C89 §3.8.2): không khớp hai
+                // dạng chuẩn thì expand macro rồi mới dispatch (rax.c redis)
+                let nd: Vec<PTok>;
+                let d: &[PTok] = if matches!(d.get(1).map(|t| &t.tok), Some(Tok::Ident(_))) {
+                    let mut v = vec![d[0].clone()];
+                    v.extend(expand_seq(&d[1..], macros, &Vec::new(), file, delta)?);
+                    nd = v;
+                    &nd
+                } else {
+                    d
+                };
+                match d.get(1).map(|t| &t.tok) {
                 Some(Tok::Str(b, _)) => {
                     let name = String::from_utf8_lossy(b).into_owned();
                     let bare = name.clone();
@@ -426,7 +452,8 @@ fn process(
                     }
                 }
                 _ => return Err(err(file, lno, "#include cần \"file\"")),
-            },
+                }
+            }
             "error" => return Err(err(file, lno, &format!("#error {}", spell_seq(&d[1..])))),
             // EXT(gcc): #warning — báo rồi đi tiếp (không có trong C89)
             "warning" => eprintln!("{}", err(file, lno, &format!("#warning {}", spell_seq(&d[1..])))),

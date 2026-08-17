@@ -29,7 +29,9 @@ struct Cg<'a> {
 
 pub fn emit(ast: &Ast) -> String {
     let mut g = Cg {
-        s: String::from(".section __TEXT,__text\n"),
+        // subsections_via_symbols: mỗi symbol một atom — bắt buộc để ld
+        // coalesce .weak_definition (inline gnu89) thay vì báo duplicate
+        s: String::from(".subsections_via_symbols\n.section __TEXT,__text\n"),
         a: ast,
         lbl: 0,
         brks: Vec::new(),
@@ -44,6 +46,9 @@ pub fn emit(ast: &Ast) -> String {
         g.fsret = f.sret;
         if !f.is_static {
             _ = writeln!(g.s, ".globl _{}", f.name);
+            if f.is_inline {
+                _ = writeln!(g.s, ".weak_definition _{}", f.name);
+            }
         }
         _ = write!(g.s, ".p2align 2\n_{}:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n", f.name);
         if f.frame > 0 {
@@ -754,6 +759,70 @@ impl Cg<'_> {
                 self.store(2, lt);
             }
             Node::VaArea(off) => _ = writeln!(self.s, "\tadd x0, x29, #{off}"),
+            // EXT(gcc): inline asm subset — operand %k gán cứng x{9+k} (an toàn
+            // vì -O0 không giữ giá trị sống trong thanh ghi qua statement);
+            // %xk/%wk ép độ rộng, %k trần theo size kiểu operand (8→x, khác→w)
+            Node::Asm(tpl, outs, ins) => {
+                let (tpl, outs, ins) = (tpl.clone(), outs.clone(), ins.clone());
+                let sizes: Vec<u32> = outs
+                    .iter()
+                    .map(|&(_, e)| e)
+                    .chain(ins.iter().copied())
+                    .map(|e| self.a.tt.size(self.a.types[e as usize]))
+                    .collect();
+                // push giá trị mọi operand theo index ("=r" push rác giữ nhịp pop)
+                for &(plus, e) in &outs {
+                    if plus {
+                        self.expr(e);
+                    }
+                    self.s += "\tstr x0, [sp, #-16]!\n";
+                }
+                for &e in &ins {
+                    self.expr(e);
+                    self.s += "\tstr x0, [sp, #-16]!\n";
+                }
+                for k in (0..outs.len() + ins.len()).rev() {
+                    _ = writeln!(self.s, "\tldr x{}, [sp], #16", 9 + k);
+                }
+                let mut sub = String::new();
+                let cs: Vec<char> = tpl.chars().collect();
+                let mut i = 0;
+                while i < cs.len() {
+                    if cs[i] == '%' && i + 1 < cs.len() {
+                        let (mut j, mut wide) = (i + 1, None);
+                        match cs[j] {
+                            'x' => (wide, j) = (Some(true), j + 1),
+                            'w' => (wide, j) = (Some(false), j + 1),
+                            '%' => {
+                                sub.push('%');
+                                i = j + 1;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        if let Some(d) = cs.get(j).and_then(|c| c.to_digit(10)) {
+                            let w = wide.unwrap_or(sizes.get(d as usize).is_none_or(|&s| s == 8));
+                            _ = write!(sub, "{}{}", if w { 'x' } else { 'w' }, 9 + d);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    sub.push(cs[i]);
+                    i += 1;
+                }
+                if !sub.is_empty() {
+                    _ = writeln!(self.s, "\t{}", sub.replace('\n', "\n\t"));
+                }
+                // writeback output: giá trị lên stack trước vì addr() phá x9+
+                for k in 0..outs.len() {
+                    _ = writeln!(self.s, "\tstr x{}, [sp, #-16]!", 9 + k);
+                }
+                for &(_, e) in outs.iter().rev() {
+                    self.addr(e);
+                    self.s += "\tmov x1, x0\n\tldr x2, [sp], #16\n";
+                    self.store(2, self.a.types[e as usize]);
+                }
+            }
             // EXT(gcc): atomics __sync_* (M12) — vòng LL/SC ldaxr/stlxr; cặp
             // acquire+release mỗi lần = đủ mạnh cho seq_cst mà GCC hứa ở __sync.
             // Quy ước reg: x0=ptr, {r}1/{r}2=value, {r}9=giá trị cũ, {r}10=mới,

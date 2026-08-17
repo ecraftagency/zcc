@@ -78,6 +78,12 @@ struct P<'a> {
     in_fn: bool,  // đang trong body hàm (compound literal: local vs global ẩn)
     attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
     saw_inline: bool, // EXT(gcc): decl_specs vừa gặp inline/__inline (gnu89)
+    // EXT(gcc): tên đã có file-scope declaration KHÔNG inline — C99 6.7.4p7:
+    // định nghĩa inline của tên đó vẫn là external definition (logreqres redis)
+    plain_decls: std::collections::HashSet<String>,
+    // EXT(c99): declarator vừa gặp mảng size không hằng (VLA) — expr của size;
+    // chỉ stmt() (local decl) tiêu thụ, hạ xuống con trỏ + Alloca
+    vla_size: Option<NodeId>,
     fname: String, // tên hàm đang parse (label symbol cho &&label trong static init)
     asm_label: Option<String>, // EXT(gcc): __asm("_sym") vừa nuốt trong skip_attrs
     renames: HashMap<String, String>, // EXT(gcc): tên C → symbol __asm (SDK versioning)
@@ -157,7 +163,11 @@ impl P<'_> {
     }
     fn is_type_word(&self, n: &str) -> bool {
         TYPE_WORDS.contains(&n)
-            || self.typedefs.contains_key(n)
+            // typedef bị biến local CÙNG TÊN shadow (redis: quicklist *quicklist)
+            // — sau dòng khai báo đó, tên là biến chứ không còn là kiểu
+            // (chỉ soi shadow TRONG body — ngoài body locals là đồ thừa hàm trước)
+            || (self.typedefs.contains_key(n)
+                && !(self.in_fn && self.locals.iter().any(|(ln, ..)| ln == n)))
             || ["typedef", "static", "extern", "auto", "register"].contains(&n)
     }
     // keyword cứng — typedef-name KHÔNG tính (vẫn được làm tên declarator/member)
@@ -293,6 +303,10 @@ impl P<'_> {
                 "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict"
                 | "__restrict__" | "__extension__" | "__volatile" | "__volatile__"
                 | "__const" | "__const__" | "_Noreturn" => {}
+                // EXT(gcc): __thread TLS — chấp nhận như global thường. ĐÚNG khi
+                // chỉ main thread đụng biến (redis io-threads=1); TLS Mach-O thật
+                // (@TLVP + tlv_get_addr) chỉ làm khi có case đòi đa luồng thật.
+                "__thread" => {}
                 // EXT(gcc): inline — zcc không có inliner; definition inline sẽ hạ
                 // về static (mỗi TU một bản, như nhánh "static __inline" của cdefs.h)
                 // để "extern __inline" gnu89 của SDK không phát duplicate symbol
@@ -351,9 +365,12 @@ impl P<'_> {
                     continue;
                 }
                 _ => {
-                    // typedef-name: chỉ khi chưa có kiểu nào khác
+                    // typedef-name: chỉ khi chưa có kiểu nào khác (và không bị
+                    // biến local cùng tên shadow — redis: quicklist *quicklist)
                     if base.is_none() && direct.is_none() && !uns && !sgn && !short && longs == 0 {
-                        if let Some(&t) = self.typedefs.get(n) {
+                        let shadowed =
+                            self.in_fn && self.locals.iter().any(|(ln, ..)| ln == n);
+                        if let Some(&t) = self.typedefs.get(n).filter(|_| !shadowed) {
                             self.pos += 1;
                             direct = Some(t);
                             any = true;
@@ -544,6 +561,8 @@ impl P<'_> {
                 self.pos += 1;
             }
         }
+        // EXT(clang): enum tag : underlying-type (SDK malloc.h) — honor kiểu nền
+        let under = if self.eat(&Tok::Punct(":")) { Some(self.typename()?) } else { None };
         if self.eat(&Tok::Punct("{")) {
             let mut val = 0i64;
             let mut any_neg = false;
@@ -562,13 +581,13 @@ impl P<'_> {
             }
             // khớp clang: mọi enumerator không âm → underlying unsigned int
             // (quan trọng cho bitfield kiểu enum: phải zero-extend)
-            let t = if any_neg { INT } else { UINT };
+            let t = under.unwrap_or(if any_neg { INT } else { UINT });
             if !tag.is_empty() {
                 self.enum_tags.insert(tag, t);
             }
             return Ok(t);
         }
-        Ok(self.enum_tags.get(&tag).copied().unwrap_or(INT))
+        Ok(under.or_else(|| self.enum_tags.get(&tag).copied()).unwrap_or(INT))
     }
     // declarator đầy đủ C: con trỏ, nested "(...)", suffix mảng/hàm.
     // need_name=false cho abstract declarator (cast, sizeof, param không tên).
@@ -600,6 +619,15 @@ impl P<'_> {
             self.pos = save;
             let res = self.declarator(outer, need_name)?;
             self.pos = end;
+            // đuôi sau suffix ngoài: attribute/asm-label (mach_init.h:
+            // "extern int (*f)(...) __printflike(1,0);")
+            self.asm_label = None;
+            self.skip_attrs()?;
+            if let Some(l) = self.asm_label.take() {
+                if !res.0.is_empty() {
+                    self.renames.insert(res.0.clone(), l);
+                }
+            }
             return Ok(res);
         }
         let name = match self.toks.get(self.pos) {
@@ -719,7 +747,24 @@ impl P<'_> {
     }
     fn suffixes(&mut self, t: TypeId) -> Result<TypeId, String> {
         if self.eat(&Tok::Punct("[")) {
-            let n = if self.peek("]") { 0 } else { self.const_expr()? as u64 };
+            let n = if self.peek("]") {
+                0
+            } else {
+                let save = self.pos;
+                match self.const_expr() {
+                    Ok(v) => v as u64,
+                    // EXT(c99): size không hằng = VLA — giữ expr cho stmt() hạ
+                    // xuống alloca; chỉ 1 chiều không hằng (chiều trong phải hằng)
+                    Err(_) => {
+                        self.pos = save;
+                        let e = self.expr()?;
+                        if self.vla_size.replace(e).is_some() {
+                            return Err("VLA nhiều chiều không hằng: chưa hỗ trợ".into());
+                        }
+                        0
+                    }
+                }
+            };
             self.expect(Tok::Punct("]"))?;
             let inner = self.suffixes(t)?; // đa chiều: int a[2][3] = array 2 của array 3
             return Ok(self.tt.add(Ty::Array(inner, n)));
@@ -748,8 +793,12 @@ impl P<'_> {
             self.pos += 2;
             return Ok(empty); // (void)
         }
-        // old-style ident list: f(a, b)
-        if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if !self.is_type_word(n)) {
+        // old-style ident list: f(a, b) — nhưng __attribute__/nullability mở đầu
+        // param hiện đại (SDK mig_errors.h: f(__unused T *x)), không phải tên
+        if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if !self.is_type_word(n)
+            && !matches!(n.as_str(), "__attribute__" | "__attribute"
+                | "_Nullable" | "_Nonnull" | "_Null_unspecified"))
+        {
             let mut pnames = Vec::new();
             loop {
                 pnames.push(self.ident()?);
@@ -768,6 +817,7 @@ impl P<'_> {
             }
             let (bt, _) = self.decl_specs()?.ok_or("cần kiểu tham số")?;
             let (nm, pt) = self.declarator(bt, false)?;
+            self.vla_size = None; // EXT(c99): param VLA decay về con trỏ — bỏ size
             // điều chỉnh kiểu param: mảng → con trỏ, hàm → con trỏ hàm
             let pt = match self.tt.tys[pt as usize] {
                 Ty::Array(e, _) => self.tt.ptr_to(e),
@@ -979,6 +1029,10 @@ impl P<'_> {
             Node::Call(_, args, _) | Node::Sync(_, args, _) => {
                 args.iter().any(|&x| self.has_label(x))
             }
+            Node::Asm(_, outs, ins) => {
+                outs.iter().any(|&(_, e)| self.has_label(e))
+                    || ins.iter().any(|&e| self.has_label(e))
+            }
             Node::CallPtr(f, args, _) => {
                 self.has_label(*f) || args.iter().any(|&x| self.has_label(x))
             }
@@ -1010,25 +1064,58 @@ impl P<'_> {
             }
         }
         if self.eat_kw("asm") || self.eat_kw("__asm__") || self.eat_kw("__asm") {
-            // GNU asm statement: nuốt (template rỗng + constraint = barrier, no-op ở -O0)
-            while self.eat_kw("volatile") || self.eat_kw("__volatile__") {}
-            self.expect(Tok::Punct("("))?;
-            match self.toks.get(self.pos) {
-                Some(Tok::Str(s, _)) if s.is_empty() => {}
-                _ => return Err("asm chỉ hỗ trợ template rỗng (barrier)".into()),
+            // EXT(gcc): inline asm SUBSET (xxhash đòi ở M14): template phát
+            // verbatim + constraint thanh ghi "=r"/"+r"/"r". Clobber bỏ qua —
+            // vô hại ở -O0 vì mọi statement reload từ memory, chỉ sp/x29/x30
+            // là bất khả xâm phạm. KHÔNG "m", không [tên], không asm goto —
+            // lỗi rõ ràng để không im lặng sinh code sai.
+            while self.eat_kw("volatile") || self.eat_kw("__volatile__") || self.eat_kw("__volatile")
+            {
             }
-            let mut depth = 1;
-            while depth > 0 {
-                match self.toks.get(self.pos) {
-                    Some(Tok::Punct("(")) => depth += 1,
-                    Some(Tok::Punct(")")) => depth -= 1,
-                    None => return Err("asm không đóng".into()),
-                    _ => {}
-                }
+            self.expect(Tok::Punct("("))?;
+            let mut tpl = String::new();
+            while let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
+                tpl.push_str(&String::from_utf8_lossy(b));
                 self.pos += 1;
             }
+            let mut outs: Vec<(bool, NodeId)> = Vec::new();
+            let mut ins: Vec<NodeId> = Vec::new();
+            for sect in 0..3 {
+                if !self.eat(&Tok::Punct(":")) {
+                    break;
+                }
+                while let Some(Tok::Str(c, _)) = self.toks.get(self.pos) {
+                    let c = String::from_utf8_lossy(c).into_owned();
+                    self.pos += 1;
+                    if sect < 2 {
+                        self.expect(Tok::Punct("("))?;
+                        let e = self.assign()?;
+                        self.expect(Tok::Punct(")"))?;
+                        match (sect, c.as_str()) {
+                            (0, "=r") => outs.push((false, e)),
+                            (0, "+r") => outs.push((true, e)),
+                            (1, "r") => ins.push(e),
+                            _ => {
+                                return Err(format!(
+                                    "asm: constraint \"{c}\" chưa hỗ trợ (chỉ =r +r r)"
+                                ))
+                            }
+                        }
+                        if sect == 0 {
+                            self.check_lval(e)?;
+                        }
+                    }
+                    if !self.eat(&Tok::Punct(",")) {
+                        break;
+                    }
+                }
+            }
+            if outs.len() + ins.len() > 7 {
+                return Err("asm: tối đa 7 operand (x9-x15)".into());
+            }
+            self.expect(Tok::Punct(")"))?;
             self.expect(Tok::Punct(";"))?;
-            return Ok(self.push(Node::Block(Vec::new()), INT));
+            return Ok(self.push(Node::Asm(tpl, outs, ins), INT));
         }
         if self.eat_kw("__label__") {
             // GNU local label declaration — label của mình vốn function-scope, nuốt
@@ -1167,6 +1254,7 @@ impl P<'_> {
             if !self.eat(&Tok::Punct(";")) {
                 loop {
                     let (name, mut t) = self.declarator(bt, true)?;
+                    let vla = self.vla_size.take(); // EXT(c99)
                     match storage {
                         Storage::Typedef => {
                             self.typedefs.insert(name, t);
@@ -1204,6 +1292,27 @@ impl P<'_> {
                                 t,
                                 Vloc::Glob(self.globals.len() as u32 - 1),
                             ));
+                        }
+                        // EXT(c99): VLA local → con trỏ + alloca(n*sizeof(elem)).
+                        // Hệ quả biết trước: sizeof(vla) = 8 (size con trỏ), sai
+                        // spec nhưng redis không đụng; epilogue mov sp,x29 thu hồi.
+                        _ if vla.is_some() => {
+                            if self.peek("=") {
+                                return Err("VLA có initializer".into());
+                            }
+                            let elem = match self.tt.tys[t as usize] {
+                                Ty::Array(e, _) => e,
+                                _ => return Err("size không hằng ngoài mảng".into()),
+                            };
+                            let pt = self.tt.ptr_to(elem);
+                            let off = self.alloc_local(name, pt);
+                            let n = self.cast(vla.unwrap(), ULONG);
+                            let esz = self.tt.size(elem);
+                            let sz = self.push(Node::Num(esz as i64), ULONG);
+                            let bytes = self.push(Node::Bin("*", n, sz), ULONG);
+                            let al = self.push(Node::Alloca(bytes), pt);
+                            let v = self.push(Node::Var(off), pt);
+                            stmts.push(self.mkassign(v, al)?);
                         }
                         _ => {
                             if self.eat(&Tok::Punct("=")) {
@@ -1370,6 +1479,7 @@ impl P<'_> {
         init: Init,
         out: &mut Vec<(u32, TypeId, FlatItem)>,
     ) -> Result<(), String> {
+        let init = self.unbrace_str(t, init);
         match init {
             Init::S(mut b, wide) => {
                 if let Ty::Array(e, n) = self.tt.tys[t as usize] {
@@ -1557,11 +1667,27 @@ impl P<'_> {
         }
     }
     // parse init + đổ phẳng + chốt size mảng []. Trả (flat, init có phải {..}/"..").
+    // C89 3.5.7: string literal init mảng char/wchar được bọc {} tùy chọn
+    // (luac.c: static char Output[]={ "luac.out" }) — bóc ngoặc ra Init::S
+    fn unbrace_str(&self, t: TypeId, init: Init) -> Init {
+        if let Ty::Array(e, _) = self.tt.tys[t as usize] {
+            let esz = self.tt.size(e);
+            let hit = matches!(&init, Init::L(v) if v.len() == 1
+                && matches!(&v[0], (Desig::No, Init::S(_, w)) if esz == 1 || (*w && esz == 4)));
+            if hit {
+                if let Init::L(v) = init {
+                    return v.into_iter().next().unwrap().1;
+                }
+            }
+        }
+        init
+    }
     fn flat_init(
         &mut self,
         t: &mut TypeId,
     ) -> Result<(Vec<(u32, TypeId, FlatItem)>, bool), String> {
         let init = self.parse_init()?;
+        let init = self.unbrace_str(*t, init);
         let agg = matches!(init, Init::L(_) | Init::S(..));
         let mut flat = Vec::new();
         match (self.tt.tys[*t as usize], init) {
@@ -2472,6 +2598,7 @@ impl P<'_> {
     }
     fn program(&mut self) -> Result<Vec<Func>, String> {
         let mut funcs = Vec::new();
+        let mut ranges: Vec<(u32, u32)> = Vec::new(); // body [n0,n1) từng func
         while self.pos < self.toks.len() {
             let (bt, storage) = match self.decl_specs()? {
                 Some(x) => x,
@@ -2483,6 +2610,9 @@ impl P<'_> {
                 continue; // định nghĩa struct/union/enum thuần
             }
             let (name, t) = self.declarator(bt, true)?;
+            if self.vla_size.take().is_some() {
+                return Err("VLA chỉ được là biến local".into()); // EXT(c99)
+            }
             // funcdef: declarator ra kiểu Func và theo sau là "{" hoặc old-style decl list
             if let Ty::Func(fidx) = self.tt.tys[t as usize] {
                 let is_def = self.peek("{")
@@ -2572,11 +2702,16 @@ impl P<'_> {
                         0
                     };
                     self.in_fn = true;
+                    let n0 = self.nodes.len() as u32; // range node của body (cho DCE weak)
                     let body = self.stmt()?;
+                    let n1 = self.nodes.len() as u32;
                     self.in_fn = false;
-                    let is_static = storage == Storage::Static
-                        || self.static_fns.contains(&name)
-                        || inline_fn; // EXT(gcc): inline definition → static
+                    let is_static =
+                        storage == Storage::Static || self.static_fns.contains(&name);
+                    // EXT(gcc): inline (kể cả static inline) không có declaration
+                    // trần (C99 6.7.4p7) → ứng viên DCE; codegen phát weak nếu
+                    // non-static để các TU cùng phát coalesce được
+                    let is_inline = inline_fn && !self.plain_decls.contains(&name);
                     funcs.push(Func {
                         name,
                         params,
@@ -2584,9 +2719,11 @@ impl P<'_> {
                         body,
                         ret: sig.ret,
                         is_static,
+                        is_inline,
                         variadic: sig.variadic,
                         sret,
                     });
+                    ranges.push((n0, n1));
                     continue;
                 }
             }
@@ -2600,6 +2737,9 @@ impl P<'_> {
                 } else if matches!(self.tt.tys[t as usize], Ty::Func(_)) {
                     if storage == Storage::Static {
                         self.static_fns.insert(name.clone());
+                    }
+                    if !inline_fn {
+                        self.plain_decls.insert(name.clone()); // C99 6.7.4p7
                     }
                     self.fns.insert(name, t); // prototype
                 } else {
@@ -2633,6 +2773,61 @@ impl P<'_> {
             }
             self.expect(Tok::Punct(";"))?;
         }
+        // EXT(gcc): DCE hàm weak (inline) không ai với tới — như clang không
+        // phát inline chưa dùng. Bắt buộc: body inline trong header (server.h
+        // redis) tham chiếu symbol mà TU khác (redis-cli) không link.
+        // Root = mọi tham chiếu NGOÀI body các hàm weak (hàm thường, global
+        // init); lan truyền qua đồ thị gọi giữa các hàm weak.
+        let weak_idx: HashMap<&str, usize> = funcs
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_inline)
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+        if !weak_idx.is_empty() {
+            let mut in_weak = vec![false; self.nodes.len()];
+            for (i, f) in funcs.iter().enumerate() {
+                if f.is_inline {
+                    in_weak[ranges[i].0 as usize..ranges[i].1 as usize].fill(true);
+                }
+            }
+            fn refname(n: &Node) -> Option<&str> {
+                match n {
+                    Node::Call(nm, ..) | Node::FunAddr(nm) => Some(nm.as_str()),
+                    _ => None,
+                }
+            }
+            let mut used = vec![false; funcs.len()];
+            let mut queue: Vec<usize> = Vec::new();
+            for (k, n) in self.nodes.iter().enumerate() {
+                if !in_weak[k] {
+                    if let Some(&i) = refname(n).and_then(|nm| weak_idx.get(nm)) {
+                        if !used[i] {
+                            used[i] = true;
+                            queue.push(i);
+                        }
+                    }
+                }
+            }
+            while let Some(i) = queue.pop() {
+                for k in ranges[i].0..ranges[i].1 {
+                    if let Some(&j) =
+                        refname(&self.nodes[k as usize]).and_then(|nm| weak_idx.get(nm))
+                    {
+                        if !used[j] {
+                            used[j] = true;
+                            queue.push(j);
+                        }
+                    }
+                }
+            }
+            let mut i = 0;
+            funcs.retain(|f| {
+                let keep = !f.is_inline || used[i];
+                i += 1;
+                keep
+            });
+        }
         Ok(funcs)
     }
 }
@@ -2655,6 +2850,7 @@ pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast,
         strs: Vec::new(),
         fns: HashMap::new(),
         static_fns: std::collections::HashSet::new(),
+        plain_decls: std::collections::HashSet::new(),
         tags: HashMap::new(),
         typedefs: HashMap::new(),
         enums: HashMap::new(),
@@ -2665,6 +2861,7 @@ pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast,
         in_fn: false,
         attr_aligned: None,
         saw_inline: false,
+        vla_size: None,
         asm_label: None,
         renames: HashMap::new(),
         fname: String::new(),

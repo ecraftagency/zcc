@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         (Vec::<String>::new(), Vec::<String>::new(), Vec::<String>::new());
     // -l/-L giữ nguyên thứ tự CLI, forward thẳng cho ld; -MMD/-MF sinh .d cho make
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
+    let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
                     return ExitCode::SUCCESS; // configure dò `$CC -v`: phải exit 0
                 }
             }
+            "-shared" | "-dynamiclib" => shared = true,
             "-MMD" | "-MD" => depgen = true, // .d chỉ chứa header thật (nhúng <..> bỏ)
             "-MP" => {}                      // deps của mình đều 1 dòng, phony khỏi cần
             "-MF" => {
@@ -207,6 +209,9 @@ fn main() -> ExitCode {
                 let mut ld: Vec<&str> = objs.iter().map(|s| s.as_str()).collect();
                 ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L theo thứ tự CLI
                 ld.extend(["-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"]);
+                if shared {
+                    ld.push("-dylib"); // dynamic library: không cần entry _main
+                }
                 ok = run("ld", &ld);
             }
             for t in &tmps {

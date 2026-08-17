@@ -59,4 +59,8 @@ FILE *tmpfile(void);
 char *tmpnam(char *);
 void perror(const char *);
 void setbuf(FILE *, char *);
+#define _IOFBF 0 /* giá trị Darwin — lua liolib đòi */
+#define _IOLBF 1
+#define _IONBF 2
+int setvbuf(FILE *, char *, int, size_t);
 #endif
