@@ -150,19 +150,31 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
     đổi nạn nhân ngẫu nhiên theo run) + 2 file `*_ssl_conf_command.t` treo
     với CẢ cc. Bài học: `prove -j4` làm flake cert nặng thêm — triage SSL
     phải chạy tuần tự.
-- **redis tests** (`./runtest` chính chủ, lịch 156 unit, --clients 4,
-  2026-08-17): chạy tới unit 147+/156 thì crash + TIMEOUT tại các unit bật
-  `io-threads ≥ 2` (`unit/networking:232`, `unit/introspection:1114`) — tái
-  hiện được bằng rerun đơn lẻ từng unit, đúng nợ M14 `__thread` = no-op (chỉ
-  an toàn io-threads=1); trả nợ TLS thật thì mở khóa nốt. Trên đường tới đó
-  suite này bắt 1 bug thật (float.h thiếu `DBL_MANT_DIG` → Lua double2ll trả
-  0, fix 3f67a0e) + 3 bài học kit: socket path phải ngắn (`sun_path` 104 trên
-  macOS — chạy từ `/tmp/zr.*`), test modules phải build `CC=zcc LD=zcc LIBS=`
-  (Makefile modules gọi `ld` trần — fail cả với cc stock, driver mọc
-  `-bundle`/`-undefined <arg>` từ đây), cần `make all` (redis-check-aof/rdb
-  là copy của redis-server). CHÚ Ý khi đọc log: `integration/logging.tcl` CỐ
-  Ý crash server (SIGABRT/SIGSEGV) để test crash report — các block
-  `REDIS BUG REPORT` từ unit đó là hành vi đúng, không phải bug zcc.
+- **redis tests** (`./runtest` chính chủ, lịch 156 unit, 2026-08-17):
+  - Run 1 (--clients 4, build `__thread` no-op): chạy tới 147+/156 thì crash
+    tại unit io-threads ≥ 2 — đúng nợ TLS; trả nợ TLS thật (M14) mở khóa.
+  - Run 2 FULL (--clients 8, build TLS thật): **156/156 unit, 6959 ok / 6 err**
+    — 6 err ("Timeout waiting for blocked clients", 5 unit/type/list +
+    1 cluster/slot-stats) tưởng flake tải nhưng TÁI HIỆN SOLO; trọng tài
+    redis-cc cùng source chạy solo PASS SẠCH → luật "fail mới = bug zcc" nghiệm
+    đúng lần 2. Thủ phạm: **`ceill` không prototype trong math.h nhúng** →
+    implicit-int đọc x0 thay d0 → `BLPOP key <giây>` lưu timeout=0 = block
+    vĩnh viễn (mọi lệnh block theo GIÂY đi qua long double + `ceill` của
+    `getTimeoutFromObjectOrReply`; đường milliseconds đi integer nên thoát).
+    Fix: map họ `*l` về bản double trong math.h nhúng (đóng lỗ soundness của
+    lệch chuẩn long double=double; trên ELF còn né ABI fp128 glibc) + ext test
+    `c99_ldbl_mathl.c`. Rerun sau fix: unit/type/list **295 ok/0 err**,
+    slot-stats **73 ok/0 err**.
+  - Suite này tổng cộng bắt 2 bug thật: float.h thiếu `DBL_MANT_DIG` (Lua
+    double2ll trả 0, fix 3f67a0e) + ceill trên. Bài học kit: socket path phải
+    ngắn (`sun_path` 104 trên macOS — chạy từ `/tmp/zr.*`), test modules phải
+    build `CC=zcc LD=zcc LIBS=` TRƯỚC `make -C src all` (Makefile modules gọi
+    `ld` trần với SDK path chết — fail cả với cc stock), cần `make all`
+    (redis-check-aof/rdb là copy của redis-server). Triage nhanh: `./runtest
+    --single <unit> --only "<tên test>"` — KHÔNG chạy full suite khi mổ.
+    CHÚ Ý khi đọc log: `integration/logging.tcl` CỐ Ý crash server để test
+    crash report — block `REDIS BUG REPORT` từ unit đó là hành vi đúng; grep
+    đếm err phải bóc mã màu ANSI trước (`sed 's/\x1b\[[0-9;]*m//g'`).
 
 ## Bẫy đã trả học phí (đọc trước khi debug "ma")
 
@@ -172,10 +184,13 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
 - **Thuật toán offset arg sống ở 3 nơi phải khớp từng byte**: codegen
   `call()`, codegen spill prologue, parser `va_off`. Sửa 1 nơi = sửa 3 nơi,
   rồi chạy `abi.sh`.
-- **Implicit-int cắt pointer**: libc thiếu prototype trong header nhúng →
-  return int → sxtw cắt 64-bit → segfault PHỤ THUỘC ASLR (lldb tắt ASLR nên
-  không repro — heisenbug đúng nghĩa đen). Nghi crash kiểu này: `nm -u`
-  binary, đối chiếu từng symbol với `src/headers/*.h`.
+- **Implicit-int cắt pointer/double**: libc thiếu prototype trong header
+  nhúng → return int → hai biến thể: (1) pointer bị sxtw cắt 64-bit →
+  segfault PHỤ THUỘC ASLR (getprogname, lldb tắt ASLR nên không repro —
+  heisenbug đúng nghĩa đen); (2) return double nằm ở d0 nhưng caller đọc x0
+  rác → giá trị sai LẶNG LẼ, không crash (ceill → redis BLPOP timeout=0 =
+  block vĩnh viễn, fail deterministic mà nhìn như flake timing). Nghi bug
+  kiểu này: `nm -u` binary, đối chiếu từng symbol với `src/headers/*.h`.
 - **Stale .o thế hệ cũ** trong cây build ngoài → lỗi link "ma" (duplicate/
   undefined không giải thích được). Luôn `make distclean` + `rm src/*.o`
   trước khi debug lỗi link. (Mandelbug: phụ thuộc LỊCH SỬ build, không phụ

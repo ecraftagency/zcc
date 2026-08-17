@@ -39,4 +39,21 @@ double ldexp(double, int);
 long double ldexpl(long double, int);
 double frexp(double, int *);
 double modf(double, double *);
+/* long double = double (lech chuan CO CHU DICH cua zcc) — ho *l map ve ban
+   double de dong lo hong soundness: goi symbol *l that se dinh implicit-int
+   (Darwin) hoac ABI fp128 cua glibc (ELF). Bat boi redis ceill: timeout
+   BLPOP thanh 0 = block vinh vien. Chi map cac ham C89 da khai o tren. */
+#define ceill ceil
+#define floorl floor
+#define fabsl fabs
+#define sqrtl sqrt
+#define powl pow
+#define fmodl fmod
+#define expl exp
+#define logl log
+#define log10l log10
+#define sinl sin
+#define cosl cos
+#define tanl tan
+#define atan2l atan2
 #endif
