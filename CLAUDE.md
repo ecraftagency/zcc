@@ -4,7 +4,7 @@ C89 compiler viết bằng Rust. Tác giả: Vu (xưng hô "mày/tao", trả l�
 
 ## 2 yêu cầu tối thượng (mọi quyết định quy về đây)
 
-1. **Strict compliance C89** — hỗ trợ đầy đủ ngôn ngữ C89, ngữ nghĩa đúng spec. Target DUY NHẤT: executable AArch64 trên macOS Apple Silicon (Mach-O). Không x86, không Linux, không Windows.
+1. **Strict compliance C89** — hỗ trợ đầy đủ ngôn ngữ C89, ngữ nghĩa đúng spec; giai đoạn 2 mở rộng thành **C89+** (xem thang milestone). Target DUY NHẤT: executable AArch64 trên macOS Apple Silicon (Mach-O). Tương lai xa (không thiết kế trước): ELF Linux arm64 → x86_64.
 2. **Ít LOC nhất có thể** — không optimization pass (ngữ nghĩa -O0), không tính năng nào được viết trước khi có một file `.c` test đòi hỏi nó, không abstraction đón đầu, **zero external crate** (dependency cũng là LOC).
 
 Khi 2 yêu cầu xung đột: compliance thắng LOC.
@@ -45,7 +45,26 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), KHÔNG Box/r
 - **M5**: string literal, `char *`, gọi `printf` (nhớ luật varargs-lên-stack). Từ đây test diff được stdout.
 - **M6**: struct/union, typedef, enum, global variables, initializer.
 - **M7**: preprocessor C89 đầy đủ (`#include #define #if...` — macro expansion/rescan là boss thật của cả dự án).
-- **M8** (cúp): compile được `chibicc` hoặc `tcc`, binary sinh ra compile được hello world (kiểm chứng bắc cầu — thay cho self-hosting vì Rust không self-host được).
+- **M8** (cúp): compile được `chibicc` hoặc `tcc`, binary sinh ra compile được hello world (kiểm chứng bắc cầu — thay cho self-hosting vì Rust không self-host được). ĐẠT 2026-08-17, lặp lại bằng `tests/m8.sh`.
+
+## Thang milestone giai đoạn 2 — C89+ (đích: nginx + redis trên M1 Mach-O, tổng < 10k LOC)
+
+"C89+" = giữ khung C89, cherry-pick đúng phần C99/C11/GCC-extension mà nginx/redis đạp phải. KHÔNG claim C99 (không VLA, không _Complex trừ khi bị đòi). Mỗi milestone: suite cũ (run.sh, m8.sh) phải giữ xanh.
+
+**Luật decouple extension (vì mục đích sư phạm — người đọc phải phân biệt được đâu là ISO C, đâu là phương ngữ vendor):**
+- Logic extension có thịt (bảng `__builtin_*`, eval `__has_*`, skip `__attribute__`, asm-label…) sống trong **`src/ext.rs`**; core chỉ gọi ra qua hàm tên `ext_*`.
+- Điểm chạm không tách file được (nhánh parse len trong core) BẮT BUỘC đánh marker **`// EXT(gcc)`** / `// EXT(clang)` / `// EXT(apple)` / `// EXT(c99)` — `grep 'EXT(' src/` phải liệt kê đủ 100% bề mặt lệch chuẩn.
+- Tiêu chí kiểm chứng: cắt ext.rs + các nhánh có marker → phần còn lại là pure C89 compiler vẫn pass nguyên suite C89. Decouple chứng minh bằng phép cắt, không tự tuyên bố.
+- Test extension để riêng `tests/ext/` (trọng tài `cc` không kèm `-std=c89`), không trộn vào `tests/cases/`.
+
+- **M9 — driver đúng chuẩn cc** (điều kiện sống còn để tích hợp toolchain): nhiều input một lệnh (`zcc a.c b.o c.o -o app` — compile phần .c, forward tất cả .o cho ld), `-l`/`-L`, `-U`, `-MMD -MF` (make của redis cần), `-v`, exit code + diagnostic format `file:line:` chuẩn (configure grep stderr), flag lạ nuốt im lặng nhưng KHÔNG nuốt nhầm flag có tham số đi kèm (`-o` `-I`…). **Gate: build tcc bằng chính Makefile gốc của nó (không ONE_SOURCE) — nhiều .c → .o → link — rồi m8.sh vẫn pass.**
+- **M10 — ngôn ngữ C89+**: mixed declarations + decl trong `for(...)`, `long long` thật + `_Bool`, variadic macros `__VA_ARGS__`, `__typeof__`, flexible array member, `inline`/`__restrict`/`__extension__` no-op, `__attribute__` parse-skip + honor `aligned`/`packed`, `__builtin_expect/unreachable`, designated init C99 (dạng nginx/redis dùng). **Gate: mỗi feature một case trong tests/cases; chạy lại torture đo delta (các case long long/mixed-decl phải chuyển sang pass).**
+- **M11 — nuốt header THẬT của SDK** (bỏ dần stub — trả nợ library): `_Nullable` family, `__attribute__((availability...))`, blocks `^` (parse-skip ở vị trí declarator), `__asm("_rename")` (đổi symbol khi emit), `__has_include/__has_feature/__has_builtin`, `#pragma` skip. Driver mặc định `-I $SDK/usr/include` khi include không có trong embedded. **Gate: một file include `pthread.h`, `sys/socket.h`, `netinet/in.h`, `sys/event.h`, `signal.h` từ SDK thật — compile, tạo socket + kqueue, chạy đúng.**
+- **M12 — atomics + đa luồng**: `__sync_*` cơ bản (fetch_add, compare_and_swap, lock_test_and_set, synchronize) bằng ldaxr/stlxr loop; map `__atomic_*` sang cùng codegen nếu bị đòi. **Gate: test pthread N thread cùng đếm atomic counter ra kết quả đúng; `atomicvar.h` của redis chọn được path compile sạch.**
+- **M13 — nginx** (boss configure): sống qua `./configure --without-http_rewrite_module --without-http_gzip_module` (né pcre/zlib), make hết, vỡ đâu vá đó theo cuốn chiếu. **Gate: `./nginx` serve file tĩnh, `curl localhost` ra đúng nội dung, master + worker process chạy.**
+- **M14 — redis** (cúp giai đoạn 2): `make CC=zcc MALLOC=libc` — kéo theo vendored deps (lua, hiredis, linenoise) cũng compile bằng zcc. **Gate: `redis-server` chạy, `redis-cli` PING→PONG + SET/GET đúng.**
+
+Ngân sách LOC suy từ hiện trạng 5281 (2026-08-17): M9 ~150, M10 ~350, M11 ~250, M12 ~150, M13+M14 là vá không đoán trước — tổng dự kiến ~6.6k, trần cứng 10k. Stub headers (473 dòng) teo dần từ M11.
 
 ## Vòng lặp phát triển & test
 
