@@ -8,8 +8,11 @@
 # So stdout với trọng tài cc, chạy 3 lần (bẫy ASLR + bẫy scheduling).
 set -e
 cd "$(dirname "$0")/.."
-cargo build
-ZCC="$PWD/target/debug/zcc"
+# ZCC đặt sẵn từ env (box Linux) — không thì tự build
+if [ -z "$ZCC" ]; then
+    cargo build
+    ZCC="$PWD/target/debug/zcc"
+fi
 WORK="${1:-$(mktemp -d)}"
 
 cat > "$WORK/gate.c" <<'EOF'

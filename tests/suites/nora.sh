@@ -5,8 +5,11 @@
 # Gate: tập FAIL ⊆ baseline nora.known-fail.
 set -e
 cd "$(dirname "$0")/../.."
-cargo build --quiet 2>/dev/null || cargo build
-export ZCC="$PWD/target/debug/zcc"
+# ZCC đặt sẵn từ env (chạy trong box Linux, không cargo) — không thì tự build
+if [ -z "$ZCC" ]; then
+    cargo build --quiet 2>/dev/null || cargo build
+    export ZCC="$PWD/target/debug/zcc"
+fi
 C="${ZCC_SUITE_CACHE:-$HOME/.cache/zcc-suites}"
 export DIR="$C/nora/tests"
 [ -d "$DIR" ] || { echo "thiếu cache: clone nora theo tests/README.md"; exit 2; }

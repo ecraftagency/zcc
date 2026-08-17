@@ -8,8 +8,11 @@
 # Gate: tập FAIL ⊆ baseline tcc.known-fail.
 set -e
 cd "$(dirname "$0")/../.."
-cargo build --quiet 2>/dev/null || cargo build
-ZCC="$PWD/target/debug/zcc"
+# ZCC đặt sẵn từ env — không thì tự build (LƯU Ý: suite này Darwin-only, cần xcrun/SDK)
+if [ -z "$ZCC" ]; then
+    cargo build --quiet 2>/dev/null || cargo build
+    ZCC="$PWD/target/debug/zcc"
+fi
 C="${ZCC_SUITE_CACHE:-$HOME/.cache/zcc-suites}"
 SRC="$C/tinycc"
 [ -d "$SRC" ] || git clone --depth 1 https://github.com/TinyCC/tinycc.git "$SRC"
