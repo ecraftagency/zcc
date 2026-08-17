@@ -216,4 +216,5 @@ def write_fold(outdir, folds):
                      % ("\n".join(e for e, _ in ch),
                         "\n".join("    " + p for _, p in ch)))
 
-main(sys.argv[1])
+if __name__ == "__main__":
+    main(sys.argv[1])

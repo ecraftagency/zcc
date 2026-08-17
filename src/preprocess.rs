@@ -833,7 +833,7 @@ fn eval_if(
     if p != ts.len() {
         return Err(err(file, lno, "token thừa trong biểu thức #if"));
     }
-    Ok(v != 0)
+    Ok(v.0 != 0)
 }
 
 // resolve defined(X) / __has_include(...) thành 0|1 trong biểu thức #if
@@ -930,7 +930,13 @@ fn eat(ts: &[Tok], p: &mut usize, op: &str) -> bool {
     }
 }
 
-fn ternary(ts: &[Tok], p: &mut usize) -> Result<i64, String> {
+// Giá trị #if = (bit, unsigned): C89 3.8.1 — mọi số học trong #if tính bằng
+// long/unsigned long, UAC thu về 1 bit "có toán hạng unsigned không". Bỏ bit
+// này (eval thuần i64) là sai / % >> so-sánh khi trộn dấu: -1L < 0xFF..FFUL
+// phải bằng 0. Bug bắt bởi tests/cpp.sh (họ F, vét cạn #if).
+type PV = (i64, bool);
+
+fn ternary(ts: &[Tok], p: &mut usize) -> Result<PV, String> {
     let c = binlv(ts, p, 0)?;
     if !eat(ts, p, "?") {
         return Ok(c);
@@ -940,7 +946,8 @@ fn ternary(ts: &[Tok], p: &mut usize) -> Result<i64, String> {
         return Err("thiếu ':' của '?'".into());
     }
     let b = ternary(ts, p)?;
-    Ok(if c != 0 { a } else { b })
+    // kiểu chung của ?: là UAC hai nhánh, giá trị lấy theo nhánh chọn
+    Ok((if c.0 != 0 { a.0 } else { b.0 }, a.1 | b.1))
 }
 
 // Bậc ưu tiên nhị phân C, thấp → cao.
@@ -957,7 +964,7 @@ const LEVELS: [&[&str]; 10] = [
     &["*", "/", "%"],
 ];
 
-fn binlv(ts: &[Tok], p: &mut usize, lv: usize) -> Result<i64, String> {
+fn binlv(ts: &[Tok], p: &mut usize, lv: usize) -> Result<PV, String> {
     if lv == LEVELS.len() {
         return unary(ts, p);
     }
@@ -969,40 +976,52 @@ fn binlv(ts: &[Tok], p: &mut usize, lv: usize) -> Result<i64, String> {
         };
         *p += 1;
         let r = binlv(ts, p, lv + 1)?;
+        let u = l.1 | r.1; // UAC: một bên unsigned → phép toán unsigned
+        let b = |x: bool| (x as i64, false);
         // wrapping: overflow là UB bên C, đừng panic bên Rust
         l = match op {
-            "||" => (l != 0 || r != 0) as i64,
-            "&&" => (l != 0 && r != 0) as i64,
-            "|" => l | r,
-            "^" => l ^ r,
-            "&" => l & r,
-            "==" => (l == r) as i64,
-            "!=" => (l != r) as i64,
-            "<" => (l < r) as i64,
-            ">" => (l > r) as i64,
-            "<=" => (l <= r) as i64,
-            ">=" => (l >= r) as i64,
-            "<<" => l.wrapping_shl(r as u32),
-            ">>" => l.wrapping_shr(r as u32),
-            "+" => l.wrapping_add(r),
-            "-" => l.wrapping_sub(r),
-            "*" => l.wrapping_mul(r),
+            "||" => b(l.0 != 0 || r.0 != 0),
+            "&&" => b(l.0 != 0 && r.0 != 0),
+            "|" => (l.0 | r.0, u),
+            "^" => (l.0 ^ r.0, u),
+            "&" => (l.0 & r.0, u),
+            "==" => b(l.0 == r.0),
+            "!=" => b(l.0 != r.0),
+            "<" if u => b((l.0 as u64) < (r.0 as u64)),
+            ">" if u => b((l.0 as u64) > (r.0 as u64)),
+            "<=" if u => b((l.0 as u64) <= (r.0 as u64)),
+            ">=" if u => b((l.0 as u64) >= (r.0 as u64)),
+            "<" => b(l.0 < r.0),
+            ">" => b(l.0 > r.0),
+            "<=" => b(l.0 <= r.0),
+            ">=" => b(l.0 >= r.0),
+            // shift: kiểu kết quả = kiểu VẾ TRÁI (3.3.7 — không UAC)
+            "<<" => (l.0.wrapping_shl(r.0 as u32), l.1),
+            ">>" if l.1 => (((l.0 as u64).wrapping_shr(r.0 as u32)) as i64, true),
+            ">>" => (l.0.wrapping_shr(r.0 as u32), l.1),
+            "+" => (l.0.wrapping_add(r.0), u),
+            "-" => (l.0.wrapping_sub(r.0), u),
+            "*" => (l.0.wrapping_mul(r.0), u),
             // chia 0 trong nhánh chết của && || phải vô hại (eval eager) → cho 0
-            "/" | "%" if r == 0 => 0,
-            "/" => l.wrapping_div(r),
-            "%" => l.wrapping_rem(r),
+            "/" | "%" if r.0 == 0 => (0, u),
+            "/" if u => (((l.0 as u64) / (r.0 as u64)) as i64, true),
+            "%" if u => (((l.0 as u64) % (r.0 as u64)) as i64, true),
+            "/" => (l.0.wrapping_div(r.0), false),
+            "%" => (l.0.wrapping_rem(r.0), false),
             _ => unreachable!(),
         };
     }
 }
 
-fn unary(ts: &[Tok], p: &mut usize) -> Result<i64, String> {
+fn unary(ts: &[Tok], p: &mut usize) -> Result<PV, String> {
     if eat(ts, p, "!") {
-        Ok((unary(ts, p)? == 0) as i64)
+        Ok(((unary(ts, p)?.0 == 0) as i64, false))
     } else if eat(ts, p, "~") {
-        Ok(!unary(ts, p)?)
+        let v = unary(ts, p)?;
+        Ok((!v.0, v.1))
     } else if eat(ts, p, "-") {
-        Ok(unary(ts, p)?.wrapping_neg())
+        let v = unary(ts, p)?;
+        Ok((v.0.wrapping_neg(), v.1))
     } else if eat(ts, p, "+") {
         unary(ts, p)
     } else if eat(ts, p, "(") {
@@ -1011,9 +1030,9 @@ fn unary(ts: &[Tok], p: &mut usize) -> Result<i64, String> {
             return Err("thiếu ')' trong #if".into());
         }
         Ok(v)
-    } else if let Some(&Tok::Num(n, _)) = ts.get(*p) {
+    } else if let Some(&Tok::Num(n, k)) = ts.get(*p) {
         *p += 1;
-        Ok(n)
+        Ok((n, matches!(k, NumK::U | NumK::UL)))
     } else {
         Err("biểu thức #if hỏng".into())
     }
