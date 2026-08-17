@@ -35,6 +35,7 @@ fn main() -> ExitCode {
     // -l/-L giữ nguyên thứ tự CLI, forward thẳng cho ld; -MMD/-MF sinh .d cho make
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
     let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
+    let (mut nostdinc, mut bundle) = (false, false);
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -64,6 +65,15 @@ fn main() -> ExitCode {
                 }
             }
             "-shared" | "-dynamiclib" => shared = true,
+            "-bundle" => bundle = true, // Mach-O bundle (redis test modules dlopen)
+            "-undefined" => {
+                // "-undefined dynamic_lookup": forward nguyên cặp cho ld (module
+                // tham chiếu RedisModule_* resolve lúc runtime)
+                i += 1;
+                libs.push("-undefined".to_string());
+                libs.push(args.get(i).cloned().unwrap_or_default());
+            }
+            "-nostdinc" => nostdinc = true, // musl: chỉ dùng -I, bỏ header nhúng + SDK
             "-MMD" | "-MD" => depgen = true, // .d chỉ chứa header thật (nhúng <..> bỏ)
             "-MP" => {}                      // deps của mình đều 1 dòng, phony khỏi cần
             "-MF" => {
@@ -96,8 +106,11 @@ fn main() -> ExitCode {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     // M11: header không phải nhúng và không thấy ở -I → tra SDK thật (ưu tiên CUỐI,
-    // sau mọi -I của user; header nhúng vẫn thắng cho 25 tên libc cơ bản)
-    if !sdk.is_empty() {
+    // sau mọi -I của user; header nhúng vẫn thắng cho 25 tên libc cơ bản).
+    // -nostdinc (chuẩn cc): sentinel \x01 đầu incs tắt bảng nhúng, không thêm SDK.
+    if nostdinc {
+        incs.insert(0, "\u{1}nostdinc".to_string());
+    } else if !sdk.is_empty() {
         incs.push(format!("{}/usr/include", sdk));
     }
     // .c → (asm text, danh sách file thật đã đọc — cho -MMD); .o/.a đi thẳng linker
@@ -211,6 +224,9 @@ fn main() -> ExitCode {
                 ld.extend(["-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"]);
                 if shared {
                     ld.push("-dylib"); // dynamic library: không cần entry _main
+                }
+                if bundle {
+                    ld.push("-bundle");
                 }
                 ok = run("ld", &ld);
             }

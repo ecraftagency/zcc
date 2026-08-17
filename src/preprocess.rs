@@ -204,6 +204,10 @@ pub fn preprocess(
 fn inc_find(incs: &[String], name: &str) -> Option<String> {
     incs.iter().map(|d| format!("{}/{}", d, name)).find(|p| std::path::Path::new(p).exists())
 }
+// -nostdinc: driver cắm sentinel \x01 đầu incs → bỏ bảng header nhúng (musl)
+fn no_stdinc(incs: &[String]) -> bool {
+    incs.first().is_some_and(|s| s.starts_with('\u{1}'))
+}
 
 fn synth(tok: Tok) -> PTok {
     PTok { tok, bol: false, ws: true, line: 0, file: 0, hide: Vec::new(), raw: String::new() }
@@ -406,7 +410,9 @@ fn process(
                     // không có file thật → thử bảng header nhúng ("stddef.h"...)
                     let mut path = path;
                     if !std::path::Path::new(&path).exists() {
-                        if let Some((_, src)) = HEADERS.iter().find(|(n, _)| *n == bare) {
+                        if let Some((_, src)) =
+                            HEADERS.iter().find(|(n, _)| *n == bare && !no_stdinc(incs))
+                        {
                             let hname = format!("<{}>", bare);
                             let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
                             files.push(hname.clone());
@@ -432,7 +438,11 @@ fn process(
                         k += 1;
                     }
                     // header nhúng thắng (libc stub của zcc); không có thì tra -I
-                    match HEADERS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s) {
+                    match HEADERS
+                        .iter()
+                        .find(|(n, _)| *n == name && !no_stdinc(incs))
+                        .map(|(_, s)| *s)
+                    {
                         Some(src) => {
                             let hname = format!("<{}>", name);
                             let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
@@ -911,7 +921,8 @@ fn if_resolve(
             }
             i += 1;
             let found = !next
-                && (HEADERS.iter().any(|(n, _)| *n == name) || inc_find(incs, &name).is_some());
+                && ((!no_stdinc(incs) && HEADERS.iter().any(|(n, _)| *n == name))
+                    || inc_find(incs, &name).is_some());
             pre.push(synth(Tok::Num(found as i64, NumK::I)));
         } else {
             pre.push(d[i].clone());

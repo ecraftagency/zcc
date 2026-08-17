@@ -72,6 +72,21 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), KHÔNG Box/r
 
 Ngân sách LOC suy từ hiện trạng 5281 (2026-08-17): M9 ~150, M10 ~350, M11 ~250, M12 ~150, M13+M14 là vá không đoán trước — tổng dự kiến ~6.6k, trần cứng 10k. **Chốt sổ giai đoạn 2 (2026-08-17): 6107 LOC Rust + 333 dòng stub headers — dưới dự kiến 6.6k, còn xa trần 10k.**
 
+## Thang milestone giai đoạn 3 — đa target ELF (chốt hướng 2026-08-17, chưa khởi công)
+
+Quyết định đã chốt với Vu: mở **arm64 ELF Linux trước, x86_64 ELF sau** (đảo được vì arm64 ELF tái dùng instruction selection sẵn có; chạy native trong Docker/OrbStack trên M1). **Windows/PE: BỎ** — LLP64 phá tiền đề LP64 lock của frontend + chiến dịch header MinGW thứ hai + thủng trần 10k; dev Windows ăn qua WSL2 với binary ELF, zero LOC. Ngân sách ước: M15 +~1.2k, M16 +~1.8k → ~9.2k, còn buffer mỏng dưới trần.
+
+- **M15 — arm64 ELF Linux**: file `codegen/arm64_elf.rs` + flag `--target`. Phần rẻ (thay chuỗi ~20 điểm): section ELF (`.text/.data/.rodata/.bss/.weak`), bỏ prefix `_`, reloc `:lo12:`/`:got:` thay `@PAGE`/`@GOTPAGE`, bỏ `.subsections_via_symbols`; bảng predefine theo target (`__linux__ __ELF__`, bỏ họ `__APPLE__`). Phần thịt: (1) **va_list = struct 32 byte AAPCS** (`__stack/__gr_top/__vr_top/__gr_offs/__vr_offs`) + register-save area trong prologue — món to nhất ~200 LOC; (2) variadic vô danh vào x0–x7/v0–v7 như named (bỏ đặc sản Apple stack-only); (3) stack args slot 8 tròn (bỏ packing natural-align — đơn giản hóa cả 3 nơi khớp-từng-byte); (4) **`char` mặc định unsigned trên Linux arm64** — thấm lexer/parser, phải tham số hóa xuyên boundary; (5) `long double`: GIỮ = double, lệch chuẩn CÓ CHỦ ĐÍCH (Linux đòi quad IEEE 128 — fp128 phi lý với ngân sách; `%Lf` sẽ sai, ai đạp thì tính). Toolchain: cross-compile zcc thành binary Linux (`aarch64-unknown-linux-musl` static) chạy trong box, as/ld binutils native trong box. .so ELF: khi `-shared` mọi truy cập global qua GOT. **Gate: abi.sh + alg.sh chạy NGUYÊN XI trong box với trọng tài gcc** — bộ gate khoa học thành cross-target proof.
+- **M16 — x86_64 ELF**: instruction selection mới + SysV classification (boss ABI cuối cùng). TyTab tham số hóa size/align làm từ M15.
+- **Nợ tồn giai đoạn 2 (trả dần trong M15/M16, đã có harness sẵn):**
+  - nginx-tests chạy lại với zcc hiện hành + prove full log (điểm cũ 493 file/2491 test PASS nhưng log cụt mất số skip, binary build trước 3 bug fix 2026-08-17).
+  - `tests/suites/tcc.sh` (suite 6, VIẾT RỒI chưa chạy): tcc build 2 lần cc/zcc, chạy tests2 của chính tcc, cần smoke + đóng baseline.
+  - `tests/suites/musl.sh` (suite 7, VIẾT RỒI, HOÃN): compile-only trên Darwin; thăng cấp thành build thật + libc-test khi M15 có box Linux.
+  - Driver harness riêng (flag matrix: -nostdinc/-bundle/-undefined/-MMD/-shared… hiện chỉ được test gián tiếp qua m9/m13/m14).
+  - Probe coreutils/sbase configure để đo bề mặt fail (hướng "build phần mềm kinh điển" của Vu; sbase trước — C sạch, GNU coreutils = đánh nhau với gnulib).
+  - TLS thật cho `__thread` (Mach-O `@TLVP` / ELF TLS model) — nợ từ M14. ĐÃ CÓ CHỦ NỢ: redis-tests chính chủ chạy tới 147+/156 unit rồi crash+TIMEOUT đúng tại các unit bật `io-threads ≥ 2` (unit/networking, unit/introspection — tái hiện bằng rerun đơn lẻ). Trả nợ TLS = full pass suite redis. Chi tiết + bài học kit: tests/README.md mục "Suite chính chủ".
+  - Tổ chức ext theo vendor (ý Vu 2026-08-17): marker `EXT(vendor)` đã group ĐỦ về logic (grep được, kể cả nhánh trong core không tách file nổi); khi ext.rs vượt ~300 LOC thì nâng lên group vật lý `ext/gcc.rs, ext/clang.rs, ext/apple.rs…` — trước ngưỡng đó là abstraction đón đầu. Quy ước attribution: ghi theo phương ngữ GỐC (clang nuốt ext của gcc thì vẫn là EXT(gcc)).
+
 ## Vòng lặp phát triển & test
 
 - Test harness: `tests/run.sh` — mỗi case `tests/cases/*.c` compile bằng cả `cc -std=c89 -O0` (trọng tài) lẫn zcc, chạy hai binary, diff exit code (sau M5: diff cả stdout).

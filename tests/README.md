@@ -111,6 +111,25 @@ Nguyên tắc baseline: mỗi dòng known-fail phải có lời giải thích tr
 trên (hoặc commit message thêm nó). Baseline KHÔNG phải thùng rác giấu bug —
 fail mới không giải thích được = bug zcc cho tới khi chứng minh ngược lại.
 
+## Suite chính chủ nginx/redis (trụ 3 — phần mềm thật tự kiểm chứng chính nó)
+
+- **nginx-tests** (nginx.org/tests): 493 file / 2491 test PASS (2026-08-17).
+  Nợ đã ghi: log cụt mất số skip + binary build TRƯỚC 3 bug fix cùng ngày →
+  phải rerun full-log bằng zcc hiện hành (nợ giai đoạn 3, xem CLAUDE.md).
+- **redis tests** (`./runtest` chính chủ, lịch 156 unit, --clients 4,
+  2026-08-17): chạy tới unit 147+/156 thì crash + TIMEOUT tại các unit bật
+  `io-threads ≥ 2` (`unit/networking:232`, `unit/introspection:1114`) — tái
+  hiện được bằng rerun đơn lẻ từng unit, đúng nợ M14 `__thread` = no-op (chỉ
+  an toàn io-threads=1); trả nợ TLS thật thì mở khóa nốt. Trên đường tới đó
+  suite này bắt 1 bug thật (float.h thiếu `DBL_MANT_DIG` → Lua double2ll trả
+  0, fix 3f67a0e) + 3 bài học kit: socket path phải ngắn (`sun_path` 104 trên
+  macOS — chạy từ `/tmp/zr.*`), test modules phải build `CC=zcc LD=zcc LIBS=`
+  (Makefile modules gọi `ld` trần — fail cả với cc stock, driver mọc
+  `-bundle`/`-undefined <arg>` từ đây), cần `make all` (redis-check-aof/rdb
+  là copy của redis-server). CHÚ Ý khi đọc log: `integration/logging.tcl` CỐ
+  Ý crash server (SIGABRT/SIGSEGV) để test crash report — các block
+  `REDIS BUG REPORT` từ unit đó là hành vi đúng, không phải bug zcc.
+
 ## Bẫy đã trả học phí (đọc trước khi debug "ma")
 
 - **Lỗi ABI cùng-compiler tự triệt tiêu** — nginx/redis chạy ngon suốt vẫn
