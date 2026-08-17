@@ -1,3 +1,4 @@
 /target
 /tests/out
 chat.txt
+tests/__pycache__/
