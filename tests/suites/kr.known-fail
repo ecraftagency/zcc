@@ -1,0 +1,11 @@
+FAIL 01.06-arrays_e.1.13-length_histogram
+FAIL 02.06-relational_and_logical_operators_e-2.2-loop
+FAIL 02.09-bitwise_operators_e-2.6-setbits
+FAIL 02.09-bitwise_operators_e-2.7-invert
+FAIL 02.09-bitwise_operators_e-2.8-rightrot
+FAIL 03.05-loops_while_and_for_e-3.3-expand
+FAIL 03.05-loops_while_and_for_ex-atoi
+FAIL 03.06-loops_do_while_e-3.6-itoa
+FAIL 05.02-pointers_and_function_arguments_e-5.2-getfloat
+FAIL 05.02-pointers_and_function_arguments_ex-getint
+FAIL 08.06-example_listing_directories_ex-fsize

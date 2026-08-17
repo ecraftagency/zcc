@@ -52,6 +52,7 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
         b'b' => 8,
         b'f' => 12,
         b'v' => 11,
+        b'e' => 27, // EXT(gcc): \e = ESC (chibicc test/string.c đòi)
         b'\\' | b'\'' | b'"' | b'?' => c as u32,
         b'x' => {
             let mut v = 0u32;
@@ -74,7 +75,9 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
             }
             v
         }
-        _ => return Err(format!("escape lạ '\\{}'", c as char)),
+        // escape không định nghĩa: C89 3.1.3.4 để UB — theo gcc/clang cho
+        // identity ('\j' == 'j'; chibicc test/string.c assert đúng điều này)
+        _ => c as u32,
     })
 }
 

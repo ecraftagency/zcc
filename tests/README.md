@@ -90,20 +90,26 @@ Mọi phép RÚT GỌN coverage phải kèm lý do soundness đọc được t�
 - `m14.sh` — redis: clone sạch → make CC=zcc MALLOC=libc (deps vendored đi
   qua zcc hết) → PING/SET/GET/INCR đúng. **Cúp giai đoạn 2.**
 
-## Tài sản NGOÀI repo (dựng lại được, không commit vì là repo người khác)
+## Suite công nghiệp ngoài — `tests/suites/*.sh` (trụ 2)
 
-Bốn suite ngoài từng chạy thời M8 (harness gốc nằm ở scratchpad session cũ,
-đã mất — con số là điểm chốt cuối 2026-08-17):
+Harness trong repo, source suite cache ở `~/.cache/zcc-suites`
+(`ZCC_SUITE_CACHE` đổi được; mất cache thì clone lại theo bảng). Khuôn chung:
+referee-filter (case `cc -std=c89` không nhận = ngoài scope → skip),
+differential exit+stdout, **gate = tập FAIL ⊆ baseline `*.known-fail`** đã
+triage từng dòng. CHẠY TUẦN TỰ từng suite — mỗi cái đã ăn đủ 8 core, chạy đè
+nhau là nghẽn (đã trả học phí).
 
-| Suite | Nguồn | Điểm chốt | Cách dựng lại |
+| Suite | Nguồn (clone --depth 1) | Điểm 2026-08-17 | Ghi chú triage baseline |
 |---|---|---|---|
-| c-testsuite | github.com/c-testsuite/c-testsuite | 217/220 (fail: VLA/_Generic — ngoài C89) | clone; với mỗi `tests/single-exec/*.c`: compile zcc vs `cc -std=c89 -w -O0`, diff exit+stdout |
-| GCC torture | gcc/testsuite/gcc.c-torture/execute | 1374/1481, 213 skip (vector_size, _Complex, VLA... ngoài scope) | clone gcc (mirror), lọc file cc -std=c89 compile được làm referee, diff |
-| chibicc test | github.com/rui314/chibicc | 13/14 (fail: VLA) | clone, chạy test/*.c qua zcc |
-| Nora Sandler | github.com/nlsandler/writing-a-c-compiler-tests | valid 772/772 | clone, chạy valid/ qua zcc, diff với cc |
+| `torture.sh` | gcc-mirror/gcc (sparse `gcc/testsuite/gcc.c-torture/execute`) | 1389 pass, 213 skip, 92 fail baselined / 1694 | fail toàn ext ngoài scope: 28 vector_size, 21 _Complex, 25 `__builtin_*` (abort/…_overflow/llabs-as-builtin), 4 VLA, 4 attribute corner, 3 predef macro gcc (`__FLT_MIN__`…), 2 hex-float C99, case range, `{}` rỗng, wchar, 1 source Latin-1 (zcc đòi UTF-8). Lần chạy đầu bắt 2 bug THẬT đã fix: pr60017 (global init bitfield phát trọn container → đè member chen byte trống — Itanium), pr33631 (designator không bị tiêu thụ khi elision descend → parser lặp VÔ HẠN; kéo theo fix `[1] = 5` mảng lồng apply desig 2 lần) |
+| `cts.sh` | c-testsuite/c-testsuite | 218/220 | 00162 = C99 array-qualifier `[const 5]`; 00219 = C11 `_Generic` |
+| `nora.sh` | nlsandler/writing-a-c-compiler-tests | 555 pass, 137 skip, 0 fail | skip = referee c89 từ chối (chương ngoài C89) |
+| `chibicc.sh` | rui314/chibicc | 14 pass, 24 skip, 3 fail | string = C11 `u""`; typeof trần = TỪ CHỐI CÓ CHỦ ĐÍCH (va tên biến C89 — xem parser.rs); vla ngoài subset; skip gồm cả test referee tự fail trên arm64 (oracle vô hiệu) |
+| `kr.sh` | caisah/K-and-R-exercises-and-examples | 87 pass, 30 skip, 11 fail | fail = UB của CHÍNH bài tập (scanf fail → đọc biến chưa init, itoa off-by-one, fsize đọc directory) — rác stack đổi theo run nên baseline so THEO TÊN, hội tụ sau vài lần chạy; mọi entrant mới phải triage tay trước khi thêm |
 
-Khi cần chạy lại: viết harness ~20 dòng sh theo đúng khuôn `run.sh` (compile
-hai bên, diff exit + stdout). Đừng commit source suite ngoài vào repo.
+Nguyên tắc baseline: mỗi dòng known-fail phải có lời giải thích trong bảng
+trên (hoặc commit message thêm nó). Baseline KHÔNG phải thùng rác giấu bug —
+fail mới không giải thích được = bug zcc cho tới khi chứng minh ngược lại.
 
 ## Bẫy đã trả học phí (đọc trước khi debug "ma")
 

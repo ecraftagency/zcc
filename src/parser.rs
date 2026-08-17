@@ -1571,9 +1571,15 @@ impl P<'_> {
             Ty::Array(e, n) => {
                 let esz = self.tt.size(e);
                 let (mut i, mut cnt) = (0u32, 0u32);
-                while let Some((d, _)) = it.peek() {
+                while let Some((d, _)) = it.peek_mut() {
                     match d {
-                        Desig::Idx(k) => i = *k, // quay lui index TRƯỚC khi xét đầy
+                        // quay lui index TRƯỚC khi xét đầy; desig của tầng NÀY dùng
+                        // xong phải XÓA — elision descend giữ chung iterator, tầng
+                        // trong thấy lại sẽ apply nhầm (hoặc lặp vô hạn với Mem)
+                        Desig::Idx(k) => {
+                            i = *k;
+                            *d = Desig::No;
+                        }
                         Desig::Rng(lo, hi) => {
                             let (lo, hi) = (*lo, *hi);
                             let init = it.next().unwrap().1;
@@ -1606,12 +1612,17 @@ impl P<'_> {
                     if let Some((Desig::Mem(nm), _)) = it.peek() {
                         // designator quay lui cursor TRƯỚC khi xét đầy; không thấy
                         // trực tiếp thì trỏ vào anon member chứa nó (descend tự tìm lại)
-                        i = match members.iter().position(|(mn, ..)| mn == nm) {
-                            Some(k) => k,
+                        let nm = nm.clone();
+                        i = match members.iter().position(|(mn, ..)| *mn == nm) {
+                            Some(k) => {
+                                // desig tầng NÀY đã dùng: xóa kẻo tầng trong lặp vô hạn
+                                it.peek_mut().unwrap().0 = Desig::No;
+                                k
+                            }
                             None => match members.iter().position(|(mn, mt2, _)| {
                                 mn.is_empty()
                                     && matches!(self.tt.tys[*mt2 as usize], Ty::Struct(s2)
-                                        if self.find_member(s2, nm).is_some())
+                                        if self.find_member(s2, &nm).is_some())
                             }) {
                                 Some(k) => k,
                                 None => break, // member của tầng NGOÀI → trả cursor về caller
@@ -1749,6 +1760,11 @@ impl P<'_> {
                     return matches!(self.tt.tys[g.ty as usize], Ty::Array(..) | Ty::Func(_))
                         .then(|| (g.name.clone(), 0));
                 }
+                // decay MEMBER kiểu mảng: int *p = g.a.arr (C89 3.4 address
+                // constant qua path . -> [] — chibicc initializer.c đòi)
+                Node::Member(..) if matches!(self.tt.tys[self.ty(e) as usize], Ty::Array(..)) => {
+                    return self.glval(e);
+                }
                 Node::Bin(op @ ("+" | "-"), l, r) => {
                     let (s, k) = self.gaddr(*l)?;
                     let d = self.fold(*r).ok()?;
@@ -1859,6 +1875,7 @@ impl P<'_> {
         flat: Vec<(u32, TypeId, FlatItem)>,
     ) -> Result<GInit, String> {
         let mut list: Vec<(u32, u32, GInit)> = Vec::new();
+        let mut bfs: Vec<(u32, u32, u128)> = Vec::new(); // bitfield: (byte đầu, byte sau cuối, ảnh bit)
         for (off, mt, item) in flat {
             match item {
                 FlatItem::E(e) => {
@@ -1878,17 +1895,14 @@ impl P<'_> {
                             continue;
                         }
                     }
-                    // bitfield: gộp (OR) các field chung một đơn vị chứa
-                    if let Ty::Bitfield(b, boff, w) = self.tt.tys[mt as usize] {
-                        let mask = (!0u64 >> (64 - w)) as i64; // w ≥ 1 (w=0 không có tên field)
-                        let v = (self.fold(e)? & mask) << boff;
-                        if let Some(p) = list.iter_mut().find(|x| x.0 == off) {
-                            if let GInit::Num(old) = p.2 {
-                                p.2 = GInit::Num(old | v);
-                                continue;
-                            }
-                        }
-                        list.push((off, self.tt.size(b), GInit::Num(v)));
+                    // bitfield: chỉ phát ĐÚNG dải byte field chiếm — Itanium cho
+                    // member thường chen vào byte trống của container, phát trọn
+                    // container sẽ đè/trôi hàng xóm (gdata List không quay lui)
+                    if let Ty::Bitfield(_, boff, w) = self.tt.tys[mt as usize] {
+                        let mask = !0u64 >> (64 - w); // w ≥ 1 (w=0 không có tên field)
+                        let v = (self.fold(e)? as u64) & mask;
+                        let (s0, s1) = (off + boff / 8, off + (boff + w).div_ceil(8));
+                        bfs.push((s0, s1, (v as u128) << (boff % 8)));
                         continue;
                     }
                     let gi = self.gitem(e, mt)?;
@@ -1899,6 +1913,22 @@ impl P<'_> {
                     list.push((off, n, GInit::Bytes(b)));
                 }
             }
+        }
+        // các field giao byte nhau (chung container) OR thành một dải Bytes
+        bfs.sort_by_key(|x| x.0);
+        let mut runs: Vec<(u32, u32, u128)> = Vec::new();
+        for (s0, s1, img) in bfs {
+            match runs.last_mut() {
+                Some(r) if s0 < r.1 => {
+                    r.2 |= img << ((s0 - r.0) * 8);
+                    r.1 = r.1.max(s1);
+                }
+                _ => runs.push((s0, s1, img)),
+            }
+        }
+        for (s0, s1, img) in runs {
+            let bytes: Vec<u8> = (0..s1 - s0).map(|k| (img >> (8 * k)) as u8).collect();
+            list.push((s0, s1 - s0, GInit::Bytes(bytes)));
         }
         // designator có thể ra ngoài thứ tự / ghi đè: sort ổn định + giữ bản CUỐI
         list.sort_by_key(|x| x.0);

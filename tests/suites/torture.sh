@@ -16,8 +16,8 @@ export DIR="$C/gcc/gcc/testsuite/gcc.c-torture/execute"
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
-ls "$DIR"/*.c | xargs -P 8 -I{} sh -c '
-    f="{}"; b=$(basename "$f" .c)
+ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
+    f="$1"; b=$(basename "$f" .c)
     cc -std=c89 -w -O0 "$f" -o "$D/$b.cc" 2>/dev/null || { echo "skip $b"; exit 0; }
     perl -e "alarm 10; exec @ARGV" "$D/$b.cc" >/dev/null 2>&1 || { echo "skip $b"; exit 0; }
     if "$ZCC" "$f" -o "$D/$b.z" 2>/dev/null \
@@ -26,11 +26,12 @@ ls "$DIR"/*.c | xargs -P 8 -I{} sh -c '
     else
         echo "FAIL $b"
     fi
-' > "$D/res"
+' sh > "$D/res"
 
 p=$(grep -c '^pass' "$D/res" || true); s=$(grep -c '^skip' "$D/res" || true)
 grep '^FAIL' "$D/res" | sort > "$D/fails"
-new=$(comm -23 "$D/fails" <(sort "$(dirname "$0")/torture.known-fail" 2>/dev/null || :) || true)
+sort "$(dirname "$0")/torture.known-fail" > "$D/known" 2>/dev/null || : > "$D/known"
+new=$(comm -23 "$D/fails" "$D/known" || true)
 echo "torture: $p pass, $s skip, $(wc -l < "$D/fails" | tr -d ' ') fail"
 if [ -n "$new" ]; then
     echo "TORTURE FAIL MỚI (ngoài baseline):"; echo "$new" | head -20; exit 1
