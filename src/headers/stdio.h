@@ -5,6 +5,7 @@
 typedef unsigned long size_t;
 #endif
 typedef struct __sFILE FILE;
+extern const int sys_nerr; /* nginx dò NGX_SYS_NERR qua biến này */
 extern FILE *__stdinp;
 extern FILE *__stdoutp;
 extern FILE *__stderrp;

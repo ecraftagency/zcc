@@ -10,6 +10,17 @@ use crate::ast::SyncOp;
 // (add_and_fetch, sub_and_fetch, fetch_and_add, bool_compare_and_swap),
 // postgres s_lock (lock_test_and_set, lock_release); val_compare_and_swap và
 // fetch_and_sub thêm vì cùng khuôn codegen, coi như miễn phí.
+// EXT(clang): họ operator __has_* trong #if (M13 — TargetConditionals.h,
+// arm/_types.h gọi TRƯỚC khi cdefs.h kịp fallback-define). __has_include xử lý
+// riêng (phải tra file thật); các tên này "defined" sẵn và luôn eval 0 —
+// "không có feature" là câu trả lời an toàn vì SDK luôn có nhánh fallback.
+pub fn has_operator_zero(name: &str) -> bool {
+    matches!(
+        name,
+        "__has_feature" | "__has_extension" | "__has_builtin" | "__has_attribute"
+    )
+}
+
 pub fn sync_op(name: &str) -> Option<(SyncOp, usize)> {
     Some(match name {
         "__sync_fetch_and_add" => (SyncOp::FetchAdd, 2),

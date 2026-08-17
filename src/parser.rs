@@ -77,6 +77,7 @@ struct P<'a> {
     va_off: u32,  // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
     in_fn: bool,  // đang trong body hàm (compound literal: local vs global ẩn)
     attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
+    saw_inline: bool, // EXT(gcc): decl_specs vừa gặp inline/__inline (gnu89)
     fname: String, // tên hàm đang parse (label symbol cho &&label trong static init)
     asm_label: Option<String>, // EXT(gcc): __asm("_sym") vừa nuốt trong skip_attrs
     renames: HashMap<String, String>, // EXT(gcc): tên C → symbol __asm (SDK versioning)
@@ -279,6 +280,7 @@ impl P<'_> {
     // None = token hiện tại không mở đầu một declaration
     fn decl_specs(&mut self) -> Result<Option<(TypeId, Storage)>, String> {
         self.attr_aligned = None; // của declaration trước, không lây
+        self.saw_inline = false;
         let mut storage = Storage::None;
         let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
         let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
@@ -288,10 +290,13 @@ impl P<'_> {
                 _ => break,
             };
             match n {
-                "const" | "volatile" | "auto" | "register" | "inline" | "__inline"
-                | "__inline__" | "restrict" | "__restrict" | "__restrict__"
-                | "__extension__" | "__volatile" | "__volatile__" | "__const" | "__const__"
-                | "_Noreturn" => {}
+                "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict"
+                | "__restrict__" | "__extension__" | "__volatile" | "__volatile__"
+                | "__const" | "__const__" | "_Noreturn" => {}
+                // EXT(gcc): inline — zcc không có inliner; definition inline sẽ hạ
+                // về static (mỗi TU một bản, như nhánh "static __inline" của cdefs.h)
+                // để "extern __inline" gnu89 của SDK không phát duplicate symbol
+                "inline" | "__inline" | "__inline__" => self.saw_inline = true,
                 // EXT(clang): nullability — no-op về ngữ nghĩa
                 "_Nullable" | "_Nonnull" | "_Null_unspecified" => {}
                 "__attribute__" | "__asm__" | "__asm" => {
@@ -2472,6 +2477,8 @@ impl P<'_> {
                 Some(x) => x,
                 None => (INT, Storage::None), // implicit int: main() {...}
             };
+            // chốt NGAY: declarator/param/body sẽ gọi decl_specs và reset flag
+            let inline_fn = self.saw_inline;
             if self.eat(&Tok::Punct(";")) {
                 continue; // định nghĩa struct/union/enum thuần
             }
@@ -2567,8 +2574,9 @@ impl P<'_> {
                     self.in_fn = true;
                     let body = self.stmt()?;
                     self.in_fn = false;
-                    let is_static =
-                        storage == Storage::Static || self.static_fns.contains(&name);
+                    let is_static = storage == Storage::Static
+                        || self.static_fns.contains(&name)
+                        || inline_fn; // EXT(gcc): inline definition → static
                     funcs.push(Func {
                         name,
                         params,
@@ -2656,6 +2664,7 @@ pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast,
         va_off: 16,
         in_fn: false,
         attr_aligned: None,
+        saw_inline: false,
         asm_label: None,
         renames: HashMap::new(),
         fname: String::new(),

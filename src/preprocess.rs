@@ -21,14 +21,13 @@ type Macros = HashMap<String, Macro>;
 
 // Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
 // nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-const HEADERS: [(&str, &str); 25] = [
+const HEADERS: [(&str, &str); 20] = [
     ("wchar.h", include_str!("headers/wchar.h")),
     ("inttypes.h", include_str!("headers/inttypes.h")),
-    ("fcntl.h", include_str!("headers/fcntl.h")),
-    ("time.h", include_str!("headers/time.h")),
-    ("unistd.h", include_str!("headers/unistd.h")),
+
+
+
     ("dlfcn.h", include_str!("headers/dlfcn.h")),
-    ("sys/time.h", include_str!("headers/sys/time.h")),
     ("sys/mman.h", include_str!("headers/sys/mman.h")),
     ("libkern/OSCacheControl.h", include_str!("headers/libkern/OSCacheControl.h")),
     ("setjmp.h", include_str!("headers/setjmp.h")),
@@ -38,7 +37,7 @@ const HEADERS: [(&str, &str); 25] = [
     ("assert.h", include_str!("headers/assert.h")),
     ("stdint.h", include_str!("headers/stdint.h")),
     ("ctype.h", include_str!("headers/ctype.h")),
-    ("errno.h", include_str!("headers/errno.h")),
+
     ("float.h", include_str!("headers/float.h")),
     ("limits.h", include_str!("headers/limits.h")),
     ("math.h", include_str!("headers/math.h")),
@@ -66,6 +65,9 @@ pub fn preprocess(
         ("__GNUC__", "4"),
         ("__GNUC_MINOR__", "2"),
         ("__GNUC_PATCHLEVEL__", "1"),
+        // EXT(apple): TargetConditionals.h chọn nhánh GNUC bằng
+        // defined(__GNUC__) && defined(__APPLE_CC__) — giá trị 6000 như clang
+        ("__APPLE_CC__", "6000"),
         ("__CHAR_BIT__", "8"),
         ("__SCHAR_MAX__", "127"),
         ("__SHRT_MAX__", "32767"),
@@ -276,8 +278,11 @@ fn process(
                 let v = active && {
                     let name = ident_of(d.get(1))
                         .ok_or_else(|| err(file, lno, "thiếu tên sau #ifdef/#ifndef"))?;
-                    // EXT(clang): __has_include "defined" sẵn (SDK dò #ifndef để fallback)
-                    (macros.contains_key(name) || name == "__has_include") == (kw == "ifdef")
+                    // EXT(clang): __has_include + họ __has_* "defined" sẵn
+                    (macros.contains_key(name)
+                        || name == "__has_include"
+                        || crate::ext::has_operator_zero(name))
+                        == (kw == "ifdef")
                 };
                 conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
             }
@@ -694,7 +699,12 @@ fn substitute(
             if rhs.is_empty() {
                 out.push(l);
             } else {
-                let s = format!("{}{}", spell(&l.tok), spell(&rhs[0].tok));
+                // spelling GỐC (raw) khi có — spell() từ giá trị làm rớt suffix
+                // số (199506L → "199506", cdefs.h paste ra sai tên macro)
+                let sp = |p: &PTok| {
+                    if p.raw.is_empty() { spell(&p.tok) } else { p.raw.clone() }
+                };
+                let s = format!("{}{}", sp(&l), sp(&rhs[0]));
                 let one = lex(&s)
                     .ok()
                     .and_then(|mut v| if v.len() == 1 { Some(v.remove(0).tok) } else { None })
@@ -814,8 +824,10 @@ fn if_resolve(
             let at = if paren { i + 2 } else { i + 1 };
             let name =
                 ident_of(d.get(at)).ok_or_else(|| err(file, lno, "defined cần tên macro"))?;
-            // EXT(clang): __has_include là operator builtin — "defined" với nó = 1
-            let def = macros.contains_key(name) || name == "__has_include";
+            // EXT(clang): __has_include + họ __has_* là operator builtin — "defined" = 1
+            let def = macros.contains_key(name)
+                || name == "__has_include"
+                || crate::ext::has_operator_zero(name);
             pre.push(synth(Tok::Num(def as i64, NumK::I)));
             i = at + 1;
             if paren {
@@ -824,6 +836,23 @@ fn if_resolve(
                 }
                 i += 1;
             }
+        } else if matches!(&d[i].tok, Tok::Ident(n) if crate::ext::has_operator_zero(n))
+            && matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("(")))
+        {
+            // EXT(clang): __has_feature/extension/builtin/attribute(...) → 0,
+            // nuốt ngoặc cân bằng (arg chỉ là ident nhưng cứ đề phòng lồng nhau)
+            i += 2;
+            let mut depth = 1;
+            while depth > 0 {
+                match d.get(i).map(|t| &t.tok) {
+                    Some(Tok::Punct("(")) => depth += 1,
+                    Some(Tok::Punct(")")) => depth -= 1,
+                    None => return Err(err(file, lno, "__has_*( thiếu ')'")),
+                    _ => {}
+                }
+                i += 1;
+            }
+            pre.push(synth(Tok::Num(0, NumK::I)));
         } else if matches!(&d[i].tok, Tok::Ident(n) if n == "__has_include" || n == "__has_include_next")
         {
             // EXT(clang): __has_include(<h> | "h") — eval TRƯỚC expand (tên header
