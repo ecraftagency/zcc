@@ -42,6 +42,12 @@ Quyết định đã chốt: mở **arm64 ELF Linux trước** (tái dùng instr
 - **M16 — x86_64 ELF (HOÃN — quyết định Vu 2026-08-17)**: nhường LOC cho M17 trước; instruction selection mới + SysV classification khi nào mở lại tính sau.
 - **M17 (KẾ TIẾP) — chiến dịch độ phủ**: dùng LOC còn lại (~2.2k dưới trần sau khi hoãn M16) mua coverage dialect gcc/clang + cherry-pick C99/C11 — GIỮ LUẬT: không implement theo checklist, mỗi feature phải có phần mềm kinh điển thật đòi. Rổ mục tiêu theo coverage-per-LOC: sqlite (amalgamation, khả năng gần zero-cost) → zlib → lua standalone (gate riêng, đã qua trong redis) → jemalloc (hẹn từ M14) → curl → git → sbase → coreutils (gnulib, để cuối). Khi ext.rs vượt ~300 LOC: tách `ext/gcc.rs, ext/clang.rs…` theo phương ngữ GỐC. Rổ đòi quá ngân sách → quyết định lại trần bằng số liệu probe, không nhồi.
 
+- **M18 (dự kiến) — chiến dịch correctness 100%** (Vu chốt 4 khía 2026-08-17, xếp sau/xen kẽ M17):
+  1. **Csmith generative fuzzing** — sinh hàng loạt chương trình C ngẫu nhiên CAM KẾT không-UB, differential zcc↔gcc/cc (checksum output + crash-khi-compile = bug). Cùng huyết thống alg.sh (trọng tài + generator lọc UB) nhưng generative cả chương trình: vét được tổ hợp struct lồng/pointer sâu mà corpus tĩnh (torture/nginx/redis) không bao giờ chạm. Mục tiêu: harness `tests/csmith.sh` chạy nightly, reduce case bằng creduce khi bắt được.
+  2. **Valgrind memcheck** — bọc runtest/binary thật để phơi stack lệch/ghi lấn thầm lặng chưa tới mức segfault. LƯU Ý: Valgrind KHÔNG hỗ trợ macOS arm64 → chạy trong box Linux với binary zcc-ELF (M15 mở khóa đúng cửa này); món rẻ hơn trên Darwin: `-fsanitize=address` không có (zcc -O0 không sanitizer) → dùng guard page/malloc debug của libc (`MallocScribble`).
+  3. **Floating-point rigor** — Paranoia test suite (kinh điển IEEE-754: rounding/overflow/underflow/precision) + UCB ieeecc754 nếu tha được; hiện FP mới qua alg.sh mẫu biên + torture, chưa qua bài khắc nghiệt chuyên FP.
+  4. **Linkage & symbol multi-file** — gate `link.sh` mới: tentative definitions rải nhiều TU (C89 3.7.2 — linker gộp), weak symbol, shadow global/local, gọi hàm KHÔNG prototype với default argument promotion (char→int, float→double) link chéo cc↔zcc (mở rộng tự nhiên của abi.sh sang không gian linkage).
+
 ### Sổ nợ (trả dần trong M15+, harness sẵn)
 
 - ~~nginx-tests rerun~~ TRẢ XONG 2026-08-17: minimal 493 file/1136 test All PASS; build FULL (ssl+http2+stream+mail, pcre2+openssl@3) 5346 test, fail-chỉ-zcc = RỖNG (trọng tài nginx-cc cùng config fail giống hệt — tests/README.md).
