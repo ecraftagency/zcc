@@ -29,6 +29,7 @@ fn write_or_die(path: &str, data: &str) -> bool {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let (mut inputs, mut output, mut mode) = (Vec::new(), None, "ld");
+    let (mut defs, mut incs) = (Vec::<String>::new(), Vec::<String>::new());
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -37,7 +38,17 @@ fn main() -> ExitCode {
                 output = args.get(i).map(|s| s.as_str());
             }
             "-S" => mode = "s",
+            "-E" => mode = "e",
             "-c" => mode = "o",
+            "-D" | "-I" => {
+                let k = args[i].clone();
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    if k == "-D" { defs.push(v.clone()) } else { incs.push(v.clone()) }
+                }
+            }
+            s if s.starts_with("-D") => defs.push(s[2..].to_string()),
+            s if s.starts_with("-I") => incs.push(s[2..].to_string()),
             "-arch" | "-isysroot" | "-framework" | "-include" => i += 1, // flag có đối số rời
             s if s.starts_with('-') => {} // -O -g -W… -std=… : nuốt để tương thích cc
             s => inputs.push(s),
@@ -54,7 +65,9 @@ fn main() -> ExitCode {
     }
     // .c → asm text; input khác (.o/.a) đi thẳng xuống linker
     let emit_asm = |path: &str| -> Option<String> {
-        match preprocess::preprocess(path).and_then(|t| parser::parse(&t)) {
+        match preprocess::preprocess(path, &defs, &incs)
+            .and_then(|(t, locs, files)| parser::parse(&t, &locs, &files))
+        {
             Ok(ast) => Some(codegen::emit(&ast)),
             Err(e) => {
                 eprintln!("zcc: {}: {}", path, e);
@@ -67,6 +80,33 @@ fn main() -> ExitCode {
         file.strip_suffix(".c").unwrap_or(file).to_string()
     };
     let ok = match mode {
+        "e" => {
+            // dump token đã preprocess (debug); mỗi token cách 1 space, xuống dòng theo line gốc
+            let mut ok = true;
+            for path in &inputs {
+                match preprocess::preprocess(path, &defs, &incs) {
+                    Ok((toks, locs, _)) => {
+                        let mut cur = (u32::MAX, u32::MAX);
+                        let mut s = String::new();
+                        for (t, &l) in toks.iter().zip(&locs) {
+                            if l != cur {
+                                s.push('\n');
+                                cur = l;
+                            }
+                            s.push_str(&preprocess::spell(t));
+                            s.push(' ');
+                        }
+                        s.push('\n');
+                        print!("{}", s);
+                    }
+                    Err(e) => {
+                        eprintln!("zcc: {}: {}", path, e);
+                        ok = false;
+                    }
+                }
+            }
+            ok
+        }
         "s" | "o" => {
             let mut ok = true;
             for path in &inputs {

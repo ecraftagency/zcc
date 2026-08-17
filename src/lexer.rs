@@ -18,7 +18,7 @@ pub enum Tok {
     FNum(f64, bool), // hằng thực; bool = double (không suffix f/F)
     Ident(String),
     Punct(&'static str),
-    Str(Vec<u8>), // bytes đã xử lý escape, chưa gồm NUL cuối
+    Str(Vec<u8>, bool), // (bytes đã xử lý escape chưa gồm NUL cuối, wide L"..")
 }
 
 #[derive(Clone, Debug)]
@@ -27,6 +27,8 @@ pub struct PTok {
     pub bol: bool,
     pub ws: bool,
     pub line: u32,
+    pub file: u32, // id vào bảng file của preprocess (0 = file gốc)
+    pub hide: Vec<String>, // hideset: macro đã expand ra token này (chặn expand lại)
     pub raw: String, // spelling gốc (Num/Str/Char) cho # stringize; rỗng = spell từ giá trị
 }
 
@@ -39,7 +41,7 @@ const PUNCTS: [&str; 48] = [
 
 // Escape C89 đầy đủ: \n \t \r \a \b \f \v \\ \' \" \? \ooo \xhh.
 // Vào: i trỏ ngay SAU dấu '\', ra: byte giá trị + i đã nhảy qua escape.
-fn escape(b: &[u8], i: &mut usize) -> Result<u8, String> {
+fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
     let c = *b.get(*i).ok_or("escape cụt")?;
     *i += 1;
     Ok(match c {
@@ -50,14 +52,14 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u8, String> {
         b'b' => 8,
         b'f' => 12,
         b'v' => 11,
-        b'\\' | b'\'' | b'"' | b'?' => c,
+        b'\\' | b'\'' | b'"' | b'?' => c as u32,
         b'x' => {
             let mut v = 0u32;
             while let Some(d) = b.get(*i).and_then(|c| (*c as char).to_digit(16)) {
                 v = v * 16 + d;
                 *i += 1;
             }
-            v as u8
+            v
         }
         b'0'..=b'7' => {
             let mut v = (c - b'0') as u32;
@@ -70,7 +72,7 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u8, String> {
                     _ => break,
                 }
             }
-            v as u8
+            v
         }
         _ => return Err(format!("escape lạ '\\{}'", c as char)),
     })
@@ -228,8 +230,9 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             continue;
         }
         let tok_start = i;
-        // wide literal L'x' / L"s": wchar = int, bỏ prefix (đủ cho test C89)
-        let c = if c == b'L' && matches!(b.get(i + 1), Some(b'\'' | b'"')) {
+        // wide literal L'x' / L"s": wchar = int (LP64 Darwin)
+        let wide = c == b'L' && matches!(b.get(i + 1), Some(b'\'' | b'"'));
+        let c = if wide {
             i += 1;
             b[i]
         } else {
@@ -243,8 +246,10 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             i += 1;
             let v = match *b.get(i).ok_or("hằng ký tự không đóng")? {
                 b'\\' => {
+                    let e;
                     i += 1;
-                    escape(b, &mut i)? as i8 as i64 // char signed trên Darwin
+                    e = escape(b, &mut i)?;
+                    if wide { e as i64 } else { e as u8 as i8 as i64 } // char signed trên Darwin
                 }
                 e => {
                     i += 1;
@@ -264,7 +269,7 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
                     b'"' => break,
                     b'\\' => {
                         i += 1;
-                        bytes.push(escape(b, &mut i)?);
+                        bytes.push(escape(b, &mut i)? as u8);
                     }
                     e => {
                         bytes.push(e);
@@ -273,7 +278,7 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
                 }
             }
             i += 1;
-            Tok::Str(bytes)
+            Tok::Str(bytes, wide)
         } else if c == b'_' || c.is_ascii_alphabetic() {
             let s = i;
             while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
@@ -290,10 +295,10 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             }
         };
         let raw = match tok {
-            Tok::Num(..) | Tok::FNum(..) | Tok::Str(_) => src[tok_start..i].to_string(),
+            Tok::Num(..) | Tok::FNum(..) | Tok::Str(..) => src[tok_start..i].to_string(),
             _ => String::new(),
         };
-        toks.push(PTok { tok, bol, ws, line, raw });
+        toks.push(PTok { tok, bol, ws, line, file: 0, hide: Vec::new(), raw });
         bol = false;
         ws = false;
     }

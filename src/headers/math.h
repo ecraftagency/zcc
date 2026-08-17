@@ -21,6 +21,7 @@ double floor(double);
 double fabs(double);
 double fmod(double, double);
 double ldexp(double, int);
+long double ldexpl(long double, int);
 double frexp(double, int *);
 double modf(double, double *);
 #endif

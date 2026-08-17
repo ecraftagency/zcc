@@ -10,7 +10,7 @@
 //
 // ABI: args int x0-x7, float v0-v7 (2 counter riêng), quá thì stack 8-byte/slot;
 // arg VÔ DANH của variadic LUÔN lên stack (đặc sản Apple). Return: x0 / d0.
-// Label: "L{n}" tuần tự; "LC{id}" đích case; "L_{fn}_{tên}" label goto.
+// Label: "L{n}" tuần tự; "LC{id}" đích case; "lg_{fn}.{tên}" label goto.
 use crate::ast::{Ast, GInit, Node, NodeId, Ty, TypeId, VOID};
 use std::fmt::Write;
 
@@ -228,11 +228,19 @@ impl Cg<'_> {
                 _ => writeln!(self.s, "\t.quad {v}"),
             },
             GInit::Str(i) => writeln!(self.s, "\t.quad l_str{i}"),
+            GInit::StrOff(i, k) => writeln!(self.s, "\t.quad l_str{i} + {k}"),
             // prefix \x01 = symbol nội bộ đã đủ tên (label &&), không thêm gạch dưới
-            GInit::Addr(n) => match n.strip_prefix('\x01') {
-                Some(raw) => writeln!(self.s, "\t.quad {raw}"),
-                None => writeln!(self.s, "\t.quad _{n}"),
-            },
+            GInit::Addr(n, k) => {
+                let sym = match n.strip_prefix('\x01') {
+                    Some(raw) => raw.to_string(),
+                    None => format!("_{n}"),
+                };
+                if *k == 0 {
+                    writeln!(self.s, "\t.quad {sym}")
+                } else {
+                    writeln!(self.s, "\t.quad {sym} + {k}")
+                }
+            }
             GInit::Diff(a, b) => match sz {
                 4 => writeln!(self.s, "\t.long {a} - {b}"),
                 _ => writeln!(self.s, "\t.quad {a} - {b}"),
@@ -573,13 +581,13 @@ impl Cg<'_> {
             }
             Node::Break => _ = writeln!(self.s, "\tb L{}", self.brks.last().unwrap()),
             Node::Continue => _ = writeln!(self.s, "\tb L{}", self.conts.last().unwrap()),
-            Node::Goto(name) => _ = writeln!(self.s, "\tb lg_{}_{}", self.fname, name),
+            Node::Goto(name) => _ = writeln!(self.s, "\tb lg_{}.{}", self.fname, name),
             Node::GotoPtr(e) => {
                 self.expr(*e);
                 self.s += "\tbr x0\n";
             }
             Node::Label(name, st) => {
-                _ = writeln!(self.s, "lg_{}_{}:", self.fname, name);
+                _ = writeln!(self.s, "lg_{}.{}:", self.fname, name);
                 self.stmt(*st);
             }
             _ => self.expr(id),
@@ -608,13 +616,17 @@ impl Cg<'_> {
             }
             Node::Member(b, off) => {
                 self.addr(*b);
-                if *off > 0 {
+                if *off > 4095 {
+                    self.imm("x9", *off as i64);
+                    self.s += "\tadd x0, x0, x9\n";
+                } else if *off > 0 {
                     _ = writeln!(self.s, "\tadd x0, x0, #{off}");
                 }
             }
             Node::Deref(e) => self.expr(*e),
             // giá trị của expr kiểu struct = địa chỉ (SRet temp, compound literal...)
-            Node::SRet(..) | Node::Comma(..) | Node::Assign(..) | Node::Cond(..) => {
+            Node::SRet(..) | Node::Comma(..) | Node::Assign(..) | Node::Cond(..) | Node::Block(_)
+            | Node::Str(_) => {
                 self.expr(id)
             }
             _ => unreachable!("không phải lvalue"),
@@ -643,10 +655,14 @@ impl Cg<'_> {
                     name
                 );
             }
+            Node::Alloca(e) => {
+                self.expr(*e);
+                self.s += "\tadd x0, x0, #15\n\tand x0, x0, #0xfffffffffffffff0\n\tsub sp, sp, x0\n\tmov x0, sp\n";
+            }
             Node::LabelAddr(name) => {
                 _ = writeln!(
                     self.s,
-                    "\tadrp x0, lg_{0}_{1}@PAGE\n\tadd x0, x0, lg_{0}_{1}@PAGEOFF",
+                    "\tadrp x0, lg_{0}.{1}@PAGE\n\tadd x0, x0, lg_{0}.{1}@PAGEOFF",
                     self.fname, name
                 );
             }
@@ -658,6 +674,22 @@ impl Cg<'_> {
             Node::Assign(l, r) => {
                 let (l, r) = (*l, *r);
                 let lt = self.a.types[l as usize];
+                // RHS chứa alloca: sub sp làm lệch mọi push đang treo — phải
+                // eval alloca TRƯỚC rồi mới lấy địa chỉ lvalue
+                let mut rr = r;
+                while let Node::Cast(i) = self.a.nodes[rr as usize] {
+                    rr = i;
+                }
+                if matches!(self.a.nodes[rr as usize], Node::Alloca(_))
+                    && !matches!(self.a.tt.tys[lt as usize], Ty::Struct(_))
+                {
+                    self.expr(r);
+                    self.s += "\tstr x0, [sp, #-16]!\n";
+                    self.addr(l);
+                    self.s += "\tmov x1, x0\n\tldr x0, [sp], #16\n";
+                    self.store(0, lt);
+                    return;
+                }
                 self.addr(l);
                 self.s += "\tstr x0, [sp, #-16]!\n";
                 self.expr(r);

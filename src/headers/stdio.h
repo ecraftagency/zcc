@@ -23,6 +23,8 @@ int fprintf(FILE *, const char *, ...);
 int sprintf(char *, const char *, ...);
 int vprintf(const char *, char *);
 int vfprintf(FILE *, const char *, char *);
+int vsnprintf(char *, unsigned long, const char *, char *);
+FILE *fdopen(int, const char *);
 int vsprintf(char *, const char *, char *);
 int scanf(const char *, ...);
 int fscanf(FILE *, const char *, ...);

@@ -27,7 +27,7 @@ pub enum Ty {
     Float,
     Double, // long double = double trên arm64 Darwin
     Ptr(TypeId),
-    Array(TypeId, u32),
+    Array(TypeId, u64),
     Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
     Func(u32),   // index vào TyTab.fns
     Bitfield(TypeId, u32, u32), // (kiểu chứa, bit offset trong đơn vị, độ rộng bit)
@@ -97,9 +97,17 @@ impl TyTab {
             Ty::Short | Ty::UShort => 2,
             Ty::Int | Ty::UInt | Ty::Float => 4,
             Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) | Ty::Func(_) => 8,
-            Ty::Array(e, n) => self.size(e) * n,
+            Ty::Array(e, n) => self.size(e).wrapping_mul(n as u32),
             Ty::Struct(s) => self.structs[s as usize].size,
             Ty::Bitfield(b, ..) => self.size(b),
+        }
+    }
+    // sizeof cần u64: mảng khai trong sizeof(int[2^33][...]) hợp lệ dù không
+    // cấp phát được object cỡ đó (layout thật vẫn dùng size() u32)
+    pub fn size64(&self, t: TypeId) -> u64 {
+        match self.tys[t as usize] {
+            Ty::Array(e, n) => self.size64(e) * n,
+            _ => self.size(t) as u64,
         }
     }
     pub fn align(&self, t: TypeId) -> u32 {
@@ -215,6 +223,7 @@ pub enum Node {
     Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
     FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
     VaArea(u32), // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
+    Alloca(NodeId), // cấp phát động trên stack; epilogue mov sp,x29 tự thu hồi
     Str(u32),
 }
 
@@ -223,8 +232,9 @@ pub enum GInit {
     None,
     Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
     Str(u32),
-    Addr(String),             // địa chỉ symbol khác: int *p = &g; (prefix \x01 = tên đủ, không thêm _)
+    Addr(String, i64),        // symbol + offset byte: int *p = &g.m; (prefix \x01 = tên đủ, không thêm _)
     Diff(String, String),     // hiệu 2 symbol: &&a - &&b (GNU, static jump table)
+    StrOff(u32, i64),         // địa chỉ vào giữa string literal: "abc" + 1, &"X"[0]
     Bytes(Vec<u8>),           // char arr[] = "..." (đã pad đủ size)
     List(Vec<(u32, u32, GInit)>), // initializer phẳng hóa: (offset, size, item)
 }

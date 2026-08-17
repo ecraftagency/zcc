@@ -23,6 +23,11 @@ double atof(const char *);
 double strtod(const char *, char **);
 long strtol(const char *, char **, int);
 unsigned long strtoul(const char *, char **, int);
+long long strtoll(const char *, char **, int);
+unsigned long long strtoull(const char *, char **, int);
+float strtof(const char *, char **);
+long double strtold(const char *, char **);
+char *realpath(const char *, char *);
 int rand(void);
 void srand(unsigned int);
 int abs(int);
@@ -35,3 +40,6 @@ void qsort(void *, size_t, size_t, int (*)(const void *, const void *));
 void *bsearch(const void *, const void *, size_t, size_t,
               int (*)(const void *, const void *));
 #endif
+/* Darwin <sys/wait.h> — glibc kéo qua stdlib.h nên code hay dùng không include */
+#define WIFEXITED(x) (((x) & 0177) == 0)
+#define WEXITSTATUS(x) (((x) >> 8) & 0x000000ff)
