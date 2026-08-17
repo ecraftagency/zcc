@@ -180,6 +180,16 @@ impl P<'_> {
     }
 
     // ---- hằng ----
+    // EXT(gcc): compat cấu trúc cho __builtin_types_compatible_p — TyTab không
+    // intern nên so đệ quy; Func coi như compat (đủ cho consumer hiện có)
+    fn ty_compat(&self, a: TypeId, b: TypeId) -> bool {
+        match (&self.tt.tys[a as usize], &self.tt.tys[b as usize]) {
+            (Ty::Ptr(x), Ty::Ptr(y)) => self.ty_compat(*x, *y),
+            (Ty::Array(x, n), Ty::Array(y, m)) => n == m && self.ty_compat(*x, *y),
+            (Ty::Struct(x), Ty::Struct(y)) => x == y,
+            (x, y) => std::mem::discriminant(x) == std::mem::discriminant(y),
+        }
+    }
     fn const_expr(&mut self) -> Result<i64, String> {
         let e = self.cond_expr()?;
         self.fold(e)
@@ -604,9 +614,7 @@ impl P<'_> {
     // need_name=false cho abstract declarator (cast, sizeof, param không tên).
     fn declarator(&mut self, mut t: TypeId, need_name: bool) -> Result<(String, TypeId), String> {
         self.skip_attrs()?;
-        let mut starred = false; // sau '*' thì ident LUÔN là tên, kể cả trùng typedef
         while self.eat(&Tok::Punct("*")) {
-            starred = true;
             t = self.tt.ptr_to(t);
             while self.eat_kw("const")
                 || self.eat_kw("volatile")
@@ -642,8 +650,12 @@ impl P<'_> {
             return Ok(res);
         }
         let name = match self.toks.get(self.pos) {
-            // tên được phép TRÙNG typedef-name (shadow); chỉ cấm keyword cứng
-            Some(Tok::Ident(n)) if (need_name || starred) && !self.is_keyword(n) => {
+            // tên được phép TRÙNG typedef-name (shadow); chỉ cấm keyword cứng.
+            // Không cần need_name: specifier đã bị decl_specs ăn hết trước đó,
+            // abstract declarator không bao giờ chứa ident trần → ident ở đây
+            // LUÔN là tên (git: param `reftable_fsck_report_fn report_fn`
+            // với report_fn đồng thời là typedef toàn cục ở usage.h)
+            Some(Tok::Ident(n)) if !self.is_keyword(n) => {
                 let n = n.clone();
                 self.pos += 1;
                 n
@@ -758,6 +770,15 @@ impl P<'_> {
     }
     fn suffixes(&mut self, t: TypeId) -> Result<TypeId, String> {
         if self.eat(&Tok::Punct("[")) {
+            // EXT(c99): 6.7.5.3p21 — qualifier/static trong [] của array param
+            // (SDK _regex.h: `__pmatch[ restrict n ]` khi xưng C99); no-op ở -O0
+            while self.eat_kw("restrict")
+                || self.eat_kw("__restrict")
+                || self.eat_kw("__restrict__")
+                || self.eat_kw("const")
+                || self.eat_kw("volatile")
+                || self.eat_kw("static")
+            {}
             let n = if self.peek("]") {
                 0
             } else {
@@ -1063,6 +1084,14 @@ impl P<'_> {
 
     // ---- statement ----
     fn stmt(&mut self) -> R {
+        // EXT(gcc): __extension__ đầu stmt là no-op nhưng nằm trong type-word
+        // → phải bóc TRƯỚC khi phân loại decl/expr, kẻo `__extension__ ({...});`
+        // (obstack_blank của git) bị ăn nhầm thành declaration
+        if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "__extension__")
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Punct("(")))
+        {
+            self.pos += 1;
+        }
         if let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
             (self.toks.get(self.pos), self.toks.get(self.pos + 1))
         {
@@ -2403,6 +2432,9 @@ impl P<'_> {
         None
     }
     fn primary(&mut self) -> R {
+        // EXT(gcc): __extension__ trước expr = no-op tắt cảnh báo pedantic
+        // (obstack.h của git: __extension__ ({ ... }))
+        while self.eat_kw("__extension__") {}
         if self.eat(&Tok::Punct("(")) {
             // GNU statement expression ({ ...; expr; }): giá trị = stmt cuối
             if self.peek("{") {
@@ -2472,8 +2504,15 @@ impl P<'_> {
             Ok(self.push(Node::Str(i), t))
         } else if let Some(Tok::Ident(_)) = self.toks.get(self.pos) {
             let n = self.ident()?;
-            if let Some((t, loc)) =
-                self.locals.iter().rev().find(|(l, ..)| *l == n).map(|&(_, t, o)| (t, o))
+            // ngoài body hàm locals là đồ thừa hàm TRƯỚC (không dọn để rẻ) —
+            // cấm tra, kẻo ginit toàn cục &x ăn nhầm param cùng tên (git rm.c:
+            // param index_only của check_local_mod vs global index_only)
+            if let Some((t, loc)) = self
+                .locals
+                .iter()
+                .rev()
+                .find(|(l, ..)| self.in_fn && *l == n)
+                .map(|&(_, t, o)| (t, o))
             {
                 match loc {
                     Vloc::Stack(off) => return Ok(self.push(Node::Var(off), t)),
@@ -2512,6 +2551,18 @@ impl P<'_> {
                 let i = (self.strs.len() - 1) as u32;
                 let t = self.tt.add(Ty::Array(CHAR, ln as u64 + 1));
                 return Ok(self.push(Node::Str(i), t));
+            }
+            if n == "__builtin_types_compatible_p" {
+                // EXT(gcc): fold hằng 0/1 so kiểu cấu trúc — git ARRAY_SIZE
+                // (BUILD_ASSERT_OR_ZERO: sizeof(char[1-2*!(cond)])) cần nó
+                // trong constant expression; array ≠ pointer là điểm ăn tiền
+                self.expect(Tok::Punct("("))?;
+                let a = self.typename()?;
+                self.expect(Tok::Punct(","))?;
+                let b = self.typename()?;
+                self.expect(Tok::Punct(")"))?;
+                let v = self.ty_compat(a, b) as i64;
+                return Ok(self.push(Node::Num(v), INT));
             }
             if n == "__builtin_classify_type" {
                 // hằng class của kiểu arg (không eval): int=1 ptr=5 real=8
@@ -2818,30 +2869,37 @@ impl P<'_> {
                     }
                     self.fns.insert(name, t); // prototype
                 } else {
-                    let init = self.ginit(&mut t)?;
-                    let is_extern = storage == Storage::Extern && matches!(init, GInit::None);
+                    // C89 6.1.2.1: tên vào scope từ CUỐI declarator, trước init
+                    // → push trước để initializer tự tham chiếu được
+                    // (git LIST_HEAD: static struct x = { &x, &x })
                     // tentative definition: int x; int x = 3; int x; → MỘT symbol
-                    if let Some(gi) = self.globals.iter().position(|g| g.name == name) {
-                        let bigger = self.tt.size(t) > self.tt.size(self.globals[gi].ty);
-                        let g = &mut self.globals[gi];
-                        if bigger {
-                            g.ty = t; // int a[]; → int a[3]; hoàn thiện kiểu
-                        }
-                        if !matches!(init, GInit::None) {
-                            g.init = init;
-                        }
-                        g.is_extern = g.is_extern && is_extern;
-                        g.is_tls = g.is_tls || tls;
+                    let gi = if let Some(gi) =
+                        self.globals.iter().position(|g| g.name == name)
+                    {
+                        gi
                     } else {
                         self.globals.push(Global {
                             name,
                             ty: t,
-                            init,
+                            init: GInit::None,
                             is_static: storage == Storage::Static,
-                            is_extern,
+                            is_extern: true, // tạm; chốt sau khi biết có init
                             is_tls: tls,
                         });
+                        self.globals.len() - 1
+                    };
+                    let init = self.ginit(&mut t)?;
+                    let is_extern = storage == Storage::Extern && matches!(init, GInit::None);
+                    let bigger = self.tt.size(t) > self.tt.size(self.globals[gi].ty);
+                    let g = &mut self.globals[gi];
+                    if bigger {
+                        g.ty = t; // int a[]; → int a[3]; hoàn thiện kiểu
                     }
+                    if !matches!(init, GInit::None) {
+                        g.init = init;
+                    }
+                    g.is_extern = g.is_extern && is_extern;
+                    g.is_tls = g.is_tls || tls;
                 }
                 if !self.eat(&Tok::Punct(",")) {
                     break;

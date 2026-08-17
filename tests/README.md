@@ -192,6 +192,36 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
   (make test/testfixture): CHƯA chạy được trên mac — không có tcl dev
   (tclConfig.sh); đường trả nợ: box Linux + apt tcl + zcc-ELF (ghi sổ nợ).
 
+- **git 2.55.GIT** (clone depth-1, cache `~/.cache/zcc-suites/git`):
+  `make CC=zcc NO_GETTEXT=1 NO_TCLTK=1 FSMONITOR_DAEMON_BACKEND=
+  FSMONITOR_OS_SETTINGS=` (fsmonitor darwin cần Objective-C/CoreFoundation —
+  ngoài phạm vi C compiler, tắt bằng knob chuẩn của Makefile git, không sửa
+  build file) → **binary `git` 10.9MB link xong**. Smoke: version, init,
+  2×commit, log, diff --stat, fsck sạch, status. Suite chính chủ `t/`:
+  t0000-basic **92/92**, t0001-init **103/103**, t3600-rm **81/82** (fail
+  duy nhất = "TODO known breakage" của chính git, expected fail, không phải
+  bug zcc); batch 11 file subsystem pass sạch **1788 test**: t0002-gitfile
+  14, t1300-config 518, t1400-update-ref 316, t2200-add-update 20,
+  t3200-branch 171, t3903-stash 143, t4001-diff-rename 23, t4014-format-patch
+  221, t5510-fetch 239, t6402-merge-rename 46, t7501-commit 77 (stash/
+  format-patch "passed all remaining" = có known-breakage TODO của git, như
+  t3600). Tổng t/ đã chạy: **2064 pass / 0 fail thật**. Regression trong
+  repo: `cases/c89_scope_git.c` (3 bug C89) + `ext/gcc_git_compat.c` (bề mặt
+  gcc git đòi). Gate đóng sổ sau các sửa parser: shape 910 + abi 292×4 +
+  alg 43036/21552 + cpp 1425 + m12 + m14 — PASS hết, cases 66/66, ext 16/16.
+  Giá phải trả (test-first, mỗi mục có file git thật đòi): xưng
+  `__STDC_VERSION__ 199901L` (git-compat-util.h #error nếu thiếu — tiền lệ
+  xưng __GNUC__ 4.2.1 cho SDK), `[restrict n]` trong array param (C99
+  6.7.5.3p21, SDK _regex.h mở nhánh C99), họ PRI*/SCN* MAX vào inttypes.h,
+  `__builtin_types_compatible_p` fold hằng (ARRAY_SIZE/BUILD_ASSERT_OR_ZERO),
+  `__extension__` trước expr + đầu stmt (obstack.h), và **3 bug C89 thuần
+  của zcc bị git phơi ra**: (1) tên global phải vào scope TRƯỚC initializer
+  (LIST_HEAD: `static struct x = { &x, &x }`); (2) ident sau specifier trong
+  declarator LUÔN là tên kể cả trùng typedef (param `report_fn` trùng
+  typedef report_fn của usage.h); (3) locals thừa của hàm trước rò vào
+  resolve tên ở ginit toàn cục (param `index_only` của check_local_mod đè
+  global cùng tên → "cần biểu thức hằng" ma ở builtin/rm.c). Tổng +62 LOC.
+
 ## Bẫy đã trả học phí (đọc trước khi debug "ma")
 
 - **Lỗi ABI cùng-compiler tự triệt tiêu** — nginx/redis chạy ngon suốt vẫn

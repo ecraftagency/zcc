@@ -91,6 +91,10 @@ pub fn preprocess(
         ("__GNUC__", "4"),
         ("__GNUC_MINOR__", "2"),
         ("__GNUC_PATCHLEVEL__", "1"),
+        // EXT(c99): git-compat-util.h #error khi < 199901L — xưng dialect C99
+        // như đã xưng GNUC cho SDK (M11); bề mặt C89+ hiện hành đủ phần C99
+        // git đạp (designated/mixed-decl/long long/vamacro), thiếu đâu vá đó
+        ("__STDC_VERSION__", "199901L"),
         ("__CHAR_BIT__", "8"),
         ("__SCHAR_MAX__", "127"),
         ("__SHRT_MAX__", "32767"),
