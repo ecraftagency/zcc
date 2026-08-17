@@ -184,6 +184,37 @@ pub fn emit(ast: &Ast) -> String {
         }
         let (sz, al) = (ast.tt.size(gl.ty), ast.tt.align(gl.ty));
         let globl = if gl.is_static { String::new() } else { format!(".globl _{}\n", gl.name) };
+        if gl.is_tls {
+            // TLS Mach-O: bản init per-thread ở __thread_data (hoặc .tbss nếu
+            // zero), symbol chính = descriptor 3 quad (__tlv_bootstrap, 0,
+            // &init) ở __thread_vars — dyld đổi quad đầu thành tlv_get_addr
+            match &gl.init {
+                GInit::None => {
+                    _ = writeln!(
+                        g.s,
+                        ".tbss _{}$tlv$init, {}, {}",
+                        gl.name,
+                        sz.max(1),
+                        al.trailing_zeros()
+                    );
+                }
+                init => {
+                    _ = writeln!(
+                        g.s,
+                        ".section __DATA,__thread_data,thread_local_regular\n.p2align {}\n_{}$tlv$init:",
+                        al.trailing_zeros(),
+                        gl.name
+                    );
+                    g.gdata(init, sz);
+                }
+            }
+            _ = writeln!(
+                g.s,
+                ".section __DATA,__thread_vars,thread_local_variables\n{}_{1}:\n\t.quad __tlv_bootstrap\n\t.quad 0\n\t.quad _{1}$tlv$init",
+                globl, gl.name
+            );
+            continue;
+        }
         match &gl.init {
             GInit::None if gl.is_static => {
                 _ = writeln!(
@@ -616,7 +647,17 @@ impl Cg<'_> {
             Node::Var(off) => self.lea_local("x0", *off),
             Node::GVar(i) => {
                 let gl = &self.a.globals[*i as usize];
-                if gl.is_extern {
+                if gl.is_tls {
+                    // gọi qua descriptor (extern hay không cùng một đường —
+                    // linker tự indirect); tlv_get_addr của dyld bảo toàn mọi
+                    // thanh ghi trừ x0/x16/x17 nên trung gian trên stack/reg
+                    // khác sống qua blr; x30 đã save ở prologue vô điều kiện
+                    _ = writeln!(
+                        self.s,
+                        "\tadrp x0, _{0}@TLVPPAGE\n\tldr x0, [x0, _{0}@TLVPPAGEOFF]\n\tldr x16, [x0]\n\tblr x16",
+                        gl.name
+                    );
+                } else if gl.is_extern {
                     // symbol từ dylib (stdout...): bắt buộc qua GOT
                     _ = writeln!(
                         self.s,

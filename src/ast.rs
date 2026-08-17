@@ -264,6 +264,9 @@ pub struct Global {
     pub init: GInit,
     pub is_static: bool,
     pub is_extern: bool, // chỉ khai báo — không phát storage
+    // EXT(gcc): __thread — storage TLS Mach-O (__thread_data + descriptor
+    // __thread_vars), access qua @TLVPPAGE + gọi tlv_get_addr
+    pub is_tls: bool,
 }
 
 pub struct Func {

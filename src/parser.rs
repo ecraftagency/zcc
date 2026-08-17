@@ -78,6 +78,8 @@ struct P<'a> {
     in_fn: bool,  // đang trong body hàm (compound literal: local vs global ẩn)
     attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
     saw_inline: bool, // EXT(gcc): decl_specs vừa gặp inline/__inline (gnu89)
+    saw_thread: bool, // EXT(gcc): decl_specs vừa gặp __thread (capture NGAY sau
+    // decl_specs — init chứa cast sẽ gọi decl_specs lồng làm reset cờ)
     // EXT(gcc): tên đã có file-scope declaration KHÔNG inline — C99 6.7.4p7:
     // định nghĩa inline của tên đó vẫn là external definition (logreqres redis)
     plain_decls: std::collections::HashSet<String>,
@@ -291,6 +293,7 @@ impl P<'_> {
     fn decl_specs(&mut self) -> Result<Option<(TypeId, Storage)>, String> {
         self.attr_aligned = None; // của declaration trước, không lây
         self.saw_inline = false;
+        self.saw_thread = false;
         let mut storage = Storage::None;
         let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
         let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
@@ -303,10 +306,10 @@ impl P<'_> {
                 "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict"
                 | "__restrict__" | "__extension__" | "__volatile" | "__volatile__"
                 | "__const" | "__const__" | "_Noreturn" => {}
-                // EXT(gcc): __thread TLS — chấp nhận như global thường. ĐÚNG khi
-                // chỉ main thread đụng biến (redis io-threads=1); TLS Mach-O thật
-                // (@TLVP + tlv_get_addr) chỉ làm khi có case đòi đa luồng thật.
-                "__thread" => {}
+                // EXT(gcc): __thread TLS thật (Mach-O @TLVP) — redis-tests
+                // unit io-threads>=2 là chủ nợ đòi. Plain __thread trên auto
+                // local (gcc cấm) rơi tự nhiên về stack — vốn đã per-thread.
+                "__thread" => self.saw_thread = true,
                 // EXT(gcc): inline — zcc không có inliner; definition inline sẽ hạ
                 // về static (mỗi TU một bản, như nhánh "static __inline" của cdefs.h)
                 // để "extern __inline" gnu89 của SDK không phát duplicate symbol
@@ -1254,6 +1257,7 @@ impl P<'_> {
             Ok(self.push(Node::Block(v), INT))
         } else if let Some((bt, storage)) = self.decl_specs()? {
             // khai báo local (nhiều declarator, có init); typedef/static/extern xử lý riêng
+            let tls = self.saw_thread;
             let mut stmts = Vec::new();
             if !self.eat(&Tok::Punct(";")) {
                 loop {
@@ -1276,6 +1280,7 @@ impl P<'_> {
                                 init,
                                 is_static: true,
                                 is_extern: false,
+                                is_tls: tls,
                             });
                             self.locals.push((
                                 name,
@@ -1290,6 +1295,7 @@ impl P<'_> {
                                 init: GInit::None,
                                 is_static: false,
                                 is_extern: true,
+                                is_tls: tls,
                             });
                             self.locals.push((
                                 name,
@@ -2084,6 +2090,7 @@ impl P<'_> {
                                 init,
                                 is_static: true,
                                 is_extern: false,
+                                is_tls: false,
                             });
                             let g = self.push(Node::GVar(self.globals.len() as u32 - 1), t);
                             return self.postfix_ops(g);
@@ -2640,6 +2647,7 @@ impl P<'_> {
             };
             // chốt NGAY: declarator/param/body sẽ gọi decl_specs và reset flag
             let inline_fn = self.saw_inline;
+            let tls = self.saw_thread;
             if self.eat(&Tok::Punct(";")) {
                 continue; // định nghĩa struct/union/enum thuần
             }
@@ -2799,6 +2807,7 @@ impl P<'_> {
                             g.init = init;
                         }
                         g.is_extern = g.is_extern && is_extern;
+                        g.is_tls = g.is_tls || tls;
                     } else {
                         self.globals.push(Global {
                             name,
@@ -2806,6 +2815,7 @@ impl P<'_> {
                             init,
                             is_static: storage == Storage::Static,
                             is_extern,
+                            is_tls: tls,
                         });
                     }
                 }
@@ -2904,6 +2914,7 @@ pub fn parse(toks: &[Tok], locs: &[(u32, u32)], files: &[String]) -> Result<Ast,
         in_fn: false,
         attr_aligned: None,
         saw_inline: false,
+        saw_thread: false,
         vla_size: None,
         asm_label: None,
         renames: HashMap::new(),
