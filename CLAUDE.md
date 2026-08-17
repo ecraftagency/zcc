@@ -34,6 +34,7 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), không Box c
 - **Mọi kết luận đúng/sai đều differential**: trọng tài `cc` (spec bằng xương thịt) hoặc oracle độc lập; diff tại điểm UB là vô nghĩa — generator phải lọc UB trước.
 - **Gate khoa học** (vét cạn không gian hữu hạn — chạy khi đụng vùng tương ứng): abi.sh (ABI automaton, link CHÉO — lỗi ABI cùng-compiler tự triệt tiêu), alg.sh (UAC semilattice), cpp.sh (hệ viết lại hạng), shape.sh (lexer/declarator/layout). "Vét cạn" = vét không gian CẤU TRÚC + mẫu biên không gian giá trị — nói "proof" phải kèm câu này.
 - **Suite ngoài**: fail mới ngoài baseline đã triage = bug zcc cho tới khi chứng minh ngược lại; baseline không phải thùng rác giấu bug.
+- **Tối ưu vòng test**: khi triage/fix, chạy lại ĐÚNG case/unit fail lần trước, KHÔNG chạy full suite; full suite chỉ chạy một lần cuối để đóng sổ (và chạy nền, không ngồi chờ). Suite nặng chạy TUẦN TỰ, không đè nhau tranh core.
 - **Thuật toán offset arg sống ở 3 nơi phải khớp từng byte** (codegen call, codegen spill, parser va_off) — sửa 1 = sửa 3 + chạy abi.sh.
 - Đối chiếu đáp án mẫu bất cứ lúc nào: `clang -S -O0 -std=c89 foo.c`.
 - **Quy tắc số liệu của Vu**: mọi con số/quyết định phải suy ra được từ tiền đề đã tuyên bố, không magic number không nguồn gốc.
