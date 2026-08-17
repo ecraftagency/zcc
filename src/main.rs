@@ -7,6 +7,7 @@
 //   LC_MAIN) + -syslibroot từ xcrun; ld64 arm64 tự ad-hoc codesign.
 mod ast;
 mod codegen;
+mod ext;
 mod lexer;
 mod parser;
 mod preprocess;

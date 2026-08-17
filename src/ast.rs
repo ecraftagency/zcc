@@ -186,6 +186,21 @@ impl TyTab {
     }
 }
 
+// EXT(gcc): họ builtin atomic __sync_* (M12) — bảng tên ở ext.rs, codegen phát
+// vòng LL/SC ldaxr/stlxr. Nằm ở ast.rs vì đây là boundary parser ↔ codegen.
+#[derive(Clone, Copy)]
+pub enum SyncOp {
+    FetchAdd, // __sync_fetch_and_add — trả giá trị CŨ
+    AddFetch, // __sync_add_and_fetch — trả giá trị MỚI
+    FetchSub,
+    SubFetch,
+    ValCas,  // __sync_val_compare_and_swap — trả giá trị cũ
+    BoolCas, // __sync_bool_compare_and_swap — trả 1/0
+    TestSet, // __sync_lock_test_and_set — atomic exchange, trả giá trị cũ
+    Release, // __sync_lock_release — ghi 0 với release barrier
+    Barrier, // __sync_synchronize — dmb ish
+}
+
 pub enum Node {
     Num(i64),
     FNum(f64),
@@ -223,6 +238,7 @@ pub enum Node {
     Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
     FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
     VaArea(u32), // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
+    Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
     Alloca(NodeId), // cấp phát động trên stack; epilogue mov sp,x29 tự thu hồi
     Str(u32),
 }

@@ -13,8 +13,8 @@
 // Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
 // conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
 use crate::ast::{
-    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, Ty, TyTab, TypeId, BOOL, CHAR,
-    DOUBLE, FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
+    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, SyncOp, Ty, TyTab, TypeId, BOOL,
+    CHAR, DOUBLE, FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
 };
 use crate::lexer::{NumK, Tok};
 use std::collections::HashMap;
@@ -971,7 +971,9 @@ impl P<'_> {
             | Node::Post(_, e, _)
             | Node::GotoPtr(e)
             | Node::Alloca(e) => self.has_label(*e),
-            Node::Call(_, args, _) => args.iter().any(|&x| self.has_label(x)),
+            Node::Call(_, args, _) | Node::Sync(_, args, _) => {
+                args.iter().any(|&x| self.has_label(x))
+            }
             Node::CallPtr(f, args, _) => {
                 self.has_label(*f) || args.iter().any(|&x| self.has_label(x))
             }
@@ -2373,6 +2375,48 @@ impl P<'_> {
                 }
                 self.expect(Tok::Punct(")"))?;
                 return Ok(self.push(Node::Num(off), ULONG));
+            }
+            // EXT(gcc): atomics __sync_* (M12) — không phải symbol libc, hạ thẳng
+            // xuống Node::Sync cho codegen phát ldaxr/stlxr; bảng tên ở ext.rs
+            if let Some((op, arity)) = crate::ext::sync_op(&n) {
+                if self.peek("(") {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    for k in 0..arity {
+                        if k > 0 {
+                            self.expect(Tok::Punct(","))?;
+                        }
+                        args.push(self.assign()?);
+                    }
+                    self.expect(Tok::Punct(")"))?;
+                    // Barrier không có ptr; còn lại kiểu + size = pointee của arg đầu
+                    let (et, sz) = if arity == 0 {
+                        (VOID, 0)
+                    } else {
+                        let et = self
+                            .tt
+                            .pointee(self.ty(args[0]))
+                            .ok_or_else(|| format!("{n}: arg đầu phải là con trỏ"))?;
+                        let ok = self.tt.is_integer(et)
+                            || matches!(self.tt.tys[et as usize], Ty::Ptr(_));
+                        let sz = self.tt.size(et);
+                        if !ok || (sz != 4 && sz != 8) {
+                            return Err(format!(
+                                "{n}: mới hỗ trợ operand integer/pointer 4|8 byte"
+                            ));
+                        }
+                        (et, sz)
+                    };
+                    for k in 1..args.len() {
+                        args[k] = self.cast(args[k], et); // value arg về đúng độ rộng operand
+                    }
+                    let ret = match op {
+                        SyncOp::BoolCas => INT,
+                        SyncOp::Release | SyncOp::Barrier => VOID,
+                        _ => et,
+                    };
+                    return Ok(self.push(Node::Sync(op, args, sz), ret));
+                }
             }
             if let Some(&v) = self.enums.get(&n) {
                 return Ok(self.push(Node::Num(v), INT));

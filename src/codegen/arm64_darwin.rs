@@ -11,7 +11,7 @@
 // ABI: args int x0-x7, float v0-v7 (2 counter riêng), quá thì stack 8-byte/slot;
 // arg VÔ DANH của variadic LUÔN lên stack (đặc sản Apple). Return: x0 / d0.
 // Label: "L{n}" tuần tự; "LC{id}" đích case; "lg_{fn}.{tên}" label goto.
-use crate::ast::{Ast, GInit, Node, NodeId, Ty, TypeId, VOID};
+use crate::ast::{Ast, GInit, Node, NodeId, SyncOp, Ty, TypeId, VOID};
 use std::fmt::Write;
 
 const EPILOGUE: &str = "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n";
@@ -754,6 +754,90 @@ impl Cg<'_> {
                 self.store(2, lt);
             }
             Node::VaArea(off) => _ = writeln!(self.s, "\tadd x0, x29, #{off}"),
+            // EXT(gcc): atomics __sync_* (M12) — vòng LL/SC ldaxr/stlxr; cặp
+            // acquire+release mỗi lần = đủ mạnh cho seq_cst mà GCC hứa ở __sync.
+            // Quy ước reg: x0=ptr, {r}1/{r}2=value, {r}9=giá trị cũ, {r}10=mới,
+            // w11=cờ store-exclusive (0 = thành công).
+            Node::Sync(op, args, sz) => {
+                let (op, args, sz) = (*op, args.clone(), *sz);
+                for (k, &a) in args.iter().enumerate() {
+                    self.expr(a);
+                    if k + 1 < args.len() {
+                        self.s += "\tstr x0, [sp, #-16]!\n";
+                    }
+                }
+                // arg cuối đang ở x0 → dời lên vị trí, pop ngược phần còn lại
+                match args.len() {
+                    3 => self.s += "\tmov x2, x0\n\tldr x1, [sp], #16\n\tldr x0, [sp], #16\n",
+                    2 => self.s += "\tmov x1, x0\n\tldr x0, [sp], #16\n",
+                    _ => {}
+                }
+                let r = if sz == 8 { "x" } else { "w" };
+                let unsigned = self.a.tt.is_unsigned(t);
+                // kết quả về x0 theo hợp đồng canonical 64-bit (sign/zero-extend đúng kiểu)
+                let canon = |s: &mut String, res: u32| {
+                    _ = match (sz, unsigned) {
+                        (8, _) => writeln!(s, "\tmov x0, x{res}"),
+                        (_, true) => writeln!(s, "\tmov w0, w{res}"),
+                        _ => writeln!(s, "\tsxtw x0, w{res}"),
+                    };
+                };
+                let n = self.labels(3); // loop, fail (clrex), join
+                match op {
+                    SyncOp::FetchAdd | SyncOp::AddFetch | SyncOp::FetchSub | SyncOp::SubFetch => {
+                        let ins = if matches!(op, SyncOp::FetchAdd | SyncOp::AddFetch) {
+                            "add"
+                        } else {
+                            "sub"
+                        };
+                        _ = writeln!(
+                            self.s,
+                            "L{n}:\n\tldaxr {r}9, [x0]\n\t{ins} {r}10, {r}9, {r}1\n\tstlxr w11, {r}10, [x0]\n\tcbnz w11, L{n}"
+                        );
+                        let old = matches!(op, SyncOp::FetchAdd | SyncOp::FetchSub);
+                        canon(&mut self.s, if old { 9 } else { 10 });
+                    }
+                    SyncOp::ValCas | SyncOp::BoolCas => {
+                        // fail phải clrex để nhả exclusive monitor
+                        _ = writeln!(
+                            self.s,
+                            "L{n}:\n\tldaxr {r}9, [x0]\n\tcmp {r}9, {r}1\n\tb.ne L{}\n\tstlxr w11, {r}2, [x0]\n\tcbnz w11, L{n}",
+                            n + 1
+                        );
+                        if matches!(op, SyncOp::BoolCas) {
+                            _ = writeln!(
+                                self.s,
+                                "\tmov x0, #1\n\tb L{}\nL{}:\n\tclrex\n\tmov x0, #0\nL{}:",
+                                n + 2,
+                                n + 1,
+                                n + 2
+                            );
+                        } else {
+                            _ = writeln!(
+                                self.s,
+                                "\tb L{}\nL{}:\n\tclrex\nL{}:",
+                                n + 2,
+                                n + 1,
+                                n + 2
+                            );
+                        }
+                        if matches!(op, SyncOp::ValCas) {
+                            canon(&mut self.s, 9);
+                        }
+                    }
+                    SyncOp::TestSet => {
+                        _ = writeln!(
+                            self.s,
+                            "L{n}:\n\tldaxr {r}9, [x0]\n\tstlxr w11, {r}1, [x0]\n\tcbnz w11, L{n}"
+                        );
+                        canon(&mut self.s, 9);
+                    }
+                    SyncOp::Release => {
+                        _ = writeln!(self.s, "\tstlr {r}zr, [x0]");
+                    }
+                    SyncOp::Barrier => self.s += "\tdmb ish\n",
+                }
+            }
             Node::Str(i) => {
                 _ = writeln!(
                     self.s,
