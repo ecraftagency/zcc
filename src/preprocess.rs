@@ -9,7 +9,7 @@
 // (file, line, hideset) — hideset theo luật chuẩn để macro không expand lặp.
 
 use crate::ast::Target;
-use crate::lexer::{lex, NumK, PTok, Tok};
+use crate::lexer::{NumK, PTok, Tok, lex};
 use std::collections::HashMap;
 use std::fs;
 
@@ -26,7 +26,10 @@ const HEADERS: [(&str, &str); 18] = [
     ("wchar.h", include_str!("headers/wchar.h")),
     ("inttypes.h", include_str!("headers/inttypes.h")),
     ("sys/mman.h", include_str!("headers/sys/mman.h")),
-    ("libkern/OSCacheControl.h", include_str!("headers/libkern/OSCacheControl.h")),
+    (
+        "libkern/OSCacheControl.h",
+        include_str!("headers/libkern/OSCacheControl.h"),
+    ),
     ("setjmp.h", include_str!("headers/setjmp.h")),
     ("stdbool.h", include_str!("headers/stdbool.h")),
     ("stdalign.h", include_str!("headers/stdalign.h")),
@@ -50,6 +53,18 @@ pub fn preprocess(
     incs: &[String],
     tgt: Target,
 ) -> Result<(Vec<Tok>, Vec<(u32, u32)>, Vec<String>), String> {
+    let (out, files) = preprocess_pt(path, defs, undefs, incs, tgt)?;
+    let locs = out.iter().map(|t| (t.file, t.line)).collect();
+    Ok((out.into_iter().map(|t| t.tok).collect(), locs, files))
+}
+
+fn preprocess_pt(
+    path: &str,
+    defs: &[String],
+    undefs: &[String],
+    incs: &[String],
+    tgt: Target,
+) -> Result<(Vec<PTok>, Vec<String>), String> {
     let mut macros = Macros::new();
     // predefine chung mọi target (arm64 LP64 little-endian)
     let mut ones = vec!["__STDC__", "__LP64__", "__arm64__", "__aarch64__"];
@@ -147,7 +162,11 @@ pub fn preprocess(
                 Macro::Obj(lex("char *").map_err(|e| e.to_string())?),
             );
             for (m, ps, body) in [
-                ("__builtin_va_start", vec!["ap", "last"], "((ap) = (char *)__va_area__)"),
+                (
+                    "__builtin_va_start",
+                    vec!["ap", "last"],
+                    "((ap) = (char *)__va_area__)",
+                ),
                 (
                     "__builtin_va_arg",
                     vec!["ap", "t"],
@@ -169,7 +188,16 @@ pub fn preprocess(
             );
         }
     }
+    // inf/nan (musl math.h GNUC>=3.3 đòi, thiếu là thành call trần): 1e10000
+    // tràn parse f64 → inf đúng chuẩn; nan qua 0/0 (fold ra NaN). Function-like
+    // 0 tham số vì code gọi kèm ngoặc: __builtin_inff().
     for (m, ps, body) in [
+        ("__builtin_inf", vec![], "(1e10000)"),
+        ("__builtin_inff", vec![], "(1e10000f)"),
+        ("__builtin_huge_val", vec![], "(1e10000)"),
+        ("__builtin_huge_valf", vec![], "(1e10000f)"),
+        ("__builtin_nan", vec!["s"], "(0.0/0.0)"),
+        ("__builtin_nanf", vec!["s"], "(0.0f/0.0f)"),
         ("__builtin_va_end", vec!["ap"], "((void)(ap))"),
         ("__builtin_va_copy", vec!["d", "s"], "((d) = (s))"),
         ("__builtin_constant_p", vec!["e"], "0"), // 0 luôn hợp lệ theo GCC doc
@@ -177,7 +205,11 @@ pub fn preprocess(
         ("__builtin_trap", vec![], "abort()"),
         ("__builtin_return_address", vec!["n"], "((void *)0)"),
         // signbit qua -0.0: 1.0/x = -inf phân biệt được dấu của zero
-        ("__builtin_signbit", vec!["x"], "((x) < 0.0 || ((x) == 0.0 && 1.0 / (x) < 0.0))"),
+        (
+            "__builtin_signbit",
+            vec!["x"],
+            "((x) < 0.0 || ((x) == 0.0 && 1.0 / (x) < 0.0))",
+        ),
     ] {
         let toks = lex(body).map_err(|e| e.to_string())?;
         let ps = ps.into_iter().map(String::from).collect();
@@ -207,13 +239,19 @@ pub fn preprocess(
         ),
     );
     // EXT(gcc): họ __atomic_* → macro đổ về __sync_*; builtin bit-manip (ext.rs)
-    for (m, ps, body) in crate::ext::ATOMIC_MACROS.iter().chain(crate::ext::BIT_MACROS) {
+    for (m, ps, body) in crate::ext::ATOMIC_MACROS
+        .iter()
+        .chain(crate::ext::BIT_MACROS)
+    {
         let toks = lex(body).map_err(|e| e.to_string())?;
         let ps = ps.iter().map(|s| s.to_string()).collect();
         macros.insert((*m).into(), Macro::Fun(ps, false, toks));
     }
     for (i, m) in crate::ext::ATOMIC_ORDERS.iter().enumerate() {
-        macros.insert((*m).into(), Macro::Obj(vec![synth(Tok::Num(i as i64, NumK::I))]));
+        macros.insert(
+            (*m).into(),
+            Macro::Obj(vec![synth(Tok::Num(i as i64, NumK::I))]),
+        );
     }
     // -Dname[=val] từ CLI (mặc định =1, như cc); -Uname xóa (kể cả builtin)
     for d in defs {
@@ -240,12 +278,43 @@ pub fn preprocess(
             i += 1;
         }
     }
-    let locs = out.iter().map(|t| (t.file, t.line)).collect();
-    Ok((out.into_iter().map(|t| t.tok).collect(), locs, files))
+    Ok((out, files))
+}
+
+// EXT(gcc): file .S (musl memset.S aarch64) = asm PHẢI qua C preprocessor.
+// Spell lại từ PTok cần ws/raw: "v0.16B" tách thành 3 token C ("v0" ".16" "B")
+// phải ghép lại không space; token khác dòng gốc thì xuống dòng (mỗi lệnh 1 dòng).
+pub fn preprocess_asm(
+    path: &str,
+    defs: &[String],
+    undefs: &[String],
+    incs: &[String],
+    tgt: Target,
+) -> Result<String, String> {
+    let (out, _) = preprocess_pt(path, defs, undefs, incs, tgt)?;
+    let mut s = String::new();
+    let mut cur = (u32::MAX, u32::MAX);
+    for t in &out {
+        if (t.file, t.line) != cur {
+            s.push('\n');
+            cur = (t.file, t.line);
+        } else if t.ws {
+            s.push(' ');
+        }
+        if t.raw.is_empty() {
+            s.push_str(&spell(&t.tok));
+        } else {
+            s.push_str(&t.raw);
+        }
+    }
+    s.push('\n');
+    Ok(s)
 }
 
 fn inc_find(incs: &[String], name: &str) -> Option<String> {
-    incs.iter().map(|d| format!("{}/{}", d, name)).find(|p| std::path::Path::new(p).exists())
+    incs.iter()
+        .map(|d| format!("{}/{}", d, name))
+        .find(|p| std::path::Path::new(p).exists())
 }
 // -nostdinc: driver cắm sentinel \x01 đầu incs → bỏ bảng header nhúng (musl)
 fn no_stdinc(incs: &[String]) -> bool {
@@ -253,7 +322,15 @@ fn no_stdinc(incs: &[String]) -> bool {
 }
 
 fn synth(tok: Tok) -> PTok {
-    PTok { tok, bol: false, ws: true, line: 0, file: 0, hide: Vec::new(), raw: String::new() }
+    PTok {
+        tok,
+        bol: false,
+        ws: true,
+        line: 0,
+        file: 0,
+        hide: Vec::new(),
+        raw: String::new(),
+    }
 }
 
 fn err(file: &str, line: u32, msg: &str) -> String {
@@ -345,15 +422,27 @@ fn process(
                         || crate::ext::has_operator_zero(name))
                         == (kw == "ifdef")
                 };
-                conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
+                conds.push(Cond {
+                    parent: active,
+                    taken: v,
+                    active: v,
+                    in_else: false,
+                });
             }
             "if" => {
                 let v = active && eval_if(&d[1..], macros, file, delta, lno, incs)?;
-                conds.push(Cond { parent: active, taken: v, active: v, in_else: false });
+                conds.push(Cond {
+                    parent: active,
+                    taken: v,
+                    active: v,
+                    in_else: false,
+                });
             }
             "elif" => {
                 let need = {
-                    let c = conds.last().ok_or_else(|| err(file, lno, "#elif không có #if"))?;
+                    let c = conds
+                        .last()
+                        .ok_or_else(|| err(file, lno, "#elif không có #if"))?;
                     if c.in_else {
                         return Err(err(file, lno, "#elif sau #else"));
                     }
@@ -365,7 +454,9 @@ fn process(
                 c.taken = c.taken || v;
             }
             "else" => {
-                let c = conds.last_mut().ok_or_else(|| err(file, lno, "#else không có #if"))?;
+                let c = conds
+                    .last_mut()
+                    .ok_or_else(|| err(file, lno, "#else không có #if"))?;
                 if c.in_else {
                     return Err(err(file, lno, "#else kép"));
                 }
@@ -374,7 +465,9 @@ fn process(
                 c.in_else = true;
             }
             "endif" => {
-                conds.pop().ok_or_else(|| err(file, lno, "#endif không có #if"))?;
+                conds
+                    .pop()
+                    .ok_or_else(|| err(file, lno, "#endif không có #if"))?;
             }
             _ if !active => {} // directive khác trong nhánh chết: bỏ
             "define" => {
@@ -444,78 +537,81 @@ fn process(
                     d
                 };
                 match d.get(1).map(|t| &t.tok) {
-                Some(Tok::Str(b, _)) => {
-                    let name = String::from_utf8_lossy(b).into_owned();
-                    let bare = name.clone();
-                    let path = if name.starts_with('/') {
-                        name
-                    } else {
-                        match file.rsplit_once('/') {
-                            Some((dir, _)) => format!("{}/{}", dir, name),
-                            None => name,
+                    Some(Tok::Str(b, _)) => {
+                        let name = String::from_utf8_lossy(b).into_owned();
+                        let bare = name.clone();
+                        let path = if name.starts_with('/') {
+                            name
+                        } else {
+                            match file.rsplit_once('/') {
+                                Some((dir, _)) => format!("{}/{}", dir, name),
+                                None => name,
+                            }
+                        };
+                        // không có file thật → thử bảng header nhúng ("stddef.h"...)
+                        let mut path = path;
+                        if !std::path::Path::new(&path).exists() {
+                            if let Some((_, src)) = HEADERS
+                                .iter()
+                                .find(|(n, _)| *n == bare && !no_stdinc(incs) && !skip_embedded)
+                            {
+                                let hname = format!("<{}>", bare);
+                                let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
+                                files.push(hname.clone());
+                                let fid = files.len() as u32 - 1;
+                                for t in &mut toks {
+                                    t.file = fid;
+                                }
+                                out.extend(process(&toks, &hname, macros, depth + 1, incs, files)?);
+                                continue;
+                            }
+                            if let Some(p2) = inc_find(incs, &bare) {
+                                path = p2;
+                            }
                         }
-                    };
-                    // không có file thật → thử bảng header nhúng ("stddef.h"...)
-                    let mut path = path;
-                    if !std::path::Path::new(&path).exists() {
-                        if let Some((_, src)) = HEADERS
+                        out.extend(pp_file(&path, macros, depth + 1, incs, files)?);
+                    }
+                    Some(Tok::Punct("<")) => {
+                        // tên = spelling các token đến '>' (lexer tách "stdio.h" = 3 token)
+                        let mut name = String::new();
+                        let mut k = 2;
+                        while k < d.len() && d[k].tok != Tok::Punct(">") {
+                            name.push_str(&spell(&d[k].tok));
+                            k += 1;
+                        }
+                        // header nhúng thắng (libc stub của zcc); không có thì tra -I
+                        match HEADERS
                             .iter()
-                            .find(|(n, _)| *n == bare && !no_stdinc(incs) && !skip_embedded)
+                            .find(|(n, _)| *n == name && !no_stdinc(incs) && !skip_embedded)
+                            .map(|(_, s)| *s)
                         {
-                            let hname = format!("<{}>", bare);
-                            let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
-                            files.push(hname.clone());
-                            let fid = files.len() as u32 - 1;
-                            for t in &mut toks {
-                                t.file = fid;
+                            Some(src) => {
+                                let hname = format!("<{}>", name);
+                                let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
+                                files.push(hname.clone());
+                                let fid = files.len() as u32 - 1;
+                                for t in &mut toks {
+                                    t.file = fid;
+                                }
+                                out.extend(process(&toks, &hname, macros, depth + 1, incs, files)?);
                             }
-                            out.extend(process(&toks, &hname, macros, depth + 1, incs, files)?);
-                            continue;
-                        }
-                        if let Some(p2) = inc_find(incs, &bare) {
-                            path = p2;
-                        }
-                    }
-                    out.extend(pp_file(&path, macros, depth + 1, incs, files)?);
-                }
-                Some(Tok::Punct("<")) => {
-                    // tên = spelling các token đến '>' (lexer tách "stdio.h" = 3 token)
-                    let mut name = String::new();
-                    let mut k = 2;
-                    while k < d.len() && d[k].tok != Tok::Punct(">") {
-                        name.push_str(&spell(&d[k].tok));
-                        k += 1;
-                    }
-                    // header nhúng thắng (libc stub của zcc); không có thì tra -I
-                    match HEADERS
-                        .iter()
-                        .find(|(n, _)| *n == name && !no_stdinc(incs) && !skip_embedded)
-                        .map(|(_, s)| *s)
-                    {
-                        Some(src) => {
-                            let hname = format!("<{}>", name);
-                            let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
-                            files.push(hname.clone());
-                            let fid = files.len() as u32 - 1;
-                            for t in &mut toks {
-                                t.file = fid;
+                            None => {
+                                let p2 = inc_find(incs, &name).ok_or_else(|| {
+                                    err(file, lno, &format!("không có header nhúng <{}>", name))
+                                })?;
+                                out.extend(pp_file(&p2, macros, depth + 1, incs, files)?);
                             }
-                            out.extend(process(&toks, &hname, macros, depth + 1, incs, files)?);
-                        }
-                        None => {
-                            let p2 = inc_find(incs, &name).ok_or_else(|| {
-                                err(file, lno, &format!("không có header nhúng <{}>", name))
-                            })?;
-                            out.extend(pp_file(&p2, macros, depth + 1, incs, files)?);
                         }
                     }
-                }
-                _ => return Err(err(file, lno, "#include cần \"file\"")),
+                    _ => return Err(err(file, lno, "#include cần \"file\"")),
                 }
             }
             "error" => return Err(err(file, lno, &format!("#error {}", spell_seq(&d[1..])))),
             // EXT(gcc): #warning — báo rồi đi tiếp (không có trong C89)
-            "warning" => eprintln!("{}", err(file, lno, &format!("#warning {}", spell_seq(&d[1..])))),
+            "warning" => eprintln!(
+                "{}",
+                err(file, lno, &format!("#warning {}", spell_seq(&d[1..])))
+            ),
             "line" => {
                 let ex = expand_seq(&d[1..], macros, &Vec::new(), file, delta)?;
                 if let Some(Tok::Num(n, _)) = ex.first().map(|t| &t.tok) {
@@ -529,7 +625,10 @@ fn process(
                 {
                     let name = String::from_utf8_lossy(b).into_owned();
                     if p == "push_macro" {
-                        saved.entry(name.clone()).or_default().push(macros.get(&name).cloned());
+                        saved
+                            .entry(name.clone())
+                            .or_default()
+                            .push(macros.get(&name).cloned());
                     } else if p == "pop_macro" {
                         if let Some(m) = saved.get_mut(&name).and_then(|v| v.pop()) {
                             match m {
@@ -583,11 +682,17 @@ fn expand_at(
         }
     };
     if name == "__LINE__" {
-        out.push(PTok { tok: Tok::Num(t.line as i64 + delta, NumK::I), ..t.clone() });
+        out.push(PTok {
+            tok: Tok::Num(t.line as i64 + delta, NumK::I),
+            ..t.clone()
+        });
         return Ok(i + 1);
     }
     if name == "__FILE__" {
-        out.push(PTok { tok: Tok::Str(file.as_bytes().to_vec(), false), ..t.clone() });
+        out.push(PTok {
+            tok: Tok::Str(file.as_bytes().to_vec(), false),
+            ..t.clone()
+        });
         return Ok(i + 1);
     }
     if hide.contains(&name) || t.hide.contains(&name) {
@@ -637,14 +742,23 @@ fn expand_at(
                 return Err(err(
                     file,
                     t.line,
-                    &format!("macro {} cần {} đối số, nhận {}", name, params.len(), args.len()),
+                    &format!(
+                        "macro {} cần {} đối số, nhận {}",
+                        name,
+                        params.len(),
+                        args.len()
+                    ),
                 ));
             }
             let sub = substitute(body, params, &args, macros, hide, file, delta, t.line)?;
             // luật hideset chuẩn: HS kết quả = (HS(tên) ∩ HS(")" đóng)) ∪ {tên}
             let close = &toks[next - 1];
-            let callhs: Vec<String> =
-                t.hide.iter().filter(|h| close.hide.contains(h)).cloned().collect();
+            let callhs: Vec<String> = t
+                .hide
+                .iter()
+                .filter(|h| close.hide.contains(h))
+                .cloned()
+                .collect();
             let sub = retag(&sub, t, &callhs);
             let mut h = hide.clone();
             h.push(name.clone());
@@ -709,7 +823,9 @@ fn collect_args(
 ) -> Result<(Vec<Vec<PTok>>, usize), String> {
     let (mut args, mut cur, mut depth) = (Vec::new(), Vec::new(), 0u32);
     loop {
-        let t = toks.get(i).ok_or_else(|| err(file, lno, "thiếu ')' đóng đối số macro"))?;
+        let t = toks
+            .get(i)
+            .ok_or_else(|| err(file, lno, "thiếu ')' đóng đối số macro"))?;
         match &t.tok {
             Tok::Punct("(") => {
                 depth += 1;
@@ -763,7 +879,9 @@ fn substitute(
             });
             i += 2;
         } else if t.tok == Tok::Punct("##") {
-            let r = body.get(i + 1).ok_or_else(|| err(file, lno, "## ở cuối thân macro"))?;
+            let r = body
+                .get(i + 1)
+                .ok_or_else(|| err(file, lno, "## ở cuối thân macro"))?;
             // EXT(gcc): ", ## __VA_ARGS__" — arg rỗng thì XÓA dấu phẩy, có arg
             // thì giữ nguyên phẩy + args (không paste thật; rescan expand sau)
             if let Some(p) = param_of(Some(r), params) {
@@ -781,30 +899,51 @@ fn substitute(
                 Some(p) => args[p].clone(),
                 None => vec![r.clone()],
             };
-            let l = out.pop().ok_or_else(|| err(file, lno, "## ở đầu thân macro"))?;
+            let l = out
+                .pop()
+                .ok_or_else(|| err(file, lno, "## ở đầu thân macro"))?;
             if rhs.is_empty() {
                 out.push(l);
             } else {
                 // spelling GỐC (raw) khi có — spell() từ giá trị làm rớt suffix
                 // số (199506L → "199506", cdefs.h paste ra sai tên macro)
                 let sp = |p: &PTok| {
-                    if p.raw.is_empty() { spell(&p.tok) } else { p.raw.clone() }
+                    if p.raw.is_empty() {
+                        spell(&p.tok)
+                    } else {
+                        p.raw.clone()
+                    }
                 };
                 let s = format!("{}{}", sp(&l), sp(&rhs[0]));
                 let one = lex(&s)
                     .ok()
-                    .and_then(|mut v| if v.len() == 1 { Some(v.remove(0).tok) } else { None })
-                    .ok_or_else(|| {
-                        err(file, lno, &format!("## tạo token không hợp lệ '{}'", s))
-                    })?;
-                out.push(PTok { tok: one, bol: false, ws: l.ws, line: lno, file: l.file, hide: Vec::new(), raw: String::new() });
+                    .and_then(|mut v| {
+                        if v.len() == 1 {
+                            Some(v.remove(0).tok)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| err(file, lno, &format!("## tạo token không hợp lệ '{}'", s)))?;
+                out.push(PTok {
+                    tok: one,
+                    bol: false,
+                    ws: l.ws,
+                    line: lno,
+                    file: l.file,
+                    hide: Vec::new(),
+                    raw: String::new(),
+                });
                 out.extend(rhs[1..].iter().cloned());
             }
             i += 2;
         } else if let Some(p) = param_of(Some(t), params) {
             let raw = matches!(body.get(i + 1).map(|n| &n.tok), Some(Tok::Punct("##")));
-            let mut rep =
-                if raw { args[p].clone() } else { expand_seq(&args[p], macros, hide, file, delta)? };
+            let mut rep = if raw {
+                args[p].clone()
+            } else {
+                expand_seq(&args[p], macros, hide, file, delta)?
+            };
             if let Some(first) = rep.first_mut() {
                 first.ws = t.ws;
                 first.bol = false;

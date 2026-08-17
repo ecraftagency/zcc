@@ -31,7 +31,7 @@ pub enum Ty {
     Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
     Func(u32),   // index vào TyTab.fns
     Bitfield(TypeId, u32, u32), // (kiểu chứa, bit offset trong đơn vị, độ rộng bit)
-    Bool, // _Bool: store/cast normalize về 0/1
+    Bool,        // _Bool: store/cast normalize về 0/1
 }
 pub const VOID: TypeId = 0;
 pub const CHAR: TypeId = 1;
@@ -151,7 +151,9 @@ impl TyTab {
     // HFA (AAPCS64): struct mà mọi member cùng là float hoặc cùng double, 1-4 cái
     // → đi/về bằng v0-v7 thay vì GPR/gián tiếp. Trả (là double, số member).
     pub fn hfa(&self, t: TypeId) -> Option<(bool, u32)> {
-        let Ty::Struct(si) = self.tys[t as usize] else { return None };
+        let Ty::Struct(si) = self.tys[t as usize] else {
+            return None;
+        };
         let sd = &self.structs[si as usize];
         if sd.is_union || sd.members.is_empty() || sd.members.len() > 4 {
             return None;
@@ -213,7 +215,7 @@ pub enum Node {
     Neg(NodeId),
     Cast(NodeId), // kiểu đích = kiểu của chính node này trong Ast.types
     Bin(&'static str, NodeId, NodeId), // op = chính punct: "+" "<=" ...
-    Cond(NodeId, NodeId, NodeId),      // ?: — && || ! cũng desugar về đây/Bin
+    Cond(NodeId, NodeId, NodeId), // ?: — && || ! cũng desugar về đây/Bin
     Comma(NodeId, NodeId),
     Post(&'static str, NodeId, i64), // x++/x--: op "+"/"-", lvalue, delta (1 | sizeof pointee)
     Ret(Option<NodeId>),
@@ -236,18 +238,33 @@ pub enum Node {
     CallPtr(NodeId, Vec<NodeId>, u32), // gọi qua con trỏ hàm (blr)
     SRet(NodeId, u32, u32), // call trả struct ≤16B: (call, offset temp local, size) — giá trị = địa chỉ temp
     Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
-    FunAddr(String),                // địa chỉ hàm theo tên (qua GOT)
-    VaArea(u32), // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
+    FunAddr(String),        // địa chỉ hàm theo tên (qua GOT)
+    VaArea(u32),            // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
     // ELF/AAPCS: va_list = struct 32 byte, không phải char* — hai builtin thật
     // (Darwin không sinh: stdarg.h nhánh Apple vẫn đi đường macro + VaArea)
-    VaStart(NodeId),        // __builtin_va_start(ap, last): điền 5 field từ prologue
-    VaArg(NodeId, TypeId),  // __builtin_va_arg(ap, T): chọn vùng GP/VR/stack theo T
+    VaStart(NodeId),       // __builtin_va_start(ap, last): điền 5 field từ prologue
+    VaArg(NodeId, TypeId), // __builtin_va_arg(ap, T): chọn vùng GP/VR/stack theo T
     Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
-    // EXT(gcc): inline asm subset (xxhash/M14 đòi): template, outputs (là "+r"?,
-    // lvalue), inputs "r". Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
-    Asm(String, Vec<(bool, NodeId)>, Vec<NodeId>),
+    // EXT(gcc): inline asm subset (xxhash/M14; musl/M17 nới constraint).
+    // Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
+    Asm(String, Vec<AsmOp>),
     Alloca(NodeId), // cấp phát động trên stack; epilogue mov sp,x29 tự thu hồi
     Str(u32),
+}
+
+// EXT(gcc): một operand asm — bề mặt musl đòi (syscall/atomic/math):
+// "r"/"=r"/"+r"/"=&r" (pool GP x9..x15), "w" các biến thể (pool FP v16..v22),
+// "Q"/"m" (truyền ĐỊA CHỈ, %k in "[xN]"), "0".. (chung reg với operand k),
+// pin từ `register long v __asm__("x8")`. Ở ast.rs vì là boundary parser↔codegen.
+#[derive(Clone)]
+pub struct AsmOp {
+    pub e: NodeId,
+    pub out: bool,        // thuộc section output
+    pub rw: bool,         // "+": nạp giá trị trước template
+    pub mem: bool,        // "Q"/"m": operand là địa chỉ bộ nhớ
+    pub fp: bool,         // "w": v-register
+    pub tied: Option<u8>, // "k": dùng chung reg với operand k
+    pub pin: Option<u8>,  // số reg GP ghim cứng (x8 → 8)
 }
 
 #[derive(Clone)]
@@ -255,10 +272,10 @@ pub enum GInit {
     None,
     Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
     Str(u32),
-    Addr(String, i64),        // symbol + offset byte: int *p = &g.m; (prefix \x01 = tên đủ, không thêm _)
-    Diff(String, String),     // hiệu 2 symbol: &&a - &&b (GNU, static jump table)
-    StrOff(u32, i64),         // địa chỉ vào giữa string literal: "abc" + 1, &"X"[0]
-    Bytes(Vec<u8>),           // char arr[] = "..." (đã pad đủ size)
+    Addr(String, i64), // symbol + offset byte: int *p = &g.m; (prefix \x01 = tên đủ, không thêm _)
+    Diff(String, String), // hiệu 2 symbol: &&a - &&b (GNU, static jump table)
+    StrOff(u32, i64),  // địa chỉ vào giữa string literal: "abc" + 1, &"X"[0]
+    Bytes(Vec<u8>),    // char arr[] = "..." (đã pad đủ size)
     List(Vec<(u32, u32, GInit)>), // initializer phẳng hóa: (offset, size, item)
 }
 
@@ -271,6 +288,8 @@ pub struct Global {
     // EXT(gcc): __thread — storage TLS Mach-O (__thread_data + descriptor
     // __thread_vars), access qua @TLVPPAGE + gọi tlv_get_addr
     pub is_tls: bool,
+    // EXT(gcc): __attribute__((weak)) — .weak thay .globl (musl libc.h `weak`)
+    pub is_weak: bool,
 }
 
 pub struct Func {
@@ -284,6 +303,7 @@ pub struct Func {
     // DCE khi không ai dùng (như clang); non-static thì phát external weak
     // để nhiều TU cùng phát vẫn coalesce, không duplicate
     pub is_inline: bool,
+    pub is_weak: bool, // EXT(gcc): __attribute__((weak)) trên definition
     pub variadic: bool,
     pub sret: u32, // ≠0: slot giấu con trỏ x8 (trả struct >16B gián tiếp)
 }
@@ -303,5 +323,13 @@ pub struct Ast {
     pub funcs: Vec<Func>,
     pub globals: Vec<Global>,
     pub strs: Vec<Vec<u8>>, // string literal, backend tự chọn section/label
+    // EXT(gcc): __asm__("...") cấp toàn cục — phát verbatim (musl crt_arch.h
+    // định nghĩa _start bằng asm trần)
+    pub raw_asm: Vec<String>,
+    // EXT(gcc): __attribute__((alias("old"))) — (tên mới, tên cũ, weak?);
+    // musl weak_alias() dệt toàn bộ bề mặt public symbol bằng món này
+    pub aliases: Vec<(String, String, bool)>,
+    // EXT(gcc): prototype/extern mang weak — TU phát .weak để undef ref là weak
+    pub weak_decls: Vec<String>,
     pub tgt: Target,
 }

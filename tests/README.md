@@ -222,6 +222,62 @@ fail mới không giải thích được = bug zcc cho tới khi chứng minh ng
   resolve tên ở ginit toàn cục (param `index_only` của check_local_mod đè
   global cùng tên → "cần biểu thức hằng" ma ở builtin/rm.c). Tổng +62 LOC.
 
+- **musl libc 1.2.5** (cache `~/.cache/zcc-suites/musl-1.2.5`, build trong
+  box `zcc-box`): `./configure CC=zcc --target=aarch64` rồi
+  `make AR=ar RANLIB=ranlib` (configure --target sinh prefix `aarch64-ar`
+  không tồn tại — đè bằng tool trần) → **1350 object, zero error,
+  libc.a 4.3MB + crt1/crti/crtn**. Install:
+  `make install prefix=/work/musl-install AR=ar RANLIB=ranlib SHARED_LIBS=`
+  (SHARED_LIBS= tắt libc.so — đụng nợ `-shared` PIC của M15; sed config.mak
+  vô dụng vì biến sống trong Makefile). Driver mọc `ZCC_SYSROOT` (ELF-only):
+  header+crt+lib lấy TRỌN từ sysroot, tắt bảng nhúng (tên Darwin `__stdoutp`
+  không được lọt), link static không cần ld.so. **Patch 1 file trong cache**:
+  `arch/aarch64/bits/float.h` thay bằng biến thể LDBL64 của arm32
+  (LDBL_MANT_DIG 53 — musl aarch64 đòi binary128, zcc lock long double =
+  double; nhánh LDBL64 là code upstream đã test, tự nhất quán; bản gốc ở
+  `float.h.orig`). Smoke static hello + qsort/printf %8.3f %#x %e/sqrt/pow/
+  fmod/file IO/strtod: **khớp từng byte vs gcc+glibc**.
+  **libc-test (suite chính chủ, ~471 test): zcc fail 77 err-file; trọng tài
+  musl-gcc (apt musl-tools, cùng cây test, static) fail 46** — differential
+  đúng luật: mọi kết luận = `F_zcc \ F_ref` (danh sách 2 phía:
+  `libc-test/ZCC-FAILS.txt`, `libc-test-ref/REF-FAILS.txt`; diff nhớ
+  LC_ALL=C). Referee XÁC NHẬN baseline upstream (zcc fail = referee fail,
+  KHÔNG phải bug zcc): toàn bộ math thường (pow/powf, lgamma*, j0/y0/jn,
+  erfc, exp2, sinh, acosh/asinh, tgamma), strptime, wordexp, strtold,
+  mntent, daemon-failure, pthread_atfork-errno-clobber, api/unistd
+  (`_PC_TIMESTAMP_RESOLUTION`), api/main. Phần zcc-only (~24 test sau khi
+  gộp cặp static/dynamic) chia 4 rổ: (1) **hệ quả LDBL64 port** — 9 họ
+  math `*l` (acoshl…tgammal) + nghi strtod 1-ulp hex-float (floatscan dùng
+  long double nội bộ; muốn chốt phải so referee arm32 LDBL64 — nghi án
+  treo); (2) **nợ `-shared/.so` M15** — dlopen_dso, tls_align_dso/-static,
+  tls_get_new-dtv; (3) **thiếu feature** — imaginary constant `1.0fi`
+  (complex.h `I` → api/complex + tgmath); (4) **NGHI PHẠM THẬT (~10, việc
+  mở màn phiên sau)**: mbc (decode UTF-8 sai — mùi miscompile
+  bit-twiddling int32_t shift/cast) + cụm wide cùng huyết thống
+  swprintf/fgetwc-buffering/iconv-roundtrips; setjmp (`longjmp(jb,0)` →
+  r==0); vfork segfault; tls_local_exec (TLS static ELF — M15 từng pass
+  gate 4-thread!); pthread_cond_wait-cancel_ignored; cụm fp-exception
+  ilogb/ilogbf + isless (nghi fcmp vs fcmpe / exception semantics).
+  Giá phải trả (mỗi món có file musl thật đòi, chi tiết marker `EXT(`):
+  `.s/.S` passthrough qua `as` + `preprocess_asm` (crt, memset.S #define
+  reg); top-level `__asm__("...")` verbatim (crt_arch.h `_start`);
+  `__attribute__((weak))` def→`.weak`, extern decl→`.weak` per-TU
+  (`_DYNAMIC`); `alias("f")` → `.set` (weak_alias skeleton); `typeof(fn)`
+  không decay; `_Complex` = struct {re,im} intern + desugar memberwise
+  (cast/algebra + - * / == != unary-, mul/div naive = gcc
+  -fcx-limited-range); builtin `__builtin_inf*/nan*/huge_val*` = macro
+  function-like (`(1e10000)`, `(0.0/0.0)`); seed `struct __zcc_va_list`
+  complete cho ELF trong parser (stdarg.h ngoài chỉ thấy tên tag —
+  tag rỗng → sizeof(va_list)=0 → va_start đè hàng xóm). **2 bug nội tại bị
+  musl phơi**: (1) GNU ld DROP ADDEND trên GOT entry của symbol local (gas
+  viết lại `:got:sym` local thành `.text+off`, ld tạo GOT entry trỏ đầu
+  section) → FunAddr của static function trên ELF phải đi `adrp/add :lo12:`
+  trực tiếp, cấm GOT — ld64 Darwin không dính; (2) `reg_pins` (extended asm)
+  key theo stack offset nhưng không clear giữa các hàm → ghost pin x8 rò
+  sang hàm sau — segfault printf. Học phí gdb: GOT bug truy bằng
+  breakpoint `__libc_start_main` + x/gx GOT slot (trỏ `__syscall3` — sai
+  hẳn symbol là dấu vân tay addend-drop).
+
 ## Bẫy đã trả học phí (đọc trước khi debug "ma")
 
 - **Lỗi ABI cùng-compiler tự triệt tiêu** — nginx/redis chạy ngon suốt vẫn

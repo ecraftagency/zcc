@@ -43,7 +43,23 @@ Quyết định đã chốt: mở **arm64 ELF Linux trước** (tái dùng instr
 - **M17 (ĐANG CHẠY) — chiến dịch độ phủ**: dùng LOC còn lại (~2.2k dưới trần sau khi hoãn M16) mua coverage dialect gcc/clang + cherry-pick C99/C11 — GIỮ LUẬT: không implement theo checklist, mỗi feature phải có phần mềm kinh điển thật đòi. Thứ tự Vu chốt: sqlite → git → musl libc, rồi rổ còn lại theo coverage-per-LOC: zlib → lua standalone → jemalloc (hẹn từ M14) → curl → sbase → coreutils (gnulib, để cuối). Khi ext.rs vượt ~300 LOC: tách `ext/gcc.rs, ext/clang.rs…` theo phương ngữ GỐC. Rổ đòi quá ngân sách → quyết định lại trần bằng số liệu probe, không nhồi.
   - **sqlite ĐẠT (2026-08-17)**: amalgamation 262 899 dòng compile sạch nhát đầu, zero LOC; CLI chạy, differential vs cc 31 dòng khớp byte. Nợ: suite TCL chính chủ cần box Linux + tcl.
   - **git ĐẠT (2026-08-17)**: binary 2.55.GIT link + smoke đủ (init/commit/log/diff/fsck); t/ suite: t0000 92/92, t0001 103/103, t3600 81/82 (1 fail = known breakage của git). Giá +62 LOC: `__STDC_VERSION__ 199901L`, `[restrict]` array param, PRI/SCN MAX, `__builtin_types_compatible_p`, `__extension__` expr/stmt, và 3 bug C89 thuần bị phơi (scope tên global trước init; ident sau specifier là tên dù trùng typedef; locals thừa rò vào ginit). Chi tiết tests/README.md. LOC sau git: 7824 Rust + 447 header.
-  - Kế tiếp theo lệnh: **musl libc**.
+  - **musl libc 1.2.5 ĐẠT (2026-08-17)**: full build trong box —
+    **1350 object zero error, libc.a 4.3MB + crt**, install thành sysroot;
+    static hello + smoke rộng (qsort/printf/math/file IO/strtod) **khớp
+    từng byte vs gcc+glibc**. Suite chính chủ libc-test: zcc fail 77 err /
+    referee musl-gcc fail 46 — differential chốt: phần lớn fail = baseline
+    upstream; zcc-only còn ~10 nghi phạm thật (mbc/wide cluster, setjmp,
+    vfork, tls_local_exec, ilogb/isless fp-exception) + nợ -shared + LDBL64
+    hệ quả — chi tiết tests/README.md. Quyết định hệ trọng: `long double`
+    giữ = double bằng cách port `bits/float.h` LDBL64 (nhánh arm32 upstream
+    — 1 file, thế giới tự nhất quán); driver mọc `ZCC_SYSROOT`; phát hiện
+    **GNU ld drop addend trên GOT local symbol** → ELF FunAddr static đi
+    adrp/add trực tiếp (khác Darwin). Giá: `_Complex` desugar struct,
+    weak/alias/top-level asm, `.s/.S` passthrough, builtin inf/nan, seed
+    `__zcc_va_list` ELF. LOC sau musl: **8894 Rust + 424 header** (buffer
+    ~1.1k dưới trần). Vu chốt sau musl: libc build được ≈ 90% userland mở
+    khóa — M17 tạm dừng nhường **chiến dịch correctness (M18 kéo lên
+    trước)**: math/sci gate + thêm suite, đưa correctness → 100%.
 
 - **M18 (dự kiến) — chiến dịch correctness 100%** (Vu chốt 4 khía 2026-08-17, xếp sau/xen kẽ M17):
   1. **Csmith generative fuzzing** — sinh hàng loạt chương trình C ngẫu nhiên CAM KẾT không-UB, differential zcc↔gcc/cc (checksum output + crash-khi-compile = bug). Cùng huyết thống alg.sh (trọng tài + generator lọc UB) nhưng generative cả chương trình: vét được tổ hợp struct lồng/pointer sâu mà corpus tĩnh (torture/nginx/redis) không bao giờ chạm. Mục tiêu: harness `tests/csmith.sh` chạy nightly, reduce case bằng creduce khi bắt được.

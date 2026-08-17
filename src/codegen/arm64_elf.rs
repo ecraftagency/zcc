@@ -51,17 +51,26 @@ pub fn emit(ast: &Ast) -> String {
         fsret: 0,
         va: (0, 0, 0, 0),
     };
+    // EXT(gcc): __asm__("...") cấp toàn cục (musl crt_arch.h _start) — verbatim
+    for a in &ast.raw_asm {
+        g.s += a;
+        g.s += "\n.text\n"; // blob có thể đổi section — trả về .text
+    }
     for f in &ast.funcs {
         g.fname = f.name.clone();
         g.fret = f.ret;
         g.fsret = f.sret;
         if !f.is_static {
             _ = writeln!(g.s, ".globl {}", f.name);
-            if f.is_inline {
+            if f.is_inline || f.is_weak {
                 _ = writeln!(g.s, ".weak {}", f.name);
             }
         }
-        _ = write!(g.s, ".p2align 2\n{}:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n", f.name);
+        _ = write!(
+            g.s,
+            ".p2align 2\n{}:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n",
+            f.name
+        );
         if f.frame > 0 {
             g.sp_adjust("sub", f.frame);
         }
@@ -75,7 +84,13 @@ pub fn emit(ast: &Ast) -> String {
                 _ = writeln!(g.s, "\tstp q{}, q{}, [x9, #{}]", 2 * i, 2 * i + 1, 32 * i);
             }
             for i in 0..4u32 {
-                _ = writeln!(g.s, "\tstp x{}, x{}, [x9, #{}]", 2 * i, 2 * i + 1, 128 + 16 * i);
+                _ = writeln!(
+                    g.s,
+                    "\tstp x{}, x{}, [x9, #{}]",
+                    2 * i,
+                    2 * i + 1,
+                    128 + 16 * i
+                );
             }
         }
         if f.sret != 0 {
@@ -204,10 +219,20 @@ pub fn emit(ast: &Ast) -> String {
     }
     for gl in &ast.globals {
         if gl.is_extern {
+            // EXT(gcc): extern weak (musl _DYNAMIC) — ref phải là weak undef
+            if gl.is_weak {
+                _ = writeln!(g.s, ".weak {}", gl.name);
+            }
             continue;
         }
         let (sz, al) = (ast.tt.size(gl.ty), ast.tt.align(gl.ty));
-        let globl = if gl.is_static { String::new() } else { format!(".globl {}\n", gl.name) };
+        let globl = if gl.is_static {
+            String::new()
+        } else if gl.is_weak {
+            format!(".weak {}\n", gl.name) // EXT(gcc): .weak bao hàm global
+        } else {
+            format!(".globl {}\n", gl.name)
+        };
         if gl.is_tls {
             // TLS ELF: symbol chính LÀ label trong .tdata/.tbss ("awT" = TLS),
             // không descriptor — access qua tpidr_el0 + :tprel (xem addr())
@@ -261,7 +286,11 @@ pub fn emit(ast: &Ast) -> String {
             // __cstring bị linker dedup theo nội-dung-đến-NUL — string chứa
             // NUL nhúng ("\0abc") phải qua __const kẻo bị merge nhầm
             // ELF: .rodata trơn cho mọi string (không có mergeable-dedup phải né)
-            g.s += if bytes.contains(&0) { ".section .rodata\n" } else { ".section .rodata\n" };
+            g.s += if bytes.contains(&0) {
+                ".section .rodata\n"
+            } else {
+                ".section .rodata\n"
+            };
             _ = write!(g.s, "l_str{}:\n\t.asciz \"", i);
             for &b in bytes {
                 match b {
@@ -272,6 +301,15 @@ pub fn emit(ast: &Ast) -> String {
             }
             g.s += "\"\n";
         }
+    }
+    // EXT(gcc): weak prototype — undef ref hạ về weak (link không đòi symbol)
+    for w in &ast.weak_decls {
+        _ = writeln!(g.s, ".weak {}", w);
+    }
+    // EXT(gcc): __attribute__((alias)) — musl weak_alias: symbol mới = symbol cũ
+    for (new, old, weak) in &ast.aliases {
+        let vis = if *weak { ".weak" } else { ".globl" };
+        _ = writeln!(g.s, "{} {}\n.set {}, {}", vis, new, new, old);
     }
     g.s
 }
@@ -389,7 +427,11 @@ impl Cg<'_> {
         // là v SAU truncate (921016-1)
         if let Ty::Bitfield(b, _, w) = self.a.tt.tys[t as usize] {
             let sh = 64 - w;
-            let op = if self.a.tt.is_unsigned(b) { "lsr" } else { "asr" };
+            let op = if self.a.tt.is_unsigned(b) {
+                "lsr"
+            } else {
+                "asr"
+            };
             _ = writeln!(self.s, "\tlsl x0, x0, #{sh}\n\t{op} x0, x0, #{sh}");
             return;
         }
@@ -416,7 +458,11 @@ impl Cg<'_> {
                     _ => "\tldr x0, [x0]\n",
                 };
                 _ = writeln!(self.s, "\tlsl x0, x0, #{}", 64 - boff - w);
-                let sh = if self.a.tt.is_unsigned(b) { "lsr" } else { "asr" };
+                let sh = if self.a.tt.is_unsigned(b) {
+                    "lsr"
+                } else {
+                    "asr"
+                };
                 _ = writeln!(self.s, "\t{sh} x0, x0, #{}", 64 - w);
             }
             _ => {
@@ -479,13 +525,20 @@ impl Cg<'_> {
     // chuyển kiểu giá trị canonical trong x0: from → to
     fn cast_op(&mut self, from: TypeId, to: TypeId) {
         let tt = &self.a.tt;
-        if matches!(tt.tys[to as usize], Ty::Void | Ty::Struct(_) | Ty::Array(..)) {
+        if matches!(
+            tt.tys[to as usize],
+            Ty::Void | Ty::Struct(_) | Ty::Array(..)
+        ) {
             return;
         }
         match (tt.is_float(from), tt.is_float(to)) {
             (false, false) => self.ext(to),
             (false, true) => {
-                let cvt = if tt.is_unsigned(from) { "ucvtf" } else { "scvtf" };
+                let cvt = if tt.is_unsigned(from) {
+                    "ucvtf"
+                } else {
+                    "scvtf"
+                };
                 _ = writeln!(self.s, "\t{cvt} d0, x0");
                 if tt.size(to) == 4 {
                     self.s += "\tfcvt s0, d0\n\tfcvt d0, s0\n";
@@ -498,7 +551,11 @@ impl Cg<'_> {
                     return;
                 }
                 self.s += "\tfmov d0, x0\n";
-                let cvt = if self.a.tt.is_unsigned(to) { "fcvtzu" } else { "fcvtzs" };
+                let cvt = if self.a.tt.is_unsigned(to) {
+                    "fcvtzu"
+                } else {
+                    "fcvtzs"
+                };
                 if self.a.tt.size(to) == 8 {
                     _ = writeln!(self.s, "\t{cvt} x0, d0");
                 } else {
@@ -674,11 +731,7 @@ impl Cg<'_> {
                         gl.name
                     );
                 } else {
-                    _ = writeln!(
-                        self.s,
-                        "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}",
-                        gl.name
-                    );
+                    _ = writeln!(self.s, "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}", gl.name);
                 }
             }
             Node::Member(b, off) => {
@@ -692,10 +745,12 @@ impl Cg<'_> {
             }
             Node::Deref(e) => self.expr(*e),
             // giá trị của expr kiểu struct = địa chỉ (SRet temp, compound literal...)
-            Node::SRet(..) | Node::Comma(..) | Node::Assign(..) | Node::Cond(..) | Node::Block(_)
-            | Node::Str(_) => {
-                self.expr(id)
-            }
+            Node::SRet(..)
+            | Node::Comma(..)
+            | Node::Assign(..)
+            | Node::Cond(..)
+            | Node::Block(_)
+            | Node::Str(_) => self.expr(id),
             _ => unreachable!("không phải lvalue"),
         }
     }
@@ -717,11 +772,19 @@ impl Cg<'_> {
             Node::Addr(e) => self.addr(*e),
             Node::FunAddr(name) => {
                 let sy = sym(name);
-                _ = writeln!(
-                    self.s,
-                    "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
-                    sy
-                );
+                // hàm static = symbol LOCAL: cấm đi GOT — gas hạ reloc local
+                // thành .text+addend, GNU ld tạo GOT entry BỎ addend → con trỏ
+                // trỏ nhầm hàm đầu section (musl libc_start_main_stage2 → nhảy
+                // vào __syscall3). Local luôn cùng TU → adrp/add trực tiếp.
+                if self.a.funcs.iter().any(|f| f.name == *name && f.is_static) {
+                    _ = writeln!(self.s, "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}", sy);
+                } else {
+                    _ = writeln!(
+                        self.s,
+                        "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
+                        sy
+                    );
+                }
             }
             Node::Alloca(e) => {
                 self.expr(*e);
@@ -770,8 +833,7 @@ impl Cg<'_> {
                         let n = self.labels(1);
                         self.imm("x2", sz as i64);
                         _ = writeln!(self.s, "L{n}:");
-                        self.s +=
-                            "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+                        self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
                         _ = writeln!(self.s, "\tb.ne L{n}");
                     }
                     self.s += "\tmov x0, x4\n"; // giá trị = địa chỉ dst
@@ -817,7 +879,11 @@ impl Cg<'_> {
                 self.load(lt);
                 self.s += "\tldr x1, [sp], #16\n";
                 self.imm("x3", delta);
-                _ = writeln!(self.s, "\t{} x2, x0, x3", if op == "+" { "add" } else { "sub" });
+                _ = writeln!(
+                    self.s,
+                    "\t{} x2, x0, x3",
+                    if op == "+" { "add" } else { "sub" }
+                );
                 self.store(2, lt);
             }
             Node::VaArea(off) => _ = writeln!(self.s, "\tadd x0, x29, #{off}"),
@@ -831,8 +897,16 @@ impl Cg<'_> {
                 self.imm("x9", frame as i64);
                 self.s += "\tsub x9, x29, x9\n\tstr x9, [x0, #8]\n"; // __gr_top
                 self.s += "\tsub x9, x9, #64\n\tstr x9, [x0, #16]\n"; // __vr_top
-                _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #24]", (gp as i64 - 8) * 8);
-                _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #28]", (fp as i64 - 8) * 16);
+                _ = writeln!(
+                    self.s,
+                    "\tmov x9, #{}\n\tstr w9, [x0, #24]",
+                    (gp as i64 - 8) * 8
+                );
+                _ = writeln!(
+                    self.s,
+                    "\tmov x9, #{}\n\tstr w9, [x0, #28]",
+                    (fp as i64 - 8) * 16
+                );
             }
             Node::VaArg(ap, t) => {
                 let (ap, t) = (*ap, *t);
@@ -851,13 +925,20 @@ impl Cg<'_> {
                 };
                 // stack caller: mọi scalar slot 8 (kể cả double — 16 chỉ là bước
                 // VR save area), composite ≤16 theo size tròn 8, >16 = 1 slot con trỏ
-                let stk_step = if st && sz <= 16 { sz.div_ceil(8) * 8 } else { 8 };
+                let stk_step = if st && sz <= 16 {
+                    sz.div_ceil(8) * 8
+                } else {
+                    8
+                };
                 self.addr(ap); // x0 = &ap
                 let l = self.labels(2);
                 _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]\n\ttbnz w9, #31, L{l}");
                 self.s += "\tldr x10, [x0]\n\tadd x11, x10, #";
                 _ = writeln!(self.s, "{}\n\tstr x11, [x0]\n\tb L{}", stk_step, l + 1);
-                _ = writeln!(self.s, "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw");
+                _ = writeln!(
+                    self.s,
+                    "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw"
+                );
                 _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
                 _ = writeln!(self.s, "L{}:\n\tmov x0, x10", l + 1);
                 if st {
@@ -871,37 +952,68 @@ impl Cg<'_> {
             // EXT(gcc): inline asm subset — operand %k gán cứng x{9+k} (an toàn
             // vì -O0 không giữ giá trị sống trong thanh ghi qua statement);
             // %xk/%wk ép độ rộng, %k trần theo size kiểu operand (8→x, khác→w)
-            Node::Asm(tpl, outs, ins) => {
-                let (tpl, outs, ins) = (tpl.clone(), outs.clone(), ins.clone());
-                let sizes: Vec<u32> = outs
-                    .iter()
-                    .map(|&(_, e)| e)
-                    .chain(ins.iter().copied())
-                    .map(|e| self.a.tt.size(self.a.types[e as usize]))
-                    .collect();
-                // push giá trị mọi operand theo index ("=r" push rác giữ nhịp pop)
-                for &(plus, e) in &outs {
-                    if plus {
-                        self.expr(e);
+            Node::Asm(tpl, ops) => {
+                let (tpl, ops) = (tpl.clone(), ops.clone());
+                // gán reg: pin > tied > pool (GP x9.., FP v16.. — đều caller-
+                // saved); mem dùng pool GP giữ ĐỊA CHỈ
+                let (mut gp, mut vp) = (9u32, 16u32);
+                let mut regs: Vec<u32> = Vec::with_capacity(ops.len());
+                for op in &ops {
+                    let r = if let Some(p) = op.pin {
+                        p as u32
+                    } else if let Some(t) = op.tied {
+                        regs[t as usize]
+                    } else if op.fp {
+                        vp += 1;
+                        vp - 1
+                    } else {
+                        gp += 1;
+                        gp - 1
+                    };
+                    regs.push(r);
+                }
+                // eval: mem → địa chỉ, out thuần → bỏ, còn lại → giá trị; tất cả
+                // lên stack trước vì expr()/addr() phá scratch
+                let mut pushed: Vec<usize> = Vec::new();
+                for (k, op) in ops.iter().enumerate() {
+                    if op.mem {
+                        self.addr(op.e);
+                    } else if op.out && !op.rw {
+                        continue;
+                    } else {
+                        self.expr(op.e);
                     }
                     self.s += "\tstr x0, [sp, #-16]!\n";
+                    pushed.push(k);
                 }
-                for &e in &ins {
-                    self.expr(e);
-                    self.s += "\tstr x0, [sp, #-16]!\n";
-                }
-                for k in (0..outs.len() + ins.len()).rev() {
-                    _ = writeln!(self.s, "\tldr x{}, [sp], #16", 9 + k);
+                let sizes: Vec<u32> = ops
+                    .iter()
+                    .map(|o| self.a.tt.size(self.a.types[o.e as usize]))
+                    .collect();
+                // pop ngược vào reg đích; FP nhận bit pattern qua ldr d —
+                // convention: float sống trong x-reg dạng bit DOUBLE (load()
+                // fcvt lên) nên float phải demote về s-lane cho template
+                for &k in pushed.iter().rev() {
+                    if ops[k].fp {
+                        _ = writeln!(self.s, "\tldr d{}, [sp], #16", regs[k]);
+                        if sizes[k] == 4 {
+                            _ = writeln!(self.s, "\tfcvt s{0}, d{0}", regs[k]);
+                        }
+                    } else {
+                        _ = writeln!(self.s, "\tldr x{}, [sp], #16", regs[k]);
+                    }
                 }
                 let mut sub = String::new();
                 let cs: Vec<char> = tpl.chars().collect();
                 let mut i = 0;
                 while i < cs.len() {
                     if cs[i] == '%' && i + 1 < cs.len() {
-                        let (mut j, mut wide) = (i + 1, None);
+                        let (mut j, mut m) = (i + 1, ' ');
                         match cs[j] {
-                            'x' => (wide, j) = (Some(true), j + 1),
-                            'w' => (wide, j) = (Some(false), j + 1),
+                            'x' | 'w' | 's' | 'd' => {
+                                m = cs[j];
+                                j += 1;
+                            }
                             '%' => {
                                 sub.push('%');
                                 i = j + 1;
@@ -910,8 +1022,17 @@ impl Cg<'_> {
                             _ => {}
                         }
                         if let Some(d) = cs.get(j).and_then(|c| c.to_digit(10)) {
-                            let w = wide.unwrap_or(sizes.get(d as usize).is_none_or(|&s| s == 8));
-                            _ = write!(sub, "{}{}", if w { 'x' } else { 'w' }, 9 + d);
+                            let d = d as usize;
+                            let (r, op) = (regs[d], &ops[d]);
+                            if op.mem {
+                                _ = write!(sub, "[x{r}]");
+                            } else if op.fp || m == 's' || m == 'd' {
+                                let sgl = m == 's' || (m == ' ' && sizes[d] == 4);
+                                _ = write!(sub, "{}{}", if sgl { 's' } else { 'd' }, r);
+                            } else {
+                                let w = m == 'w' || (m == ' ' && sizes[d] < 8);
+                                _ = write!(sub, "{}{}", if w { 'w' } else { 'x' }, r);
+                            }
                             i = j + 1;
                             continue;
                         }
@@ -922,14 +1043,26 @@ impl Cg<'_> {
                 if !sub.is_empty() {
                     _ = writeln!(self.s, "\t{}", sub.replace('\n', "\n\t"));
                 }
-                // writeback output: giá trị lên stack trước vì addr() phá x9+
-                for k in 0..outs.len() {
-                    _ = writeln!(self.s, "\tstr x{}, [sp, #-16]!", 9 + k);
+                // writeback output (mem tự ghi qua địa chỉ): giá trị lên stack
+                // trước vì addr() phá scratch
+                let wb: Vec<usize> = (0..ops.len())
+                    .filter(|&k| ops[k].out && !ops[k].mem)
+                    .collect();
+                for &k in &wb {
+                    if ops[k].fp {
+                        if sizes[k] == 4 {
+                            // float ra từ s-lane → promote về bit double (convention)
+                            _ = writeln!(self.s, "\tfcvt d{0}, s{0}", regs[k]);
+                        }
+                        _ = writeln!(self.s, "\tstr d{}, [sp, #-16]!", regs[k]);
+                    } else {
+                        _ = writeln!(self.s, "\tstr x{}, [sp, #-16]!", regs[k]);
+                    }
                 }
-                for &(_, e) in outs.iter().rev() {
-                    self.addr(e);
+                for &k in wb.iter().rev() {
+                    self.addr(ops[k].e);
                     self.s += "\tmov x1, x0\n\tldr x2, [sp], #16\n";
-                    self.store(2, self.a.types[e as usize]);
+                    self.store(2, self.a.types[ops[k].e as usize]);
                 }
             }
             // EXT(gcc): atomics __sync_* (M12) — vòng LL/SC ldaxr/stlxr; cặp
@@ -1226,11 +1359,7 @@ impl Cg<'_> {
                     self.expr(a); // x0 = địa chỉ struct
                     let mut k = 0;
                     while k < sz {
-                        _ = writeln!(
-                            self.s,
-                            "\tldr x8, [x0, #{k}]\n\tstr x8, [sp, #{}]",
-                            o + k
-                        );
+                        _ = writeln!(self.s, "\tldr x8, [x0, #{k}]\n\tstr x8, [sp, #{}]", o + k);
                         k += 8;
                     }
                 }

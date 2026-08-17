@@ -13,9 +13,8 @@
 // Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
 // conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
 use crate::ast::{
-    Ast, FnSig, Func, GInit, Global, Node, NodeId, StructDef, SyncOp, Target, Ty, TyTab, TypeId,
-    BOOL,
-    CHAR, DOUBLE, FLOAT, INT, LONG, SHORT, UCHAR, UINT, ULONG, USHORT, VOID,
+    AsmOp, Ast, BOOL, CHAR, DOUBLE, FLOAT, FnSig, Func, GInit, Global, INT, LONG, Node, NodeId,
+    SHORT, StructDef, SyncOp, Target, Ty, TyTab, TypeId, UCHAR, UINT, ULONG, USHORT, VOID,
 };
 use crate::lexer::{NumK, Tok};
 use std::collections::HashMap;
@@ -75,12 +74,12 @@ struct P<'a> {
     enums: HashMap<String, i64>,
     enum_tags: HashMap<String, TypeId>, // tag → underlying (INT | UINT, khớp clang)
     switches: Vec<(Vec<(i64, NodeId)>, Option<NodeId>)>,
-    fret: TypeId, // kiểu trả về của hàm đang parse
-    va_off: u32,  // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
-    in_fn: bool,  // đang trong body hàm (compound literal: local vs global ẩn)
+    fret: TypeId,              // kiểu trả về của hàm đang parse
+    va_off: u32,               // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
+    in_fn: bool,               // đang trong body hàm (compound literal: local vs global ẩn)
     attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
-    saw_inline: bool, // EXT(gcc): decl_specs vừa gặp inline/__inline (gnu89)
-    saw_thread: bool, // EXT(gcc): decl_specs vừa gặp __thread (capture NGAY sau
+    saw_inline: bool,          // EXT(gcc): decl_specs vừa gặp inline/__inline (gnu89)
+    saw_thread: bool,          // EXT(gcc): decl_specs vừa gặp __thread (capture NGAY sau
     // decl_specs — init chứa cast sẽ gọi decl_specs lồng làm reset cờ)
     // EXT(gcc): tên đã có file-scope declaration KHÔNG inline — C99 6.7.4p7:
     // định nghĩa inline của tên đó vẫn là external definition (logreqres redis)
@@ -88,9 +87,27 @@ struct P<'a> {
     // EXT(c99): declarator vừa gặp mảng size không hằng (VLA) — expr của size;
     // chỉ stmt() (local decl) tiêu thụ, hạ xuống con trỏ + Alloca
     vla_size: Option<NodeId>,
+    // EXT(gcc): local ghim reg `register long v __asm__("x8")` (musl syscall)
+    // — key = offset stack của local, value = số reg GP
+    reg_pins: HashMap<u32, u8>,
+    // EXT(c99): con trỏ tới VLA `char (*p)[w]` (musl lsearch/dynlink) — key =
+    // TypeId của Array(elem, 0) pointee (không intern nên unique mỗi decl),
+    // value = offset local ẩn giữ SIZE BYTE runtime; mkbin scale theo nó
+    vla_arrs: HashMap<TypeId, u32>,
+    // EXT(c99): _Complex t (musl src/complex) hạ về struct {re, im} — layout,
+    // union punning, HFA ABI (AAPCS64 coi complex như struct 2 phần tử) ăn
+    // nguyên máy móc struct sẵn có. Key = elem (FLOAT/DOUBLE), value = TypeId struct.
+    cplx_tys: HashMap<TypeId, TypeId>,
     fname: String, // tên hàm đang parse (label symbol cho &&label trong static init)
     asm_label: Option<String>, // EXT(gcc): __asm("_sym") vừa nuốt trong skip_attrs
     renames: HashMap<String, String>, // EXT(gcc): tên C → symbol __asm (SDK versioning)
+    attr_weak: bool,            // EXT(gcc): __attribute__((weak)) (musl)
+    attr_alias: Option<String>, // EXT(gcc): __attribute__((alias("sym"))) (musl weak_alias)
+    raw_asm: Vec<String>,       // EXT(gcc): __asm__("...") cấp toàn cục (musl crt)
+    aliases: Vec<(String, String, bool)>, // (mới, cũ, weak)
+    // EXT(gcc): prototype mang weak (musl `extern weak hidden _DYNAMIC[]`) —
+    // TU tham chiếu phải phát .weak kẻo strong undef ref làm link đòi symbol
+    weak_decls: Vec<String>,
 }
 
 type R = Result<NodeId, String>;
@@ -122,10 +139,29 @@ const ASSIGN_OPS: [(&str, &str); 11] = [
     ("^=", "^"),
 ];
 
-const TYPE_WORDS: [&str; 21] = [
-    "void", "char", "short", "int", "long", "signed", "unsigned", "float", "double", "struct",
-    "union", "enum", "const", "volatile", "_Bool", "__const", "__volatile", "__signed",
-    "__signed__", "__typeof__", "__typeof", // EXT(gcc): typeof trần KHÔNG nhận (va tên biến C89)
+const TYPE_WORDS: [&str; 22] = [
+    "void",
+    "char",
+    "short",
+    "int",
+    "long",
+    "signed",
+    "unsigned",
+    "float",
+    "double",
+    "struct",
+    "union",
+    "enum",
+    "const",
+    "volatile",
+    "_Bool",
+    "_Complex", // EXT(c99)
+    "__const",
+    "__volatile",
+    "__signed",
+    "__signed__",
+    "__typeof__",
+    "__typeof", // EXT(gcc): typeof trần KHÔNG nhận (va tên biến C89)
 ];
 
 impl P<'_> {
@@ -278,12 +314,25 @@ impl P<'_> {
     }
     // hằng thực cho global init kiểu float
     fn fold_f(&self, id: NodeId) -> Result<f64, String> {
+        // cây con kiểu NGUYÊN (musl: (double)(1 << k) trong POWF_SCALE):
+        // fold nguyên trọn vẹn rồi đổi sang thực theo dấu
+        if !self.tt.is_float(self.ty(id)) {
+            if let Ok(v) = self.fold(id) {
+                return Ok(if self.tt.is_unsigned(self.ty(id)) {
+                    v as u64 as f64
+                } else {
+                    v as f64
+                });
+            }
+        }
         match &self.nodes[id as usize] {
             Node::FNum(v) => Ok(*v),
             // unsigned 64-bit: 9223372036854775810ul phải thành 9.2e18 chứ không âm
-            Node::Num(v) => {
-                Ok(if self.tt.is_unsigned(self.ty(id)) { *v as u64 as f64 } else { *v as f64 })
-            }
+            Node::Num(v) => Ok(if self.tt.is_unsigned(self.ty(id)) {
+                *v as u64 as f64
+            } else {
+                *v as f64
+            }),
             Node::Neg(e) => Ok(-self.fold_f(*e)?),
             Node::Cast(e) => self.fold_f(*e),
             Node::Bin(op, l, r) => {
@@ -306,9 +355,12 @@ impl P<'_> {
         self.attr_aligned = None; // của declaration trước, không lây
         self.saw_inline = false;
         self.saw_thread = false;
+        self.attr_weak = false;
+        self.attr_alias = None;
         let mut storage = Storage::None;
         let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
         let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
+        let mut cplx = false; // EXT(c99): _Complex
         loop {
             let n = match self.toks.get(self.pos) {
                 Some(Tok::Ident(n)) => n.as_str(),
@@ -316,8 +368,8 @@ impl P<'_> {
             };
             match n {
                 "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict"
-                | "__restrict__" | "__extension__" | "__volatile" | "__volatile__"
-                | "__const" | "__const__" | "_Noreturn" => {}
+                | "__restrict__" | "__extension__" | "__volatile" | "__volatile__" | "__const"
+                | "__const__" | "_Noreturn" => {}
                 // EXT(gcc): __thread TLS thật (Mach-O @TLVP) — redis-tests
                 // unit io-threads>=2 là chủ nợ đòi. Plain __thread trên auto
                 // local (gcc cấm) rơi tự nhiên về stack — vốn đã per-thread.
@@ -347,6 +399,8 @@ impl P<'_> {
                 "static" => storage = Storage::Static,
                 "extern" => storage = Storage::Extern,
                 "void" | "char" | "int" | "float" | "double" | "_Bool" => base = Some(n),
+                // EXT(c99): _Complex — musl src/complex; hạ về struct {re, im}
+                "_Complex" => cplx = true,
                 "short" => short = true,
                 "long" => longs += 1,
                 "signed" | "__signed" | "__signed__" => sgn = true,
@@ -372,7 +426,17 @@ impl P<'_> {
                         self.typename()?
                     } else {
                         let e = self.expr()?; // node thành rác arena, như sizeof
-                        self.ty(e)
+                        let mut t = self.ty(e);
+                        // typeof(tên hàm) = KIỂU HÀM, không decay (musl weak_alias:
+                        // extern __typeof(f) g — g phải là hàm để alias đúng nhánh)
+                        if let Node::FunAddr(_) = self.nodes[e as usize] {
+                            if let Ty::Ptr(p) = self.tt.tys[t as usize] {
+                                if matches!(self.tt.tys[p as usize], Ty::Func(_)) {
+                                    t = p;
+                                }
+                            }
+                        }
+                        t
                     };
                     self.expect(Tok::Punct(")"))?;
                     direct = Some(t);
@@ -383,8 +447,7 @@ impl P<'_> {
                     // typedef-name: chỉ khi chưa có kiểu nào khác (và không bị
                     // biến local cùng tên shadow — redis: quicklist *quicklist)
                     if base.is_none() && direct.is_none() && !uns && !sgn && !short && longs == 0 {
-                        let shadowed =
-                            self.in_fn && self.locals.iter().any(|(ln, ..)| ln == n);
+                        let shadowed = self.in_fn && self.locals.iter().any(|(ln, ..)| ln == n);
                         if let Some(&t) = self.typedefs.get(n).filter(|_| !shadowed) {
                             self.pos += 1;
                             direct = Some(t);
@@ -422,27 +485,45 @@ impl P<'_> {
             _ => {
                 // họ int (kể cả không có "int" tường minh)
                 if short {
-                    if uns {
-                        USHORT
-                    } else {
-                        SHORT
-                    }
+                    if uns { USHORT } else { SHORT }
                 } else if longs > 0 {
-                    if uns {
-                        ULONG
-                    } else {
-                        LONG
-                    }
+                    if uns { ULONG } else { LONG }
                 } else {
-                    if uns {
-                        UINT
-                    } else {
-                        INT
-                    }
+                    if uns { UINT } else { INT }
                 }
             }
         };
+        if cplx {
+            // EXT(c99): float _Complex / double _Complex / long double _Complex
+            // (long double = double); _Complex trần = double _Complex (theo gcc)
+            let elem = if t == FLOAT { FLOAT } else { DOUBLE };
+            return Ok(Some((self.cplx_of(elem), storage)));
+        }
         Ok(Some((t, storage)))
+    }
+    // EXT(c99): intern struct {re, im} đại diện _Complex elem — AAPCS64 truyền
+    // complex "as if" struct 2 phần tử nên HFA machinery sẵn có cho ABI đúng
+    fn cplx_of(&mut self, elem: TypeId) -> TypeId {
+        if let Some(&t) = self.cplx_tys.get(&elem) {
+            return t;
+        }
+        let sz = self.tt.size(elem);
+        self.tt.structs.push(crate::ast::StructDef {
+            members: vec![("re".into(), elem, 0), ("im".into(), elem, sz)],
+            size: 2 * sz,
+            align: sz,
+            is_union: false,
+        });
+        let t = self.tt.add(Ty::Struct((self.tt.structs.len() - 1) as u32));
+        self.cplx_tys.insert(elem, t);
+        t
+    }
+    // tra ngược: t có phải kiểu complex không → elem
+    fn cplx_elem(&self, t: TypeId) -> Option<TypeId> {
+        self.cplx_tys
+            .iter()
+            .find(|kv| *kv.1 == t)
+            .map(|kv| *kv.0)
     }
     fn struct_union(&mut self, is_union: bool) -> Result<TypeId, String> {
         let (packed, aligned) = self.skip_attrs()?;
@@ -471,12 +552,14 @@ impl P<'_> {
         }
         // có thân: tag đã có placeholder INCOMPLETE thì định nghĩa vào đúng slot
         // (tự tham chiếu được); tag đã complete → định nghĩa MỚI shadow (scope con)
-        let incomplete = tag.as_ref().and_then(|g| self.tags.get(g)).copied().filter(|&t| {
-            match self.tt.tys[t as usize] {
-                Ty::Struct(si) => self.tt.structs[si as usize].members.is_empty(),
-                _ => false,
-            }
-        });
+        let incomplete =
+            tag.as_ref()
+                .and_then(|g| self.tags.get(g))
+                .copied()
+                .filter(|&t| match self.tt.tys[t as usize] {
+                    Ty::Struct(si) => self.tt.structs[si as usize].members.is_empty(),
+                    _ => false,
+                });
         let t = match incomplete {
             Some(t) => t,
             None => {
@@ -493,7 +576,9 @@ impl P<'_> {
                 t
             }
         };
-        let Ty::Struct(sidx) = self.tt.tys[t as usize] else { unreachable!() };
+        let Ty::Struct(sidx) = self.tt.tys[t as usize] else {
+            unreachable!()
+        };
         let mut members = Vec::new();
         // layout theo ABI Itanium (khoá clang Darwin — bitfield là impl-def C89
         // nhưng interop SDK bắt buộc khớp platform): cursor cấp phát theo BIT;
@@ -511,9 +596,17 @@ impl P<'_> {
                     // member ĐƠN tên rỗng (giữ cursor init đúng); truy cập
                     // xuyên qua bằng find_member đệ quy
                     let (sz, al) = (self.tt.size(bt), self.tt.align(bt));
-                    let o = if is_union { 0 } else { bits.div_ceil(8).div_ceil(al) * al };
+                    let o = if is_union {
+                        0
+                    } else {
+                        bits.div_ceil(8).div_ceil(al) * al
+                    };
                     members.push((String::new(), bt, o));
-                    bits = if is_union { bits.max(sz * 8) } else { (o + sz) * 8 };
+                    bits = if is_union {
+                        bits.max(sz * 8)
+                    } else {
+                        (o + sz) * 8
+                    };
                     mx = mx.max(al);
                 }
                 self.expect(Tok::Punct(";"))?;
@@ -553,10 +646,22 @@ impl P<'_> {
                     }
                 } else {
                     let sz = self.tt.size(mt);
-                    let al = if packed { 1 } else { self.tt.align(mt).max(attr_al) };
-                    let o = if is_union { 0 } else { bits.div_ceil(8).div_ceil(al) * al };
+                    let al = if packed {
+                        1
+                    } else {
+                        self.tt.align(mt).max(attr_al)
+                    };
+                    let o = if is_union {
+                        0
+                    } else {
+                        bits.div_ceil(8).div_ceil(al) * al
+                    };
                     members.push((mn, mt, o));
-                    bits = if is_union { bits.max(sz * 8) } else { (o + sz) * 8 };
+                    bits = if is_union {
+                        bits.max(sz * 8)
+                    } else {
+                        (o + sz) * 8
+                    };
                     mx = mx.max(al);
                 }
                 if !self.eat(&Tok::Punct(",")) {
@@ -568,8 +673,12 @@ impl P<'_> {
         if let Some(a) = aligned {
             mx = mx.max(a);
         }
-        self.tt.structs[sidx as usize] =
-            StructDef { members, size: bits.div_ceil(8).div_ceil(mx) * mx, align: mx, is_union };
+        self.tt.structs[sidx as usize] = StructDef {
+            members,
+            size: bits.div_ceil(8).div_ceil(mx) * mx,
+            align: mx,
+            is_union,
+        };
         Ok(t)
     }
     fn enum_spec(&mut self) -> Result<TypeId, String> {
@@ -583,7 +692,11 @@ impl P<'_> {
             }
         }
         // EXT(clang): enum tag : underlying-type (SDK malloc.h) — honor kiểu nền
-        let under = if self.eat(&Tok::Punct(":")) { Some(self.typename()?) } else { None };
+        let under = if self.eat(&Tok::Punct(":")) {
+            Some(self.typename()?)
+        } else {
+            None
+        };
         if self.eat(&Tok::Punct("{")) {
             let mut val = 0i64;
             let mut any_neg = false;
@@ -608,7 +721,9 @@ impl P<'_> {
             }
             return Ok(t);
         }
-        Ok(under.or_else(|| self.enum_tags.get(&tag).copied()).unwrap_or(INT))
+        Ok(under
+            .or_else(|| self.enum_tags.get(&tag).copied())
+            .unwrap_or(INT))
     }
     // declarator đầy đủ C: con trỏ, nested "(...)", suffix mảng/hàm.
     // need_name=false cho abstract declarator (cast, sizeof, param không tên).
@@ -666,7 +781,10 @@ impl P<'_> {
                 n
             }
             _ if need_name => {
-                return Err(format!("cần tên trong declarator, gặp {:?}", self.toks.get(self.pos)))
+                return Err(format!(
+                    "cần tên trong declarator, gặp {:?}",
+                    self.toks.get(self.pos)
+                ));
             }
             _ => String::new(),
         };
@@ -713,6 +831,16 @@ impl P<'_> {
                     let n = self.ident()?;
                     match n.as_str() {
                         "packed" | "__packed__" => packed = true,
+                        // EXT(gcc): weak/alias — bộ xương weak_alias() của musl
+                        "weak" | "__weak__" => self.attr_weak = true,
+                        "alias" | "__alias__" => {
+                            self.expect(Tok::Punct("("))?;
+                            if let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
+                                self.attr_alias = Some(String::from_utf8_lossy(b).into_owned());
+                                self.pos += 1;
+                            }
+                            self.expect(Tok::Punct(")"))?;
+                        }
                         "aligned" | "__aligned__" => {
                             if self.eat(&Tok::Punct("(")) {
                                 let v = self.const_expr()? as u32;
@@ -817,7 +945,10 @@ impl P<'_> {
             oldstyle: false,
         };
         if self.eat(&Tok::Punct(")")) {
-            return Ok(FnSig { oldstyle: true, ..empty }); // () — không thông tin
+            return Ok(FnSig {
+                oldstyle: true,
+                ..empty
+            }); // () — không thông tin
         }
         if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "void")
             && self.toks.get(self.pos + 1) == Some(&Tok::Punct(")"))
@@ -839,7 +970,11 @@ impl P<'_> {
                 }
             }
             self.expect(Tok::Punct(")"))?;
-            return Ok(FnSig { pnames, oldstyle: true, ..empty });
+            return Ok(FnSig {
+                pnames,
+                oldstyle: true,
+                ..empty
+            });
         }
         let (mut params, mut pnames, mut variadic) = (Vec::new(), Vec::new(), false);
         loop {
@@ -863,7 +998,13 @@ impl P<'_> {
             }
         }
         self.expect(Tok::Punct(")"))?;
-        Ok(FnSig { ret, params, pnames, variadic, oldstyle: false })
+        Ok(FnSig {
+            ret,
+            params,
+            pnames,
+            variadic,
+            oldstyle: false,
+        })
     }
     fn typename(&mut self) -> Result<TypeId, String> {
         let (bt, _) = self.decl_specs()?.ok_or("cần tên kiểu")?;
@@ -875,6 +1016,57 @@ impl P<'_> {
     fn cast(&mut self, e: NodeId, to: TypeId) -> NodeId {
         if self.ty(e) == to {
             return e;
+        }
+        // EXT(c99): chuyển đổi complex (6.3.1.6/6.3.1.7) — desugar member-wise.
+        // complex → real: lấy phần thực (creal của musl CHÍNH LÀ cast này);
+        // real/complex → complex: temp + gán từng phần, phần ảo = 0.
+        let (se, de) = (self.cplx_elem(self.ty(e)), self.cplx_elem(to));
+        if let (Some(sel), None) = (se, de) {
+            if self.tt.is_integer(to) || self.tt.is_float(to) {
+                let m = self.push(Node::Member(e, 0), sel);
+                return self.cast(m, to);
+            }
+        }
+        if de.is_some()
+            && self.in_fn
+            && (se.is_some() || self.tt.is_integer(self.ty(e)) || self.tt.is_float(self.ty(e)))
+        {
+            let del = de.unwrap();
+            let esz = self.tt.size(del);
+            let off = self.alloc_local(format!(".cplx{}", self.nodes.len()), to);
+            let mut pre = None;
+            let (rs, is_) = match se {
+                Some(sel) => {
+                    // nguồn cũng complex: chốt vào temp để không eval 2 lần
+                    let st = self.ty(e);
+                    let soff = self.alloc_local(format!(".cplxs{}", self.nodes.len()), st);
+                    let sv = self.push(Node::Var(soff), st);
+                    pre = Some(self.push(Node::Assign(sv, e), st));
+                    let ssz = self.tt.size(sel);
+                    let b1 = self.push(Node::Var(soff), st);
+                    let m1 = self.push(Node::Member(b1, 0), sel);
+                    let b2 = self.push(Node::Var(soff), st);
+                    let m2 = self.push(Node::Member(b2, ssz), sel);
+                    (self.cast(m1, del), self.cast(m2, del))
+                }
+                None => {
+                    let z = self.push(Node::FNum(0.0), del);
+                    (self.cast(e, del), z)
+                }
+            };
+            let dv = self.push(Node::Var(off), to);
+            let mr = self.push(Node::Member(dv, 0), del);
+            let ar = self.push(Node::Assign(mr, rs), del);
+            let dv2 = self.push(Node::Var(off), to);
+            let mi = self.push(Node::Member(dv2, esz), del);
+            let ai = self.push(Node::Assign(mi, is_), del);
+            let val = self.push(Node::Var(off), to);
+            let mut seq = self.push(Node::Comma(ai, val), to);
+            seq = self.push(Node::Comma(ar, seq), to);
+            if let Some(p) = pre {
+                seq = self.push(Node::Comma(p, seq), to);
+            }
+            return seq;
         }
         self.push(Node::Cast(e), to)
     }
@@ -902,8 +1094,10 @@ impl P<'_> {
             // float+float / float+int → FLOAT (operand phải TRÒN về f32 —
             // 16777217L != (float)16777217e0 phân biệt được); còn lại double.
             // Số học chạy trong double (C89 cho phép dư precision).
-            let fl = |t: TypeId| matches!(self.tt.tys[t as usize], Ty::Double)
-                || !self.tt.is_integer(t) && !matches!(self.tt.tys[t as usize], Ty::Float);
+            let fl = |t: TypeId| {
+                matches!(self.tt.tys[t as usize], Ty::Double)
+                    || !self.tt.is_integer(t) && !matches!(self.tt.tys[t as usize], Ty::Float)
+            };
             return if fl(lt) || fl(rt) { DOUBLE } else { FLOAT };
         }
         if !self.tt.is_integer(lt) || !self.tt.is_integer(rt) {
@@ -973,21 +1167,33 @@ impl P<'_> {
             Ok(e)
         }
     }
+    // scale bước con trỏ: pointee VLA → nạp size byte từ local ẩn, còn lại hằng
+    fn vla_scale(&mut self, e: TypeId) -> NodeId {
+        match self.vla_arrs.get(&e) {
+            Some(&off) => self.push(Node::Var(off), LONG),
+            None => self.push(Node::Num(self.tt.size(e) as i64), LONG),
+        }
+    }
     // Dựng node binary op kèm chèn conversion + scale con trỏ
     fn mkbin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
+        // EXT(c99): complex là struct — PHẢI chặn trước nhánh scalar, nếu không
+        // codegen coi địa chỉ struct như giá trị 8 byte đầu → sai im lặng
+        if self.cplx_elem(self.ty(l)).is_some() || self.cplx_elem(self.ty(r)).is_some() {
+            return self.cplx_bin(op, l, r);
+        }
         let (lp, rp) = (self.tt.pointee(self.ty(l)), self.tt.pointee(self.ty(r)));
         match (op, lp, rp) {
             ("+", None, Some(_)) => self.mkbin("+", r, l), // int + ptr: giao hoán
             ("+" | "-", Some(e), None) => {
                 let r = self.cast(r, LONG);
-                let sz = self.push(Node::Num(self.tt.size(e) as i64), LONG);
+                let sz = self.vla_scale(e);
                 let r = self.push(Node::Bin("*", r, sz), LONG);
                 let t = self.tt.ptr_to(e);
                 Ok(self.push(Node::Bin(op, l, r), t))
             }
             ("-", Some(e), Some(_)) => {
                 let d = self.push(Node::Bin("-", l, r), LONG);
-                let sz = self.push(Node::Num(self.tt.size(e) as i64), LONG);
+                let sz = self.vla_scale(e);
                 Ok(self.push(Node::Bin("/", d, sz), LONG))
             }
             _ => match op {
@@ -1015,6 +1221,106 @@ impl P<'_> {
             },
         }
     }
+    // EXT(c99): đại số complex hạ member-wise qua temp (6.3.1.8 UAC + phép toán
+    // trên trường số phức). Nhân/chia dùng công thức đại số thẳng — KHÔNG Annex G
+    // NaN-fixup/scaling (tương đương gcc -fcx-limited-range; deviation tuyên bố,
+    // musl src/complex tự decompose creal/cimag ở các đường biên nên ít đụng).
+    fn cplx_bin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
+        if !self.in_fn {
+            return Err("toán tử complex trong biểu thức hằng".into());
+        }
+        let lf = self.cplx_elem(self.ty(l)).unwrap_or(self.ty(l)) == FLOAT;
+        let rf = self.cplx_elem(self.ty(r)).unwrap_or(self.ty(r)) == FLOAT;
+        let elem = if lf && rf { FLOAT } else { DOUBLE };
+        let ct = self.cplx_of(elem);
+        let esz = self.tt.size(elem);
+        let (lv, rv) = (self.cast(l, ct), self.cast(r, ct));
+        let ao = self.alloc_local(format!(".ca{}", self.nodes.len()), ct);
+        let av = self.push(Node::Var(ao), ct);
+        let p1 = self.push(Node::Assign(av, lv), ct);
+        let bo = self.alloc_local(format!(".cb{}", self.nodes.len()), ct);
+        let bv = self.push(Node::Var(bo), ct);
+        let p2 = self.push(Node::Assign(bv, rv), ct);
+        // đọc member tươi mỗi lần dùng (temp nên không có side effect)
+        let m = |s: &mut Self, o: u32, k: u32| {
+            let v = s.push(Node::Var(o), ct);
+            s.push(Node::Member(v, k), elem)
+        };
+        if matches!(op, "==" | "!=") {
+            let (a, b) = (m(self, ao, 0), m(self, bo, 0));
+            let e1 = self.mkbin("==", a, b)?;
+            let (a, b) = (m(self, ao, esz), m(self, bo, esz));
+            let e2 = self.mkbin("==", a, b)?;
+            let mut val = self.mkbin("&", e1, e2)?;
+            if op == "!=" {
+                let z = self.push(Node::Num(0), INT);
+                val = self.mkbin("==", val, z)?;
+            }
+            let s2 = self.push(Node::Comma(p2, val), INT);
+            return Ok(self.push(Node::Comma(p1, s2), INT));
+        }
+        let mut p3 = None;
+        let (rre, rim) = match op {
+            "+" | "-" => {
+                let (a, b) = (m(self, ao, 0), m(self, bo, 0));
+                let re = self.mkbin(op, a, b)?;
+                let (a, b) = (m(self, ao, esz), m(self, bo, esz));
+                (re, self.mkbin(op, a, b)?)
+            }
+            "*" => {
+                let (a, b) = (m(self, ao, 0), m(self, bo, 0));
+                let t1 = self.mkbin("*", a, b)?;
+                let (a, b) = (m(self, ao, esz), m(self, bo, esz));
+                let t2 = self.mkbin("*", a, b)?;
+                let re = self.mkbin("-", t1, t2)?;
+                let (a, b) = (m(self, ao, 0), m(self, bo, esz));
+                let t3 = self.mkbin("*", a, b)?;
+                let (a, b) = (m(self, ao, esz), m(self, bo, 0));
+                let t4 = self.mkbin("*", a, b)?;
+                (re, self.mkbin("+", t3, t4)?)
+            }
+            "/" => {
+                let (x, y) = (m(self, bo, 0), m(self, bo, 0));
+                let d1 = self.mkbin("*", x, y)?;
+                let (x, y) = (m(self, bo, esz), m(self, bo, esz));
+                let d2 = self.mkbin("*", x, y)?;
+                let d = self.mkbin("+", d1, d2)?;
+                let dof = self.alloc_local(format!(".cd{}", self.nodes.len()), elem);
+                let dv = self.push(Node::Var(dof), elem);
+                p3 = Some(self.push(Node::Assign(dv, d), elem));
+                let (a, b) = (m(self, ao, 0), m(self, bo, 0));
+                let t1 = self.mkbin("*", a, b)?;
+                let (a, b) = (m(self, ao, esz), m(self, bo, esz));
+                let t2 = self.mkbin("*", a, b)?;
+                let nre = self.mkbin("+", t1, t2)?;
+                let dr = self.push(Node::Var(dof), elem);
+                let re = self.mkbin("/", nre, dr)?;
+                let (a, b) = (m(self, ao, esz), m(self, bo, 0));
+                let t3 = self.mkbin("*", a, b)?;
+                let (a, b) = (m(self, ao, 0), m(self, bo, esz));
+                let t4 = self.mkbin("*", a, b)?;
+                let nim = self.mkbin("-", t3, t4)?;
+                let di = self.push(Node::Var(dof), elem);
+                (re, self.mkbin("/", nim, di)?)
+            }
+            _ => return Err(format!("op '{}' trên complex", op)),
+        };
+        let ro = self.alloc_local(format!(".cr{}", self.nodes.len()), ct);
+        let rv1 = self.push(Node::Var(ro), ct);
+        let mr = self.push(Node::Member(rv1, 0), elem);
+        let ar = self.push(Node::Assign(mr, rre), elem);
+        let rv2 = self.push(Node::Var(ro), ct);
+        let mi = self.push(Node::Member(rv2, esz), elem);
+        let ai = self.push(Node::Assign(mi, rim), elem);
+        let val = self.push(Node::Var(ro), ct);
+        let mut seq = self.push(Node::Comma(ai, val), ct);
+        seq = self.push(Node::Comma(ar, seq), ct);
+        if let Some(p) = p3 {
+            seq = self.push(Node::Comma(p, seq), ct);
+        }
+        seq = self.push(Node::Comma(p2, seq), ct);
+        Ok(self.push(Node::Comma(p1, seq), ct))
+    }
 
     // ---- local/scope ----
     fn alloc_local(&mut self, name: String, t: TypeId) -> u32 {
@@ -1029,9 +1335,7 @@ impl P<'_> {
             // Case cũng là jump target (bảng switch tham chiếu LC{id})
             Node::Label(..) | Node::Case(..) => true,
             Node::If(a, b, c) => {
-                self.has_label(*a)
-                    || self.has_label(*b)
-                    || c.is_some_and(|x| self.has_label(x))
+                self.has_label(*a) || self.has_label(*b) || c.is_some_and(|x| self.has_label(x))
             }
             Node::While(a, b)
             | Node::Do(a, b)
@@ -1039,14 +1343,14 @@ impl P<'_> {
             | Node::Assign(a, b)
             | Node::Bin(_, a, b) => self.has_label(*a) || self.has_label(*b),
             Node::For(a, b, c, d) => {
-                [a, b, c].iter().any(|x| x.is_some_and(|x| self.has_label(x)))
+                [a, b, c]
+                    .iter()
+                    .any(|x| x.is_some_and(|x| self.has_label(x)))
                     || self.has_label(*d)
             }
             Node::Switch(a, b, ..) => self.has_label(*a) || self.has_label(*b),
             Node::Block(v) => v.iter().any(|&x| self.has_label(x)),
-            Node::Cond(a, b, c) => {
-                self.has_label(*a) || self.has_label(*b) || self.has_label(*c)
-            }
+            Node::Cond(a, b, c) => self.has_label(*a) || self.has_label(*b) || self.has_label(*c),
             Node::Ret(e) => e.is_some_and(|x| self.has_label(x)),
             Node::Deref(e)
             | Node::Addr(e)
@@ -1061,10 +1365,7 @@ impl P<'_> {
             Node::Call(_, args, _) | Node::Sync(_, args, _) => {
                 args.iter().any(|&x| self.has_label(x))
             }
-            Node::Asm(_, outs, ins) => {
-                outs.iter().any(|&(_, e)| self.has_label(e))
-                    || ins.iter().any(|&e| self.has_label(e))
-            }
+            Node::Asm(_, ops) => ops.iter().any(|o| self.has_label(o.e)),
             Node::CallPtr(f, args, _) => {
                 self.has_label(*f) || args.iter().any(|&x| self.has_label(x))
             }
@@ -1104,22 +1405,22 @@ impl P<'_> {
             }
         }
         if self.eat_kw("asm") || self.eat_kw("__asm__") || self.eat_kw("__asm") {
-            // EXT(gcc): inline asm SUBSET (xxhash đòi ở M14): template phát
-            // verbatim + constraint thanh ghi "=r"/"+r"/"r". Clobber bỏ qua —
+            // EXT(gcc): inline asm SUBSET (xxhash M14; musl M17 nới): template
+            // phát verbatim; constraint xem AsmOp bên ast.rs. Clobber bỏ qua —
             // vô hại ở -O0 vì mọi statement reload từ memory, chỉ sp/x29/x30
-            // là bất khả xâm phạm. KHÔNG "m", không [tên], không asm goto —
-            // lỗi rõ ràng để không im lặng sinh code sai.
-            while self.eat_kw("volatile") || self.eat_kw("__volatile__") || self.eat_kw("__volatile")
-            {
-            }
+            // là bất khả xâm phạm. KHÔNG [tên], không asm goto — lỗi rõ ràng
+            // để không im lặng sinh code sai.
+            while self.eat_kw("volatile")
+                || self.eat_kw("__volatile__")
+                || self.eat_kw("__volatile")
+            {}
             self.expect(Tok::Punct("("))?;
             let mut tpl = String::new();
             while let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
                 tpl.push_str(&String::from_utf8_lossy(b));
                 self.pos += 1;
             }
-            let mut outs: Vec<(bool, NodeId)> = Vec::new();
-            let mut ins: Vec<NodeId> = Vec::new();
+            let mut ops: Vec<AsmOp> = Vec::new();
             for sect in 0..3 {
                 if !self.eat(&Tok::Punct(":")) {
                     break;
@@ -1131,31 +1432,50 @@ impl P<'_> {
                         self.expect(Tok::Punct("("))?;
                         let e = self.assign()?;
                         self.expect(Tok::Punct(")"))?;
-                        match (sect, c.as_str()) {
-                            (0, "=r") => outs.push((false, e)),
-                            (0, "+r") => outs.push((true, e)),
-                            (1, "r") => ins.push(e),
-                            _ => {
-                                return Err(format!(
-                                    "asm: constraint \"{c}\" chưa hỗ trợ (chỉ =r +r r)"
-                                ))
+                        let mut op = AsmOp {
+                            e,
+                            out: sect == 0,
+                            rw: c.starts_with('+'),
+                            mem: false,
+                            fp: false,
+                            tied: None,
+                            pin: None,
+                        };
+                        // "&" (early-clobber) vô hại: pool mỗi operand một reg riêng
+                        match c.trim_start_matches(['=', '+', '&']) {
+                            "r" => {}
+                            "w" => op.fp = true,
+                            "Q" | "m" => op.mem = true,
+                            d if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => {
+                                op.tied = Some(d.parse().map_err(|e| format!("{e}"))?)
                             }
+                            _ => return Err(format!("asm: constraint \"{c}\" chưa hỗ trợ")),
                         }
-                        if sect == 0 {
+                        if let Node::Var(off) = self.nodes[e as usize] {
+                            op.pin = self.reg_pins.get(&off).copied();
+                        }
+                        if op.out {
                             self.check_lval(e)?;
                         }
+                        ops.push(op);
                     }
                     if !self.eat(&Tok::Punct(",")) {
                         break;
                     }
                 }
             }
-            if outs.len() + ins.len() > 7 {
-                return Err("asm: tối đa 7 operand (x9-x15)".into());
+            // pool tách GP/FP; pin và tied không tốn pool
+            let pool = |fp: bool| {
+                ops.iter()
+                    .filter(|o| o.fp == fp && o.pin.is_none() && o.tied.is_none())
+                    .count()
+            };
+            if pool(false) > 7 || pool(true) > 7 {
+                return Err("asm: tối đa 7 operand mỗi pool (x9-x15 / v16-v22)".into());
             }
             self.expect(Tok::Punct(")"))?;
             self.expect(Tok::Punct(";"))?;
-            return Ok(self.push(Node::Asm(tpl, outs, ins), INT));
+            return Ok(self.push(Node::Asm(tpl, ops), INT));
         }
         if self.eat_kw("__label__") {
             // GNU local label declaration — label của mình vốn function-scope, nuốt
@@ -1169,7 +1489,11 @@ impl P<'_> {
                 return Ok(self.push(Node::Ret(None), INT));
             }
             let e = self.expr()?;
-            let e = if self.fret == VOID { e } else { self.cast(e, self.fret) };
+            let e = if self.fret == VOID {
+                e
+            } else {
+                self.cast(e, self.fret)
+            };
             self.expect(Tok::Punct(";"))?;
             Ok(self.push(Node::Ret(Some(e)), INT))
         } else if self.eat_kw("if") {
@@ -1178,7 +1502,11 @@ impl P<'_> {
             let c = self.truthy(c)?;
             self.expect(Tok::Punct(")"))?;
             let t = self.stmt()?;
-            let e = if self.eat_kw("else") { Some(self.stmt()?) } else { None };
+            let e = if self.eat_kw("else") {
+                Some(self.stmt()?)
+            } else {
+                None
+            };
             // điều kiện hằng → giữ đúng nhánh (DCE tối thiểu — clang -O0 cũng
             // làm, torture link_error dựa vào); nhánh bỏ chứa label thì thôi
             if let Ok(v) = self.fold(c) {
@@ -1234,7 +1562,11 @@ impl P<'_> {
             if self.tt.size(ct) == 4 {
                 let uns = self.tt.is_unsigned(ct);
                 for (v, _) in &mut cases {
-                    *v = if uns { *v as u32 as i64 } else { *v as i32 as i64 };
+                    *v = if uns {
+                        *v as u32 as i64
+                    } else {
+                        *v as i32 as i64
+                    };
                 }
             }
             Ok(self.push(Node::Switch(c, b, cases, def), INT))
@@ -1243,7 +1575,11 @@ impl P<'_> {
             self.expect(Tok::Punct(":"))?;
             let st = self.stmt()?;
             let id = self.push(Node::Case(st), INT);
-            self.switches.last_mut().ok_or("case ngoài switch")?.0.push((v, id));
+            self.switches
+                .last_mut()
+                .ok_or("case ngoài switch")?
+                .0
+                .push((v, id));
             Ok(id)
         } else if self.eat_kw("default") {
             self.expect(Tok::Punct(":"))?;
@@ -1296,6 +1632,15 @@ impl P<'_> {
                 loop {
                     let (name, mut t) = self.declarator(bt, true)?;
                     let vla = self.vla_size.take(); // EXT(c99)
+                    // EXT(gcc): asm-label trên LOCAL = ghim reg (musl syscall
+                    // `register long x8 __asm__("x8")`); gỡ khỏi renames vì
+                    // local không có symbol để rename
+                    let pin = self.renames.remove(&name).and_then(|l| {
+                        l.strip_prefix('x')
+                            .or_else(|| l.strip_prefix('w'))
+                            .and_then(|d| d.parse::<u8>().ok())
+                            .filter(|&r| r < 29)
+                    });
                     match storage {
                         Storage::Typedef => {
                             self.typedefs.insert(name, t);
@@ -1314,12 +1659,10 @@ impl P<'_> {
                                 is_static: true,
                                 is_extern: false,
                                 is_tls: tls,
+                                is_weak: false,
                             });
-                            self.locals.push((
-                                name,
-                                t,
-                                Vloc::Glob(self.globals.len() as u32 - 1),
-                            ));
+                            self.locals
+                                .push((name, t, Vloc::Glob(self.globals.len() as u32 - 1)));
                         }
                         Storage::Extern => {
                             self.globals.push(Global {
@@ -1329,33 +1672,58 @@ impl P<'_> {
                                 is_static: false,
                                 is_extern: true,
                                 is_tls: tls,
+                                is_weak: false,
                             });
-                            self.locals.push((
-                                name,
-                                t,
-                                Vloc::Glob(self.globals.len() as u32 - 1),
-                            ));
+                            self.locals
+                                .push((name, t, Vloc::Glob(self.globals.len() as u32 - 1)));
                         }
                         // EXT(c99): VLA local → con trỏ + alloca(n*sizeof(elem)).
                         // Hệ quả biết trước: sizeof(vla) = 8 (size con trỏ), sai
                         // spec nhưng redis không đụng; epilogue mov sp,x29 thu hồi.
                         _ if vla.is_some() => {
-                            if self.peek("=") {
-                                return Err("VLA có initializer".into());
+                            // con trỏ tới VLA `char (*p)[w]` (musl): KHÔNG cấp
+                            // phát — chỉ ghi size byte pointee vào local ẩn để
+                            // mkbin scale runtime; init scalar bình thường
+                            if let Ty::Ptr(inner) = self.tt.tys[t as usize] {
+                                let Ty::Array(elem, 0) = self.tt.tys[inner as usize] else {
+                                    return Err(
+                                        "size không hằng sau con trỏ: chỉ hỗ trợ (*p)[w]".into()
+                                    );
+                                };
+                                let w = self.cast(vla.unwrap(), ULONG);
+                                let esz = self.push(Node::Num(self.tt.size(elem) as i64), ULONG);
+                                let bytes = self.push(Node::Bin("*", w, esz), ULONG);
+                                let hid = self.alloc_local(format!("{name}.vlasz"), ULONG);
+                                let hv = self.push(Node::Var(hid), ULONG);
+                                stmts.push(self.mkassign(hv, bytes)?);
+                                self.vla_arrs.insert(inner, hid);
+                                let off = self.alloc_local(name, t);
+                                if let Some(r) = pin {
+                                    self.reg_pins.insert(off, r);
+                                }
+                                if self.eat(&Tok::Punct("=")) {
+                                    let e = self.assign()?;
+                                    let v = self.push(Node::Var(off), t);
+                                    stmts.push(self.mkassign(v, e)?);
+                                }
+                            } else {
+                                if self.peek("=") {
+                                    return Err("VLA có initializer".into());
+                                }
+                                let elem = match self.tt.tys[t as usize] {
+                                    Ty::Array(e, _) => e,
+                                    _ => return Err("size không hằng ngoài mảng".into()),
+                                };
+                                let pt = self.tt.ptr_to(elem);
+                                let off = self.alloc_local(name, pt);
+                                let n = self.cast(vla.unwrap(), ULONG);
+                                let esz = self.tt.size(elem);
+                                let sz = self.push(Node::Num(esz as i64), ULONG);
+                                let bytes = self.push(Node::Bin("*", n, sz), ULONG);
+                                let al = self.push(Node::Alloca(bytes), pt);
+                                let v = self.push(Node::Var(off), pt);
+                                stmts.push(self.mkassign(v, al)?);
                             }
-                            let elem = match self.tt.tys[t as usize] {
-                                Ty::Array(e, _) => e,
-                                _ => return Err("size không hằng ngoài mảng".into()),
-                            };
-                            let pt = self.tt.ptr_to(elem);
-                            let off = self.alloc_local(name, pt);
-                            let n = self.cast(vla.unwrap(), ULONG);
-                            let esz = self.tt.size(elem);
-                            let sz = self.push(Node::Num(esz as i64), ULONG);
-                            let bytes = self.push(Node::Bin("*", n, sz), ULONG);
-                            let al = self.push(Node::Alloca(bytes), pt);
-                            let v = self.push(Node::Var(off), pt);
-                            stmts.push(self.mkassign(v, al)?);
                         }
                         _ => {
                             if self.eat(&Tok::Punct("=")) {
@@ -1370,6 +1738,9 @@ impl P<'_> {
                                 let (flat, agg) = self.flat_init(&mut t)?;
                                 if no_size {
                                     off = self.alloc_local(name, t);
+                                }
+                                if let Some(r) = pin {
+                                    self.reg_pins.insert(off, r);
                                 }
                                 let v = self.push(Node::Var(off), t);
                                 // aggregate {..}/"..": zero-fill trước (partial init)
@@ -1390,17 +1761,19 @@ impl P<'_> {
                                         }
                                         FlatItem::B(b) => {
                                             for (bi, &byte) in b.iter().enumerate() {
-                                                let bv = self
-                                                    .push(Node::Member(v, o + bi as u32), CHAR);
-                                                let num =
-                                                    self.push(Node::Num(byte as i64), INT);
+                                                let bv =
+                                                    self.push(Node::Member(v, o + bi as u32), CHAR);
+                                                let num = self.push(Node::Num(byte as i64), INT);
                                                 stmts.push(self.mkassign(bv, num)?);
                                             }
                                         }
                                     }
                                 }
                             } else {
-                                self.alloc_local(name, t);
+                                let off = self.alloc_local(name, t);
+                                if let Some(r) = pin {
+                                    self.reg_pins.insert(off, r);
+                                }
                             }
                         }
                     }
@@ -1770,7 +2143,9 @@ impl P<'_> {
                 _ => break,
             }
         }
-        let Node::Bin("-", l, r) = self.nodes[e as usize] else { return None };
+        let Node::Bin("-", l, r) = self.nodes[e as usize] else {
+            return None;
+        };
         let strip = |mut n: NodeId| {
             while let Node::Cast(i) = self.nodes[n as usize] {
                 n = i;
@@ -1887,15 +2262,22 @@ impl P<'_> {
         }
         if self.tt.is_float(t) {
             let v = self.fold_f(e0)?;
-            let bits =
-                if self.tt.size(t) == 4 { (v as f32).to_bits() as i64 } else { v.to_bits() as i64 };
+            let bits = if self.tt.size(t) == 4 {
+                (v as f32).to_bits() as i64
+            } else {
+                v.to_bits() as i64
+            };
             return Ok(GInit::Num(bits));
         }
         // hằng nguyên từ biểu thức thực: (int)1.9 v.v. — fold_f rồi truncate
         if self.tt.is_float(self.ty(e0)) || self.tt.is_float(self.ty(e)) {
             if let Ok(v) = self.fold_f(e) {
                 // cast Rust saturate: unsigned phải đi đường u64 kẻo 1.8e19 → i64::MAX
-                let n = if self.tt.is_unsigned(t) { v as u64 as i64 } else { v as i64 };
+                let n = if self.tt.is_unsigned(t) {
+                    v as u64 as i64
+                } else {
+                    v as i64
+                };
                 return Ok(GInit::Num(n));
             }
         }
@@ -1909,10 +2291,7 @@ impl P<'_> {
         let (flat, _) = self.flat_init(t)?;
         self.flat_to_ginit(flat)
     }
-    fn flat_to_ginit(
-        &mut self,
-        flat: Vec<(u32, TypeId, FlatItem)>,
-    ) -> Result<GInit, String> {
+    fn flat_to_ginit(&mut self, flat: Vec<(u32, TypeId, FlatItem)>) -> Result<GInit, String> {
         let mut list: Vec<(u32, u32, GInit)> = Vec::new();
         let mut bfs: Vec<(u32, u32, u128)> = Vec::new(); // bitfield: (byte đầu, byte sau cuối, ảnh bit)
         for (off, mt, item) in flat {
@@ -2124,6 +2503,7 @@ impl P<'_> {
                                 is_static: true,
                                 is_extern: false,
                                 is_tls: false,
+                                is_weak: false,
                             });
                             let g = self.push(Node::GVar(self.globals.len() as u32 - 1), t);
                             return self.postfix_ops(g);
@@ -2131,15 +2511,13 @@ impl P<'_> {
                         let (flat, _) = self.flat_init(&mut t)?;
                         let off = self.alloc_local(String::new(), t);
                         let v = self.push(Node::Var(off), t);
-                        let mut acc = if matches!(
-                            self.tt.tys[t as usize],
-                            Ty::Array(..) | Ty::Struct(_)
-                        ) {
-                            let sz = self.tt.size(t);
-                            Some(self.push(Node::Zero(v, sz), VOID))
-                        } else {
-                            None
-                        };
+                        let mut acc =
+                            if matches!(self.tt.tys[t as usize], Ty::Array(..) | Ty::Struct(_)) {
+                                let sz = self.tt.size(t);
+                                Some(self.push(Node::Zero(v, sz), VOID))
+                            } else {
+                                None
+                            };
                         for (o, mt, item) in flat {
                             let mut add = |p: &mut Self, e: NodeId| {
                                 acc = Some(match acc {
@@ -2155,8 +2533,7 @@ impl P<'_> {
                                 }
                                 FlatItem::B(b) => {
                                     for (bi, &byte) in b.iter().enumerate() {
-                                        let bv =
-                                            self.push(Node::Member(v, o + bi as u32), CHAR);
+                                        let bv = self.push(Node::Member(v, o + bi as u32), CHAR);
                                         let num = self.push(Node::Num(byte as i64), INT);
                                         let a = self.mkassign(bv, num)?;
                                         add(self, a);
@@ -2182,9 +2559,22 @@ impl P<'_> {
         }
         if self.eat(&Tok::Punct("-")) {
             let e = self.unary()?;
+            // EXT(c99): -z trên complex → 0 - z (0.0 giữ elem để không lên double)
+            if let Some(el) = self.cplx_elem(self.ty(e)) {
+                let z = self.push(Node::FNum(0.0), el);
+                return self.mkbin("-", z, e);
+            }
             let t = self.ty(e);
-            let t = if self.tt.is_float(t) { t } else { self.promote(t) };
-            let e = if self.tt.is_float(t) { e } else { self.cast(e, t) };
+            let t = if self.tt.is_float(t) {
+                t
+            } else {
+                self.promote(t)
+            };
+            let e = if self.tt.is_float(t) {
+                e
+            } else {
+                self.cast(e, t)
+            };
             Ok(self.push(Node::Neg(e), t))
         } else if self.eat(&Tok::Punct("+")) {
             self.unary()
@@ -2281,19 +2671,26 @@ impl P<'_> {
             .tt
             .fnsig(self.ty(callee))
             .map(|s| (s.ret, s.params.clone(), s.variadic, s.oldstyle));
-        let (ret, params, variadic, oldstyle) =
-            sig.ok_or("gọi thứ không phải hàm/con trỏ hàm")?;
+        let (ret, params, variadic, oldstyle) = sig.ok_or("gọi thứ không phải hàm/con trỏ hàm")?;
         for (i, a) in args.iter_mut().enumerate() {
             if i < params.len() && !oldstyle {
                 *a = self.cast(*a, params[i]);
             } else {
                 // default argument promotions
                 let t = self.ty(*a);
-                let pt = if self.tt.is_float(t) { DOUBLE } else { self.promote(t) };
+                let pt = if self.tt.is_float(t) {
+                    DOUBLE
+                } else {
+                    self.promote(t)
+                };
                 *a = self.cast(*a, pt);
             }
         }
-        let nreg = if variadic { params.len() as u32 } else { args.len() as u32 };
+        let nreg = if variadic {
+            params.len() as u32
+        } else {
+            args.len() as u32
+        };
         // struct >16B by value: ABI truyền GIÁN TIẾP — copy vào temp, đưa con trỏ.
         // Ngoại lệ: HFA có NAMED arg đi bằng v0-v7 (anonymous variadic vẫn gián tiếp)
         for (i, a) in args.iter_mut().enumerate() {
@@ -2338,8 +2735,10 @@ impl P<'_> {
                 let i = self.expr()?;
                 self.expect(Tok::Punct("]"))?;
                 let sum = self.mkbin("+", e, i)?;
-                let t =
-                    self.tt.pointee(self.ty(sum)).ok_or("index thứ không phải mảng/con trỏ")?;
+                let t = self
+                    .tt
+                    .pointee(self.ty(sum))
+                    .ok_or("index thứ không phải mảng/con trỏ")?;
                 e = self.push(Node::Deref(sum), t);
             } else if self.eat(&Tok::Punct("(")) {
                 let mut args = Vec::new();
@@ -2356,7 +2755,10 @@ impl P<'_> {
             } else if self.eat(&Tok::Punct(".")) {
                 e = self.member(e)?;
             } else if self.eat(&Tok::Punct("->")) {
-                let t = self.tt.pointee(self.ty(e)).ok_or("-> trên thứ không phải con trỏ")?;
+                let t = self
+                    .tt
+                    .pointee(self.ty(e))
+                    .ok_or("-> trên thứ không phải con trỏ")?;
                 let d = self.push(Node::Deref(e), t);
                 e = self.member(d)?;
             } else if self.eat(&Tok::Punct("++")) {
@@ -2373,24 +2775,34 @@ impl P<'_> {
         let Ty::Struct(sd) = self.tt.tys[self.ty(base) as usize] else {
             return Err("truy cập member trên thứ không phải struct/union".into());
         };
-        let (mt, off) =
-            self.find_member(sd, &name).ok_or(format!("không có member: {}", name))?;
+        let (mt, off) = self
+            .find_member(sd, &name)
+            .ok_or(format!("không có member: {}", name))?;
         Ok(self.push(Node::Member(base, off), mt))
     }
     // attr packed/aligned đứng SAU thân: tính lại layout tại chỗ
     fn repack(&mut self, t: TypeId, packed: bool, aligned: Option<u32>) {
-        let Ty::Struct(si) = self.tt.tys[t as usize] else { return };
+        let Ty::Struct(si) = self.tt.tys[t as usize] else {
+            return;
+        };
         let sd = &self.tt.structs[si as usize];
         if sd.is_union
-            || sd.members.iter().any(|m| matches!(self.tt.tys[m.1 as usize], Ty::Bitfield(..)))
+            || sd
+                .members
+                .iter()
+                .any(|m| matches!(self.tt.tys[m.1 as usize], Ty::Bitfield(..)))
         {
             return;
         }
         let mut members = sd.members.clone();
         // packed: align hạ về 1 NHƯNG giữ phần aligned tường minh trước đó
         // (sd.align vượt align tự nhiên của member ⟺ có aligned(n) đứng trước)
-        let natural =
-            sd.members.iter().map(|m| self.tt.align(m.1)).max().unwrap_or(1);
+        let natural = sd
+            .members
+            .iter()
+            .map(|m| self.tt.align(m.1))
+            .max()
+            .unwrap_or(1);
         let mut align = if packed {
             if sd.align > natural { sd.align } else { 1 }
         } else {
@@ -2500,7 +2912,9 @@ impl P<'_> {
             }
             self.strs.push(bytes);
             let i = (self.strs.len() - 1) as u32;
-            let t = self.tt.add(Ty::Array(CHAR, self.strs[i as usize].len() as u64 + 1));
+            let t = self
+                .tt
+                .add(Ty::Array(CHAR, self.strs[i as usize].len() as u64 + 1));
             Ok(self.push(Node::Str(i), t))
         } else if let Some(Tok::Ident(_)) = self.toks.get(self.pos) {
             let n = self.ident()?;
@@ -2679,7 +3093,10 @@ impl P<'_> {
             }
             if self.peek("(") {
                 // __builtin_abort... → abort (GCC builtin đổ về libc)
-                let n = n.strip_prefix("__builtin_").map(str::to_string).unwrap_or(n);
+                let n = n
+                    .strip_prefix("__builtin_")
+                    .map(str::to_string)
+                    .unwrap_or(n);
                 if n == "alloca" {
                     // không có symbol libc; sub sp trực tiếp (epilogue mov sp,x29 thu hồi)
                     self.expect(Tok::Punct("("))?;
@@ -2716,6 +3133,23 @@ impl P<'_> {
         let mut funcs = Vec::new();
         let mut ranges: Vec<(u32, u32)> = Vec::new(); // body [n0,n1) từng func
         while self.pos < self.toks.len() {
+            // EXT(gcc): __asm__("...") cấp toàn cục → phát verbatim (musl
+            // crt_arch.h định nghĩa _start; PHẢI bắt trước decl_specs vì
+            // skip_attrs sẽ nuốt nhầm thành asm-label)
+            if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "__asm__" || n == "__asm" || n == "asm")
+                && self.toks.get(self.pos + 1) == Some(&Tok::Punct("("))
+            {
+                self.pos += 2;
+                let mut s = String::new();
+                while let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
+                    s.push_str(&String::from_utf8_lossy(b));
+                    self.pos += 1;
+                }
+                self.expect(Tok::Punct(")"))?;
+                self.expect(Tok::Punct(";"))?;
+                self.raw_asm.push(s);
+                continue;
+            }
             let (bt, storage) = match self.decl_specs()? {
                 Some(x) => x,
                 None => (INT, Storage::None), // implicit int: main() {...}
@@ -2723,6 +3157,7 @@ impl P<'_> {
             // chốt NGAY: declarator/param/body sẽ gọi decl_specs và reset flag
             let inline_fn = self.saw_inline;
             let tls = self.saw_thread;
+            let weak_fn = self.attr_weak; // EXT(gcc): weak đứng trước declarator
             if self.eat(&Tok::Punct(";")) {
                 continue; // định nghĩa struct/union/enum thuần
             }
@@ -2738,6 +3173,7 @@ impl P<'_> {
                     self.fns.insert(name.clone(), t);
                     let sig = self.tt.fns[fidx as usize].clone();
                     self.locals.clear();
+                    self.reg_pins.clear(); // key = offset stack — hàm mới trùng offset là dính pin ma
                     self.cur_off = 0;
                     self.fret = sig.ret;
                     self.fname = name.clone();
@@ -2832,8 +3268,7 @@ impl P<'_> {
                     let body = self.stmt()?;
                     let n1 = self.nodes.len() as u32;
                     self.in_fn = false;
-                    let is_static =
-                        storage == Storage::Static || self.static_fns.contains(&name);
+                    let is_static = storage == Storage::Static || self.static_fns.contains(&name);
                     // EXT(gcc): inline (kể cả static inline) không có declaration
                     // trần (C99 6.7.4p7) → ứng viên DCE; codegen phát weak nếu
                     // non-static để các TU cùng phát coalesce được
@@ -2846,6 +3281,7 @@ impl P<'_> {
                         ret: sig.ret,
                         is_static,
                         is_inline,
+                        is_weak: weak_fn || self.attr_weak,
                         variadic: sig.variadic,
                         sret,
                     });
@@ -2867,15 +3303,28 @@ impl P<'_> {
                     if !inline_fn {
                         self.plain_decls.insert(name.clone()); // C99 6.7.4p7
                     }
+                    // EXT(gcc): weak_alias musl — declaration hàm mang alias("old")
+                    if let Some(old) = self.attr_alias.take() {
+                        self.aliases
+                            .push((name.clone(), old, weak_fn || self.attr_weak));
+                    } else if weak_fn || self.attr_weak {
+                        self.weak_decls.push(name.clone()); // weak proto trần
+                    }
                     self.fns.insert(name, t); // prototype
                 } else {
                     // C89 6.1.2.1: tên vào scope từ CUỐI declarator, trước init
                     // → push trước để initializer tự tham chiếu được
                     // (git LIST_HEAD: static struct x = { &x, &x })
                     // tentative definition: int x; int x = 3; int x; → MỘT symbol
-                    let gi = if let Some(gi) =
-                        self.globals.iter().position(|g| g.name == name)
-                    {
+                    // EXT(gcc): alias trên object (musl weak_alias data) — chỉ
+                    // phát .set, không phát storage; vẫn đăng ký extern để TU
+                    // này tham chiếu tên mới được
+                    let obj_alias = self.attr_alias.take();
+                    if let Some(old) = &obj_alias {
+                        self.aliases
+                            .push((name.clone(), old.clone(), weak_fn || self.attr_weak));
+                    }
+                    let gi = if let Some(gi) = self.globals.iter().position(|g| g.name == name) {
                         gi
                     } else {
                         self.globals.push(Global {
@@ -2885,11 +3334,13 @@ impl P<'_> {
                             is_static: storage == Storage::Static,
                             is_extern: true, // tạm; chốt sau khi biết có init
                             is_tls: tls,
+                            is_weak: false,
                         });
                         self.globals.len() - 1
                     };
                     let init = self.ginit(&mut t)?;
-                    let is_extern = storage == Storage::Extern && matches!(init, GInit::None);
+                    let is_extern = (storage == Storage::Extern || obj_alias.is_some())
+                        && matches!(init, GInit::None);
                     let bigger = self.tt.size(t) > self.tt.size(self.globals[gi].ty);
                     let g = &mut self.globals[gi];
                     if bigger {
@@ -2900,6 +3351,7 @@ impl P<'_> {
                     }
                     g.is_extern = g.is_extern && is_extern;
                     g.is_tls = g.is_tls || tls;
+                    g.is_weak = g.is_weak || weak_fn || self.attr_weak;
                 }
                 if !self.eat(&Tok::Punct(",")) {
                     break;
@@ -3004,9 +3456,17 @@ pub fn parse(
         saw_inline: false,
         saw_thread: false,
         vla_size: None,
+        reg_pins: HashMap::new(),
+        vla_arrs: HashMap::new(),
+        cplx_tys: HashMap::new(),
         asm_label: None,
         renames: HashMap::new(),
         fname: String::new(),
+        attr_weak: false,
+        attr_alias: None,
+        raw_asm: Vec::new(),
+        aliases: Vec::new(),
+        weak_decls: Vec::new(),
     };
     // EXT(gcc): __uint128_t/__int128_t — CHỈ storage 16 byte align 16 (SDK mach
     // NEON state trong mcontext cần layout đúng); arithmetic không hỗ trợ.
@@ -3020,6 +3480,27 @@ pub fn parse(
         let t = p.tt.add(Ty::Struct(p.tt.structs.len() as u32 - 1));
         p.typedefs.insert("__uint128_t".into(), t);
         p.typedefs.insert("__int128_t".into(), t);
+    }
+    // ELF: seed struct __zcc_va_list COMPLETE — header ngoài (musl stdarg.h)
+    // chỉ thấy `__builtin_va_list` = tên tag này, không có thân; thiếu seed thì
+    // va_list local size 0 → va_start ghi 32 byte đè slot hàng xóm (vfprintf
+    // musl nát con trỏ fmt). stdarg.h nhúng định nghĩa lại chỉ shadow, vô hại.
+    if tgt == Target::Arm64Elf {
+        let pv = p.tt.ptr_to(VOID);
+        p.tt.structs.push(crate::ast::StructDef {
+            members: vec![
+                ("__stack".into(), pv, 0),
+                ("__gr_top".into(), pv, 8),
+                ("__vr_top".into(), pv, 16),
+                ("__gr_offs".into(), INT, 24),
+                ("__vr_offs".into(), INT, 28),
+            ],
+            size: 32,
+            align: 8,
+            is_union: false,
+        });
+        let t = p.tt.add(Ty::Struct(p.tt.structs.len() as u32 - 1));
+        p.tags.insert("__zcc_va_list".into(), t);
     }
     // libc trả con trỏ: gọi không prototype (torture hay thế) mà để implicit
     // int thì sxtw cắt nửa cao địa chỉ heap → seed sẵn kiểu trả về đúng.
@@ -3041,7 +3522,9 @@ pub fn parse(
             p.fns.insert(f.into(), ft);
         }
         // libm trả double (implicit int sẽ đọc x0 thay vì d0)
-        for f in ["copysign", "fabs", "sqrt", "floor", "ceil", "fmod", "pow", "atan2"] {
+        for f in [
+            "copysign", "fabs", "sqrt", "floor", "ceil", "fmod", "pow", "atan2",
+        ] {
             let sig = FnSig {
                 ret: DOUBLE,
                 params: Vec::new(),
@@ -3091,12 +3574,17 @@ pub fn parse(
         funcs,
         globals: p.globals,
         strs: p.strs,
+        raw_asm: p.raw_asm,
+        aliases: p.aliases,
+        weak_decls: p.weak_decls,
     })
 }
 
 // L"..": nguồn là UTF-8 → giải mã ra code point cho wchar_t (byte escape lẻ
 // >127 không phải UTF-8 hợp lệ sẽ thành U+FFFD — chấp nhận)
 fn wchars(b: &[u8]) -> Vec<u32> {
-    String::from_utf8_lossy(b).chars().map(|c| c as u32).collect()
+    String::from_utf8_lossy(b)
+        .chars()
+        .map(|c| c as u32)
+        .collect()
 }
-

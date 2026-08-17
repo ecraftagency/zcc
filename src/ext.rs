@@ -27,13 +27,41 @@ pub fn has_operator_zero(name: &str) -> bool {
 // nên KHÔNG dùng được trên trang read-only. fetch_or/and/xor chỉ jemalloc đòi
 // (build MALLOC=libc không đụng) — chưa làm.
 pub const ATOMIC_MACROS: &[(&str, &[&str], &str)] = &[
-    ("__atomic_load_n", &["p", "mo"], "__sync_fetch_and_add((p), 0)"),
-    ("__atomic_store_n", &["p", "v", "mo"], "((void)__sync_lock_test_and_set((p), (v)))"),
-    ("__atomic_exchange_n", &["p", "v", "mo"], "__sync_lock_test_and_set((p), (v))"),
-    ("__atomic_fetch_add", &["p", "v", "mo"], "__sync_fetch_and_add((p), (v))"),
-    ("__atomic_add_fetch", &["p", "v", "mo"], "__sync_add_and_fetch((p), (v))"),
-    ("__atomic_fetch_sub", &["p", "v", "mo"], "__sync_fetch_and_sub((p), (v))"),
-    ("__atomic_sub_fetch", &["p", "v", "mo"], "__sync_sub_and_fetch((p), (v))"),
+    (
+        "__atomic_load_n",
+        &["p", "mo"],
+        "__sync_fetch_and_add((p), 0)",
+    ),
+    (
+        "__atomic_store_n",
+        &["p", "v", "mo"],
+        "((void)__sync_lock_test_and_set((p), (v)))",
+    ),
+    (
+        "__atomic_exchange_n",
+        &["p", "v", "mo"],
+        "__sync_lock_test_and_set((p), (v))",
+    ),
+    (
+        "__atomic_fetch_add",
+        &["p", "v", "mo"],
+        "__sync_fetch_and_add((p), (v))",
+    ),
+    (
+        "__atomic_add_fetch",
+        &["p", "v", "mo"],
+        "__sync_add_and_fetch((p), (v))",
+    ),
+    (
+        "__atomic_fetch_sub",
+        &["p", "v", "mo"],
+        "__sync_fetch_and_sub((p), (v))",
+    ),
+    (
+        "__atomic_sub_fetch",
+        &["p", "v", "mo"],
+        "__sync_sub_and_fetch((p), (v))",
+    ),
     ("__atomic_thread_fence", &["mo"], "__sync_synchronize()"),
     (
         "__atomic_compare_exchange_n",
@@ -49,35 +77,62 @@ pub const ATOMIC_MACROS: &[(&str, &[&str], &str)] = &[
 // nhau giữa các macro vì bswap64 expand lồng bswap32 (arg nằm TRONG block con:
 // trùng tên là tự tham chiếu). clz/ctz với x=0: UB, giống GCC.
 pub const BIT_MACROS: &[(&str, &[&str], &str)] = &[
-    ("__builtin_bswap16", &["x"],
-     "({ unsigned short __zb16 = (x); (unsigned short)((__zb16 >> 8) | (__zb16 << 8)); })"),
-    ("__builtin_bswap32", &["x"],
-     "({ unsigned int __zb32 = (x); (__zb32 >> 24) | ((__zb32 >> 8) & 0xff00u) \
-        | ((__zb32 << 8) & 0xff0000u) | (__zb32 << 24); })"),
-    ("__builtin_bswap64", &["x"],
-     "({ unsigned long long __zb64 = (x); \
+    (
+        "__builtin_bswap16",
+        &["x"],
+        "({ unsigned short __zb16 = (x); (unsigned short)((__zb16 >> 8) | (__zb16 << 8)); })",
+    ),
+    (
+        "__builtin_bswap32",
+        &["x"],
+        "({ unsigned int __zb32 = (x); (__zb32 >> 24) | ((__zb32 >> 8) & 0xff00u) \
+        | ((__zb32 << 8) & 0xff0000u) | (__zb32 << 24); })",
+    ),
+    (
+        "__builtin_bswap64",
+        &["x"],
+        "({ unsigned long long __zb64 = (x); \
         ((unsigned long long)__builtin_bswap32((unsigned int)__zb64) << 32) \
-        | __builtin_bswap32((unsigned int)(__zb64 >> 32)); })"),
-    ("__builtin_clz", &["x"],
-     "({ unsigned __zc32 = (x); int __zn32 = 0; \
-        while (!(__zc32 >> 31)) { __zn32++; __zc32 <<= 1; } __zn32; })"),
+        | __builtin_bswap32((unsigned int)(__zb64 >> 32)); })",
+    ),
+    (
+        "__builtin_clz",
+        &["x"],
+        "({ unsigned __zc32 = (x); int __zn32 = 0; \
+        while (!(__zc32 >> 31)) { __zn32++; __zc32 <<= 1; } __zn32; })",
+    ),
     ("__builtin_clzl", &["x"], "__builtin_clzll(x)"),
-    ("__builtin_clzll", &["x"],
-     "({ unsigned long long __zc64 = (x); int __zn64 = 0; \
-        while (!(__zc64 >> 63)) { __zn64++; __zc64 <<= 1; } __zn64; })"),
-    ("__builtin_ctz", &["x"],
-     "({ unsigned __zt32 = (x); int __zm32 = 0; \
-        while (!(__zt32 & 1)) { __zm32++; __zt32 >>= 1; } __zm32; })"),
+    (
+        "__builtin_clzll",
+        &["x"],
+        "({ unsigned long long __zc64 = (x); int __zn64 = 0; \
+        while (!(__zc64 >> 63)) { __zn64++; __zc64 <<= 1; } __zn64; })",
+    ),
+    (
+        "__builtin_ctz",
+        &["x"],
+        "({ unsigned __zt32 = (x); int __zm32 = 0; \
+        while (!(__zt32 & 1)) { __zm32++; __zt32 >>= 1; } __zm32; })",
+    ),
     ("__builtin_ctzl", &["x"], "__builtin_ctzll(x)"),
-    ("__builtin_ctzll", &["x"],
-     "({ unsigned long long __zt64 = (x); int __zm64 = 0; \
-        while (!(__zt64 & 1)) { __zm64++; __zt64 >>= 1; } __zm64; })"),
-    ("__builtin_popcount", &["x"],
-     "({ unsigned __zp32 = (x); int __zq32 = 0; \
-        while (__zp32) { __zq32 += __zp32 & 1; __zp32 >>= 1; } __zq32; })"),
-    ("__builtin_popcountll", &["x"],
-     "({ unsigned long long __zp64 = (x); int __zq64 = 0; \
-        while (__zp64) { __zq64 += (int)(__zp64 & 1); __zp64 >>= 1; } __zq64; })"),
+    (
+        "__builtin_ctzll",
+        &["x"],
+        "({ unsigned long long __zt64 = (x); int __zm64 = 0; \
+        while (!(__zt64 & 1)) { __zm64++; __zt64 >>= 1; } __zm64; })",
+    ),
+    (
+        "__builtin_popcount",
+        &["x"],
+        "({ unsigned __zp32 = (x); int __zq32 = 0; \
+        while (__zp32) { __zq32 += __zp32 & 1; __zp32 >>= 1; } __zq32; })",
+    ),
+    (
+        "__builtin_popcountll",
+        &["x"],
+        "({ unsigned long long __zp64 = (x); int __zq64 = 0; \
+        while (__zp64) { __zq64 += (int)(__zp64 & 1); __zp64 >>= 1; } __zq64; })",
+    ),
 ];
 
 // __ATOMIC_RELAXED..__ATOMIC_SEQ_CST = 0..5 (giá trị như GCC); sự TỒN TẠI của

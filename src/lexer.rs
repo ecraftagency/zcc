@@ -27,9 +27,9 @@ pub struct PTok {
     pub bol: bool,
     pub ws: bool,
     pub line: u32,
-    pub file: u32, // id vào bảng file của preprocess (0 = file gốc)
+    pub file: u32,         // id vào bảng file của preprocess (0 = file gốc)
     pub hide: Vec<String>, // hideset: macro đã expand ra token này (chặn expand lại)
-    pub raw: String, // spelling gốc (Num/Str/Char) cho # stringize; rỗng = spell từ giá trị
+    pub raw: String,       // spelling gốc (Num/Str/Char) cho # stringize; rỗng = spell từ giá trị
 }
 
 // Punct dài đứng trước để match trước ("<<=" trước "<<" trước "<").
@@ -100,6 +100,63 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
         while b.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
             *i += 1;
         }
+        // EXT(c99): hex float 0x1.8p3 = mantissa hex × 2^mũ — musl src/math
+        // dùng dày đặc (bảng hằng exp/log/pow). Tích lũy nhân-16 chính xác
+        // tới 2^53, đủ cho mọi literal ≤13 hex digit; sai lệch còn lại bị
+        // differential vs cc bắt.
+        if matches!(b.get(*i), Some(b'.' | b'p' | b'P')) {
+            let mut v: f64 = 0.0;
+            for c in src[d..*i].bytes() {
+                v = v * 16.0 + (c as char).to_digit(16).unwrap() as f64;
+            }
+            if b.get(*i) == Some(&b'.') {
+                *i += 1;
+                let mut scale = 1.0f64 / 16.0;
+                while let Some(c) = b.get(*i).filter(|c| c.is_ascii_hexdigit()) {
+                    v += (*c as char).to_digit(16).unwrap() as f64 * scale;
+                    scale /= 16.0;
+                    *i += 1;
+                }
+            }
+            if !matches!(b.get(*i), Some(b'p' | b'P')) {
+                return Err("hex float cần mũ p".into());
+            }
+            *i += 1;
+            let neg = match b.get(*i) {
+                Some(b'-') => {
+                    *i += 1;
+                    true
+                }
+                Some(b'+') => {
+                    *i += 1;
+                    false
+                }
+                _ => false,
+            };
+            let e0 = *i;
+            while b.get(*i).is_some_and(|c| c.is_ascii_digit()) {
+                *i += 1;
+            }
+            let mut exp: i32 = src[e0..*i].parse().map_err(|e| format!("{e}"))?;
+            if neg {
+                exp = -exp;
+            }
+            // powi(-1074) = 1/2^1074 = 1/inf = 0 — tách 2 bước để vào được
+            // vùng subnormal (0x1p-1074 = DBL_TRUE_MIN của musl)
+            let v = if exp >= -1022 {
+                v * 2.0f64.powi(exp)
+            } else {
+                v * 2.0f64.powi(-1022) * 2.0f64.powi(exp + 1022)
+            };
+            let mut dbl = true;
+            if matches!(b.get(*i), Some(b'f' | b'F')) {
+                *i += 1;
+                dbl = false;
+            } else if matches!(b.get(*i), Some(b'l' | b'L')) {
+                *i += 1; // long double = double (deviation đã tuyên bố)
+            }
+            return Ok(Tok::FNum(v, dbl));
+        }
         let v = u64::from_str_radix(&src[d..*i], 16).map_err(|e| format!("{e}"))?;
         return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
     }
@@ -136,8 +193,8 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
         return Ok(Tok::FNum(v, dbl));
     }
     let octal = b[s] == b'0' && *i > s + 1;
-    let v = u64::from_str_radix(&src[s..*i], if octal { 8 } else { 10 })
-        .map_err(|e| format!("{e}"))?;
+    let v =
+        u64::from_str_radix(&src[s..*i], if octal { 8 } else { 10 }).map_err(|e| format!("{e}"))?;
     Ok(Tok::Num(v as i64, suffix_kind(b, i, v, octal)?))
 }
 
@@ -314,7 +371,15 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             Tok::Num(..) | Tok::FNum(..) | Tok::Str(..) => src[tok_start..i].to_string(),
             _ => String::new(),
         };
-        toks.push(PTok { tok, bol, ws, line, file: 0, hide: Vec::new(), raw });
+        toks.push(PTok {
+            tok,
+            bol,
+            ws,
+            line,
+            file: 0,
+            hide: Vec::new(),
+            raw,
+        });
         bol = false;
         ws = false;
     }

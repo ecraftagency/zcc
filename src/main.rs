@@ -32,21 +32,30 @@ fn run(cmd: &str, args: &[&str]) -> bool {
 }
 
 fn write_or_die(path: &str, data: &str) -> bool {
-    fs::write(path, data).map_err(|e| eprintln!("zcc: {}: {}", path, e)).is_ok()
+    fs::write(path, data)
+        .map_err(|e| eprintln!("zcc: {}: {}", path, e))
+        .is_ok()
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let (mut inputs, mut output, mut mode) = (Vec::new(), None, "ld");
-    let (mut defs, mut incs, mut undefs) =
-        (Vec::<String>::new(), Vec::<String>::new(), Vec::<String>::new());
+    let (mut defs, mut incs, mut undefs) = (
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+        Vec::<String>::new(),
+    );
     // -l/-L giữ nguyên thứ tự CLI, forward thẳng cho ld; -MMD/-MF sinh .d cho make
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
     let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
     let (mut nostdinc, mut bundle) = (false, false);
     let mut tgt = HOST_TGT;
     let set_tgt = |v: &str, tgt: &mut Target| {
-        *tgt = if v.contains("linux") { Target::Arm64Elf } else { Target::Arm64Darwin };
+        *tgt = if v.contains("linux") {
+            Target::Arm64Elf
+        } else {
+            Target::Arm64Darwin
+        };
     };
     let mut i = 1;
     while i < args.len() {
@@ -94,7 +103,7 @@ fn main() -> ExitCode {
             }
             "-nostdinc" => nostdinc = true, // musl: chỉ dùng -I, bỏ header nhúng + SDK
             "-MMD" | "-MD" => depgen = true, // .d chỉ chứa header thật (nhúng <..> bỏ)
-            "-MP" => {}                      // deps của mình đều 1 dòng, phony khỏi cần
+            "-MP" => {}                     // deps của mình đều 1 dòng, phony khỏi cần
             "-MF" => {
                 i += 1;
                 depfile = args.get(i).cloned();
@@ -131,8 +140,16 @@ fn main() -> ExitCode {
     // sau mọi -I của user; header nhúng vẫn thắng cho 25 tên libc cơ bản).
     // ELF: thay SDK bằng glibc include của box (đường Debian/Ubuntu multiarch).
     // -nostdinc (chuẩn cc): sentinel \x01 đầu incs tắt bảng nhúng, không thêm SDK.
+    // ELF: ZCC_SYSROOT=<musl install> — header + crt + libc lấy TRỌN từ musl
+    // (libc-test M17 đòi: test phải compile/link против musl do zcc build,
+    // không phải glibc của box); không set thì glibc như cũ
+    let sysroot = std::env::var("ZCC_SYSROOT").ok().filter(|_| tgt == Target::Arm64Elf);
     if nostdinc {
         incs.insert(0, "\u{1}nostdinc".to_string());
+    } else if let Some(s) = &sysroot {
+        // musl headers trọn bộ — tắt bảng nhúng kẻo tên Darwin (__stdoutp) lọt vào
+        incs.insert(0, "\u{1}nostdinc".to_string());
+        incs.push(format!("{s}/include"));
     } else if tgt == Target::Arm64Elf {
         incs.push("/usr/include/aarch64-linux-gnu".to_string());
         incs.push("/usr/include".to_string());
@@ -166,7 +183,11 @@ fn main() -> ExitCode {
     };
     let stem_of = |path: &str| {
         let file = path.rsplit('/').next().unwrap();
-        file.strip_suffix(".c").unwrap_or(file).to_string()
+        let stem = file
+            .strip_suffix(".c")
+            .or_else(|| file.strip_suffix(".s"))
+            .or_else(|| file.strip_suffix(".S"));
+        stem.unwrap_or(file).to_string()
     };
     let ok = match mode {
         "e" => {
@@ -199,6 +220,35 @@ fn main() -> ExitCode {
         "s" | "o" => {
             let mut ok = true;
             for path in &inputs {
+                // luật driver drop-in: build system thật (musl) đưa file .s
+                // thẳng cho $CC -c — chuyển nguyên văn cho as, không qua C;
+                // .S (viết hoa) = asm cần C preprocessor (musl memset.S #define reg)
+                if path.ends_with(".s") || path.ends_with(".S") {
+                    let stem = stem_of(path);
+                    let default = format!("{stem}.o");
+                    let out = output.unwrap_or(&default);
+                    ok = if path.ends_with(".S") {
+                        let tmp_s = format!("{}.zcc.s", out);
+                        match preprocess::preprocess_asm(path, &defs, &undefs, &incs, tgt) {
+                            Ok(asm) => {
+                                let r =
+                                    write_or_die(&tmp_s, &asm) && run("as", &[&tmp_s, "-o", out]);
+                                fs::remove_file(&tmp_s).ok();
+                                r
+                            }
+                            Err(e) => {
+                                eprintln!("zcc: {}: {}", path, e);
+                                false
+                            }
+                        }
+                    } else {
+                        run("as", &[path, "-o", out])
+                    };
+                    if !ok {
+                        break;
+                    }
+                    continue;
+                }
                 let Some((asm, files)) = emit_asm(path) else {
                     ok = false;
                     break;
@@ -248,7 +298,10 @@ fn main() -> ExitCode {
                 let mut ld: Vec<&str> = Vec::new();
                 // ELF executable: entry qua crt1.o (_start → __libc_start_main → main),
                 // ctor/dtor qua crti/crtn — khác Darwin (LC_MAIN, không cần crt).
-                let crt = "/usr/lib/aarch64-linux-gnu";
+                let crt = match &sysroot {
+                    Some(s) => format!("{s}/lib"),
+                    None => "/usr/lib/aarch64-linux-gnu".to_string(),
+                };
                 let (crt1, crti, crtn) = (
                     format!("{crt}/crt1.o"),
                     format!("{crt}/crti.o"),
@@ -261,9 +314,7 @@ fn main() -> ExitCode {
                 ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L theo thứ tự CLI
                 match tgt {
                     Target::Arm64Darwin => {
-                        ld.extend([
-                            "-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64",
-                        ]);
+                        ld.extend(["-o", out, "-lSystem", "-syslibroot", &sdk, "-arch", "arm64"]);
                         if shared {
                             ld.push("-dylib"); // dynamic library: không cần entry _main
                         }
@@ -276,13 +327,14 @@ fn main() -> ExitCode {
                             ld.push("-shared");
                         } else {
                             ld.push(&crtn);
-                            ld.extend([
-                                "-dynamic-linker",
-                                "/lib/ld-linux-aarch64.so.1",
-                            ]);
+                            if sysroot.is_none() {
+                                // musl sysroot chỉ có libc.a → static, không cần ld.so
+                                ld.extend(["-dynamic-linker", "/lib/ld-linux-aarch64.so.1"]);
+                            }
                         }
-                        // -lm tách riêng trên glibc (Darwin gộp hết vào libSystem)
-                        ld.extend(["-o", out, "-lc", "-lm", "-L", crt]);
+                        // -lm tách riêng trên glibc (Darwin gộp hết vào libSystem;
+                        // musl install có libm.a rỗng nên -lm vô hại)
+                        ld.extend(["-o", out, "-lc", "-lm", "-L", &crt]);
                     }
                 }
                 ok = run("ld", &ld);
@@ -293,5 +345,9 @@ fn main() -> ExitCode {
             ok
         }
     };
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
