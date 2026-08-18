@@ -10,8 +10,11 @@
 # Lý thuyết từng lớp: đọc đầu mỗi gen_*.py. Chạy: tests/shape.sh [lex|decl|layout]
 set -e
 cd "$(dirname "$0")/.."
-cargo build --quiet 2>/dev/null || cargo build
-ZCC=target/debug/zcc
+# ZCC đặt sẵn từ env (chạy trong box Linux, không cargo) — không thì tự build
+if [ -z "$ZCC" ]; then
+    cargo build --quiet 2>/dev/null || cargo build
+    ZCC=target/debug/zcc
+fi
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 

@@ -42,10 +42,12 @@ Mọi phép RÚT GỌN coverage phải kèm lý do soundness đọc được t�
 ## Gate trong repo (tất cả là script, chạy từ repo root)
 
 ### Suite nền
-- `run.sh` — mỗi case `cases/*.c` compile bằng cả `cc -std=c89 -w -O0`
-  (trọng tài) lẫn zcc, chạy 2 binary, diff exit code + stdout.
-  `run.sh ext` — như trên cho `ext/*.c` (trọng tài `cc` KHÔNG kèm `-std=c89`,
-  vì đây là extension; luật decouple: xem CLAUDE.md).
+- `run.sh` — mỗi case `cases/*.c` compile bằng cả `cc -std=c99 -w -O0`
+  (trọng tài; nâng từ c89 khi hiến chương re-baseline C99 2026-08-18 —
+  case `c99_digraph_vla.c` chấm digraphs + sizeof(VLA) runtime) lẫn zcc,
+  chạy 2 binary, diff exit code + stdout.
+  `run.sh ext` — như trên cho `ext/*.c` với `-std=gnu99` (lãnh thổ vendor
+  extension; luật decouple: xem CLAUDE.md).
 
 ### Gate khoa học (vét cạn không gian hữu hạn — chạy khi đụng vùng tương ứng)
 - `abi.sh` + `gen_abi.py` — **lớp 6**. ABI mô hình hoá automaton: trạng thái
@@ -131,6 +133,48 @@ nhau là nghẽn (đã trả học phí).
 Nguyên tắc baseline: mỗi dòng known-fail phải có lời giải thích trong bảng
 trên (hoặc commit message thêm nó). Baseline KHÔNG phải thùng rác giấu bug —
 fail mới không giải thích được = bug zcc cho tới khi chứng minh ngược lại.
+
+### Triage đợt box ELF 2026-08-18 (referee gcc rộng hơn clang → case mới lọt scope)
+
+Referee drift: skip-set trên Darwin lập bằng clang (từ chối nhiều ext gcc),
+trong box gcc NUỐT nên case vào scope. Đợt này bắt 7 bug THẬT đã fix (xem
+commit): `__gnuc_va_list` thiếu trong stdarg.h nhúng; array-param size trỏ
+param trước (glibc regex.h); bảng header nhúng đè glibc trên ELF (MAP_ANON
+Darwin 0x1000 vs Linux 0x20 — mìn runtime); octal pp-number `08` chết ở lex
+(pcre2.h PCRE2_DATE); thiếu predefine `__USER_LABEL_PREFIX__` (scanf →
+`__isoc99_scanf` dính tên rác); **va_arg HFA đọc GP thay VR save area**
+(AAPCS C.3 — miscompile im lặng, torture 920625-1); aligned(n) sau declarator
+bị vứt (torture 20050215-1). Baseline thêm sau triage:
+- torture +17: 13 nested-fn/trampoline/label-values (gcc-only, ngoài scope),
+  3 VLA-in-struct + VLA sâu hơn subset musl (20040308-1/20040423-1/20041218-2,
+  20070919-1), 2 scalar_storage_order (gcc-only; zcc nuốt attribute → sai —
+  nợ: nên reject thay vì nuốt).
+- cts +00204: long double = fp128 trên AAPCS64 Linux, zcc lock double (đúng
+  Darwin, SỔ NỢ ELF — cần soft-fp128 nếu phần mềm thật đòi).
+- chibicc +builtin: typeof trần (cùng quyết định thiết kế với entry typeof).
+- kr +4, nora +5: UB drift — main rơi khỏi `}` không return (zcc theo C99
+  5.1.2.2.3 trả 0 như clang; gcc -std=c89 trả rác w0), scanf fail → đọc biến
+  chưa init, đọc argv ngoài argc. Differential tại UB vô nghĩa.
+
+Đợt 2 (overnight3 — lần đầu full-suite hậu-fix chạy trọn, lòi phần đuôi
+overnight2 chết non chưa tới): torture +20, triage từng con:
+- 15 nested-fn/trampoline/label-values/computed-goto (nestfunc-1..7,
+  nest-align-1, nest-stdar-1, comp-goto-2, pr22061-3/4, pr24135, 920721-4,
+  931002-1) — gcc-only, vĩnh viễn ngoài scope.
+- pr41935: offsetof trên VLA member — họ VLA, ngoài scope.
+- medce-1: đòi DCE nhánh hằng-giả ngay -O0 (call `link_error` phải biến mất
+  lúc link) — zcc không optimization pass là THIẾT KẾ, không mua.
+- bitfld-3, pr32244-1, pr34971: **SỔ NỢ ext** — bitfield `unsigned long long
+  :33/:40/:41` (C89 chỉ cho int), gcc reduce arithmetic về đúng width
+  (shift 40-bit precision), zcc load mask đúng nhưng arithmetic 64-bit.
+  Chưa phần mềm thật đòi; nếu đòi → reduce sau mỗi op trên giá trị bitfield.
+- 991014-1: **SỔ NỢ LP64** — struct 2^62 byte, sizeof bị cắt u32 đâu đó
+  trong layout (trả 0x1FFFFF00 thay vì 0x3FFF…FF00). Biên không gian giá
+  trị, không chặn phần mềm thật; fix = soát đường size u32→u64 trong TyTab.
+Bug thật fix đợt này: lexer chết cứng vì `$` TRONG `#if 0` (sqlite testfixture
+amalgamation giữ block Tcl mà bản release strip đi) — pp-token lạ chỉ được
+chết ở phase 7; fix = `$` vào identifier (EXT(gcc), mặc định gcc mọi target).
+Hạ tầng: shape.sh thêm guard ZCC env (pattern abi.sh) — box không có cargo.
 
 ## Suite chính chủ nginx/redis (trụ 3 — phần mềm thật tự kiểm chứng chính nó)
 

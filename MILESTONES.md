@@ -61,22 +61,146 @@ Quyết định đã chốt: mở **arm64 ELF Linux trước** (tái dùng instr
     khóa — M17 tạm dừng nhường **chiến dịch correctness (M18 kéo lên
     trước)**: math/sci gate + thêm suite, đưa correctness → 100%.
 
-- **M18 (dự kiến) — chiến dịch correctness 100%** (Vu chốt 4 khía 2026-08-17, xếp sau/xen kẽ M17):
-  1. **Csmith generative fuzzing** — sinh hàng loạt chương trình C ngẫu nhiên CAM KẾT không-UB, differential zcc↔gcc/cc (checksum output + crash-khi-compile = bug). Cùng huyết thống alg.sh (trọng tài + generator lọc UB) nhưng generative cả chương trình: vét được tổ hợp struct lồng/pointer sâu mà corpus tĩnh (torture/nginx/redis) không bao giờ chạm. Mục tiêu: harness `tests/csmith.sh` chạy nightly, reduce case bằng creduce khi bắt được.
+- **M18 (dự kiến) — chiến dịch correctness 100%** (Vu chốt 4 khía 2026-08-17; bổ sung 2026-08-18: sau khi pass hết suite hiện hành, replenish theo 2 trục — (a) độ phủ định lý cao nhất có thể, (b) suite công nghiệp bổ sung).
+  **LUẬT FREEZE (Vu chốt 2026-08-18): trong suốt M18, bề mặt feature ĐÓNG BĂNG — không mua feature/dialect mới (M17 coverage campaign tạm khóa, kể cả visibility attr của M20), để proof hội tụ trên mục tiêu đứng yên và mọi kết luận suite/gate được BẢO TOÀN. Chỉ được sửa: bug làm bề mặt HIỆN HÀNH sai ngữ nghĩa (fix ≠ feature), và chỉ phục vụ các compile goal hiện tại (musl, sqlite, git, redis, nginx + suite/gate của chúng) — không fix đón đầu cho phần mềm chưa vào rổ. Mở băng = sự kiện có sổ: từng feature mới phải khai dòng PROOF.md + gate trước khi merge.**
+  0. **PROOF.md — sổ định lý (trục a, thước đo đứng trên 4 khía dưới)**: mỗi feature một dòng — *thuộc không gian nào / hữu hạn (vét cạn = định lý) hay vô hạn (quy nạp + differential = bằng chứng) / gate nào giữ / phần dư phải thừa nhận*. "Độ phủ toán" = tỷ lệ feature có gate đứng gác, đo được chứ không cảm tính. Vùng trống đã biết cần gate mới: variadic + HFA vào abi.sh (bug 920625-1 lọt đúng ô này), FP (khía 3), linkage (khía 4), codegen simulation per-node (yếu nhất — hiện phi hình thức).
+  1. **Csmith generative fuzzing (trục b)** — sinh hàng loạt chương trình C ngẫu nhiên CAM KẾT không-UB, differential zcc↔gcc/cc (checksum output + crash-khi-compile = bug). Cùng huyết thống alg.sh (trọng tài + generator lọc UB) nhưng generative cả chương trình: vét được tổ hợp struct lồng/pointer sâu mà corpus tĩnh (torture/nginx/redis) không bao giờ chạm. Mục tiêu: harness `tests/csmith.sh` chạy nightly, reduce case bằng creduce khi bắt được. Cùng rổ trục b: **yarpgen** (thế hệ sau Csmith, UB-free by construction, nặng loop/arithmetic — bù đúng vùng Csmith mỏng), **c-testsuite** (~220 case conformance độc lập), đều differential trong box. Suite thương mại (Plum Hall/Perennial — chuẩn công nghiệp thật sự) ghi nhận tồn tại, không mua.
   2. **Valgrind memcheck** — bọc runtest/binary thật để phơi stack lệch/ghi lấn thầm lặng chưa tới mức segfault. LƯU Ý: Valgrind KHÔNG hỗ trợ macOS arm64 → chạy trong box Linux với binary zcc-ELF (M15 mở khóa đúng cửa này); món rẻ hơn trên Darwin: `-fsanitize=address` không có (zcc -O0 không sanitizer) → dùng guard page/malloc debug của libc (`MallocScribble`).
-  3. **Floating-point rigor** — Paranoia test suite (kinh điển IEEE-754: rounding/overflow/underflow/precision) + UCB ieeecc754 nếu tha được; hiện FP mới qua alg.sh mẫu biên + torture, chưa qua bài khắc nghiệt chuyên FP.
+  3. **Numeric rigor — gate `num.sh` + ĐỊNH LÝ QUY GIẢN** (Vu mở rộng 2026-08-18: thiếu suite/định lý cho scientific tool — long long/float/double, overflow/underflow). Định lý quy giản -O0: zcc không tự tính arithmetic lúc runtime — silicon IEEE 754 là tiên đề; nghĩa vụ proof rút về 3 mệnh đề: (i) đúng instruction + đúng width per node (cấm tính thừa precision — double rounding); (ii) đúng chuỗi conversion UAC/6.3 (nối alg.sh); (iii) hai nơi compiler TỰ tính phải bit-identical runtime: constant folder (kể cả inf/NaN/subnormal, unsigned wrap mod 2^n) và literal parser (decimal→double correctly-rounded; literal `f` parse THẲNG f32, cấm qua f64). Tầng gate: (a) **vét cạn f32 một ngôi 2^32** — mọi cast/negate/convert trên toàn bộ 4 tỷ bit pattern, differential gcc trong box = định lý vét cạn thật; (b) hai ngôi: vét không gian cấu trúc cross-product giá trị đặc biệt (±0, subnormal min/max, normal min/max, ±1, ±inf, NaN) + mẫu biên rounding; (c) int: biên overflow per (op × width × sign), unsigned wrap, fold-vs-runtime. Suite ngoài: Paranoia (Kahan), **Berkeley TestFloat** (oracle softfloat độc lập), IBM FPgen vectors, **testbase David Gay** (chuyên strtod/literal). Ghi chú: libc-test math/* (ULP check vector crlibm) CHÍNH LÀ suite scientific đang chạy — cụm fail math trong 77 suspect là đầu vào chiến dịch này. Sổ nợ liên đới: long double=double trên ELF (fp128) là lệch chuẩn CÓ SỔ, scientific tool thật đòi thì thương lượng lại. Mìn ĐÃ XÁC NHẬN chờ gate này xử: literal `f` parse f64→thu hẹp f32 (parser.rs ~2923, double rounding — C89 6.1.3.1 cho latitude 1 ULP nên chưa phạm chuẩn, nhưng lệch gcc/clang ở case hiếm kiểu 7.038531e-26f; fix = parse thẳng f32 từ PTok.raw khi num.sh đổ bộ).
   4. **Linkage & symbol multi-file** — gate `link.sh` mới: tentative definitions rải nhiều TU (C89 3.7.2 — linker gộp), weak symbol, shadow global/local, gọi hàm KHÔNG prototype với default argument promotion (char→int, float→double) link chéo cc↔zcc (mở rộng tự nhiên của abi.sh sang không gian linkage).
 
-### Sổ nợ (trả dần trong M15+, harness sẵn)
+- **M19 (dự kiến) — chiến dịch userland: shell + đồ kinh điển** (Vu chốt hướng
+  2026-08-18: "build được gần như toàn bộ userland" nằm trong lộ trình
+  replenish compiler capability; hợp lưu với Tầm nhìn xa — initramfs musl-static
+  boot qemu cần shell mới thành hệ SỐNG). Luật giữ nguyên: test-first, mỗi ext
+  mới phải có phần mềm trong rổ đòi; mỗi mục chấm bằng suite chính chủ của nó.
+  Thứ tự theo giá/coverage:
+  1. **dash** — POSIX sh nhỏ nhất, gần chắc build ngay; mở khóa initramfs
+     tương tác. Oracle: chạy chính test POSIX của nó + so gcc.
+  2. **busybox** (hoặc sbase+ubase đã nằm rổ M17) — một binary = cả userland
+     (init/sh/coreutils/mount); kconfig + GNU ext vừa phải. Đây là "gần như
+     toàn bộ userland" trong một mục tiêu.
+  3. **bash** — biểu tượng + suite `tests/` chính chủ dày (trụ 3 đúng nghĩa);
+     dialect bảo thủ hơn tiếng đồn (autoconf-era C). Kèm readline bundled.
+  4. **GNU make** — tự build phần mềm TRÊN hệ đích → userland tự tái sản xuất.
+  5. **zsh** — stretch (to, module dlopen → đòi nợ -shared/TLS-in-so trước).
+  6. **Chuỗi foundation lib → PostgreSQL 18** (Vu ký 2026-08-18 "chơi postgres
+     18 mới nhất luôn"): zlib → libpng (đòi zlib — test luôn chuỗi dep) →
+     libjpeg (bản IJG C thuần, không phải turbo-SIMD) → **PG18**. Mỗi lib chấm
+     bằng self-test chính chủ (minigzip round-trip, pngtest, djpeg regression);
+     PG chấm bằng `make check` = pg_regress, vừa là goal vừa là suite công
+     nghiệp mới cho kho. Đã trinh sát + TRẢ TRƯỚC 18/8 (52 LOC, local PASS
+     19/19 ext + 67/67 cases): __sync_fetch_and_and/or/xor (atomics/
+     generic-gcc.h dùng thẳng cả họ khi HAVE_GCC__SYNC_INT32_CAS bật) +
+     _Static_assert EXT(c11) hai scope (StaticAssertStmt/Decl). Phần còn lại
+     PG18 đã có sẵn từ M12–M17: spinlock TAS (slock_t arm64 = int),
+     CAS 32/64, barrier, asm-label, __builtin_expect/constant_p/unreachable.
+     KHÔNG cần lib async ngoài: AIO PG18 tự trồng, io_method=worker default,
+     io_uring/liburing là opt-in configure — không bật; --without-icu
+     --without-readline --without-zlib nếu cần tối giản (PG17+ đã xóa
+     --disable-spinlocks nên cụm __sync là bắt buộc — đã có).
+  - **systemd: TỪ CHỐI CÓ SỔ** — không phải vì to mà vì sai target kép:
+    (a) glibc-only chính thức (musl không được hỗ trợ — Alpine/Void dùng
+    runit/openrc vì đúng lý do này), hệ đích của mình là musl-static;
+    (b) GNU11 dày đặc `__attribute__((cleanup))` = ngữ nghĩa destructor,
+    _Generic, meson — mua bề mặt dialect khổng lồ cho MỘT phần mềm không chạy
+    được trên hệ đích. PID 1 cho hệ nhỏ: **sinit/runit** (vài trăm dòng C
+    thuần) hoặc init tự viết trong initramfs — đúng khí chất MINIX-inspired.
+
+- **M20 (dự kiến) — dynamic linking musl: loader + .so** (Vu chốt 2026-08-18:
+  hệ phải chạy dynamic như distro thật — static toàn phần chỉ là bước đệm
+  bootstrap; Alpine cũng ship musl dynamic). Trả trọn dòng nợ M15 "-shared
+  chưa prove". Đặc sản musl: **ld-musl CHÍNH LÀ libc.so** — build được libc
+  shared là có loader, không có mảnh GNU nào mọc thêm. Các mảnh, theo thứ tự:
+  1. **zcc: visibility** — lỗ thật đã soi 2026-08-18: zcc nuốt im
+     `__attribute__((visibility("hidden")))`, không phát `.hidden`, và dưới
+     -fPIC đẩy MỌI global non-static qua GOT. musl ldso đòi hidden = truy cập
+     TRỰC TIẾP (non-preemptible, và đường _dlstart chạy TRƯỚC self-relocation
+     không được đụng GOT chưa reloc). Việc: parse visibility → emit `.hidden`
+     + adrp/add trực tiếp kể cả khi pic.
+  2. **Build musl shared**: compile lại -fPIC (.lo), link `libc.so` (-shared
+     -nostdlib, entry _dlstart tự reloc) → `ld-musl-aarch64.so.1` trong
+     sysroot. LƯU Ý cache: config.mak cũ đã bake quyết định static — phải
+     configure lại khi mở shared.
+  3. **Driver sysroot dynamic mode**: PT_INTERP = <sysroot>/lib/libc.so,
+     link против libc.so (giữ static làm mặc định/flag — initramfs vẫn cần).
+  4. **TLS model cho .so**: local-exec hiện tại chỉ đúng trong exe —
+     initial-exec cho .so (dòng nợ TLS-in-so M15 gộp vào đây).
+  5. **Gate link.sh mọc chiều dynamic**: interposition exe-đè-so, PLT, GOT
+     data, link chéo gcc-main↔zcc-so và ngược (copy-reloc phía gcc vs
+     GOT-luôn phía zcc — đúng automaton ABI, vét được).
+  - Chấm điểm: libc-test nhánh dynamic + dlopen/dso tests (đang ngoài scope
+    static), rồi dash/busybox link dynamic chạy trên ld-musl do zcc build.
 
 - ~~nginx-tests rerun~~ TRẢ XONG 2026-08-17: minimal 493 file/1136 test All PASS; build FULL (ssl+http2+stream+mail, pcre2+openssl@3) 5346 test, fail-chỉ-zcc = RỖNG (trọng tài nginx-cc cùng config fail giống hệt — tests/README.md).
 - ~~tcc.sh smoke~~ TRẢ XONG 2026-08-17: 108 pass, 31 skip, 0 fail — baseline rỗng ngay lần đầu.
 - ~~TLS thật cho `__thread` Mach-O~~ TRẢ XONG 2026-08-17 (xem M14); phần ELF TLS model chuyển vào M15.
 - `tests/suites/musl.sh` (suite 7, VIẾT RỒI, HOÃN): compile-only trên Darwin; box Linux đã có (M15) — thăng cấp thành build thật + libc-test khi mở lại.
 - Nợ M15: `-shared` ELF (.so + GOT toàn cục) chưa prove; va_arg composite vắt ngang reg/stack (AAPCS C.11) chưa xử.
+- **Mục tiêu C99-ĐỦ (Vu chốt 2026-08-18: userland mượt cần đủ C99, không chỉ ext-theo-đòi; thi hành NGAY KHI M18 mở băng, trước M19).** Đo 18/8 bằng 20 probe differential: **18/20 đã ăn** (mixed decl, for-decl, __VA_ARGS__ + empty arg, inline + extern inline, restrict, _Bool, compound literal cả static, designated init cả nested, flexible array, __func__, long long, UCN, wide string, VLA local/param/ptr, _Complex đại số đủ, hex float, _Pragma; __STDC_VERSION__ đã xưng 199901L). Còn thiếu, xếp giá: (1) `sizeof(VLA)` runtime — FAIL probe, đáng mua nhất; (2) digraphs `<% %> <: :>` — bảng lexer vài dòng, mua cho tròn; (3) `#pragma STDC FP_CONTRACT/FENV_ACCESS/CX_LIMITED_RANGE` — nuốt-và-ghi-nhận là CONFORMING ở -O0 (không bao giờ contract, không tối ưu qua fenv); (4) `tgmath.h` — cần builtin dispatch, phần mềm thật gần như không dùng, mua CUỐI; (5) `long double`=double — VẪN CONFORMING C99 (5.2.4.2.2 chỉ đòi ≥ double; MSVC cùng lựa chọn) — vấn đề fp128 là NỢ ABI ELF interop, sổ riêng, không tính vào C99. Thư viện C99 (snprintf, stdint, wchar…) = musl gánh, đã có. Luật mở băng giữ nguyên: mỗi món vào kèm dòng PROOF.md + gate (sizeof-VLA vào shape.sh, digraph vào gen_lex).
+  **THI HÀNH XONG 18/8 cùng ngày (Vu ký sớm, không chờ mở băng — lệnh "trừ tgmath.h ra đưa toàn bộ c99 vào")**: hiến chương #1 đổi **Strict compliance C99**; 24 marker `EXT(c99)` hạ thành chú thích `C99:` (bề mặt lệch chuẩn còn 88 vendor: 77 gcc + 8 clang + 3 apple); mua (1) `sizeof(VLA)` runtime — local ẩn `.vlasz` chốt byte lúc khai báo, sizeof + alloca cùng đọc (vla_szs key offset, clear mỗi hàm như reg_pins; phủ cả `sizeof(int[n])` typename + `sizeof *p` qua vla_arrs); (2) digraphs — bảng DIGRAPHS 6 mục ánh xạ về punct chính tắc TRƯỚC bảng PUNCTS (C 6.4.6 vô điều kiện, không có luật `<::` C++); (3) `#pragma STDC` — nuốt sẵn, tuyên bố conforming ở -O0. Trọng tài run.sh cases/ nâng `-std=c89`→`-std=c99`, corpus 67/67 (case mới c99_digraph_vla.c differential khớp byte), shape + cpp PASS. **Deviation tuyên bố duy nhất còn lại của C99: tgmath.h** (cần builtin dispatch/_Generic, userland thật không dùng — mua khi có chủ nợ, đường rẻ là header kiểu musl `__typeof__`).
 - Driver harness riêng (flag matrix: -nostdinc/-bundle/-undefined/-MMD/-shared… hiện chỉ test gián tiếp qua m9/m13/m14).
 - Probe sqlite/zlib/sbase/jemalloc… để đo bề mặt fail (nạp cho M17).
 
 ## Tầm nhìn xa
 
 Dùng zcc phối hợp qemu viết một hệ điều hành đơn giản → cần mode freestanding (không libc, assembler directive bare-metal). KHÔNG thiết kế trước — chỉ giữ codegen tách file để thay được (đã là luật kiến trúc).
+
+Bước đệm đã khả thi từ 2026-08-18 (musl sysroot + crt tự build, static ELF
+kernel tự map không cần loader): **initramfs Linux nhỏ** — kernel arm64 +
+`/init` static-musl-zcc boot trong qemu; M19 cấp shell/tools biến nó thành hệ
+sống. Học boot chain/initramfs/syscall surface ở đây trước khi thay kernel
+bằng của mình.
+
+**M21 (đích công bố, Vu chốt hướng 2026-08-18)** — distro PoC console-first.
+**TIỀN ĐỀ CỨNG (Vu chốt 2026-08-18): KHÔNG compose bất kỳ distro nào khi chưa
+pass hết toàn bộ test suite / sci proof hiện hành VÀ các suite+proof tương lai
+(M18 trọn vẹn: PROOF.md không ô trống + Csmith/yarpgen/c-testsuite + 4 khía).
+Correctness đi trước danh tiếng — thứ tự không thương lượng: M18 → M19/M20 →
+M21.** Nội dung:
+rootfs = musl + ld-musl + init + shell + utils, TẤT CẢ userland compile bằng
+zcc (kernel vay như mọi distro; as/ld binutils ở build-time — claim chuẩn:
+"zcc là compiler duy nhất trong toolchain"; claim "GNU-free build chain" chỉ
+phát biểu SAU khi có assembler/linker riêng — món này để ngỏ, đòi thương
+lượng lại trần LOC). Điều kiện công bố theo hiến chương: artifact tái lập
+được — script dựng image từ source + zcc seed (binary musl static, không cần
+rustc trên hệ), boot qemu, kèm bảng suite (libc-test, redis, git t/, sqlite
+byte-diff). Quảng bá bằng lệnh người ta tự chạy lại được, không tự tuyên bố.
+
+**M22 (dự kiến, Vu duyệt ngân sách 2026-08-18) — zas + zld: toolchain không GNU.**
+Xếp SAU M20 (phải học semantics reloc/PLT/GOT/TLS qua GNU ld trước rồi mới
+reimplement) và sau M21 nấc 1. Ngân sách LOC: **trần compiler 10k KHÔNG đổi**
+(src/ nguyên vẹn); zas/zld là binary riêng, sổ riêng — zas ~2k (assembler
+aarch64 subset: chỉ nuốt (a) output của chính zcc — tập mnemonic vét bằng grep
+codegen, (b) file .s viết tay của musl), zld static ~1.5k + dynamic ~1k (chỉ
+tập relocation zas sinh ra: ADR_PREL_PG_HI21, ADD_ABS_LO12, CALL26, ABS64,
+cụm GOT/TLS). **Dynamic là ĐIỀU KIỆN HOÀN THÀNH, không phải option (Vu chốt
+lần 2, 2026-08-18): zlinux bắt buộc chạy .so + loader — không all-static dù
+disk rẻ; zld static-only chỉ là nấc nội bộ, CHƯA đủ tư cách thay GNU ld.** Tổng toolchain mục tiêu **<15k** — vẫn không đối thủ cùng hạng
+(tcc 80k x86, cproc mượn QBE). Toán: assembler = automaton bảng tra encoding
+(hữu hạn → vét cạn); linker = reachability + đại số relocation. Gate:
+differential vs GNU as/ld — cùng .s, diff semantic readelf/objdump; cùng .o,
+binary chạy qua suite chính chủ. Món phụ ăn theo: thời gian assemble về tay
+mình (Apple clang-as 3.9s vs GNU as 1s trên sqlite .s 742k dòng — đo
+2026-08-18). Claim mở khóa: "toolchain không một dòng GNU: zcc → zas → zld →
+musl". Mức meta khai trung thực khi công bố: zcc build bằng rustc (seed
+binary — mọi toolchain đều cần compiler mồi; giáo trình dây sang Trusting
+Trust của Thompson).
+**Luật interface (Vu chốt 2026-08-18): zas/zld BẮT BUỘC drop-in với
+make/configure/m4 — nối dài luật driver của hiến chương.** Cụ thể: (1) bề
+mặt flag mua test-first từ chính log build verbose của rổ (mọi invocation
+`as`/`ld` mà driver zcc + build system thật đã phát — V=1 log các overnight
+chính là bản ghi spec); (2) TUYỆT ĐỐI không nuốt nhầm flag có tham số;
+(3) exit code + stderr format để configure grep được; (4) bẫy libtool/m4:
+LT_PATH_LD sniff `ld --version` tìm chuỗi "GNU" và đổi hành vi theo —
+quyết định masquerade hay dạy libtool nhận diện riêng sẽ chốt bằng số liệu
+khi busybox/bash vào rổ, không đoán trước; (5) hợp đồng tối thiểu của zld =
+CHÍNH lệnh ld mà driver zcc đang phát hôm nay (crt1/crti/crtn, -dynamic-linker,
+-lc -lm, -shared/-soname khi M20) + đuôi -Wl, mà build system tunnel qua.
+(6) Lỗ hổng claim đã điểm danh 2026-08-18: build thật còn gọi **ar/ranlib**
+(musl đóng libc.a, redis đóng deps, mọi static lib) — "GNU-free" đòi thêm
+**zar** (~200-300 LOC: format ar cổ điển + symbol index /; ranlib = zar -s).
+nm/strip/objcopy/readelf KHÔNG bắt buộc cho build chain — tool chẩn đoán,
+vay được không mất claim.
+Câu chuyện khác biệt: toolchain auditable — "trusting trust" cỡ một học kỳ
+sinh viên.

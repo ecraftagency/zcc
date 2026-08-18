@@ -46,6 +46,7 @@ pub const FLOAT: TypeId = 9;
 pub const DOUBLE: TypeId = 10;
 pub const BOOL: TypeId = 11;
 
+#[derive(Clone)]
 pub struct StructDef {
     pub members: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset)
     pub size: u32,
@@ -198,6 +199,9 @@ pub enum SyncOp {
     SubFetch,
     ValCas,  // __sync_val_compare_and_swap — trả giá trị cũ
     BoolCas, // __sync_bool_compare_and_swap — trả 1/0
+    FetchAnd, // __sync_fetch_and_and — postgres18 atomics/generic-gcc.h
+    FetchOr,  // __sync_fetch_and_or
+    FetchXor, // __sync_fetch_and_xor
     TestSet, // __sync_lock_test_and_set — atomic exchange, trả giá trị cũ
     Release, // __sync_lock_release — ghi 0 với release barrier
     Barrier, // __sync_synchronize — dmb ish
@@ -243,7 +247,10 @@ pub enum Node {
     // ELF/AAPCS: va_list = struct 32 byte, không phải char* — hai builtin thật
     // (Darwin không sinh: stdarg.h nhánh Apple vẫn đi đường macro + VaArea)
     VaStart(NodeId),       // __builtin_va_start(ap, last): điền 5 field từ prologue
-    VaArg(NodeId, TypeId), // __builtin_va_arg(ap, T): chọn vùng GP/VR/stack theo T
+    // __builtin_va_arg(ap, T): chọn vùng GP/VR/stack theo T; u32 = offset local
+    // scratch (parser cấp khi T là struct — HFA từ VR save area nằm rải mỗi
+    // member 1 q-slot 16B, backend gather về scratch liên tục)
+    VaArg(NodeId, TypeId, u32),
     Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
     // EXT(gcc): inline asm subset (xxhash/M14; musl/M17 nới constraint).
     // Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
@@ -329,6 +336,9 @@ pub struct Ast {
     // EXT(gcc): __attribute__((alias("old"))) — (tên mới, tên cũ, weak?);
     // musl weak_alias() dệt toàn bộ bề mặt public symbol bằng món này
     pub aliases: Vec<(String, String, bool)>,
+    // -fPIC (driver set sau parse): ELF .so — global non-static preemptible,
+    // backend phải đi GOT thay adrp trực tiếp
+    pub pic: bool,
     // EXT(gcc): prototype/extern mang weak — TU phát .weak để undef ref là weak
     pub weak_decls: Vec<String>,
     pub tgt: Target,

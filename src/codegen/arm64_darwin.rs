@@ -1022,17 +1022,25 @@ impl Cg<'_> {
                 };
                 let n = self.labels(3); // loop, fail (clrex), join
                 match op {
-                    SyncOp::FetchAdd | SyncOp::AddFetch | SyncOp::FetchSub | SyncOp::SubFetch => {
-                        let ins = if matches!(op, SyncOp::FetchAdd | SyncOp::AddFetch) {
-                            "add"
-                        } else {
-                            "sub"
+                    SyncOp::FetchAdd
+                    | SyncOp::AddFetch
+                    | SyncOp::FetchSub
+                    | SyncOp::SubFetch
+                    | SyncOp::FetchAnd
+                    | SyncOp::FetchOr
+                    | SyncOp::FetchXor => {
+                        let ins = match op {
+                            SyncOp::FetchAdd | SyncOp::AddFetch => "add",
+                            SyncOp::FetchSub | SyncOp::SubFetch => "sub",
+                            SyncOp::FetchAnd => "and",
+                            SyncOp::FetchOr => "orr",
+                            _ => "eor",
                         };
                         _ = writeln!(
                             self.s,
                             "L{n}:\n\tldaxr {r}9, [x0]\n\t{ins} {r}10, {r}9, {r}1\n\tstlxr w11, {r}10, [x0]\n\tcbnz w11, L{n}"
                         );
-                        let old = matches!(op, SyncOp::FetchAdd | SyncOp::FetchSub);
+                        let old = !matches!(op, SyncOp::AddFetch | SyncOp::SubFetch);
                         canon(&mut self.s, if old { 9 } else { 10 });
                     }
                     SyncOp::ValCas | SyncOp::BoolCas => {

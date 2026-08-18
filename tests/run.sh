@@ -1,12 +1,13 @@
 #!/bin/sh
 # Diff zcc với clang trên từng case: tests/run.sh [cases|ext]
-# Trọng tài = cc hệ thống -O0. cases/ (mặc định): thêm -std=c89 — lãnh thổ C89
-# thuần. ext/: KHÔNG -std — phương ngữ C89+ (C99 cherry-pick + GCC extension).
+# Trọng tài = cc hệ thống -O0. cases/ (mặc định): -std=c99 — lãnh thổ ISO C99
+# (chuẩn gốc từ 2026-08-18, C89 là tập con). ext/: -std=gnu99 — phương ngữ
+# vendor (GCC/clang/Apple extension).
 cd "$(dirname "$0")" || exit 1
 cargo build -q --manifest-path ../Cargo.toml || exit 1
 ZCC=../target/debug/zcc
 DIR=${1:-cases}
-STD=-std=c89
+STD=-std=c99
 [ "$DIR" = ext ] && STD=-std=gnu99
 mkdir -p out
 pass=0 fail=0

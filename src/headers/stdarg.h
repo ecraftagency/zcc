@@ -24,6 +24,10 @@ typedef struct __zcc_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
 #define va_arg(ap, t) __builtin_va_arg(ap, t)
 #endif
+/* glibc protocol: header (sys/syslog.h, stdio.h) #define __need___va_list roi
+   #include <stdarg.h>, doi COMPILER cung cap __gnuc_va_list — thieu la
+   "__gnuc_va_list __ap" thanh param khong kieu. */
+typedef va_list __gnuc_va_list;
 #define va_end(ap) ((void)(ap)) /* arg phai duoc eval — side effect (va-arg-21) */
 #define va_copy(d, s) ((d) = (s))
 #endif

@@ -48,6 +48,7 @@ fn main() -> ExitCode {
     // -l/-L giữ nguyên thứ tự CLI, forward thẳng cho ld; -MMD/-MF sinh .d cho make
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
     let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
+    let mut pic = false; // -fPIC → backend ELF đi GOT cho global non-static
     let (mut nostdinc, mut bundle) = (false, false);
     let mut tgt = HOST_TGT;
     let set_tgt = |v: &str, tgt: &mut Target| {
@@ -93,6 +94,9 @@ fn main() -> ExitCode {
                 }
             }
             "-shared" | "-dynamiclib" => shared = true,
+            // ELF .so: global non-static = preemptible, PHẢI qua GOT (ld từ chối
+            // adrp trực tiếp khi -shared); redis module build .xo bằng -fPIC
+            "-fPIC" | "-fpic" => pic = true,
             "-bundle" => bundle = true, // Mach-O bundle (redis test modules dlopen)
             "-undefined" => {
                 // "-undefined dynamic_lookup": forward nguyên cặp cho ld (module
@@ -151,6 +155,8 @@ fn main() -> ExitCode {
         incs.insert(0, "\u{1}nostdinc".to_string());
         incs.push(format!("{s}/include"));
     } else if tgt == Target::Arm64Elf {
+        // sentinel: bảng nhúng chỉ phục vụ header compiler-owned, libc = glibc
+        incs.insert(0, "\u{1}elf".to_string());
         incs.push("/usr/include/aarch64-linux-gnu".to_string());
         incs.push("/usr/include".to_string());
     } else if !sdk.is_empty() {
@@ -159,7 +165,12 @@ fn main() -> ExitCode {
     // .c → (asm text, danh sách file thật đã đọc — cho -MMD); .o/.a đi thẳng linker
     let emit_asm = |path: &str| -> Option<(String, Vec<String>)> {
         match preprocess::preprocess(path, &defs, &undefs, &incs, tgt).and_then(
-            |(t, locs, files)| parser::parse(&t, &locs, &files, tgt).map(|ast| (ast, files)),
+            |(t, locs, files)| {
+                parser::parse(&t, &locs, &files, tgt).map(|mut ast| {
+                    ast.pic = pic;
+                    (ast, files)
+                })
+            },
         ) {
             Ok((ast, files)) => Some((codegen::emit(&ast), files)),
             Err(e) => {
@@ -293,6 +304,20 @@ fn main() -> ExitCode {
                 if !ok {
                     break;
                 }
+            }
+            // glibc: atexit nằm trong libc_nonshared.a tham chiếu __dso_handle
+            // (hidden) — gcc cấp qua crtbegin.o; zcc link as→ld trực tiếp nên tự
+            // phát stub (self-address: hợp lệ cho cả exe lẫn .so, chỉ là tag
+            // identity cho __cxa_atexit)
+            if ok && tgt == Target::Arm64Elf && sysroot.is_none() {
+                let (ds, do_) = (format!("{out}.zccdso.s"), format!("{out}.zccdso.o"));
+                ok = write_or_die(
+                    &ds,
+                    ".hidden __dso_handle\n.globl __dso_handle\n.data\n.p2align 3\n__dso_handle:\n.xword __dso_handle\n",
+                ) && run("as", &[&ds, "-o", &do_]);
+                fs::remove_file(&ds).ok();
+                tmps.push(do_.clone());
+                objs.push(do_);
             }
             if ok {
                 let mut ld: Vec<&str> = Vec::new();

@@ -32,6 +32,16 @@ pub struct PTok {
     pub raw: String,       // spelling gốc (Num/Str/Char) cho # stringize; rỗng = spell từ giá trị
 }
 
+// C99 6.4.6: digraphs — dài trước ngắn ("%:%:" trước "%:").
+const DIGRAPHS: [(&str, &'static str); 6] = [
+    ("%:%:", "##"),
+    ("%:", "#"),
+    ("<:", "["),
+    (":>", "]"),
+    ("<%", "{"),
+    ("%>", "}"),
+];
+
 // Punct dài đứng trước để match trước ("<<=" trước "<<" trước "<").
 const PUNCTS: [&str; 48] = [
     "...", "<<=", ">>=", "->", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "==",
@@ -100,7 +110,7 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
         while b.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
             *i += 1;
         }
-        // EXT(c99): hex float 0x1.8p3 = mantissa hex × 2^mũ — musl src/math
+        // C99: hex float 0x1.8p3 = mantissa hex × 2^mũ — musl src/math
         // dùng dày đặc (bảng hằng exp/log/pow). Tích lũy nhân-16 chính xác
         // tới 2^53, đủ cho mọi literal ≤13 hex digit; sai lệch còn lại bị
         // differential vs cc bắt.
@@ -193,6 +203,10 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
         return Ok(Tok::FNum(v, dbl));
     }
     let octal = b[s] == b'0' && *i > s + 1;
+    // "08" là pp-number hợp lệ, chỉ ill-formed khi DÙNG làm hằng (pcre2.h:
+    // `#define PCRE2_DATE 2025-08-27` không ai eval) — gcc lex qua, lỗi lúc
+    // convert; zcc lex eager nên hạ xuống decimal thay vì chết cả TU
+    let octal = octal && !src[s..*i].contains(['8', '9']);
     let v =
         u64::from_str_radix(&src[s..*i], if octal { 8 } else { 10 }).map_err(|e| format!("{e}"))?;
     Ok(Tok::Num(v as i64, suffix_kind(b, i, v, octal)?))
@@ -246,7 +260,15 @@ fn suffix_kind(b: &[u8], i: &mut usize, v: u64, oct_hex: bool) -> Result<NumK, S
     })
 }
 
+// Wrapper cho nguồn synthetic (macro builtin, token paste) — không chứa hằng
+// ký tự ≥128 nên char signedness không chạm tới.
 pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
+    lex_t(src, false)
+}
+// char_uns: plain char UNSIGNED (Linux arm64, AAPCS64) — điểm chạm duy nhất
+// là GIÁ TRỊ escape ≥ 128 trong hằng ký tự ('\377' = 255 vs -1 Darwin);
+// nguồn file thật phải đi đường này với cờ theo target.
+pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
     let b = src.as_bytes();
     let (mut i, mut toks) = (0, Vec::new());
     let (mut line, mut bol, mut ws) = (1u32, true, false);
@@ -313,7 +335,15 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
                     b'\\' => {
                         i += 1;
                         let e = escape(b, &mut i)?;
-                        if wide { e as i64 } else { e as u8 as i8 as i64 } // char signed trên Darwin
+                        // char signed trên Darwin, unsigned trên Linux arm64;
+                        // wide giữ nguyên giá trị (không cắt u8)
+                        if wide {
+                            e as i64
+                        } else if char_uns {
+                            e as u8 as i64
+                        } else {
+                            e as u8 as i8 as i64
+                        }
                     }
                     e => {
                         i += 1;
@@ -352,12 +382,21 @@ pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
             }
             i += 1;
             Tok::Str(bytes, wide)
-        } else if c == b'_' || c.is_ascii_alphabetic() {
+        } else if c == b'_' || c == b'$' || c.is_ascii_alphabetic() {
+            // EXT(gcc): '$' hợp lệ trong identifier (mặc định gcc mọi target ELF/Darwin);
+            // tối thiểu phải sống qua lexer để #if 0 skip được (pp-token chỉ chết ở phase 7)
             let s = i;
-            while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+            while i < b.len() && (b[i] == b'_' || b[i] == b'$' || b[i].is_ascii_alphanumeric()) {
                 i += 1;
             }
             Tok::Ident(src[s..i].to_string())
+        } else if let Some((d, p)) = DIGRAPHS.iter().find(|(d, _)| src[i..].starts_with(d)) {
+            // C99 6.4.6: digraph = spelling thay thế vô điều kiện (phase 3),
+            // ánh xạ về punct chính tắc ngay tại lexer — phải đứng TRƯỚC bảng
+            // PUNCTS vì "<:" sẽ bị match ngắn thành "<". Không có luật "<::"
+            // kiểu C++: trong C, "<:" LUÔN là "[".
+            i += d.len();
+            Tok::Punct(p)
         } else {
             match PUNCTS.iter().find(|p| src[i..].starts_with(**p)) {
                 Some(p) => {

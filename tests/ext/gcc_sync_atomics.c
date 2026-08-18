@@ -32,5 +32,18 @@ int main(void)
     i = -5;
     printf("%d\n", __sync_fetch_and_add(&i, -3));                    /* -5 */
     printf("%d %d\n", i, i < 0);                                     /* -8 1 */
+
+    /* bitwise fetch (postgres18 atomics/generic-gcc.h): trả CŨ, ghi op */
+    u = 0xF0F0F0F0u;
+    printf("%u %u\n", __sync_fetch_and_and(&u, 0xFF00FF00u), u);     /* cũ, F000F000 */
+    printf("%u %u\n", __sync_fetch_and_or(&u, 0x0F0F0F0Fu), u);      /* F000F000, FF0FFF0F */
+    printf("%u %u\n", __sync_fetch_and_xor(&u, 0xFFFFFFFFu), u);     /* FF0FFF0F, ~ */
+    l = 0x7000000000000003L;
+    printf("%ld %ld\n", __sync_fetch_and_and(&l, 0x7000000000000001L), l);
+    printf("%ld %ld\n", __sync_fetch_and_or(&l, 0x0800000000000004L), l);
+    printf("%ld %ld\n", __sync_fetch_and_xor(&l, 0x0000000000000005L), l);
+    /* int âm: sign-extend kết quả bitwise 32-bit */
+    i = -8;
+    printf("%d %d\n", __sync_fetch_and_xor(&i, 7), i);               /* -8, -15 */
     return 0;
 }

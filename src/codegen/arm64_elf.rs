@@ -723,8 +723,9 @@ impl Cg<'_> {
                         "\tmrs x0, tpidr_el0\n\tadd x0, x0, #:tprel_hi12:{0}, lsl #12\n\tadd x0, x0, #:tprel_lo12_nc:{0}",
                         gl.name
                     );
-                } else if gl.is_extern {
-                    // symbol từ dylib (stdout...): bắt buộc qua GOT
+                } else if gl.is_extern || self.a.pic {
+                    // extern (stdout...) bắt buộc GOT; -fPIC: cả global TỰ ĐỊNH
+                    // NGHĨA non-static cũng preemptible trong .so → GOT nốt
                     _ = writeln!(
                         self.s,
                         "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
@@ -908,24 +909,30 @@ impl Cg<'_> {
                     (fp as i64 - 8) * 16
                 );
             }
-            Node::VaArg(ap, t) => {
-                let (ap, t) = (*ap, *t);
+            Node::VaArg(ap, t, tmp) => {
+                let (ap, t, tmp) = (*ap, *t, *tmp);
                 // chọn vùng: offs âm → còn reg trong save area, ≥0 → stack caller.
-                // Scalar khớp chính xác AAPCS; composite ≤16 đi block GP (đủ cho
-                // trường hợp không vắt ngang reg/stack), >16 gián tiếp qua con trỏ.
+                // Scalar khớp chính xác AAPCS; HFA đi VR (C.3) — save area để mỗi
+                // member 1 q-slot 16B nên phải gather về scratch liên tục;
+                // composite thường ≤16 đi block GP, >16 gián tiếp qua con trỏ
+                // (HFA >16 KHÔNG gián tiếp — C.3 giữ by-value).
                 let st = matches!(self.a.tt.tys[t as usize], Ty::Struct(_));
                 let sz = self.a.tt.size(t);
                 let fl = self.a.tt.is_float(t);
+                let hfa = if st { self.a.tt.hfa(t) } else { None };
                 let (offs, top, step) = if fl {
                     (28, 16, 16)
+                } else if let Some((_, n)) = hfa {
+                    (28, 16, n * 16)
                 } else if st && sz <= 16 {
                     (24, 8, sz.div_ceil(8) * 8)
                 } else {
                     (24, 8, 8)
                 };
                 // stack caller: mọi scalar slot 8 (kể cả double — 16 chỉ là bước
-                // VR save area), composite ≤16 theo size tròn 8, >16 = 1 slot con trỏ
-                let stk_step = if st && sz <= 16 {
+                // VR save area), composite by-value theo size tròn 8, indirect = 1
+                // slot con trỏ; trên stack HFA nằm LIỀN như composite thường
+                let stk_step = if st && (sz <= 16 || hfa.is_some()) {
                     sz.div_ceil(8) * 8
                 } else {
                     8
@@ -940,9 +947,23 @@ impl Cg<'_> {
                     "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw"
                 );
                 _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
+                if let Some((dbl, n)) = hfa {
+                    // gather: member j ở [x10 + 16j] → scratch + j*esz
+                    self.lea_local("x11", tmp);
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(self.s, "\tldr x12, [x10, #{}]", 16 * j);
+                            _ = writeln!(self.s, "\tstr x12, [x11, #{}]", 8 * j);
+                        } else {
+                            _ = writeln!(self.s, "\tldr w12, [x10, #{}]", 16 * j);
+                            _ = writeln!(self.s, "\tstr w12, [x11, #{}]", 4 * j);
+                        }
+                    }
+                    self.s += "\tmov x10, x11\n";
+                }
                 _ = writeln!(self.s, "L{}:\n\tmov x0, x10", l + 1);
                 if st {
-                    if sz > 16 {
+                    if sz > 16 && hfa.is_none() {
                         self.s += "\tldr x0, [x0]\n"; // >16B: slot chứa CON TRỎ
                     } // struct: giá trị = địa chỉ (quy ước struct-expr của zcc)
                 } else {
@@ -1095,17 +1116,25 @@ impl Cg<'_> {
                 };
                 let n = self.labels(3); // loop, fail (clrex), join
                 match op {
-                    SyncOp::FetchAdd | SyncOp::AddFetch | SyncOp::FetchSub | SyncOp::SubFetch => {
-                        let ins = if matches!(op, SyncOp::FetchAdd | SyncOp::AddFetch) {
-                            "add"
-                        } else {
-                            "sub"
+                    SyncOp::FetchAdd
+                    | SyncOp::AddFetch
+                    | SyncOp::FetchSub
+                    | SyncOp::SubFetch
+                    | SyncOp::FetchAnd
+                    | SyncOp::FetchOr
+                    | SyncOp::FetchXor => {
+                        let ins = match op {
+                            SyncOp::FetchAdd | SyncOp::AddFetch => "add",
+                            SyncOp::FetchSub | SyncOp::SubFetch => "sub",
+                            SyncOp::FetchAnd => "and",
+                            SyncOp::FetchOr => "orr",
+                            _ => "eor",
                         };
                         _ = writeln!(
                             self.s,
                             "L{n}:\n\tldaxr {r}9, [x0]\n\t{ins} {r}10, {r}9, {r}1\n\tstlxr w11, {r}10, [x0]\n\tcbnz w11, L{n}"
                         );
-                        let old = matches!(op, SyncOp::FetchAdd | SyncOp::FetchSub);
+                        let old = !matches!(op, SyncOp::AddFetch | SyncOp::SubFetch);
                         canon(&mut self.s, if old { 9 } else { 10 });
                     }
                     SyncOp::ValCas | SyncOp::BoolCas => {

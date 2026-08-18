@@ -9,7 +9,7 @@
 // (file, line, hideset) — hideset theo luật chuẩn để macro không expand lặp.
 
 use crate::ast::Target;
-use crate::lexer::{NumK, PTok, Tok, lex};
+use crate::lexer::{NumK, PTok, Tok, lex, lex_t};
 use std::collections::HashMap;
 use std::fs;
 
@@ -106,7 +106,7 @@ fn preprocess_pt(
         ("__GNUC__", "4"),
         ("__GNUC_MINOR__", "2"),
         ("__GNUC_PATCHLEVEL__", "1"),
-        // EXT(c99): git-compat-util.h #error khi < 199901L — xưng dialect C99
+        // C99: git-compat-util.h #error khi < 199901L — xưng dialect C99
         // như đã xưng GNUC cho SDK (M11); bề mặt C89+ hiện hành đủ phần C99
         // git đạp (designated/mixed-decl/long long/vamacro), thiếu đâu vá đó
         ("__STDC_VERSION__", "199901L"),
@@ -151,6 +151,17 @@ fn preprocess_pt(
         let toks = lex(v).map_err(|e| e.to_string())?;
         macros.insert(m.into(), Macro::Obj(toks));
     }
+    // __USER_LABEL_PREFIX__: glibc __REDIRECT/__ASMNAME stringize nó thành
+    // prefix symbol asm (scanf → __isoc99_scanf); thiếu định nghĩa là
+    // "#__USER_LABEL_PREFIX__" dính nguyên văn vào tên symbol. ELF rỗng,
+    // Mach-O "_" (đúng quy ước từng ABI).
+    macros.insert(
+        "__USER_LABEL_PREFIX__".into(),
+        Macro::Obj(match tgt {
+            Target::Arm64Darwin => lex("_").map_err(|e| e.to_string())?,
+            Target::Arm64Elf => Vec::new(),
+        }),
+    );
     // __builtin_va_*: bản sao stdarg.h cho code gọi thẳng builtin (torture).
     // Darwin: va_list = char*, va_start/va_arg là macro số học con trỏ;
     // ELF: va_list = struct AAPCS (stdarg.h định nghĩa), va_start/va_arg KHÔNG
@@ -263,8 +274,8 @@ fn preprocess_pt(
         macros.remove(u.as_str());
     }
     let mut files = Vec::new();
-    let pts = pp_file(path, &mut macros, 0, incs, &mut files)?;
-    // EXT(c99): _Pragma("...") operator — nuốt như #pragma (SDK dùng trong macro)
+    let pts = pp_file(path, &mut macros, 0, incs, &mut files, tgt == Target::Arm64Elf)?;
+    // C99: _Pragma("...") operator — nuốt như #pragma (SDK dùng trong macro)
     let (mut out, mut i) = (Vec::with_capacity(pts.len()), 0);
     while i < pts.len() {
         if matches!(&pts[i].tok, Tok::Ident(n) if n == "_Pragma")
@@ -316,9 +327,26 @@ fn inc_find(incs: &[String], name: &str) -> Option<String> {
         .map(|d| format!("{}/{}", d, name))
         .find(|p| std::path::Path::new(p).exists())
 }
-// -nostdinc: driver cắm sentinel \x01 đầu incs → bỏ bảng header nhúng (musl)
-fn no_stdinc(incs: &[String]) -> bool {
-    incs.first().is_some_and(|s| s.starts_with('\u{1}'))
+// Tra bảng header nhúng. Sentinel \x01 đầu incs do driver cắm:
+// \x01nostdinc (musl sysroot / -nostdinc) — tắt trọn bảng;
+// \x01elf — chỉ nhúng header COMPILER-OWNED (mô hình gcc: stdarg/stddef/...),
+// header libc nhường glibc của box — nội dung nhúng mang giá trị Darwin
+// (MAP_ANON 0x1000 vs Linux 0x20, jmp_buf lệch layout) → sai ABI runtime.
+fn embed_src(incs: &[String], name: &str, skip: bool) -> Option<&'static str> {
+    let sent = incs.first().map(String::as_str);
+    if skip || sent == Some("\u{1}nostdinc") {
+        return None;
+    }
+    if sent == Some("\u{1}elf")
+        && !matches!(
+            name,
+            "stdarg.h" | "stddef.h" | "stdbool.h" | "stdalign.h" | "stdnoreturn.h" | "float.h"
+                | "limits.h"
+        )
+    {
+        return None;
+    }
+    HEADERS.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
 
 fn synth(tok: Tok) -> PTok {
@@ -350,19 +378,20 @@ fn pp_file(
     depth: u32,
     incs: &[String],
     files: &mut Vec<String>,
+    cu: bool, // char_uns theo target — đi vào lex_t của mọi nguồn file thật
 ) -> Result<Vec<PTok>, String> {
     if depth > 32 {
         return Err(format!("{}: include lồng quá sâu", path));
     }
     let bytes = fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
     let src = String::from_utf8_lossy(&bytes).into_owned();
-    let mut toks = lex(&src).map_err(|e| format!("{}: {}", path, e))?;
+    let mut toks = lex_t(&src, cu).map_err(|e| format!("{}: {}", path, e))?;
     files.push(path.to_string());
     let fid = files.len() as u32 - 1;
     for t in &mut toks {
         t.file = fid;
     }
-    process(&toks, path, macros, depth, incs, files)
+    process(&toks, path, macros, depth, incs, files, cu)
 }
 
 // Trạng thái một tầng #if: parent = tầng ngoài có active không; taken = đã có
@@ -381,6 +410,7 @@ fn process(
     depth: u32,
     incs: &[String],
     files: &mut Vec<String>,
+    cu: bool, // char_uns theo target
 ) -> Result<Vec<PTok>, String> {
     let (mut out, mut i) = (Vec::new(), 0);
     let mut conds: Vec<Cond> = Vec::new();
@@ -551,25 +581,22 @@ fn process(
                         // không có file thật → thử bảng header nhúng ("stddef.h"...)
                         let mut path = path;
                         if !std::path::Path::new(&path).exists() {
-                            if let Some((_, src)) = HEADERS
-                                .iter()
-                                .find(|(n, _)| *n == bare && !no_stdinc(incs) && !skip_embedded)
-                            {
+                            if let Some(src) = embed_src(incs, &bare, skip_embedded) {
                                 let hname = format!("<{}>", bare);
-                                let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
+                                let mut toks = lex_t(src, cu).map_err(|e| format!("{}: {}", hname, e))?;
                                 files.push(hname.clone());
                                 let fid = files.len() as u32 - 1;
                                 for t in &mut toks {
                                     t.file = fid;
                                 }
-                                out.extend(process(&toks, &hname, macros, depth + 1, incs, files)?);
+                                out.extend(process(&toks, &hname, macros, depth + 1, incs, files, cu)?);
                                 continue;
                             }
                             if let Some(p2) = inc_find(incs, &bare) {
                                 path = p2;
                             }
                         }
-                        out.extend(pp_file(&path, macros, depth + 1, incs, files)?);
+                        out.extend(pp_file(&path, macros, depth + 1, incs, files, cu)?);
                     }
                     Some(Tok::Punct("<")) => {
                         // tên = spelling các token đến '>' (lexer tách "stdio.h" = 3 token)
@@ -580,26 +607,22 @@ fn process(
                             k += 1;
                         }
                         // header nhúng thắng (libc stub của zcc); không có thì tra -I
-                        match HEADERS
-                            .iter()
-                            .find(|(n, _)| *n == name && !no_stdinc(incs) && !skip_embedded)
-                            .map(|(_, s)| *s)
-                        {
+                        match embed_src(incs, &name, skip_embedded) {
                             Some(src) => {
                                 let hname = format!("<{}>", name);
-                                let mut toks = lex(src).map_err(|e| format!("{}: {}", hname, e))?;
+                                let mut toks = lex_t(src, cu).map_err(|e| format!("{}: {}", hname, e))?;
                                 files.push(hname.clone());
                                 let fid = files.len() as u32 - 1;
                                 for t in &mut toks {
                                     t.file = fid;
                                 }
-                                out.extend(process(&toks, &hname, macros, depth + 1, incs, files)?);
+                                out.extend(process(&toks, &hname, macros, depth + 1, incs, files, cu)?);
                             }
                             None => {
                                 let p2 = inc_find(incs, &name).ok_or_else(|| {
                                     err(file, lno, &format!("không có header nhúng <{}>", name))
                                 })?;
-                                out.extend(pp_file(&p2, macros, depth + 1, incs, files)?);
+                                out.extend(pp_file(&p2, macros, depth + 1, incs, files, cu)?);
                             }
                         }
                     }
@@ -1109,8 +1132,7 @@ fn if_resolve(
             }
             i += 1;
             let found = !next
-                && ((!no_stdinc(incs) && HEADERS.iter().any(|(n, _)| *n == name))
-                    || inc_find(incs, &name).is_some());
+                && (embed_src(incs, &name, false).is_some() || inc_find(incs, &name).is_some());
             pre.push(synth(Tok::Num(found as i64, NumK::I)));
         } else {
             pre.push(d[i].clone());

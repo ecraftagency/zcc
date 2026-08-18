@@ -154,6 +154,9 @@ pub fn sync_op(name: &str) -> Option<(SyncOp, usize)> {
         "__sync_sub_and_fetch" => (SyncOp::SubFetch, 2),
         "__sync_val_compare_and_swap" => (SyncOp::ValCas, 3),
         "__sync_bool_compare_and_swap" => (SyncOp::BoolCas, 3),
+        "__sync_fetch_and_and" => (SyncOp::FetchAnd, 2), // postgres18 generic-gcc.h
+        "__sync_fetch_and_or" => (SyncOp::FetchOr, 2),
+        "__sync_fetch_and_xor" => (SyncOp::FetchXor, 2),
         "__sync_lock_test_and_set" => (SyncOp::TestSet, 2),
         "__sync_lock_release" => (SyncOp::Release, 1),
         "__sync_synchronize" => (SyncOp::Barrier, 0),
