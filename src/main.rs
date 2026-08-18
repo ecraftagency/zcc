@@ -38,6 +38,18 @@ fn write_or_die(path: &str, data: &str) -> bool {
 }
 
 fn main() -> ExitCode {
+    // Đệ quy parser sâu theo TU thật (sqlite testfixture 88 TU đụng mép stack
+    // 8MB mặc định — segv lúc có lúc không vì cỡ env xê dịch điểm xuất phát,
+    // 2026-08-18). Cấp tường minh 256MB: trần cứng thay vì biên may rủi.
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(drive)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+fn drive() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     let (mut inputs, mut output, mut mode) = (Vec::new(), None, "ld");
     let (mut defs, mut incs, mut undefs) = (
