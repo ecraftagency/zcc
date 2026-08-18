@@ -29,6 +29,13 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), không Box c
 
 ## Luật test & proof
 
+- **LUẬT ĐO TỐC ĐỘ (Vu 2026-08-18, đứng TRÊN mọi luật test khác)**: một cơ
+  chế iteration dù hàn lâm hay khoa học đến đâu, nếu MEASURE cho ra con số
+  ngược lại — tức làm iteration CHẬM HƠN thao tác trực giác (detect bug →
+  fix → test ngay lại đúng cái fail) — thì DẸP NGAY, dù là 10k/20k/100k dòng
+  code quý báu. Học phí sống: SOP v3 4-tầng/B0-B1/harvest/regress bị diệt
+  cùng ngày sinh vì chính nó làm bài test redis xếp hàng sau giấy tờ.
+  Ritchie viết C compiler trên PDP-11 không cần cái nào trong số đó.
 - **MATHEMATIC FOUNDATION (luật gốc)**: mọi feature của compiler phải liên kết hoặc rút ra từ một nguyên lý — lý thuyết trình biên dịch, toán rời rạc, tập hợp, automata (lexer = ngôn ngữ chính quy, preprocessor = hệ viết lại hạng, parser = văn phạm phi ngữ cảnh, UAC = semilattice, ABI = automaton hữu hạn, codegen = simulation per-node). Test nội bộ phải phủ math proof tối đa có thể: feature mới trước hết hỏi "nó thuộc không gian nào, vét được không, gate nào giữ nó".
 - **Test-first ép LOC**: compile chương trình thật TRƯỚC, vỡ ở construct nào mới implement construct đó.
 - **Mọi kết luận đúng/sai đều differential**: trọng tài `cc` (spec bằng xương thịt) hoặc oracle độc lập; diff tại điểm UB là vô nghĩa — generator phải lọc UB trước.
