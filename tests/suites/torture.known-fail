@@ -127,3 +127,11 @@ FAIL simd-2
 FAIL simd-6
 FAIL vla-dealloc-1
 FAIL wchar_t-1
+pr47237
+pr51447
+pr64242
+pr71494
+pr80692
+pr82210
+pr84521
+pr85331

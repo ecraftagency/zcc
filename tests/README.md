@@ -176,6 +176,23 @@ amalgamation giữ block Tcl mà bản release strip đi) — pp-token lạ ch�
 chết ở phase 7; fix = `$` vào identifier (EXT(gcc), mặc định gcc mọi target).
 Hạ tầng: shape.sh thêm guard ZCC env (pattern abi.sh) — box không có cargo.
 
+Đợt 3 (overnight4/5/6 — 18/8 tối): torture +9 fail mới, triage từ dump
+triage-suite-torture (lưu ý cách đọc dump: dòng "Segmentation fault"/
+"Aborted" trần dưới "compile stderr" là sh báo BINARY ĐÃ COMPILE chết lúc
+chạy — miscompile runtime, không phải zcc crash; "zcc exit: 0" là rc của
+`head` cuối pipeline, số rác):
+- pr47237 (__builtin_apply/apply_args), pr51447 + pr71494 (nested fn),
+  pr80692 (_Decimal64), pr85331 (vector ext) — gcc-only, ngoài scope.
+- pr64242 (label-value + VLA), pr82210 (VLA nhiều chiều — đã tuyên bố
+  không hỗ trợ) — họ đã có trong sổ.
+- pr84521: __builtin_setjmp/longjmp (ABI nội bộ gcc, phần mềm thật dùng
+  setjmp libc) — ngoài scope.
+- pr92904: **BUG THẬT chưa fix, KHÔNG vào known-fail** — va_arg composite
+  `aligned(16)` trên ELF thiếu rounding NGRN chẵn (AAPCS64 C.8/B.5);
+  Darwin không differential được (clang cũng fail rc=134 — vùng ABI gcc/
+  clang chia rẽ). Fix phải theo luật 3-nơi-khớp-byte + mở rộng abi.sh
+  phủ variadic aligned-composite.
+
 ## Suite chính chủ nginx/redis (trụ 3 — phần mềm thật tự kiểm chứng chính nó)
 
 - **nginx-tests** (github.com/nginx/nginx-tests, 2026-08-17, zcc hiện hành,
