@@ -26,6 +26,13 @@ pub enum Ty {
     ULong,
     Float,
     Double, // long double = double trên arm64 Darwin
+    // C99: long double trên ELF (AAPCS64 Linux = binary128). Quy ước zcc:
+    // MEMORY là binary128 thật 16/16 (psABI đúng — struct/global/va-slot khớp
+    // gcc), REGISTER vẫn canonical f64; nới/hạ tại load/store/biên ABI bằng
+    // __extenddftf2/__trunctfdf2 (libgcc). Số học chạy double — float.h khai
+    // LDBL_MANT_DIG 53 nên tự nhất quán C99. Darwin KHÔNG sinh type này
+    // (parser map long double → DOUBLE, ABI Apple vốn thế).
+    LDouble,
     Ptr(TypeId),
     Array(TypeId, u64),
     Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
@@ -45,6 +52,7 @@ pub const ULONG: TypeId = 8;
 pub const FLOAT: TypeId = 9;
 pub const DOUBLE: TypeId = 10;
 pub const BOOL: TypeId = 11;
+pub const LDOUBLE: TypeId = 12;
 
 #[derive(Clone)]
 pub struct StructDef {
@@ -86,6 +94,7 @@ impl TyTab {
                 Ty::Float,
                 Ty::Double,
                 Ty::Bool,
+                Ty::LDouble,
             ],
             structs: Vec::new(),
             fns: Vec::new(),
@@ -98,6 +107,7 @@ impl TyTab {
             Ty::Short | Ty::UShort => 2,
             Ty::Int | Ty::UInt | Ty::Float => 4,
             Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) | Ty::Func(_) => 8,
+            Ty::LDouble => 16,
             Ty::Array(e, n) => self.size(e).wrapping_mul(n as u32),
             Ty::Struct(s) => self.structs[s as usize].size,
             Ty::Bitfield(b, ..) => self.size(b),
@@ -125,7 +135,7 @@ impl TyTab {
         }
     }
     pub fn is_float(&self, t: TypeId) -> bool {
-        matches!(self.tys[t as usize], Ty::Float | Ty::Double)
+        matches!(self.tys[t as usize], Ty::Float | Ty::Double | Ty::LDouble)
     }
     pub fn is_unsigned(&self, t: TypeId) -> bool {
         match self.tys[t as usize] {

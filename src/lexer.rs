@@ -15,7 +15,7 @@ pub enum NumK {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Num(i64, NumK),
-    FNum(f64, bool), // hằng thực; bool = double (không suffix f/F)
+    FNum(f64, u8), // hằng thực; 0 = float (f/F), 1 = double, 2 = long double (l/L)
     Ident(String),
     Punct(&'static str),
     Str(Vec<u8>, bool), // (bytes đã xử lý escape chưa gồm NUL cuối, wide L"..")
@@ -158,14 +158,15 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
             } else {
                 v * 2.0f64.powi(-1022) * 2.0f64.powi(exp + 1022)
             };
-            let mut dbl = true;
+            let mut k = 1u8;
             if matches!(b.get(*i), Some(b'f' | b'F')) {
                 *i += 1;
-                dbl = false;
+                k = 0;
             } else if matches!(b.get(*i), Some(b'l' | b'L')) {
-                *i += 1; // long double = double (deviation đã tuyên bố)
+                *i += 1; // long double: Darwin = double; ELF = binary128 tại biên ABI
+                k = 2;
             }
-            return Ok(Tok::FNum(v, dbl));
+            return Ok(Tok::FNum(v, k));
         }
         let v = u64::from_str_radix(&src[d..*i], 16).map_err(|e| format!("{e}"))?;
         return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
@@ -193,14 +194,15 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
             }
         }
         let v: f64 = src[s..*i].parse().map_err(|e| format!("{e}"))?;
-        let mut dbl = true;
+        let mut k = 1u8;
         if matches!(b.get(*i), Some(b'f' | b'F')) {
             *i += 1;
-            dbl = false;
+            k = 0;
         } else if matches!(b.get(*i), Some(b'l' | b'L')) {
-            *i += 1; // long double = double trên arm64 Darwin
+            *i += 1; // long double: Darwin = double; ELF = binary128 tại biên ABI
+            k = 2;
         }
-        return Ok(Tok::FNum(v, dbl));
+        return Ok(Tok::FNum(v, k));
     }
     let octal = b[s] == b'0' && *i > s + 1;
     // "08" là pp-number hợp lệ, chỉ ill-formed khi DÙNG làm hằng (pcre2.h:

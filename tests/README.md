@@ -3,6 +3,12 @@
 Nguyên tắc: **mọi tài sản test hoặc là script chạy được trong repo, hoặc được
 ghi ở đây kèm cách dựng lại**. Không có tài sản mồ côi.
 
+Quy trình vận hành (Vu 2026-08-18): **`tests/SOP.md`** (v4 TỐI GIẢN — vòng
+lặp repro→fix→test-ngay ≤5 phút, suite không nằm trong vòng lặp) + bảng án
+**`tests/ledger.md`**. Đọc SOP trước khi đụng test; không án → không patch.
+Dụng cụ (18/8, SOP v4 tối giản): `probe.sh` (runner box chuẩn) +
+`gate.sh <vùng>` (dispatcher gate khoa học); image `zcc-box` đã bake deps.
+
 ## Bản đồ 6 lớp proof (mỗi lớp một nền tảng toán, một cách discharge)
 
 | # | Lớp | Nền tảng | Không gian | Gate |
@@ -71,6 +77,18 @@ Mọi phép RÚT GỌN coverage phải kèm lý do soundness đọc được t�
   compiler đều "đúng" — diff vô nghĩa. 4 phép so: run zcc↔cc, fold zcc↔cc,
   và biểu đồ giao hoán fold↔runtime NỘI BỘ zcc (const-eval và codegen là hai
   đường từ cùng AST — phải gặp nhau).
+- `decay.sh` + `gen_decay.py` — **lớp frontend type-derivation** (sinh từ án
+  B 18/8: git merge segv theo layout ASLR = ternary string literal không
+  decay → vararg stack cắt strh 2 byte → glibc đọc con trỏ rác). Định lý:
+  lvalue conversion C99 6.3.2.1p3 (+6.5.15 ternary, 6.5.2.2p6 arg promotion,
+  6.5.17 comma) — mọi expr type T[N] thành T* trừ {sizeof, unary &,
+  literal-init}. Vét SOURCES (12 cách sinh expr array: literal/local/static/
+  member/->member/2D-row/parens/3 kiểu ternary/nested-ternary/comma) ×
+  CONTEXTS (11 ngữ cảnh: vararg reg/stack/stack-đôi, named reg/stack, assign,
+  idx, arith, ==, sizeof, &) × 2 nhánh; oracle differential cc trên
+  observable dẫn xuất (không in địa chỉ). 278 dòng diff. Thành tích lần chạy
+  đầu: bắt comma thiếu decay (6.5.17, `sizeof(0,arr)` 6≠8) — fix 1 dòng
+  parser cùng ngày với arr_decay ternary.
 - `cpp.sh` + `gen_cpp.py` — **lớp 2**. Preprocessor như hệ viết lại hạng:
   ma trận tương tác cơ chế expansion (prescan/paste/stringize/sơn-xanh/rescan,
   reify dạng chuẩn qua `#` thành string runtime — KHÔNG diff `-E` vì format

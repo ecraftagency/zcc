@@ -13,7 +13,7 @@
 // Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
 // conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
 use crate::ast::{
-    AsmOp, Ast, BOOL, CHAR, DOUBLE, FLOAT, FnSig, Func, GInit, Global, INT, LONG, Node, NodeId,
+    AsmOp, Ast, BOOL, CHAR, DOUBLE, FLOAT, FnSig, Func, GInit, Global, INT, LDOUBLE, LONG, Node, NodeId,
     SHORT, StructDef, SyncOp, Target, Ty, TyTab, TypeId, UCHAR, UINT, ULONG, USHORT, VOID,
 };
 use crate::lexer::{NumK, Tok};
@@ -511,7 +511,15 @@ impl P<'_> {
                 }
             }
             "float" => FLOAT,
-            "double" => DOUBLE, // long double = double
+            // C99 long double: ELF = binary128 TẠI BIÊN ABI/memory (số học vẫn
+            // double, float.h khai LDBL_MANT_DIG 53); Darwin ABI vốn định = double
+            "double" => {
+                if longs > 0 && self.tgt == Target::Arm64Elf {
+                    LDOUBLE
+                } else {
+                    DOUBLE
+                }
+            }
             "_Bool" => BOOL,
             _ => {
                 // họ int (kể cả không có "int" tường minh)
@@ -1170,6 +1178,13 @@ impl P<'_> {
     }
     fn common_ty(&self, lt: TypeId, rt: TypeId) -> TypeId {
         if self.tt.is_float(lt) || self.tt.is_float(rt) {
+            // C99 UAC: long double đứng đỉnh semilattice thực (giá trị vẫn f64
+            // trong reg — cast double↔ldbl là no-op, chỉ nhãn kiểu đổi cho ABI)
+            if matches!(self.tt.tys[lt as usize], Ty::LDouble)
+                || matches!(self.tt.tys[rt as usize], Ty::LDouble)
+            {
+                return LDOUBLE;
+            }
             // float+float / float+int → FLOAT (operand phải TRÒN về f32 —
             // 16777217L != (float)16777217e0 phân biệt được); còn lại double.
             // Số học chạy trong double (C89 cho phép dư precision).
@@ -2354,6 +2369,10 @@ impl P<'_> {
         }
         if self.tt.is_float(t) {
             let v = self.fold_f(e0)?;
+            if matches!(self.tt.tys[t as usize], Ty::LDouble) {
+                // memory long double ELF = binary128: nới f64 → f128 (exact)
+                return Ok(GInit::Bytes(f128_bytes(v).to_vec()));
+            }
             let bits = if self.tt.size(t) == 4 {
                 (v as f32).to_bits() as i64
             } else {
@@ -2458,7 +2477,8 @@ impl P<'_> {
         let mut l = self.assign()?;
         while self.eat(&Tok::Punct(",")) {
             let r = self.assign()?;
-            let t = self.ty(r);
+            // C99 6.5.17: vế phải qua lvalue conversion → array decay
+            let t = self.arr_decay(self.ty(r));
             l = self.push(Node::Comma(l, r), t);
         }
         Ok(l)
@@ -2487,7 +2507,7 @@ impl P<'_> {
         // diện tb==cond để giữ x0)
         if self.eat(&Tok::Punct(":")) {
             let e = self.cond_expr()?;
-            let t = self.ty(c);
+            let t = self.arr_decay(self.ty(c));
             return Ok(self.push(Node::Cond(c, c, e), t));
         }
         let t = self.expr()?;
@@ -2500,7 +2520,20 @@ impl P<'_> {
             let (t, e) = (self.cast(t, ct), self.cast(e, ct));
             Ok(self.push(Node::Cond(c, t, e), ct))
         } else {
-            Ok(self.push(Node::Cond(c, t, e), tt_))
+            // C99 6.5.15: operand mảng decay về con trỏ — giữ type mảng thì arg
+            // variadic tràn stack bị store_narrow cắt theo size mảng (git diff.c
+            // `? " " : ""` → strh 2 byte → con trỏ rác, segv theo layout)
+            let rt = self.arr_decay(tt_);
+            Ok(self.push(Node::Cond(c, t, e), rt))
+        }
+    }
+    // lvalue conversion C99 6.3.2.1p3: array → con trỏ phần tử (value = địa chỉ,
+    // codegen array-expr vốn đã trả địa chỉ nên chỉ cần đổi type)
+    fn arr_decay(&mut self, t: TypeId) -> TypeId {
+        if let Ty::Array(e, _) = self.tt.tys[t as usize] {
+            self.tt.ptr_to(e)
+        } else {
+            t
         }
     }
     fn lor(&mut self) -> R {
@@ -2789,10 +2822,15 @@ impl P<'_> {
             if i < params.len() && !oldstyle {
                 *a = self.cast(*a, params[i]);
             } else {
-                // default argument promotions
+                // default argument promotions (+ decay mảng C99 6.5.2.2p6 —
+                // thiếu thì slot stack cắt theo size mảng, xem arr_decay)
                 let t = self.ty(*a);
-                let pt = if self.tt.is_float(t) {
+                let pt = if matches!(self.tt.tys[t as usize], Ty::LDouble) {
+                    t // C99 6.5.2.2p6: promotion chỉ nâng float→double, long double GIỮ NGUYÊN
+                } else if self.tt.is_float(t) {
                     DOUBLE
+                } else if matches!(self.tt.tys[t as usize], Ty::Array(..)) {
+                    self.arr_decay(t)
                 } else {
                     self.promote(t)
                 };
@@ -2805,12 +2843,14 @@ impl P<'_> {
             args.len() as u32
         };
         // struct >16B by value: ABI truyền GIÁN TIẾP — copy vào temp, đưa con trỏ.
-        // Ngoại lệ: HFA có NAMED arg đi bằng v0-v7 (anonymous variadic vẫn gián tiếp)
+        // Ngoại lệ: HFA đi by value (AAPCS B.4) — ELF kể cả anonymous (gcc pr92904
+        // f7: d0-d3); Darwin giữ anonymous gián tiếp (quy ước nội bộ va_arg macro)
         for (i, a) in args.iter_mut().enumerate() {
             let t = self.ty(*a);
             if matches!(self.tt.tys[t as usize], Ty::Struct(_))
                 && self.tt.size(t) > 16
-                && ((i as u32) >= nreg || self.tt.hfa(t).is_none())
+                && (self.tt.hfa(t).is_none()
+                    || (self.tgt != Target::Arm64Elf && (i as u32) >= nreg))
             {
                 let off = self.alloc_local(String::new(), t);
                 let tmp = self.push(Node::Var(off), t);
@@ -2996,10 +3036,15 @@ impl P<'_> {
                 NumK::UL => ULONG,
             };
             Ok(self.push(Node::Num(v), t))
-        } else if let Some(&Tok::FNum(v, dbl)) = self.toks.get(self.pos) {
+        } else if let Some(&Tok::FNum(v, k)) = self.toks.get(self.pos) {
             self.pos += 1;
-            let v = if dbl { v } else { v as f32 as f64 };
-            Ok(self.push(Node::FNum(v), if dbl { DOUBLE } else { FLOAT }))
+            let v = if k != 0 { v } else { v as f32 as f64 };
+            let t = match k {
+                0 => FLOAT,
+                2 if self.tgt == Target::Arm64Elf => LDOUBLE, // suffix L
+                _ => DOUBLE,
+            };
+            Ok(self.push(Node::FNum(v), t))
         } else if let Some(Tok::Str(bytes, w)) = self.toks.get(self.pos) {
             let (mut bytes, mut w) = (bytes.clone(), *w);
             self.pos += 1;
@@ -3715,4 +3760,25 @@ fn wchars(b: &[u8]) -> Vec<u32> {
         .chars()
         .map(|c| c as u32)
         .collect()
+}
+
+// f64 → binary128 little-endian (nới EXACT, không rounding): sign giữ nguyên,
+// exponent rebias 1023→16383, mantissa 52 bit dồn lên đỉnh field 112 bit;
+// subnormal double normalize lại (f128 range dư sức chứa), inf/nan giữ dạng.
+fn f128_bytes(v: f64) -> [u8; 16] {
+    let b = v.to_bits();
+    let (sg, e, m) = (b >> 63, (b >> 52) & 0x7ff, b & ((1u64 << 52) - 1));
+    let (e2, m2): (u128, u128) = match e {
+        0 if m == 0 => (0, 0),
+        0 => {
+            let sh = m.leading_zeros() - 11; // đưa bit dẫn về vị trí 52 (hidden)
+            (
+                16383 - 1022 - sh as u128,
+                ((((m as u128) << sh) & ((1 << 52) - 1)) as u128) << 60,
+            )
+        }
+        0x7ff => (0x7fff, (m as u128) << 60),
+        _ => (e as u128 - 1023 + 16383, (m as u128) << 60),
+    };
+    (((sg as u128) << 127) | (e2 << 112) | m2).to_le_bytes()
 }

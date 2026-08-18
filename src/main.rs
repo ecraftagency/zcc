@@ -344,6 +344,15 @@ fn drive() -> ExitCode {
                     format!("{crt}/crti.o"),
                     format!("{crt}/crtn.o"),
                 );
+                // long double ELF: __extenddftf2/__trunctfdf2 sống trong libgcc.a
+                // (soft-fp, freestanding — không kéo dep libc); glob version dir
+                let gccl = fs::read_dir("/usr/lib/gcc/aarch64-linux-gnu")
+                    .ok()
+                    .and_then(|d| {
+                        d.filter_map(|e| e.ok().map(|e| e.path()))
+                            .find(|p| p.join("libgcc.a").exists())
+                    })
+                    .map(|p| p.to_string_lossy().into_owned());
                 if tgt == Target::Arm64Elf && !shared && !bundle {
                     ld.extend([crt1.as_str(), crti.as_str()]);
                 }
@@ -372,6 +381,9 @@ fn drive() -> ExitCode {
                         // -lm tách riêng trên glibc (Darwin gộp hết vào libSystem;
                         // musl install có libm.a rỗng nên -lm vô hại)
                         ld.extend(["-o", out, "-lc", "-lm", "-L", &crt]);
+                        if let Some(g) = &gccl {
+                            ld.extend(["-L", g, "-lgcc"]);
+                        }
                     }
                 }
                 ok = run("ld", &ld);

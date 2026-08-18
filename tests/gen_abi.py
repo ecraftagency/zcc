@@ -17,7 +17,11 @@ STRUCTS = {
     "HD2": [("double", "a"), ("double", "b")],   # HFA 2 double
     "HF4": [("float", "a"), ("float", "b"), ("float", "c"), ("float", "d")],
     "SBIG": [("long", "a"), ("long", "b"), ("long", "c")],  # >16B → con trỏ
+    "SA16": [("long", "a"), ("long", "b")],      # 16B aligned(16) — AAPCS C.9
 }
+# thuộc tính đính kèm định nghĩa struct (SA16: gcc round NGRN chẵn — pr92904;
+# clang Darwin KHÔNG round — differential per-platform nên hai bên đều tự khớp)
+ATTRS = {"SA16": " __attribute__((aligned(16)))"}
 SCALARS = ["char", "short", "int", "long", "float", "double"]
 FLOATKIND = {"float", "double", "HF2", "HD2", "HF4"}
 ALL = SCALARS + list(STRUCTS)
@@ -163,7 +167,8 @@ def main(outdir):
                 % (name, argv + ", " if argv else "", vals, repr(exp), name))
             decls.append("double %s(%s);" % (name, sig))
 
-    hdr = "\n".join("struct %s { %s };" % (t, " ".join("%s %s;" % (lt, m) for lt, m in ms))
+    hdr = "\n".join("struct %s { %s }%s;" %
+                    (t, " ".join("%s %s;" % (lt, m) for lt, m in ms), ATTRS.get(t, ""))
                     for t, ms in STRUCTS.items())
     with open(outdir + "/abi_defs.h", "w") as fp:
         fp.write(hdr + "\n" + "\n".join(decls) + "\n")

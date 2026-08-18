@@ -99,8 +99,9 @@ pub fn emit(ast: &Ast) -> String {
         }
         // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack
         // caller tại [x29 + 16 + boff]. AAPCS chuẩn: scalar tràn mỗi cái một
-        // slot 8 tròn, composite align max(8,align) size tròn 8, composite
-        // tràn khóa gp=8 (C.11). PHẢI khớp từng byte với call() và va_off.
+        // slot 8 tròn, composite align 8 size tròn 8 (over-alignment aligned(16+)
+        // bị BỎ QUA — gcc arm64 verify asm: named x3,x4 / stack [sp,8], pr92904),
+        // composite tràn khóa gp=8 (C.11). PHẢI khớp từng byte với call().
         let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
         let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
         for &(off, t) in &f.params {
@@ -119,7 +120,7 @@ pub fn emit(ast: &Ast) -> String {
                 } else {
                     fp = 8; // AAPCS C.3: HFA tràn khóa v-reg còn lại
                     let sz = ast.tt.size(t);
-                    let o = alup(boff, ast.tt.align(t).max(8));
+                    let o = alup(boff, 8);
                     boff = o + sz.div_ceil(8) * 8;
                     _ = writeln!(g.s, "\tadd x11, x29, #{}", 16 + o);
                     g.lea_local("x9", off);
@@ -162,7 +163,7 @@ pub fn emit(ast: &Ast) -> String {
                     }
                     gp += need;
                 } else {
-                    let o = alup(boff, ast.tt.align(t).max(8));
+                    let o = alup(boff, 8);
                     boff = o + 8 * need;
                     gp = 8; // AAPCS C.11: composite tràn stack khóa NGRN
                     _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o);
@@ -177,10 +178,10 @@ pub fn emit(ast: &Ast) -> String {
             let fl = ast.tt.is_float(t);
             if fl && fp < 8 {
                 g.lea_local("x9", off);
-                if ast.tt.size(t) == 4 {
-                    _ = writeln!(g.s, "\tstr s{fp}, [x9]");
-                } else {
-                    _ = writeln!(g.s, "\tstr d{fp}, [x9]");
+                match ast.tt.size(t) {
+                    4 => _ = writeln!(g.s, "\tstr s{fp}, [x9]"),
+                    16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: nguyên binary128
+                    _ => _ = writeln!(g.s, "\tstr d{fp}, [x9]"),
                 }
                 fp += 1;
             } else if !fl && gp < 8 {
@@ -196,6 +197,14 @@ pub fn emit(ast: &Ast) -> String {
                 // scalar trên stack caller: slot 8 tròn tại [x29 + 16 + boff]
                 // (AAPCS chuẩn); load đúng width — giá trị nằm low bytes slot
                 let sz = ast.tt.size(t);
+                if sz == 16 {
+                    // long double tràn: stack arg quad — slot 16, align 16 (AAPCS B/C)
+                    let o = alup(boff, 16);
+                    boff = o + 16;
+                    g.lea_local("x9", off);
+                    _ = writeln!(g.s, "\tldr q7, [x29, #{}]\n\tstr q7, [x9]", 16 + o);
+                    continue;
+                }
                 let o = alup(boff, 8);
                 boff = o + 8;
                 let src = 16 + o;
@@ -449,6 +458,8 @@ impl Cg<'_> {
     fn load(&mut self, t: TypeId) {
         match self.a.tt.tys[t as usize] {
             Ty::Float => self.s += "\tldr s0, [x0]\n\tfcvt d0, s0\n\tfmov x0, d0\n",
+            // long double: memory binary128 → hạ về f64 canonical (libgcc round đúng)
+            Ty::LDouble => self.s += "\tldr q0, [x0]\n\tbl __trunctfdf2\n\tfmov x0, d0\n",
             Ty::Bitfield(b, boff, w) => {
                 // nạp nguyên đơn vị chứa (unsigned) rồi lắc trái/phải cắt đúng field
                 self.s += match self.a.tt.size(b) {
@@ -490,6 +501,13 @@ impl Cg<'_> {
             }
             Ty::Float => {
                 _ = writeln!(self.s, "\tfmov d7, x{reg}\n\tfcvt s7, d7\n\tstr s7, [x1]");
+            }
+            Ty::LDouble => {
+                // bl clobber x1 (caller-saved) — che địa chỉ qua stack
+                _ = writeln!(
+                    self.s,
+                    "\tstr x1, [sp, #-16]!\n\tfmov d0, x{reg}\n\tbl __extenddftf2\n\tldr x1, [sp], #16\n\tstr q0, [x1]"
+                );
             }
             Ty::Bitfield(b, boff, w) => {
                 // read-modify-write đơn vị chứa
@@ -577,6 +595,8 @@ impl Cg<'_> {
                     self.expr(*e);
                     match self.a.tt.tys[self.fret as usize] {
                         Ty::Double => self.s += "\tfmov d0, x0\n",
+                        Ty::LDouble => self.s += "\tfmov d0, x0\n\tbl __extenddftf2\n", // ra q0
+
                         Ty::Float => self.s += "\tfmov d0, x0\n\tfcvt s0, d0\n",
                         Ty::Struct(_) => {
                             let sz = self.a.tt.size(self.fret);
@@ -723,9 +743,15 @@ impl Cg<'_> {
                         "\tmrs x0, tpidr_el0\n\tadd x0, x0, #:tprel_hi12:{0}, lsl #12\n\tadd x0, x0, #:tprel_lo12_nc:{0}",
                         gl.name
                     );
-                } else if gl.is_extern || self.a.pic {
-                    // extern (stdout...) bắt buộc GOT; -fPIC: cả global TỰ ĐỊNH
-                    // NGHĨA non-static cũng preemptible trong .so → GOT nốt
+                } else if gl.is_extern || (self.a.pic && !gl.is_static) {
+                    // extern (stdout...) bắt buộc GOT; -fPIC: global TỰ ĐỊNH
+                    // NGHĨA non-static cũng preemptible trong .so → GOT nốt.
+                    // static (kể cả static trong hàm: intfmts.6 của hiredis)
+                    // CẤM đi GOT — cùng bẫy với FunAddr bên dưới: gas hạ reloc
+                    // local thành section+addend, GNU ld tạo GOT entry BỎ
+                    // addend → con trỏ trỏ đầu section (redis-cli "Out of
+                    // memory" theo layout). Local binding → adrp/:lo12: thẳng
+                    // hợp lệ cả trong .so.
                     _ = writeln!(
                         self.s,
                         "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
@@ -932,21 +958,45 @@ impl Cg<'_> {
                 // stack caller: mọi scalar slot 8 (kể cả double — 16 chỉ là bước
                 // VR save area), composite by-value theo size tròn 8, indirect = 1
                 // slot con trỏ; trên stack HFA nằm LIỀN như composite thường
+                let ldbl = matches!(self.a.tt.tys[t as usize], Ty::LDouble);
                 let stk_step = if st && (sz <= 16 || hfa.is_some()) {
                     sz.div_ceil(8) * 8
+                } else if ldbl {
+                    16
                 } else {
                     8
                 };
+                // pr92904, luật runtime AAPCS: composite by-value KHÔNG BAO GIỜ
+                // split reg/stack — consume offs trước (ghi lại luôn), chỉ đi reg
+                // khi offs MỚI ≤ 0; vắt qua 0 (vd gr_offs=-8, cần 16B) → rơi
+                // nguyên khối xuống stack, offs dương khóa mọi va_arg sau (khớp
+                // caller khóa NGRN/NSRN C.11/C.3). Over-alignment (aligned(16+))
+                // của composite bị BỎ QUA — gcc arm64 không round NGRN/stack
+                // (verify asm: named x3,x4 / anon x4,x5 / stack [sp,8]).
+                let blk = st && (sz <= 16 || hfa.is_some());
                 self.addr(ap); // x0 = &ap
                 let l = self.labels(2);
-                _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]\n\ttbnz w9, #31, L{l}");
-                self.s += "\tldr x10, [x0]\n\tadd x11, x10, #";
+                _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]");
+                if blk {
+                    _ = writeln!(self.s, "\tadd w10, w9, #{step}\n\tstr w10, [x0, #{offs}]");
+                    _ = writeln!(self.s, "\tcmp w10, #0\n\tb.le L{l}");
+                } else {
+                    _ = writeln!(self.s, "\ttbnz w9, #31, L{l}");
+                }
+                self.s += "\tldr x10, [x0]\n";
+                if ldbl {
+                    // AAPCS va_arg quad: __stack round lên 16 trước khi đọc
+                    self.s += "\tadd x10, x10, #15\n\tand x10, x10, #0xfffffffffffffff0\n";
+                }
+                self.s += "\tadd x11, x10, #";
                 _ = writeln!(self.s, "{}\n\tstr x11, [x0]\n\tb L{}", stk_step, l + 1);
                 _ = writeln!(
                     self.s,
                     "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw"
                 );
-                _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
+                if !blk {
+                    _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
+                }
                 if let Some((dbl, n)) = hfa {
                     // gather: member j ở [x10 + 16j] → scratch + j*esz
                     self.lea_local("x11", tmp);
@@ -1309,8 +1359,9 @@ impl Cg<'_> {
         };
         // phân slot AAPCS CHUẨN: variadic vô danh đi reg NHƯ NAMED (khác Apple),
         // float → d0-7, int → x0-7; tràn thì stack mỗi scalar một slot 8 tròn
-        // (khác Apple pack natural-align); composite align max(8,align) size
-        // tròn 8; composite tràn stack khóa NGRN=8 (C.11), HFA tràn (C.3) không.
+        // (khác Apple pack natural-align); composite align 8 (over-alignment bị
+        // BỎ QUA — gcc verify, xem comment spill) size tròn 8; composite tràn
+        // stack khóa NGRN=8 (C.11), HFA tràn (C.3) không.
         let _ = nreg; // AAPCS không phân biệt named/vô danh khi phát call
         #[derive(Clone, Copy)]
         enum Slot {
@@ -1320,6 +1371,7 @@ impl Cg<'_> {
             St(u32, bool),     // struct → GPR: (reg đầu, chiếm 2 reg)
             StS(u32, u32),     // struct → stack: (offset, size)
             H(u32, u32, bool), // HFA → v-reg: (reg đầu, số member, là double)
+            Q(u32),            // long double → q-reg nguyên binary128
         }
         let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
         let (mut gp, mut fp, mut off) = (0u32, 0u32, 0u32);
@@ -1342,7 +1394,7 @@ impl Cg<'_> {
                     plan.push(Slot::St(gp, sz > 8));
                     gp += need;
                 } else {
-                    let o = alup(off, self.a.tt.align(t).max(8));
+                    let o = alup(off, 8);
                     plan.push(Slot::StS(o, sz));
                     off = o + sz.div_ceil(8) * 8;
                     if hfa.is_none() {
@@ -1353,7 +1405,17 @@ impl Cg<'_> {
             }
             let fl = self.a.tt.is_float(t);
             let szt = self.a.tt.size(t);
-            if fl && fp < 8 {
+            if fl && szt == 16 {
+                // long double: q-reg (NSRN như float); tràn thì stack slot 16/16
+                if fp < 8 {
+                    plan.push(Slot::Q(fp));
+                    fp += 1;
+                } else {
+                    let o = alup(off, 16);
+                    plan.push(Slot::S(o, 16, true));
+                    off = o + 16;
+                }
+            } else if fl && fp < 8 {
                 plan.push(Slot::F(fp, szt == 4));
                 fp += 1;
             } else if !fl && gp < 8 {
@@ -1373,7 +1435,12 @@ impl Cg<'_> {
             match sl {
                 Slot::S(o, sz, fl) => {
                     self.expr(a);
-                    if fl && sz == 4 {
+                    if fl && sz == 16 {
+                        _ = writeln!(
+                            self.s,
+                            "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #{o}]"
+                        );
+                    } else if fl && sz == 4 {
                         _ = writeln!(self.s, "\tfmov d7, x0\n\tfcvt s7, d7\n\tstr s7, [sp, #{o}]");
                     } else {
                         _ = match sz {
@@ -1405,9 +1472,14 @@ impl Cg<'_> {
             .filter(|(_, sl)| !matches!(sl, Slot::S(..) | Slot::StS(..)))
             .map(|(&a, &sl)| (a, sl))
             .collect();
-        for &(a, _) in &regargs {
+        for &(a, sl) in &regargs {
             self.expr(a); // struct: x0 = địa chỉ (nạp vào reg lúc pop)
-            self.s += "\tstr x0, [sp, #-16]!\n";
+            if matches!(sl, Slot::Q(_)) {
+                // nới NGAY (bl ở đây an toàn — chưa reg nào được nạp), push nguyên q
+                self.s += "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
+            } else {
+                self.s += "\tstr x0, [sp, #-16]!\n";
+            }
         }
         for &(_, sl) in regargs.iter().rev() {
             match sl {
@@ -1434,6 +1506,7 @@ impl Cg<'_> {
                         }
                     }
                 }
+                Slot::Q(i) => _ = writeln!(self.s, "\tldr q{i}, [sp], #16"),
                 Slot::S(..) | Slot::StS(..) => unreachable!(),
             }
         }
@@ -1453,6 +1526,7 @@ impl Cg<'_> {
             Ty::Void => {}
             Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
             Ty::Double => self.s += "\tfmov x0, d0\n",
+            Ty::LDouble => self.s += "\tbl __trunctfdf2\n\tfmov x0, d0\n", // q0 → f64 canonical
             Ty::Struct(_) => {} // x0/x1 thô — SRet bên trên hạ xuống temp
             _ => self.ext(rt),
         }
