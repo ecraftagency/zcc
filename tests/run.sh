@@ -4,8 +4,11 @@
 # (chuẩn gốc từ 2026-08-18, C89 là tập con). ext/: -std=gnu99 — phương ngữ
 # vendor (GCC/clang/Apple extension).
 cd "$(dirname "$0")" || exit 1
-cargo build -q --manifest-path ../Cargo.toml || exit 1
-ZCC=../target/debug/zcc
+# ZCC đặt sẵn từ env (chạy trong box Linux, không cargo) — không thì tự build
+if [ -z "${ZCC:-}" ]; then
+  cargo build -q --manifest-path ../Cargo.toml || exit 1
+  ZCC=../target/debug/zcc
+fi
 DIR=${1:-cases}
 STD=-std=c99
 [ "$DIR" = ext ] && STD=-std=gnu99

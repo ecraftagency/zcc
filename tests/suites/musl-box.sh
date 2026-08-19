@@ -22,7 +22,7 @@ cp "$M/arch/arm/bits/float.h" "$M/arch/aarch64/bits/float.h"
 cd "$M"
 [ -f config.mak ] || ./configure CC="$ZCC" --target=aarch64
 make clean >/dev/null
-make -j"$(nproc)" CC="$ZCC" AR=ar RANLIB=ranlib \
+make -j"${JOBS:-$(nproc)}" CC="$ZCC" AR=ar RANLIB=ranlib \
     lib/libc.a lib/crt1.o lib/crti.o lib/crtn.o
 rm -rf "$INST"
 make install prefix="$INST" CC="$ZCC" AR=ar RANLIB=ranlib SHARED_LIBS= >/dev/null
@@ -67,7 +67,7 @@ find src -name '*.o' -o -name '*.exe' -o -name '*.err' -o -name '*.so' \
     -o -name '*.d' | xargs rm -f 2>/dev/null || true
 printf 'CC = %s\nCFLAGS += -D_POSIX_C_SOURCE=200809L\nLDLIBS += -lpthread -lm -lrt\n' \
     "$ZCC" > config.mak
-ZCC_SYSROOT="$INST" make -k -j"$(nproc)" >/dev/null 2>&1 || true
+ZCC_SYSROOT="$INST" make -k -j"${JOBS:-$(nproc)}" >/dev/null 2>&1 || true
 LC_ALL=C sh -c 'find src -name "*.err" -size +0c | sort' > ZCC-FAILS.txt
 echo "LIBC-TEST: $(wc -l < ZCC-FAILS.txt) err-file (danh sách: $LT/ZCC-FAILS.txt)"
 
