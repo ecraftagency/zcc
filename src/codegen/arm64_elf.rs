@@ -41,7 +41,7 @@ struct Cg<'a> {
 
 pub fn emit(ast: &Ast) -> String {
     let mut g = Cg {
-        s: String::from(".text\n"),
+        s: String::from(".cfi_sections .eh_frame\n.text\n"),
         a: ast,
         lbl: 0,
         brks: Vec::new(),
@@ -66,9 +66,16 @@ pub fn emit(ast: &Ast) -> String {
                 _ = writeln!(g.s, ".weak {}", f.name);
             }
         }
+        // .type %function: st_info=STT_FUNC để dladdr/backtrace_symbols nhận diện;
+        // .size (cuối hàm) cho st_size ≠ 0 → dladdr match được địa chỉ GIỮA hàm
+        // (return-addr), không thì chỉ match đúng byte đầu → tên hàm không resolve.
+        _ = writeln!(g.s, ".type {}, %function", f.name);
+        // CFI (.eh_frame): frame-pointer-based, CFA = x29 + 16 HẰNG SỐ suốt thân
+        // hàm → không cần annotate push tạm/sub sp/alloca. Đủ cho _Unwind/backtrace()
+        // tại mọi PC giữa hàm (chỉ sai trong 2-lệnh epilogue window, không ai unwind ở đó).
         _ = write!(
             g.s,
-            ".p2align 2\n{}:\n\tstp x29, x30, [sp, #-16]!\n\tmov x29, sp\n",
+            ".p2align 2\n{}:\n\t.cfi_startproc\n\tstp x29, x30, [sp, #-16]!\n\t.cfi_def_cfa_offset 16\n\t.cfi_offset 29, -16\n\t.cfi_offset 30, -8\n\tmov x29, sp\n\t.cfi_def_cfa_register 29\n",
             f.name
         );
         if f.frame > 0 {
@@ -225,6 +232,8 @@ pub fn emit(ast: &Ast) -> String {
         g.stmt(f.body);
         g.s += "\tmov x0, #0\n";
         g.s += EPILOGUE;
+        g.s += "\t.cfi_endproc\n";
+        _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
     }
     for gl in &ast.globals {
         if gl.is_extern {

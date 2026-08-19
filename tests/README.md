@@ -205,11 +205,14 @@ chạy — miscompile runtime, không phải zcc crash; "zcc exit: 0" là rc c�
   không hỗ trợ) — họ đã có trong sổ.
 - pr84521: __builtin_setjmp/longjmp (ABI nội bộ gcc, phần mềm thật dùng
   setjmp libc) — ngoài scope.
-- pr92904: **BUG THẬT chưa fix, KHÔNG vào known-fail** — va_arg composite
-  `aligned(16)` trên ELF thiếu rounding NGRN chẵn (AAPCS64 C.8/B.5);
+- pr92904: **ĐÃ FIX (overnight8, 18/8) — ĐÓNG** — va_arg composite
+  `aligned(16)` trên ELF: chốt theo trọng tài gcc arm64 = BỎ QUA over-align
+  composite (composite không split reg/stack, blk consume-first + anon HFA
+  >16B by value; REVERT NGRN rounding align16; composite stack align = 8).
+  Bằng chứng: `~/.cache/zcc-suites/overnight8-20260818/SUMMARY.txt`
+  (`torture-pr92904: PASS`/`PR92904-PASS`, gate-abi PASS 4 hướng có SA16).
   Darwin không differential được (clang cũng fail rc=134 — vùng ABI gcc/
-  clang chia rẽ). Fix phải theo luật 3-nơi-khớp-byte + mở rộng abi.sh
-  phủ variadic aligned-composite.
+  clang chia rẽ) nên trọng tài dùng gcc-ELF.
 
 ## Suite chính chủ nginx/redis (trụ 3 — phần mềm thật tự kiểm chứng chính nó)
 

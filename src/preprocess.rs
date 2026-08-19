@@ -76,8 +76,11 @@ fn preprocess_pt(
         ]),
         Target::Arm64Elf => ones.extend([
             "__linux__",
+            "__linux", // gcc/clang định nghĩa cả bản bare; redis setproctitle.c + config.h dò `defined __linux`
             "__gnu_linux__",
             "__unix__",
+            "__unix", // đối xứng: gcc định nghĩa cả __unix lẫn __unix__
+
             "__ELF__",
             "__CHAR_UNSIGNED__", // plain char unsigned trên Linux arm64 (AAPCS)
         ]),

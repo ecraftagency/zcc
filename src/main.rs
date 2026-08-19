@@ -62,6 +62,7 @@ fn drive() -> ExitCode {
     let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
     let mut pic = false; // -fPIC → backend ELF đi GOT cho global non-static
     let (mut nostdinc, mut bundle) = (false, false);
+    let mut export_dyn = false; // -rdynamic → ld --export-dynamic (backtrace_symbols resolve tên hàm)
     let mut tgt = HOST_TGT;
     let set_tgt = |v: &str, tgt: &mut Target| {
         *tgt = if v.contains("linux") {
@@ -110,6 +111,7 @@ fn drive() -> ExitCode {
             // adrp trực tiếp khi -shared); redis module build .xo bằng -fPIC
             "-fPIC" | "-fpic" => pic = true,
             "-bundle" => bundle = true, // Mach-O bundle (redis test modules dlopen)
+            "-rdynamic" | "-export-dynamic" | "--export-dynamic" => export_dyn = true,
             "-undefined" => {
                 // "-undefined dynamic_lookup": forward nguyên cặp cho ld (module
                 // tham chiếu RedisModule_* resolve lúc runtime)
@@ -369,6 +371,12 @@ fn drive() -> ExitCode {
                         }
                     }
                     Target::Arm64Elf => {
+                        // PT_GNU_EH_FRAME (.eh_frame_hdr) để runtime unwinder tra được
+                        // CFI — glibc backtrace()/_Unwind_Backtrace cần segment này
+                        ld.push("--eh-frame-hdr");
+                        if export_dyn {
+                            ld.push("--export-dynamic"); // -rdynamic: dynsym đủ để backtrace_symbols tra tên
+                        }
                         if shared || bundle {
                             ld.push("-shared");
                         } else {
