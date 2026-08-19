@@ -9,22 +9,52 @@
 # Vét cấu trúc: SOURCES (cách sinh expr type array) × CONTEXTS (chỗ tiêu
 # thụ) × 2 nhánh ternary. Oracle differential cc trên observable DẪN XUẤT
 # (nội dung chuỗi, ký tự, sizeof, so sánh) — không bao giờ in địa chỉ thô.
+#
+# ── PROOF (miền hợp lệ của oracle differential) ───────────────────────────
+# decay(E)=&A[0], A = object mà E chỉ định. Tách 2 thành phần: (a) object A —
+# do chuẩn quy định; (b) GIÁ TRỊ SỐ của &A[0] — implementation đặt tự do, KHÔNG
+# spec-determined. Oracle sound trên observable o ⟺ o spec-determined (mọi impl
+# tuân chuẩn cho cùng o). ⟹ o là hàm của nội dung/định danh A thì hợp lệ; hàm
+# của (b) thì vô hiệu.
+#   Bổ đề định danh: context `eq` = (p1==p2). Cả hai là &A_i[0] (không null/one-
+#   past) ⟹ theo 6.5.9p6, (p1==p2) ⟺ (A1≡A2). Vậy eq spec-determined ⟺ "A1≡A2"
+#   spec-determined:
+#     • CASE 1 A=named object: 6.2.1 bind về đúng 1 object/declaration ⟹ A1≡A2
+#       spec-det = TRUE ⟹ eq=1 duy nhất → oracle HỢP LỆ.
+#     • CASE 2 A=mảng string literal: 6.4.5p6 "unspecified whether these arrays
+#       are distinct" ⟹ eq ∈ {1,2} đều tuân chuẩn → KHÔNG spec-det → oracle VÔ
+#       HIỆU (zcc .rodata trơn=distinct=2; gcc .rodata.str mergeable=1 — cả hai
+#       hợp lệ). KHÔNG phải bug decay.
+#   Vét cạn: trục định danh phân hoạch TOÀN PHẦN {named, literal-array} (ngoài
+#   6.4.5p6 không construct C99 nào cho 2 lần eval cùng lvalue ra 2 object khác
+#   cùng nội dung); c∈{0,1} quét cả 2 nhánh ternary. Cell vô hiệu = {(S,eq):
+#   S∈CASE2}. id_stable=False đánh dấu ĐÚNG các S đó (soundness: mỗi cái có 1
+#   eval rơi CASE 2; completeness: mọi S chỉ-named đều id_stable=True). Chỉ cắt
+#   context eq — GIỮ va_stk/idx/arith/szof của chính literal (hàm của nội dung
+#   6.4.5p5, spec-det) ⟹ decay của literal VẪN được chứng; chỉ bỏ ĐỊNH DANH,
+#   thứ không thuộc định lý decay. Gate sau cắt = decision procedure sound+
+#   complete trên lattice observable spec-determined.
+# ──────────────────────────────────────────────────────────────────────────
 import sys
 
-# (tên, biểu thức, lvalue? — rvalue như ternary/comma cấm unary &)
+# (tên, biểu thức, lvalue?, id_stable?)
+#   lvalue?    — rvalue như ternary/comma cấm unary & (loại CTX_ADDR)
+#   id_stable? — TRUE ⟺ mọi eval của E chỉ định NAMED object (CASE 1 ở PROOF)
+#     ⟹ eq spec-determined. FALSE ⟺ có eval chỉ định string literal (CASE 2,
+#     6.4.5p6 unspecified) ⟹ eq bị loại. Xem bổ đề định danh trên header.
 SOURCES = [
-    ("lit",     '"LIT"',                        True),
-    ("loc",     "la",                           True),
-    ("glo",     "ga",                           True),
-    ("mem",     "s.arr",                        True),
-    ("pmem",    "ps->arr",                      True),
-    ("row",     "m[1]",                         True),
-    ("paren",   "(la)",                         True),
-    ("ter_ll",  'c ? "T" : ""',                 False),  # ổ án B
-    ("ter_la",  'c ? la : "xy"',                False),
-    ("ter_row", "c ? m[0] : m[2]",              False),
-    ("ter_nst", 'c ? (c ? "a" : "bb") : "ccc"', False),
-    ("comma",   "(0, la)",                      False),
+    ("lit",     '"LIT"',                        True,  False),
+    ("loc",     "la",                           True,  True),
+    ("glo",     "ga",                           True,  True),
+    ("mem",     "s.arr",                        True,  True),
+    ("pmem",    "ps->arr",                      True,  True),
+    ("row",     "m[1]",                         True,  True),
+    ("paren",   "(la)",                         True,  True),
+    ("ter_ll",  'c ? "T" : ""',                 False, False),  # ổ án B (2 vế literal)
+    ("ter_la",  'c ? la : "xy"',                False, False),  # nhánh c==0 = literal
+    ("ter_row", "c ? m[0] : m[2]",              False, True),
+    ("ter_nst", 'c ? (c ? "a" : "bb") : "ccc"', False, False),  # toàn literal lồng
+    ("comma",   "(0, la)",                      False, True),
 ]
 
 # template dùng {E}; mọi lần thế đều bọc ({E})
@@ -53,9 +83,11 @@ CTX_ADDR = ("addr", 'printf("%d\\n", (int)sizeof(*&({E})));')
 
 def main(outdir):
     fns = []
-    for i, (sn, e, lval) in enumerate(SOURCES):
+    for i, (sn, e, lval, id_stable) in enumerate(SOURCES):
         body = []
         for cn, tpl in CONTEXTS + ([CTX_ADDR] if lval else []):
+            if cn == "eq" and not id_stable:
+                continue  # 6.4.5p6: pointer identity của literal là unspecified
             body.append('    printf("%s.%s ");' % (sn, cn))
             body.append("    " + tpl.replace("{E}", e))
         fns.append(
@@ -70,7 +102,7 @@ def main(outdir):
             "%s\n}" % (i, "\n".join(body)))
     calls = "\n".join(
         '        printf("== %s c=%%d\\n", c);\n        src_%02d(c);' % (sn, i)
-        for i, (sn, _, _) in enumerate(SOURCES))
+        for i, (sn, _, _, _) in enumerate(SOURCES))
     with open(outdir + "/decay_t.c", "w") as fp:
         fp.write(
             "#include <stdio.h>\n\n"
