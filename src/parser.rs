@@ -1769,17 +1769,28 @@ impl P<'_> {
                                 .push((name, t, Vloc::Glob(self.globals.len() as u32 - 1)));
                         }
                         Storage::Extern => {
-                            self.globals.push(Global {
-                                name: name.clone(),
-                                ty: t,
-                                init: GInit::None,
-                                is_static: false,
-                                is_extern: true,
-                                is_tls: tls,
-                                is_weak: false,
-                            });
-                            self.locals
-                                .push((name, t, Vloc::Glob(self.globals.len() as u32 - 1)));
+                            // C99 6.2.2p4: block-scope extern có prior declaration
+                            // cùng tên (file-scope) → GIỮ nguyên linkage cũ, trỏ về
+                            // ĐÚNG global đó. Chỉ push extern mới khi tên chưa từng
+                            // khai báo trong TU (nếu không: extern int b của
+                            // `static int b=20` alias nhầm sang global khác).
+                            let gi = self
+                                .globals
+                                .iter()
+                                .position(|g| g.name == name)
+                                .unwrap_or_else(|| {
+                                    self.globals.push(Global {
+                                        name: name.clone(),
+                                        ty: t,
+                                        init: GInit::None,
+                                        is_static: false,
+                                        is_extern: true,
+                                        is_tls: tls,
+                                        is_weak: false,
+                                    });
+                                    self.globals.len() - 1
+                                });
+                            self.locals.push((name, t, Vloc::Glob(gi as u32)));
                         }
                         // C99: VLA local → con trỏ + alloca(n*sizeof(elem)).
                         // Hệ quả biết trước: sizeof(vla) = 8 (size con trỏ), sai
