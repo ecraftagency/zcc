@@ -1,3 +1,10 @@
-FAIL 00162
-FAIL 00204
+# c-testsuite baseline — CHỈ chứa case ngoài scope C99 của zcc.
+#
+# ── 00219: _Generic (Vu 2026-08-20) ──
+# Case dùng _Generic (C11 6.5.1.1) — KHÔNG có trong C99. zcc strict-C99 từ chối
+# đúng (báo "biến chưa khai báo: int" tại `_Generic(a, int: ...)`). Referee
+# `cc -std=c99` NUỐT _Generic như GNU extension ⇒ oracle UNSOUND (referee đánh
+# giá superset c99+GNU, không phải strict c99 như compiler-under-test). Cùng
+# hạng bài học nora referee-standard: diff ở feature ngoài chuẩn S là vô nghĩa.
+# Không phải bug; nếu M-sau mua _Generic thì gỡ entry này.
 FAIL 00219

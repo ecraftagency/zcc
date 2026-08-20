@@ -17,8 +17,10 @@ trap 'rm -rf "$D"' EXIT
 
 ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c)
+    # CWD = $D (ghi được): case ghi file ra CWD (00187 fopen "fred.txt","w") —
+    # nếu chạy ở repo root sẽ xả rác (mac) hoặc fail vì mount read-only (box).
     if "$ZCC" "$f" -o "$D/$b" 2>/dev/null \
-       && perl -e "alarm 10; exec @ARGV" "$D/$b" > "$D/$b.out" 2>/dev/null \
+       && ( cd "$D" && perl -e "alarm 10; exec @ARGV" "./$b" ) > "$D/$b.out" 2>/dev/null \
        && cmp -s "$D/$b.out" "$f.expected"; then
         echo "pass $b"
     else
