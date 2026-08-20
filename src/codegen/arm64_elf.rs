@@ -43,6 +43,12 @@ struct Cg<'a> {
     fchain: u32,
     fuid: u32,
     fparent: u32,
+    // VLA dealloc (C99 6.8.6.1): base SP = x29 - (frame + variadic?192:0); tại
+    // label ở VLA-depth 0 restore SP về base (goto rời scope VLA phải dealloc).
+    fframe: u32,
+    fvariadic: bool,
+    fhasvla: bool,
+    vla_live: u32, // số VLA lexical đang sống (scope hiện tại) khi walk
 }
 
 pub fn emit(ast: &Ast) -> String {
@@ -59,6 +65,10 @@ pub fn emit(ast: &Ast) -> String {
         fchain: 0,
         fuid: 0,
         fparent: u32::MAX,
+        fframe: 0,
+        fvariadic: false,
+        fhasvla: false,
+        vla_live: 0,
     };
     // EXT(gcc): __asm__("...") cấp toàn cục (musl crt_arch.h _start) — verbatim
     for a in &ast.raw_asm {
@@ -72,6 +82,10 @@ pub fn emit(ast: &Ast) -> String {
         g.fchain = f.chain;
         g.fuid = f.uid;
         g.fparent = f.parent_uid;
+        g.fframe = f.frame;
+        g.fvariadic = f.variadic;
+        g.fhasvla = f.has_vla;
+        g.vla_live = 0;
         if !f.is_static {
             _ = writeln!(g.s, ".globl {}", f.name);
             if f.is_inline || f.is_weak {
@@ -480,6 +494,15 @@ impl Cg<'_> {
             _ = writeln!(self.s, "\t{op} sp, sp, x10");
         }
     }
+    // C99 6.8.6.1: SP về base cố định của frame = x29 - (frame + reg-save variadic).
+    // Dùng khi tới label depth-0 trong hàm có VLA: mọi VLA đã cấp bằng `sub sp`
+    // (địa chỉ động) phải được thu hồi trước khi thân label chạy tiếp, nếu không
+    // goto-lùi trong vòng lặp làm SP trôi xuống mãi → tràn stack.
+    fn reset_sp_base(&mut self) {
+        let off = self.fframe + if self.fvariadic { 192 } else { 0 };
+        self.lea_local("x9", off);
+        _ = writeln!(self.s, "\tmov sp, x9");
+    }
     // re-canonicalize x0 theo kiểu (sau op 32-bit / thu hẹp)
     fn ext(&mut self, t: TypeId) {
         if matches!(self.a.tt.tys[t as usize], Ty::Bool) {
@@ -689,9 +712,12 @@ impl Cg<'_> {
                 self.s += EPILOGUE;
             }
             Node::Block(v) => {
+                // vla_live = số VLA lexical sống; VLA của block này chết khi thoát
+                let save = self.vla_live;
                 for &c in v {
                     self.stmt(c);
                 }
+                self.vla_live = save;
             }
             Node::If(c, t, e) => {
                 let n = self.labels(2);
@@ -805,6 +831,13 @@ impl Cg<'_> {
             }
             Node::Label(name, st) => {
                 _ = writeln!(self.s, "lg_{}.{}:", self.fname, name);
+                // C99 6.8.6.1: label ở VLA-depth 0 ⟹ SP phải = base mọi lối vào;
+                // goto-lùi từ trong scope VLA phải dealloc (không thì loop tràn
+                // stack — 20040811/pr43220/vla-dealloc-1). Cấm goto NHẢY VÀO scope
+                // VLA nên label đích luôn depth ≤ hiện tại → restore base an toàn.
+                if self.fhasvla && self.vla_live == 0 {
+                    self.reset_sp_base();
+                }
                 self.stmt(*st);
             }
             _ => self.expr(id),
@@ -927,6 +960,7 @@ impl Cg<'_> {
             Node::Alloca(e) => {
                 self.expr(*e);
                 self.s += "\tadd x0, x0, #15\n\tand x0, x0, #0xfffffffffffffff0\n\tsub sp, sp, x0\n\tmov x0, sp\n";
+                self.vla_live += 1; // VLA sống trong scope hiện tại (dealloc tại label base-level)
             }
             Node::LabelAddr(name) => {
                 _ = writeln!(

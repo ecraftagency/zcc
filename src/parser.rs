@@ -1643,6 +1643,7 @@ impl P<'_> {
             uid,
             parent_uid: self.cur_parent_uid,
             chain,
+            has_vla: !self.vla_szs.is_empty(),
         });
         // khôi phục state hàm bao
         self.locals.truncate(base);
@@ -3751,6 +3752,7 @@ impl P<'_> {
                         uid,
                         parent_uid: u32::MAX,
                         chain: 0,
+                        has_vla: !self.vla_szs.is_empty(),
                     });
                     ranges.push((n0, n1));
                     // EXT(gcc): nested func gom trong body → xả vào funcs (static,

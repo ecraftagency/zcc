@@ -355,6 +355,9 @@ pub struct Func {
     pub uid: u32,
     pub parent_uid: u32,
     pub chain: u32,
+    // C99 6.8.6.1: có VLA → codegen phải reset SP về base tại label (goto rời
+    // scope VLA phải dealloc; nếu không, VLA trong vòng lặp goto tràn stack)
+    pub has_vla: bool,
 }
 
 // Target đi qua boundary: driver chọn, frontend dùng (char signedness, va_off,
