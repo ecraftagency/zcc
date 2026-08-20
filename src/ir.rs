@@ -19,7 +19,7 @@
 // trần 10k); verifier ở đây vì nó nhẹ và là automaton kiểm ngay sau lowering.
 #![allow(dead_code)] // gỡ khi lowering (step 2) + backend IR→asm (step 3) tiêu thụ
 
-use crate::ast::{Ast, Node, NodeId, Ty, TypeId, INT, ULONG, VOID};
+use crate::ast::{Ast, Node, NodeId, Ty, TyTab, TypeId, INT, ULONG, VOID};
 use std::collections::HashMap;
 
 pub type Tmp = u32; // định danh temp; đánh index vào IrFunc.temps (bảng kiểu Γ)
@@ -110,6 +110,7 @@ pub struct Block {
 }
 
 /// Hàm ở dạng IR: CFG (blocks) + bảng kiểu temp (Γ) + khung stack.
+#[derive(Clone)]
 pub struct IrFunc {
     pub name: String,
     pub temps: Vec<TypeId>,        // Γ: temp i có kiểu temps[i]
@@ -134,7 +135,7 @@ pub struct IrFunc {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Temp được ĐỊNH NGHĨA bởi lệnh này (đích), nếu có.
-fn inst_def(i: &Inst) -> Option<Tmp> {
+pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
     match i {
         Inst::Bin(d, ..)
         | Inst::Un(d, ..)
@@ -148,7 +149,7 @@ fn inst_def(i: &Inst) -> Option<Tmp> {
 }
 
 /// Gom mọi Tmp mà lệnh này DÙNG (đọc) vào `out`.
-fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
+pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
     let mut v = |x: &Val| {
         if let Val::Tmp(t) = x {
             out.push(*t)
@@ -179,7 +180,7 @@ fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
 }
 
 /// Gom mọi Tmp mà terminator DÙNG.
-fn term_uses(t: &Term, out: &mut Vec<Tmp>) {
+pub(crate) fn term_uses(t: &Term, out: &mut Vec<Tmp>) {
     let mut v = |x: &Val| {
         if let Val::Tmp(t) = x {
             out.push(*t)
@@ -194,7 +195,7 @@ fn term_uses(t: &Term, out: &mut Vec<Tmp>) {
 }
 
 /// Đích block của một terminator (để kiểm ref-integrity CFG).
-fn term_targets(t: &Term, out: &mut Vec<BlockId>) {
+pub(crate) fn term_targets(t: &Term, out: &mut Vec<BlockId>) {
     match t {
         Term::Jmp(b) => out.push(*b),
         Term::Br(_, a, b) => {
@@ -775,6 +776,110 @@ pub fn lower(ast: &Ast) -> Vec<IrFunc> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Ngữ nghĩa số học CORE — HÀM NGHĨA nguyên tử, dùng CHUNG bởi interp (proof-side)
+// và const-fold (opt.rs, release). MỘT định nghĩa duy nhất ⟹ folder và interpreter
+// KHÔNG THỂ lệch: đây là điều kiện faithfulness của correctness-by-construction —
+// ⟦fold(Bin op a b)⟧ = ⟦Bin op a b⟧ theo đúng nghĩa vì fold GỌI CHÍNH eval_bin.
+// (THEORY.md Phần I §A4 partial-evaluation + §III keystone.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Chuẩn hoá giá trị nguyên về đúng bề rộng+dấu của `ty` (ℤ/2^n): định lý "số học
+/// int wrap tại size*8 bit" — chính là `ext(ct)` của backend. Float: bit pattern đi thẳng.
+pub(crate) fn canon(tt: &TyTab, ty: TypeId, v: i64) -> i64 {
+    if tt.is_float(ty) {
+        return v;
+    }
+    let sz = tt.size(ty);
+    if sz >= 8 {
+        return v;
+    }
+    let bits = sz * 8;
+    let masked = (v as u64) & ((1u64 << bits) - 1);
+    if tt.is_unsigned(ty) {
+        masked as i64
+    } else {
+        let sh = 64 - bits; // sign-extend từ `bits`
+        ((masked << sh) as i64) >> sh
+    }
+}
+
+/// ⟦Bin⟧: Op thuần diễn giải trong cấu trúc đại số của `ty` (ℝ nếu float, ℤ/2^n với
+/// dấu nếu int). So sánh → {0,1}. Err tại UB (chia/mod 0) → const-fold PHẢI bỏ qua
+/// (không fold UB thành hằng: giữ nguyên lệnh, để runtime giữ hành vi target).
+pub(crate) fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result<i64, String> {
+    if tt.is_float(ty) {
+        let (a, b) = (f64::from_bits(x as u64), f64::from_bits(y as u64));
+        let r = match op {
+            Op::Add => a + b,
+            Op::Sub => a - b,
+            Op::Mul => a * b,
+            Op::Div => a / b,
+            Op::Eq => return Ok((a == b) as i64),
+            Op::Ne => return Ok((a != b) as i64),
+            Op::Lt => return Ok((a < b) as i64),
+            Op::Le => return Ok((a <= b) as i64),
+            Op::Gt => return Ok((a > b) as i64),
+            Op::Ge => return Ok((a >= b) as i64),
+            _ => return Err("eval_bin: op không hợp lệ trên float".into()),
+        };
+        return Ok(r.to_bits() as i64);
+    }
+    let u = tt.is_unsigned(ty);
+    let r = match op {
+        Op::Add => x.wrapping_add(y),
+        Op::Sub => x.wrapping_sub(y),
+        Op::Mul => x.wrapping_mul(y),
+        Op::Div if y == 0 => return Err("eval_bin: chia 0 (UB)".into()),
+        Op::Rem if y == 0 => return Err("eval_bin: mod 0 (UB)".into()),
+        Op::Div if u => ((x as u64) / (y as u64)) as i64,
+        Op::Div => x.wrapping_div(y),
+        Op::Rem if u => ((x as u64) % (y as u64)) as i64,
+        Op::Rem => x.wrapping_rem(y),
+        Op::And => x & y,
+        Op::Or => x | y,
+        Op::Xor => x ^ y,
+        Op::Shl => x.wrapping_shl(y as u32),
+        Op::Shr if u => ((x as u64) >> (y as u32)) as i64,
+        Op::Shr => x >> (y as u32),
+        Op::Eq => return Ok((x == y) as i64),
+        Op::Ne => return Ok((x != y) as i64),
+        Op::Lt => return Ok((if u { (x as u64) < (y as u64) } else { x < y }) as i64),
+        Op::Le => return Ok((if u { (x as u64) <= (y as u64) } else { x <= y }) as i64),
+        Op::Gt => return Ok((if u { (x as u64) > (y as u64) } else { x > y }) as i64),
+        Op::Ge => return Ok((if u { (x as u64) >= (y as u64) } else { x >= y }) as i64),
+    };
+    Ok(canon(tt, ty, r))
+}
+
+/// ⟦Cast⟧: chuyển giữa các miền (trunc/ext int, i↔f). _Bool normalize 0/1 (C99
+/// 6.3.1.2 / 6.3.1.4). Tổng (không UB) → const-fold luôn fold được cast hằng.
+pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
+    let is_bool = matches!(tt.tys[to as usize], Ty::Bool);
+    match (tt.is_float(from), tt.is_float(to)) {
+        (false, false) => {
+            if is_bool {
+                (v != 0) as i64
+            } else {
+                canon(tt, to, v)
+            }
+        }
+        (false, true) => {
+            let f = if tt.is_unsigned(from) { (v as u64) as f64 } else { v as f64 };
+            f.to_bits() as i64
+        }
+        (true, false) => {
+            let f = f64::from_bits(v as u64);
+            if is_bool {
+                (f != 0.0) as i64
+            } else {
+                canon(tt, to, f as i64) // trunc về 0 (C99 6.3.1.4)
+            }
+        }
+        (true, true) => v, // f64 canonical cả hai
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Interp — ngữ nghĩa DENOTATIONAL ⟦·⟧ của IR CORE (IR.md §3b). Đây là HÀM NGHĨA:
 // định nghĩa "IR này TÍNH RA gì", làm ground-truth cho commuting-square oracle
 // (pass đúng ⟺ giao hoán với interp). test-side (#[cfg(test)]) — KHÔNG vào binary
@@ -786,29 +891,9 @@ pub fn lower(ast: &Ast) -> Vec<IrFunc> {
 // địa chỉ = off (index vào mảng). Global/Str/Opaque KHÔNG mô hình hoá → Err (hàm
 // chứa chúng là "không thuần", nằm ngoài không gian commuting-square CORE).
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ast::{TyTab, TypeId, DOUBLE, INT, UINT};
-
-    /// Chuẩn hoá giá trị nguyên về đúng bề rộng+dấu của `ty` (ℤ/2^n): định lý
-    /// "số học int wrap tại size*8 bit" — chính là `ext(ct)` của backend.
-    fn canon(tt: &TyTab, ty: TypeId, v: i64) -> i64 {
-        if tt.is_float(ty) {
-            return v; // float: bit pattern đi thẳng
-        }
-        let sz = tt.size(ty);
-        if sz >= 8 {
-            return v;
-        }
-        let bits = sz * 8;
-        let masked = (v as u64) & ((1u64 << bits) - 1);
-        if tt.is_unsigned(ty) {
-            masked as i64
-        } else {
-            let sh = 64 - bits; // sign-extend từ `bits`
-            ((masked << sh) as i64) >> sh
-        }
-    }
 
     fn load_mem(mem: &[u8], addr: i64, sz: u32) -> u64 {
         let a = addr as usize;
@@ -826,7 +911,18 @@ mod tests {
     }
 
     /// Chạy IR: interp(entry, args) → giá trị trả. Đệ quy qua Call(Sym).
-    fn interp(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64]) -> Result<i64, String> {
+    pub(crate) fn interp(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64]) -> Result<i64, String> {
+        interp_d(tt, funcs, entry, args, 0)
+    }
+
+    /// interp có ĐẾM ĐỘ SÂU: interp dùng Rust-recursion cho Call, nên input ép đệ quy
+    /// lớn (vd fact(2^31)) làm tràn stack HOST — không phải bug IR. Chạm trần → Err
+    /// (input "ngoài không gian mô hình được" → equiv SKIP, giống UB). Trần chọn thấp
+    /// hơn stack thật nhiều lần để an toàn.
+    fn interp_d(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64], depth: u32) -> Result<i64, String> {
+        if depth > 500 {
+            return Err("interp: đệ quy quá sâu (input ngoài không gian mô hình)".into());
+        }
         let f = funcs
             .iter()
             .find(|f| f.name == entry)
@@ -918,7 +1014,7 @@ mod tests {
                             return Err("interp: gọi gián tiếp không mô hình hoá".into());
                         };
                         let av: Vec<i64> = args.iter().map(|v| fetch(&reg, v)).collect();
-                        let r = interp(tt, funcs, name, &av)?;
+                        let r = interp_d(tt, funcs, name, &av, depth + 1)?;
                         if let Some(d) = d {
                             reg[*d as usize] = canon(tt, f.temps[*d as usize], r);
                         }
@@ -940,83 +1036,8 @@ mod tests {
         }
     }
 
-    /// ⟦Bin⟧: Op thuần diễn giải trong cấu trúc đại số của `ty` (ℝ nếu float,
-    /// ℤ/2^n với dấu nếu int). So sánh → {0,1}.
-    fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result<i64, String> {
-        if tt.is_float(ty) {
-            let (a, b) = (f64::from_bits(x as u64), f64::from_bits(y as u64));
-            let r = match op {
-                Op::Add => a + b,
-                Op::Sub => a - b,
-                Op::Mul => a * b,
-                Op::Div => a / b,
-                Op::Eq => return Ok((a == b) as i64),
-                Op::Ne => return Ok((a != b) as i64),
-                Op::Lt => return Ok((a < b) as i64),
-                Op::Le => return Ok((a <= b) as i64),
-                Op::Gt => return Ok((a > b) as i64),
-                Op::Ge => return Ok((a >= b) as i64),
-                _ => return Err("interp: op không hợp lệ trên float".into()),
-            };
-            return Ok(r.to_bits() as i64);
-        }
-        let u = tt.is_unsigned(ty);
-        let r = match op {
-            Op::Add => x.wrapping_add(y),
-            Op::Sub => x.wrapping_sub(y),
-            Op::Mul => x.wrapping_mul(y),
-            Op::Div if y == 0 => return Err("interp: chia 0 (UB)".into()),
-            Op::Rem if y == 0 => return Err("interp: mod 0 (UB)".into()),
-            Op::Div if u => ((x as u64) / (y as u64)) as i64,
-            Op::Div => x.wrapping_div(y),
-            Op::Rem if u => ((x as u64) % (y as u64)) as i64,
-            Op::Rem => x.wrapping_rem(y),
-            Op::And => x & y,
-            Op::Or => x | y,
-            Op::Xor => x ^ y,
-            Op::Shl => x.wrapping_shl(y as u32),
-            Op::Shr if u => ((x as u64) >> (y as u32)) as i64,
-            Op::Shr => x >> (y as u32),
-            Op::Eq => return Ok((x == y) as i64),
-            Op::Ne => return Ok((x != y) as i64),
-            Op::Lt => return Ok((if u { (x as u64) < (y as u64) } else { x < y }) as i64),
-            Op::Le => return Ok((if u { (x as u64) <= (y as u64) } else { x <= y }) as i64),
-            Op::Gt => return Ok((if u { (x as u64) > (y as u64) } else { x > y }) as i64),
-            Op::Ge => return Ok((if u { (x as u64) >= (y as u64) } else { x >= y }) as i64),
-        };
-        Ok(canon(tt, ty, r))
-    }
-
-    /// ⟦Cast⟧: chuyển giữa các miền (trunc/ext int, i↔f). _Bool normalize 0/1.
-    fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
-        use crate::ast::Ty;
-        let is_bool = matches!(tt.tys[to as usize], Ty::Bool);
-        match (tt.is_float(from), tt.is_float(to)) {
-            (false, false) => {
-                if is_bool {
-                    (v != 0) as i64
-                } else {
-                    canon(tt, to, v)
-                }
-            }
-            (false, true) => {
-                let f = if tt.is_unsigned(from) { (v as u64) as f64 } else { v as f64 };
-                f.to_bits() as i64
-            }
-            (true, false) => {
-                let f = f64::from_bits(v as u64);
-                if is_bool {
-                    (f != 0.0) as i64
-                } else {
-                    canon(tt, to, f as i64) // trunc về 0 (C99 6.3.1.4)
-                }
-            }
-            (true, true) => v, // f64 canonical cả hai
-        }
-    }
-
     // Dựng nhanh một IrFunc. params = (offset khung, kiểu) — param sống trong slot.
-    fn mk(
+    pub(crate) fn mk(
         name: &str,
         temps: Vec<TypeId>,
         params: Vec<(u32, TypeId)>,
@@ -1121,20 +1142,126 @@ mod tests {
 
     // ── Lowering thật: parse snippet C → lower → verify → interp (oracle).
     // Chứng commuting-square ở tầng lowering: ⟦lower(AST)⟧ = nghĩa chương trình.
-    fn compile(name: &str, src: &str) -> (crate::ast::Ast, Vec<IrFunc>) {
-        let path = std::env::temp_dir().join(format!("zcc_ir_{name}.c"));
+    pub(crate) fn compile(name: &str, src: &str) -> (crate::ast::Ast, Vec<IrFunc>) {
+        // Tên file DUY NHẤT theo băm(src): test chạy song song, trùng `name` khác
+        // `src` sẽ đua-ghi cùng file → parse rác. Băm src ⟹ khác src = khác file.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        let path = std::env::temp_dir().join(format!("zcc_ir_{name}_{:x}.c", h.finish()));
         std::fs::write(&path, src).unwrap();
         let (t, l, f) = crate::preprocess::preprocess(path.to_str().unwrap(), &[], &[], &[]).unwrap();
         let ast = crate::parser::parse(&t, &l, &f).unwrap();
         let ir = lower(&ast);
         (ast, ir)
     }
-    fn run(name: &str, src: &str, entry: &str, args: &[i64]) -> i64 {
+    pub(crate) fn run(name: &str, src: &str, entry: &str, args: &[i64]) -> i64 {
         let (ast, ir) = compile(name, src);
         for f in &ir {
             verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
         }
         interp(&ast.tt, &ir, entry, args).unwrap()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // equiv — GATE chứng pass (commuting-square / translation-validation cơ học).
+    // Bất biến quản trị THAY trần LOC (Vu 2026-08-20): pass P đúng ⟺ ∀input,
+    // ⟦A⟧(input) = ⟦P(A)⟧(input). Ta không TIN bằng lý luận — ta ĐO bằng interp.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Battery input cho differential-interp. arity≤2: **VÉT CẠN** miền nhỏ [-6,6]^n
+    /// (exhaustive → complete cho biên value-space nhỏ) + biên INT_MAX/MIN mỗi toạ độ.
+    /// arity≥3: LCG deterministic 256 vector (Date/random cấm — deterministic để resume).
+    pub(crate) fn battery(arity: usize) -> Vec<Vec<i64>> {
+        let bound: [i64; 8] = [0, 1, -1, i32::MAX as i64, i32::MIN as i64, 255, -256, 1000003];
+        if arity == 0 {
+            return vec![vec![]];
+        }
+        let mut out: Vec<Vec<i64>> = Vec::new();
+        if arity <= 2 {
+            let small: Vec<i64> = (-6..=6).collect();
+            if arity == 1 {
+                for &x in &small {
+                    out.push(vec![x]);
+                }
+                for &x in &bound {
+                    out.push(vec![x]);
+                }
+            } else {
+                for &x in &small {
+                    for &y in &small {
+                        out.push(vec![x, y]);
+                    }
+                }
+                for &b in &bound {
+                    out.push(vec![b, 1]); // toạ độ kia = 1 (tránh 0 nuốt phép nhân)
+                    out.push(vec![1, b]);
+                    out.push(vec![b, b]);
+                }
+            }
+            return out;
+        }
+        let mut s: u64 = 0x2545F4914F6CDD1D;
+        for _ in 0..256 {
+            let mut v = Vec::with_capacity(arity);
+            for _ in 0..arity {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                v.push((s >> 33) as i64 - (1 << 30));
+            }
+            out.push(v);
+        }
+        out
+    }
+
+    /// ⟦A⟧ ≡ ⟦B⟧ trên `entry`? Observable = giá trị TRẢ. Quy ước UB (diff-tại-UB vô
+    /// nghĩa): before Err ⟹ input ngoài không gian (UB/opaque) → SKIP; before Ok ∧
+    /// after Err ⟹ pass phá well-defined → FAIL; cả hai Ok ⟹ so. Anti-vacuous: nếu
+    /// KHÔNG input nào so được (hàm toàn opaque/UB) → Err (cấm pass "pass" rỗng).
+    pub(crate) fn equiv(tt: &TyTab, a: &[IrFunc], b: &[IrFunc], entry: &str) -> Result<(), String> {
+        let fa = a.iter().find(|f| f.name == entry).ok_or("equiv: thiếu entry ở A")?;
+        let arity = fa.params.len();
+        let mut compared = 0u32;
+        for input in battery(arity) {
+            match (interp(tt, a, entry, &input), interp(tt, b, entry, &input)) {
+                (Ok(x), Ok(y)) => {
+                    if x != y {
+                        return Err(format!("equiv PHÁ VỠ: {entry}{input:?} → A={x} B={y}"));
+                    }
+                    compared += 1;
+                }
+                (Ok(x), Err(e)) => {
+                    return Err(format!("equiv: pass biến well-defined→lỗi: {entry}{input:?} A={x} B_err={e}"));
+                }
+                (Err(_), _) => {} // before ngoài không gian → skip
+            }
+        }
+        if compared == 0 {
+            return Err(format!("equiv VACUOUS: {entry} không input nào interp được — pass chưa được chứng"));
+        }
+        Ok(())
+    }
+
+    // Tự-chứng equiv (chứng chính công cụ chứng — luật input-sạch): identity phải
+    // equiv; đột biến MỘT Op phải bị bắt. Nếu test này đỏ, mọi verdict pass vô giá trị.
+    #[test]
+    fn equiv_selfproof() {
+        let (ast, ir) = compile("eqv", "int f(int a,int b){return a*b + a - 7;}");
+        equiv(&ast.tt, &ir, &ir, "f").expect("identity phải equiv");
+        let mut bad = ir.clone();
+        let mut mutated = false;
+        'outer: for f in bad.iter_mut().filter(|f| f.name == "f") {
+            for blk in f.blocks.iter_mut() {
+                for inst in blk.insts.iter_mut() {
+                    if let Inst::Bin(_, op @ Op::Mul, ..) = inst {
+                        *op = Op::Add; // Mul → Add: đột biến ngữ nghĩa
+                        mutated = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert!(mutated, "phải có Bin(Mul) để đột biến");
+        assert!(equiv(&ast.tt, &ir, &bad, "f").is_err(), "đột biến Mul→Add phải bị equiv bắt");
     }
 
     #[test]

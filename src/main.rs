@@ -9,6 +9,7 @@ mod codegen;
 mod ext;
 mod ir;
 mod lexer;
+mod opt;
 mod parser;
 mod preprocess;
 use std::{env, fs, process::Command, process::ExitCode};

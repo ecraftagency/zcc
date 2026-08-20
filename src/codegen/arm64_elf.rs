@@ -48,6 +48,10 @@ struct Cg<'a> {
     // x29 − (ir_tbase + 8 + i*8)); ir_temps = bảng kiểu temp hàm hiện tại.
     ir_tbase: u32,
     ir_temps: Vec<TypeId>,
+    // IR mode: kích thước vùng temp-slot (tbytes) nằm DƯỚI khung C. VLA-dealloc
+    // (reset_sp_base) phải trừ THÊM vùng này, nếu không sp về trên vùng temp và
+    // VLA kế `sub sp` ghi đè temp (pr43220). 0 ở AST mode → không đụng.
+    ir_tspill: u32,
 }
 
 pub fn emit(ast: &Ast) -> String {
@@ -67,6 +71,7 @@ pub fn emit(ast: &Ast) -> String {
         vla_live: 0,
         ir_tbase: 0,
         ir_temps: Vec::new(),
+        ir_tspill: 0,
     };
     // EXT(gcc): __asm__("...") cấp toàn cục (musl crt_arch.h _start) — verbatim
     for a in &ast.raw_asm {
@@ -473,7 +478,7 @@ impl Cg<'_> {
     // (địa chỉ động) phải được thu hồi trước khi thân label chạy tiếp, nếu không
     // goto-lùi trong vòng lặp làm SP trôi xuống mãi → tràn stack.
     fn reset_sp_base(&mut self) {
-        let off = self.fframe + if self.fvariadic { 192 } else { 0 };
+        let off = self.fframe + if self.fvariadic { 192 } else { 0 } + self.ir_tspill;
         self.lea_local("x9", off);
         _ = writeln!(self.s, "\tmov sp, x9");
     }
@@ -1934,6 +1939,7 @@ impl<'a> Cg<'a> {
         self.ir_tbase = irf.frame + if self.fvariadic { 192 } else { 0 };
         self.ir_temps = irf.temps.clone();
         let tbytes = (irf.temps.len() as u32 * 8).next_multiple_of(16);
+        self.ir_tspill = tbytes; // reset_sp_base (VLA-dealloc) phải trừ luôn vùng này
         if tbytes > 0 {
             self.sp_adjust("sub", tbytes);
         }
@@ -1962,7 +1968,16 @@ impl<'a> Cg<'a> {
 /// suite — CORE (scalar/control/mem/call) chạy; đuôi exotic + global/string đang
 /// mở rộng. Khi xanh hết suite: thay emit(), xoá đường AST, đo trần ≤10k.
 pub fn emit_ir(ast: &Ast) -> String {
-    let funcs = ir::lower(ast);
+    let mut funcs = ir::lower(ast);
+    // Pipeline pass tối ưu (const-fold→copy-prop→CSE→DCE tới fixpoint). Mỗi pass đã
+    // chứng bảo-toàn-⟦·⟧ ở IR→IR (opt.rs::tests, equiv commuting-square). Gate ZCC_OPT
+    // để A/B trong box trước khi bật mặc định (đo-trước-khi-tuyên; verify chặn IR hỏng).
+    if std::env::var_os("ZCC_OPT").is_some() {
+        for f in funcs.iter_mut() {
+            crate::opt::optimize(&ast.tt, f);
+            debug_assert!(ir::verify(f).is_ok(), "opt sinh IR hỏng: {}", f.name);
+        }
+    }
     let mut g = Cg {
         s: String::from(".cfi_sections .eh_frame\n.text\n"),
         a: ast,
@@ -1979,6 +1994,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         vla_live: 0,
         ir_tbase: 0,
         ir_temps: Vec::new(),
+        ir_tspill: 0,
     };
     for a in &ast.raw_asm {
         g.s += a;

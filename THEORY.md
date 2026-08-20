@@ -109,7 +109,15 @@ mọi hằng layout/ABI sống trong TyTab + file target (vế II); phần còn 
 | Well-formedness verifier | ref-integrity+def-coverage+entry | `ir.rs` (`verify`) |
 | SSA + φ-node *(mở khi cần)* | mỗi temp gán 1 lần | *[chưa]* |
 
-### A7. Optimization — chứng minh pass `[SẼ DÙNG]` (mỗi pass provable, thay trần LOC)
+### A7. Optimization — chứng minh pass `[DÙNG: IR→IR proven]` (mỗi pass provable, thay trần LOC)
+
+> Hiện trạng 2026-08-21: 5 pass đã hiện thực + CHỨNG ở IR→IR (`src/opt.rs`, 29 test):
+> const-fold / DCE / copy-prop / CSE gate bằng `ir::tests::equiv` (commuting-square,
+> ⟦A⟧≡⟦P(A)⟧ trên battery vét-cạn-miền-nhỏ + biên) + `verify`; regalloc (liveness
+> dataflow-fixpoint → interference → Chaitin coloring → `verify_coloring`) gate bằng
+> BẤT BIẾN GIAO THOA (bisimulation-đổi-tên). Orchestrator `optimize()` = fixpoint 1-4,
+> wire vào `--ir` sau cờ `ZCC_OPT` (đo box: torture opt≡noopt end-to-end). Backend tiêu
+> thụ regalloc + flip mặc định = Bước B (chưa).
 | khái niệm/định lý | mô tả |
 |---|---|
 | Denotational semantics ⟦·⟧:State→State | pass đúng ⟺ ⟦f⟧=⟦f'⟧ |
@@ -180,7 +188,7 @@ không "tối ưu tuyệt đối"; nhưng *đúng-màu* verify được trong P)
 | `decay` | dẫn xuất kiểu | type-derivation lattice |
 | `alg` | UAC + fold | join-semilattice + commuting-square fold↔runtime |
 | `abi` | ABI classify + link | finite automaton + cross-link cancellation |
-| `ir` *(kế hoạch)* | IR + pass | denotation preservation (rewrite/symbolic/bisimulation) |
+| `ir` *(`cargo test opt::`)* | IR + 5 pass | denotation preservation: equiv commuting-square (fold/DCE/copy/CSE) + interference-invariant (regalloc) |
 
 ---
 
@@ -290,6 +298,20 @@ compiler↔suite KHÔNG phải bài toán đó:
   Gödel cấm một hệ tự chứng consistency; KHÔNG cấm hai hệ độc lập đồng ý trên một vị từ decidable.
   → Cùng lý do CLAUDE.md rút Claude khỏi trust-path (kẻ-kể-chuyện-không-tin-được → chỉ verdict-cơ-học
   mới hợp lệ): dời trọng tài ra NGOÀI hệ là cách né đồng thời cả Gödel lẫn nghịch lý self-trust.
+
+**Hệ quả DEBUG (Vu 2026-08-21) — fix THEO PHÂN RÃ, cấm patch cảm tính.** Khi zcc fail
+suite (nhất là csmith/yarpgen), GIẢ ĐỊNH lý thuyết cho feature đó hợp lý ⟹ fail chỉ có
+thể do 1 trong 3 (hoặc kết hợp), THỨ TỰ ưu tiên điều tra: **(1)** từ theorem phân rã ra SAI
+control-flow/algorithm → có ≥1 LOC **nằm ngoài theorem** (vế I); **(2)** **spec-constant**
+ISO/OS/arch apply SAI (vế II); **(3)** test/oracle/referee/generator lỗi hoặc thu input rác
+(xác suất THẤP, ≠0) — RÀNG bởi LUẬT SUY-ĐOÁN-TỘI: compiler có tội tới khi chứng minh vô tội,
+nên cause-3 là hạng CHÓT, chỉ tuyên sau proof ĐA CHIỀU cơ học + trọng tài độc lập; cấm dùng
+làm phản xạ đổ lỗi, cấm cớ "clang/gcc cũng fail". Ta code theo phân rã ⟹ fix theo phân rã:
+ĐỊNH VỊ lỗi bằng phép đo cơ học (bisect pass/module, diff asm, seek case) TRƯỚC, phân loại
+vế-I/II/III SAU, sửa đúng chỗ đó. Nếu sửa mà phải thêm dòng-không-map-định-lý → sai hướng.
+MEASURE đè mọi hypothesis — hypothesis-fix đầu tiên sai là bình thường, cứ đo tiếp (case mẫu
+pr43220: đoán CSE-vế-I → đo bác bỏ → thực ra vế-II hằng frame-layout ở backend). (Chi tiết:
+memory `zcc-debug-by-decomposition`.)
 
 ---
 
