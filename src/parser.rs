@@ -1624,6 +1624,10 @@ impl P<'_> {
             Ok(self.push(Node::While(c, b), INT))
         } else if self.eat_kw("for") {
             self.expect(Tok::Punct("("))?;
+            // C99 6.8.5.3: for-init declaration được scope TỚI HẾT for (init+cond+
+            // incr+body), phải đóng sau body kẻo leak shadow ra ngoài. Chỉ cho auto/
+            // register object nên chỉ cần locals (không tag/typedef).
+            let scope = self.locals.len();
             // C99 (clang -std=c89 cho): "for (int i = 0; ...)" — init là declaration
             let i = if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if self.is_type_word(n))
             {
@@ -1637,6 +1641,7 @@ impl P<'_> {
             };
             let n = self.opt_expr(")")?;
             let b = self.stmt()?;
+            self.locals.truncate(scope);
             Ok(self.push(Node::For(i, c, n, b), INT))
         } else if self.eat_kw("do") {
             let b = self.stmt()?;
