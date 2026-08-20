@@ -2,6 +2,15 @@
 
 C89+ compiler viết bằng Rust. Tác giả: Vu (xưng hô "mày/tao", trả lời tiếng Việt, thuật ngữ kỹ thuật giữ tiếng Anh).
 
+## Luật gốc số 0 — định lý phân rã source (nếu chỉ giữ 1 luật, giữ luật này. Chi tiết: `THEORY.md`)
+
+```
+zcc source  =  ( math / theory     → control-flow + data-structure + algorithm )
+            ⊕  ( iso / os / arch / gcc spec → constant + param + value-table )
+```
+
+Mỗi dòng `src/` thuộc ĐÚNG một trong hai vế, không có dòng thứ ba: hoặc *thuật toán/cấu trúc/luồng* rút từ một định lý (map được về `THEORY.md` Phần I), hoặc *hằng/bảng-tra* chép từ một dòng spec (`THEORY.md` Phần II — không magic number không nguồn gốc). **Correctness-by-construction:** nếu không LOC nào nằm ngoài không gian {theory-fact ∪ spec-fact} và mỗi dòng là hiện thực TRUNG THÀNH của vế của nó, zcc **tất yếu pass mọi suite** — vì zcc và referee đều là bóng của cùng một spec; mismatch ⟹ bug trung-thành NẰM TRONG không gian, gate bắt được. Kỷ luật 2-fact giữ điều kiện này: **0 FAIL** (miscompile), NOT-IMPL cho lỗ hổng completeness. Phủ 250+ app = bằng chứng RẺ (khả dụng); pass csmith/yarpgen + sci-gate = bằng chứng correctness ĐẮT (chục compiler cùng cỡ vẫn trượt). Gödel/Rice/Halting nằm NGOÀI quan hệ compiler↔suite: differential dùng oracle ĐỘC LẬP nên zcc không bao giờ tự-chứng-mình — né cả bất toàn lẫn self-trust (cùng lý do Claude bị rút khỏi trust-path). **Hỏi "zcc dựa nền lý thuyết nào" → in `THEORY.md`; thêm định lý/hằng mới → cập nhật `THEORY.md`.**
+
 ## 2 yêu cầu tối thượng (mọi quyết định quy về đây)
 
 1. **Strict compliance C99** (Vu nâng chuẩn gốc từ C89, 2026-08-18 — C89 tự động là tập con; 4 món C99 cuối mua khi M18 mở băng, xem MILESTONES "C99-ĐỦ") — ngữ nghĩa đúng spec; phần mở rộng (C11/vendor) chỉ tồn tại khi có phần mềm thật đòi, marker `EXT(gcc/clang/apple)` giữ nguyên; ghi chú `C99:` trong code là chú thích sư phạm, không phải ranh giới lệch chuẩn. Target đã đạt: AArch64 macOS Mach-O + AArch64 ELF Linux; x86_64 HOÃN.
