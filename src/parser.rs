@@ -148,7 +148,7 @@ const ASSIGN_OPS: [(&str, &str); 11] = [
     ("^=", "^"),
 ];
 
-const TYPE_WORDS: [&str; 22] = [
+const TYPE_WORDS: [&str; 24] = [
     "void",
     "char",
     "short",
@@ -164,7 +164,9 @@ const TYPE_WORDS: [&str; 22] = [
     "const",
     "volatile",
     "_Bool",
-    "_Complex", // C99
+    "_Complex",     // C99
+    "__complex__",  // EXT(gcc): bí danh _Complex
+    "__complex",    // EXT(gcc): dạng không gạch đuôi (`__complex double`)
     "__const",
     "__volatile",
     "__signed",
@@ -430,8 +432,9 @@ impl P<'_> {
                 "static" => storage = Storage::Static,
                 "extern" => storage = Storage::Extern,
                 "void" | "char" | "int" | "float" | "double" | "_Bool" => base = Some(n),
-                // C99: _Complex — musl src/complex; hạ về struct {re, im}
-                "_Complex" => cplx = true,
+                // C99: _Complex — musl src/complex; hạ về struct {re, im}.
+                // EXT(gcc): __complex__ / __complex là bí danh (torture complex-*)
+                "_Complex" | "__complex__" | "__complex" => cplx = true,
                 "short" => short = true,
                 "long" => longs += 1,
                 "signed" | "__signed" | "__signed__" => sgn = true,
@@ -1319,15 +1322,77 @@ impl P<'_> {
     // trên trường số phức). Nhân/chia dùng công thức đại số thẳng — KHÔNG Annex G
     // NaN-fixup/scaling (tương đương gcc -fcx-limited-range; deviation tuyên bố,
     // musl src/complex tự decompose creal/cimag ở các đường biên nên ít đụng).
-    fn cplx_bin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
-        if !self.in_fn {
-            return Err("toán tử complex trong biểu thức hằng".into());
+    // đọc hằng phức từ node const: Bin("__ci",re,im) | scalar thực → (re,im)
+    fn ccval(&self, id: NodeId) -> Option<(f64, f64)> {
+        match &self.nodes[id as usize] {
+            Node::Bin("__ci", a, b) => Some((self.fold_f(*a).ok()?, self.fold_f(*b).ok()?)),
+            _ => self.fold_f(id).ok().map(|v| (v, 0.0)),
         }
+    }
+    // hằng ảo → temp complex {re=0, im=v} (phép nhúng ℝ→ℂ).
+    // !in_fn (static init): dựng sentinel Bin("__ci",0,v) để ginit fold ra bytes.
+    fn cplx_imag(&mut self, im: f64, elem: TypeId) -> NodeId {
+        let ct = self.cplx_of(elem);
+        if !self.in_fn {
+            let (z, v) = (self.push(Node::FNum(0.0), elem), self.push(Node::FNum(im), elem));
+            return self.push(Node::Bin("__ci", z, v), ct);
+        }
+        let esz = self.tt.size(elem);
+        let o = self.alloc_local(format!(".ci{}", self.nodes.len()), ct);
+        let vr = self.push(Node::Var(o), ct);
+        let mre = self.push(Node::Member(vr, 0), elem);
+        let zero = self.push(Node::FNum(0.0), elem);
+        let are = self.push(Node::Assign(mre, zero), elem);
+        let vi = self.push(Node::Var(o), ct);
+        let mim = self.push(Node::Member(vi, esz), elem);
+        let imv = self.push(Node::FNum(im), elem);
+        let aim = self.push(Node::Assign(mim, imv), elem);
+        let val = self.push(Node::Var(o), ct);
+        let seq = self.push(Node::Comma(aim, val), ct);
+        self.push(Node::Comma(are, seq), ct)
+    }
+    // π₁/π₂: __real__ z / __imag__ z — phép chiếu ℂ→ℝ (Member re@0 / im@esz)
+    fn cplx_proj(&mut self, e: NodeId, imag: bool) -> R {
+        if let Some(el) = self.cplx_elem(self.ty(e)) {
+            let off = if imag { self.tt.size(el) } else { 0 };
+            return Ok(self.push(Node::Member(e, off), el));
+        }
+        // scalar thực: __real__ x = x; __imag__ x = 0 (cùng kiểu)
+        if imag {
+            let t = self.ty(e);
+            return Ok(if self.tt.is_float(t) {
+                self.push(Node::FNum(0.0), t)
+            } else {
+                self.push(Node::Num(0), t)
+            });
+        }
+        Ok(e)
+    }
+    fn cplx_bin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
         let lf = self.cplx_elem(self.ty(l)).unwrap_or(self.ty(l)) == FLOAT;
         let rf = self.cplx_elem(self.ty(r)).unwrap_or(self.ty(r)) == FLOAT;
         let elem = if lf && rf { FLOAT } else { DOUBLE };
         let ct = self.cplx_of(elem);
         let esz = self.tt.size(elem);
+        // static init: fold hằng ℂ → sentinel Bin("__ci",re,im) (không temp runtime)
+        if !self.in_fn {
+            let ((a, b), (c, d)) = (
+                self.ccval(l).ok_or("toán tử complex trên hạng không hằng")?,
+                self.ccval(r).ok_or("toán tử complex trên hạng không hằng")?,
+            );
+            let (re, im) = match op {
+                "+" => (a + c, b + d),
+                "-" => (a - c, b - d),
+                "*" => (a * c - b * d, a * d + b * c),
+                "/" => {
+                    let den = c * c + d * d;
+                    ((a * c + b * d) / den, (b * c - a * d) / den)
+                }
+                _ => return Err(format!("op '{op}' trên hằng complex")),
+            };
+            let (rn, in_) = (self.push(Node::FNum(re), elem), self.push(Node::FNum(im), elem));
+            return Ok(self.push(Node::Bin("__ci", rn, in_), ct));
+        }
         let (lv, rv) = (self.cast(l, ct), self.cast(r, ct));
         let ao = self.alloc_local(format!(".ca{}", self.nodes.len()), ct);
         let av = self.push(Node::Var(ao), ct);
@@ -1399,6 +1464,17 @@ impl P<'_> {
             }
             _ => return Err(format!("op '{}' trên complex", op)),
         };
+        let mut seq = self.cplx_pack(rre, rim, elem);
+        if let Some(p) = p3 {
+            seq = self.push(Node::Comma(p, seq), ct);
+        }
+        seq = self.push(Node::Comma(p2, seq), ct);
+        Ok(self.push(Node::Comma(p1, seq), ct))
+    }
+    // gói (re,im) → temp complex, trả về Var(temp) (cần in_fn)
+    fn cplx_pack(&mut self, rre: NodeId, rim: NodeId, elem: TypeId) -> NodeId {
+        let ct = self.cplx_of(elem);
+        let esz = self.tt.size(elem);
         let ro = self.alloc_local(format!(".cr{}", self.nodes.len()), ct);
         let rv1 = self.push(Node::Var(ro), ct);
         let mr = self.push(Node::Member(rv1, 0), elem);
@@ -1407,13 +1483,18 @@ impl P<'_> {
         let mi = self.push(Node::Member(rv2, esz), elem);
         let ai = self.push(Node::Assign(mi, rim), elem);
         let val = self.push(Node::Var(ro), ct);
-        let mut seq = self.push(Node::Comma(ai, val), ct);
-        seq = self.push(Node::Comma(ar, seq), ct);
-        if let Some(p) = p3 {
-            seq = self.push(Node::Comma(p, seq), ct);
-        }
-        seq = self.push(Node::Comma(p2, seq), ct);
-        Ok(self.push(Node::Comma(p1, seq), ct))
+        let seq = self.push(Node::Comma(ai, val), ct);
+        self.push(Node::Comma(ar, seq), ct)
+    }
+    // EXT(gcc): ~z trên complex = liên hợp (re, −im). Dùng Neg (FNEG lật sign
+    // bit) chứ KHÔNG 0−im: liên hợp của +0 là −0 (signed zero, khớp cc bit-đối-bit).
+    fn cplx_conj(&mut self, e: NodeId) -> R {
+        let el = self.cplx_elem(self.ty(e)).ok_or("~ trên không phải complex")?;
+        let esz = self.tt.size(el);
+        let re = self.push(Node::Member(e, 0), el);
+        let im0 = self.push(Node::Member(e, esz), el);
+        let im = self.push(Node::Neg(im0), el);
+        Ok(self.cplx_pack(re, im, el))
     }
 
     // ---- local/scope ----
@@ -2072,6 +2153,13 @@ impl P<'_> {
                 Ok(())
             }
             Init::E(e) => {
+                // complex FLOATING (init HẰNG tĩnh, !in_fn) là scalar leaf: gitem fold
+                // (re,im) ra bytes. Local runtime (in_fn) PHẢI giữ đường cũ — assign
+                // scalar vào struct{re,im} 16-byte sẽ sai/crash; descend vào .re.
+                if !self.in_fn && self.cplx_elem(t).is_some_and(|el| self.tt.is_float(el)) {
+                    out.push((base, t, FlatItem::E(e)));
+                    return Ok(());
+                }
                 // scalar "chảy" vào leaf đầu khi t aggregate mà expr khác kiểu
                 let (mut t, mut base) = (t, base);
                 while !self.scalar(t) && self.ty(e) != t {
@@ -2383,6 +2471,17 @@ impl P<'_> {
         if let Some((s, k)) = self.gaddr(e) {
             return Ok(GInit::Addr(s, k));
         }
+        // static init complex FLOATING: (re,im) → hai ô float liền kề {re,im}
+        if let Some(el) = self.cplx_elem(t).filter(|&el| self.tt.is_float(el)) {
+            let (re, im) = self.ccval(e).ok_or("init complex không hằng")?;
+            let esz = self.tt.size(el);
+            let bits =
+                |v: f64| if esz == 4 { (v as f32).to_bits() as i64 } else { v.to_bits() as i64 };
+            return Ok(GInit::List(vec![
+                (0, esz, GInit::Num(bits(re))),
+                (esz, esz, GInit::Num(bits(im))),
+            ]));
+        }
         if self.tt.is_float(t) {
             let v = self.fold_f(e0)?;
             if matches!(self.tt.tys[t as usize], Ty::LDouble) {
@@ -2622,6 +2721,15 @@ impl P<'_> {
         self.opassign(e, op, one)
     }
     fn unary(&mut self) -> R {
+        // EXT(gcc): __real__/__imag__ z — phép chiếu ℂ→ℝ (C99 dùng creal/cimag)
+        if self.eat_kw("__real__") || self.eat_kw("__real") {
+            let e = self.unary()?;
+            return self.cplx_proj(e, false);
+        }
+        if self.eat_kw("__imag__") || self.eat_kw("__imag") {
+            let e = self.unary()?;
+            return self.cplx_proj(e, true);
+        }
         // cast: "(" typename ")"
         if self.peek("(") {
             if let Some(Tok::Ident(n)) = self.toks.get(self.pos + 1) {
@@ -2730,6 +2838,9 @@ impl P<'_> {
             }
         } else if self.eat(&Tok::Punct("~")) {
             let e = self.unary()?;
+            if self.cplx_elem(self.ty(e)).is_some() {
+                return self.cplx_conj(e); // ~z = liên hợp
+            }
             let m = self.push(Node::Num(-1), INT);
             self.mkbin("^", e, m)
         } else if self.eat(&Tok::Punct("++")) {
@@ -3061,6 +3172,12 @@ impl P<'_> {
                 _ => DOUBLE,
             };
             Ok(self.push(Node::FNum(v), t))
+        } else if let Some(&Tok::INum(v, k)) = self.toks.get(self.pos) {
+            // C99 6.4.4.2: hằng ảo `v i` = 0 + v·i (phép nhúng ℝ→ℂ)
+            self.pos += 1;
+            let elem = if k == 0 { FLOAT } else { DOUBLE };
+            let v = if k == 0 { v as f32 as f64 } else { v };
+            Ok(self.cplx_imag(v, elem))
         } else if let Some(Tok::Str(bytes, w)) = self.toks.get(self.pos) {
             let (mut bytes, mut w) = (bytes.clone(), *w);
             self.pos += 1;

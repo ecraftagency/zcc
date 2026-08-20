@@ -16,6 +16,9 @@ pub enum NumK {
 pub enum Tok {
     Num(i64, NumK),
     FNum(f64, u8), // hằng thực; 0 = float (f/F), 1 = double, 2 = long double (l/L)
+    // C99 6.4.4.2 / EXT(gcc): hằng ẢO `1.0i` `1.0iF` — phép nhúng ℝ→ℂ (b ↦ 0+bi);
+    // giá trị + elem-kind (như FNum). Parser dựng temp complex {re=0, im=v}.
+    INum(f64, u8),
     Ident(String),
     Punct(&'static str),
     Str(Vec<u8>, bool), // (bytes đã xử lý escape chưa gồm NUL cuối, wide L"..")
@@ -92,6 +95,21 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
 }
 
 // Hằng số bắt đầu tại i (digit, hoặc '.' + digit). Trả token + i mới.
+// hậu tố hằng thực: fFlL (kind) + iIjJ (ảo) theo THỨ TỰ BẤT KỲ (gcc: 1.0if == 1.0fi)
+fn fsuffix(b: &[u8], i: &mut usize) -> (u8, bool) {
+    let (mut k, mut im) = (1u8, false);
+    loop {
+        match b.get(*i) {
+            Some(b'f' | b'F') => k = 0,
+            Some(b'l' | b'L') => k = 2, // long double: Darwin=double; ELF=binary128 tại biên ABI
+            Some(b'i' | b'I' | b'j' | b'J') => im = true,
+            _ => break,
+        }
+        *i += 1;
+    }
+    (k, im)
+}
+
 fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
     let s = *i;
     if src[s..].starts_with("0b") || src[s..].starts_with("0B") {
@@ -158,15 +176,8 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
             } else {
                 v * 2.0f64.powi(-1022) * 2.0f64.powi(exp + 1022)
             };
-            let mut k = 1u8;
-            if matches!(b.get(*i), Some(b'f' | b'F')) {
-                *i += 1;
-                k = 0;
-            } else if matches!(b.get(*i), Some(b'l' | b'L')) {
-                *i += 1; // long double: Darwin = double; ELF = binary128 tại biên ABI
-                k = 2;
-            }
-            return Ok(Tok::FNum(v, k));
+            let (k, im) = fsuffix(b, i);
+            return Ok(if im { Tok::INum(v, k) } else { Tok::FNum(v, k) });
         }
         let v = u64::from_str_radix(&src[d..*i], 16).map_err(|e| format!("{e}"))?;
         return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
@@ -194,15 +205,8 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
             }
         }
         let v: f64 = src[s..*i].parse().map_err(|e| format!("{e}"))?;
-        let mut k = 1u8;
-        if matches!(b.get(*i), Some(b'f' | b'F')) {
-            *i += 1;
-            k = 0;
-        } else if matches!(b.get(*i), Some(b'l' | b'L')) {
-            *i += 1; // long double: Darwin = double; ELF = binary128 tại biên ABI
-            k = 2;
-        }
-        return Ok(Tok::FNum(v, k));
+        let (k, im) = fsuffix(b, i);
+        return Ok(if im { Tok::INum(v, k) } else { Tok::FNum(v, k) });
     }
     let octal = b[s] == b'0' && *i > s + 1;
     // "08" là pp-number hợp lệ, chỉ ill-formed khi DÙNG làm hằng (pcre2.h:
@@ -409,7 +413,9 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
             }
         };
         let raw = match tok {
-            Tok::Num(..) | Tok::FNum(..) | Tok::Str(..) => src[tok_start..i].to_string(),
+            Tok::Num(..) | Tok::FNum(..) | Tok::INum(..) | Tok::Str(..) => {
+                src[tok_start..i].to_string()
+            }
             _ => String::new(),
         };
         toks.push(PTok {

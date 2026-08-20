@@ -202,6 +202,23 @@ def incdec_cases():
                 out.append((t, v, "--"))
     return out
 
+def complex_cases():
+    """ℂ = trường trên ℝ² (C99 6.2.5). Vét field ops +,−,× trên _Complex
+    float/double × lưới góc (giá trị exact trong float ⇒ × cũng exact, khớp cc
+    bit-đối-bit — KHÔNG gồm / vì __divdc3 Smith của cc lệch ULP với công thức
+    thẳng, deviation đã tuyên trong cplx_bin). Cũng phủ liên hợp ~ và phép
+    chiếu __real__/__imag__ (π₁,π₂). Hằng ảo `Nif` khớp lexer INum."""
+    out = []
+    corners = [0.0, 1.0, -2.0, 3.0]
+    for t in ("float", "double"):
+        for are in corners:
+            for aim in corners:
+                for bre in corners:
+                    for bim in corners:
+                        for op in ("+", "-", "*"):
+                            out.append((t, are, aim, bre, bim, op))
+    return out
+
 def main(outdir):
     bins = enum_cases()
     flts = float_cases()
@@ -244,6 +261,20 @@ def main(outdir):
         blocks.append(
             "{ %s a = %s; %s p = %sa; printf(\"%s %s\\n\", %sa, %sp); }"
             % (t, clit(t, v), t, op, fmt, fmt, cast, cast))
+    # ---- complex: field ops + liên hợp + chiếu (runtime, trọng tài cc) ----
+    for t, are, aim, bre, bim, op in complex_cases():
+        sfx = "if" if t == "float" else "i"  # hằng ảo khớp lexer INum
+        ce = lambda v: "%r%s" % (v, "f" if t == "float" else "")
+        blocks.append(
+            "{ %s _Complex a = %s + (%s)*1.0%s; %s _Complex b = %s + (%s)*1.0%s;"
+            " %s _Complex r = a %s b;"
+            " printf(\"%%a %%a\\n\", (double)__real__ r, (double)__imag__ r); }"
+            % (t, ce(are), ce(aim), sfx, t, ce(bre), ce(bim), sfx, t, op))
+        if op == "+":  # liên hợp ~z = (re,−im) một lần cho mỗi cặp (a)
+            blocks.append(
+                "{ %s _Complex a = %s + (%s)*1.0%s; %s _Complex r = ~a;"
+                " printf(\"%%a %%a\\n\", (double)__real__ r, (double)__imag__ r); }"
+                % (t, ce(are), ce(aim), sfx, t))
     write_prog(outdir, "run", blocks)
 
     # ---- họ fold_*.c + fri_*.c: chỉ int (miền const-expr C89), binary + unary ----

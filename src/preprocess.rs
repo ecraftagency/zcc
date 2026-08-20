@@ -991,6 +991,7 @@ pub fn spell(t: &Tok) -> String {
         Tok::Num(n, NumK::U | NumK::UL) => (*n as u64).to_string(),
         Tok::Num(n, _) => n.to_string(),
         Tok::FNum(v, _) => format!("{v:?}"),
+        Tok::INum(v, _) => format!("{v:?}i"),
         Tok::Ident(s) => s.clone(),
         Tok::Punct(p) => p.to_string(),
         Tok::Str(b, _) => {
