@@ -249,7 +249,8 @@ pub enum Node {
     Do(NodeId, NodeId), // body, cond
     // cond, body, (giá trị case → NodeId của Case), Case default. Label đích
     // của case = "LC{node id của Case}" — id arena duy nhất nên khỏi cấp phát.
-    Switch(NodeId, NodeId, Vec<(i64, NodeId)>, Option<NodeId>),
+    // cases = (lo, hi, Case-id); single value ⟺ lo==hi. EXT(gcc): case lo...hi.
+    Switch(NodeId, NodeId, Vec<(i64, i64, NodeId)>, Option<NodeId>),
     Case(NodeId),
     Break,
     Continue,

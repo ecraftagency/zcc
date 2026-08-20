@@ -73,7 +73,7 @@ struct P<'a> {
     typedefs: HashMap<String, TypeId>,
     enums: HashMap<String, i64>,
     enum_tags: HashMap<String, TypeId>, // tag → underlying (INT | UINT, khớp clang)
-    switches: Vec<(Vec<(i64, NodeId)>, Option<NodeId>)>,
+    switches: Vec<(Vec<(i64, i64, NodeId)>, Option<NodeId>)>,
     fret: TypeId,              // kiểu trả về của hàm đang parse
     va_off: u32,               // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
     in_fn: bool,               // đang trong body hàm (compound literal: local vs global ẩn)
@@ -1749,17 +1749,21 @@ impl P<'_> {
             let ct = self.promote(self.ty(c));
             if self.tt.size(ct) == 4 {
                 let uns = self.tt.is_unsigned(ct);
-                for (v, _) in &mut cases {
-                    *v = if uns {
-                        *v as u32 as i64
-                    } else {
-                        *v as i32 as i64
-                    };
+                let narrow = |v: i64| if uns { v as u32 as i64 } else { v as i32 as i64 };
+                for (lo, hi, _) in &mut cases {
+                    *lo = narrow(*lo);
+                    *hi = narrow(*hi);
                 }
             }
             Ok(self.push(Node::Switch(c, b, cases, def), INT))
         } else if self.eat_kw("case") {
-            let v = self.const_expr()?;
+            let lo = self.const_expr()?;
+            // EXT(gcc): case lo ... hi — nhãn cho MỌI giá trị trong [lo,hi]
+            let hi = if self.eat(&Tok::Punct("...")) {
+                self.const_expr()?
+            } else {
+                lo
+            };
             self.expect(Tok::Punct(":"))?;
             let st = self.stmt()?;
             let id = self.push(Node::Case(st), INT);
@@ -1767,7 +1771,7 @@ impl P<'_> {
                 .last_mut()
                 .ok_or("case ngoài switch")?
                 .0
-                .push((v, id));
+                .push((lo, hi, id));
             Ok(id)
         } else if self.eat_kw("default") {
             self.expect(Tok::Punct(":"))?;

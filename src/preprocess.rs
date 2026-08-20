@@ -132,6 +132,11 @@ fn preprocess_pt(
         ("__ORDER_BIG_ENDIAN__", "4321"),
         ("__ORDER_PDP_ENDIAN__", "3412"),
         ("__BYTE_ORDER__", "1234"),
+        // Hằng float.h GCC predefine (IEEE754): FLT_MIN=2^-126, FLT_MAX=(2-2^-23)·2^127,
+        // DBL_MANT_DIG=53 bit mantissa. Chỉ 3 macro corpus torture thật đòi (test-first).
+        ("__FLT_MIN__", "1.17549435082228750797e-38F"),
+        ("__FLT_MAX__", "3.40282346638528859812e+38F"),
+        ("__DBL_MANT_DIG__", "53"),
     ] {
         let toks = lex(v).map_err(|e| e.to_string())?;
         macros.insert(m.into(), Macro::Obj(toks));

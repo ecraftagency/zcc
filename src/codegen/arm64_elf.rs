@@ -707,9 +707,13 @@ impl Cg<'_> {
             Node::Switch(c, b, cases, def) => {
                 let n = self.labels(1);
                 self.expr(*c);
-                for &(v, cid) in cases {
-                    self.imm("x1", v);
-                    _ = writeln!(self.s, "\tcmp x0, x1\n\tb.eq LC{cid}");
+                // (lo,hi): val∈[lo,hi] ⟺ (unsigned)(val-lo) ≤ (hi-lo). Phủ single
+                // (hi-lo=0 ⟺ b.ls là ==) lẫn EXT(gcc) case-range, không cần dấu.
+                for &(lo, hi, cid) in cases {
+                    self.imm("x1", lo);
+                    self.s += "\tsub x2, x0, x1\n";
+                    self.imm("x1", hi.wrapping_sub(lo));
+                    _ = writeln!(self.s, "\tcmp x2, x1\n\tb.ls LC{cid}");
                 }
                 match def {
                     Some(d) => _ = writeln!(self.s, "\tb LC{d}"),
