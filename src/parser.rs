@@ -311,6 +311,11 @@ impl P<'_> {
                 // thu hẹp theo kiểu đích để (char)300 v.v. đúng
                 let v = self.fold(*e)?;
                 let t = self.ty(id);
+                // _Bool KHÔNG thu hẹp modular: C99 6.3.1.2 = (value != 0). size 1 +
+                // unsigned trùng nhánh `v as u8` → (_Bool)0x100 ra 0 (sai). Chặn trước.
+                if matches!(self.tt.tys[t as usize], Ty::Bool) {
+                    return Ok((v != 0) as i64);
+                }
                 Ok(match self.tt.size(t) {
                     1 if self.tt.is_unsigned(t) => v as u8 as i64,
                     1 => v as i8 as i64,
