@@ -355,7 +355,7 @@ fn process(
     let mut saved: HashMap<String, Vec<Option<Macro>>> = HashMap::new(); // push_macro
 
     while i < toks.len() {
-        let active = conds.last().map_or(true, |c| c.active);
+        let active = conds.last().is_none_or(|c| c.active);
         let t = &toks[i];
         if !(t.bol && t.tok == Tok::Punct("#")) {
             if active {
@@ -589,14 +589,13 @@ fn process(
                             .entry(name.clone())
                             .or_default()
                             .push(macros.get(&name).cloned());
-                    } else if p == "pop_macro" {
-                        if let Some(m) = saved.get_mut(&name).and_then(|v| v.pop()) {
+                    } else if p == "pop_macro"
+                        && let Some(m) = saved.get_mut(&name).and_then(|v| v.pop()) {
                             match m {
                                 Some(m) => drop(macros.insert(name, m)),
                                 None => drop(macros.remove(&name)),
                             }
                         }
-                    }
                 }
             }
             _ => return Err(err(file, lno, &format!("directive lạ #{}", kw))),
@@ -848,8 +847,8 @@ fn substitute(
                 .ok_or_else(|| err(file, lno, "## ở cuối thân macro"))?;
             // EXT(gcc): ", ## __VA_ARGS__" — arg rỗng thì XÓA dấu phẩy, có arg
             // thì giữ nguyên phẩy + args (không paste thật; rescan expand sau)
-            if let Some(p) = param_of(Some(r), params) {
-                if matches!(out.last().map(|x| &x.tok), Some(Tok::Punct(","))) {
+            if let Some(p) = param_of(Some(r), params)
+                && matches!(out.last().map(|x| &x.tok), Some(Tok::Punct(","))) {
                     if args[p].is_empty() {
                         out.pop();
                     } else {
@@ -858,7 +857,6 @@ fn substitute(
                     i += 2;
                     continue;
                 }
-            }
             let rhs = match param_of(Some(r), params) {
                 Some(p) => args[p].clone(),
                 None => vec![r.clone()],

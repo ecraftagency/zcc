@@ -209,8 +209,8 @@ pub fn copy_prop(f: &mut IrFunc) -> u32 {
     let mut subst: Vec<Option<Val>> = vec![None; nt];
     for b in &f.blocks {
         for i in &b.insts {
-            if let Inst::Copy(d, _, src) = i {
-                if defcnt[*d as usize] == 1 {
+            if let Inst::Copy(d, _, src) = i
+                && defcnt[*d as usize] == 1 {
                     let ok = match src {
                         Val::Imm(_) | Val::FImm(_) => true,
                         Val::Tmp(s) => defcnt[*s as usize] == 1,
@@ -219,7 +219,6 @@ pub fn copy_prop(f: &mut IrFunc) -> u32 {
                         subst[*d as usize] = Some(*src);
                     }
                 }
-            }
         }
     }
     let mut n = 0u32;
@@ -227,22 +226,20 @@ pub fn copy_prop(f: &mut IrFunc) -> u32 {
         for i in b.insts.iter_mut() {
             each_use_mut(i, |v| {
                 let r = resolve(&subst, *v);
-                if !matches!((*v, r), (Val::Tmp(a), Val::Tmp(b)) if a == b) {
-                    if !matches!(*v, Val::Imm(_) | Val::FImm(_)) {
+                if !matches!((*v, r), (Val::Tmp(a), Val::Tmp(b)) if a == b)
+                    && !matches!(*v, Val::Imm(_) | Val::FImm(_)) {
                         *v = r;
                         n += 1;
                     }
-                }
             });
         }
         each_use_term_mut(&mut b.term, |v| {
             let r = resolve(&subst, *v);
-            if !matches!((*v, r), (Val::Tmp(a), Val::Tmp(b)) if a == b) {
-                if !matches!(*v, Val::Imm(_) | Val::FImm(_)) {
+            if !matches!((*v, r), (Val::Tmp(a), Val::Tmp(b)) if a == b)
+                && !matches!(*v, Val::Imm(_) | Val::FImm(_)) {
                     *v = r;
                     n += 1;
                 }
-            }
         });
     }
     n
@@ -524,11 +521,10 @@ pub fn color(adj: &[HashSet<Tmp>], k: u32) -> Alloc {
     while let Some(v) = stack.pop() {
         let mut used = vec![false; k as usize];
         for &nb in &adj[v as usize] {
-            if let Some(c) = colr[nb as usize] {
-                if (c as usize) < k as usize {
+            if let Some(c) = colr[nb as usize]
+                && (c as usize) < k as usize {
                     used[c as usize] = true;
                 }
-            }
         }
         match (0..k).find(|&c| !used[c as usize]) {
             Some(c) => colr[v as usize] = Some(c),

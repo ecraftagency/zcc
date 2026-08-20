@@ -378,15 +378,14 @@ impl P<'_> {
     fn fold_f(&self, id: NodeId) -> Result<f64, String> {
         // cây con kiểu NGUYÊN (musl: (double)(1 << k) trong POWF_SCALE):
         // fold nguyên trọn vẹn rồi đổi sang thực theo dấu
-        if !self.tt.is_float(self.ty(id)) {
-            if let Ok(v) = self.fold(id) {
+        if !self.tt.is_float(self.ty(id))
+            && let Ok(v) = self.fold(id) {
                 return Ok(if self.tt.is_unsigned(self.ty(id)) {
                     v as u64 as f64
                 } else {
                     v as f64
                 });
             }
-        }
         match &self.nodes[id as usize] {
             Node::FNum(v) => Ok(*v),
             // unsigned 64-bit: 9223372036854775810ul phải thành 9.2e18 chứ không âm
@@ -493,13 +492,11 @@ impl P<'_> {
                         let mut t = self.ty(e);
                         // typeof(tên hàm) = KIỂU HÀM, không decay (musl weak_alias:
                         // extern __typeof(f) g — g phải là hàm để alias đúng nhánh)
-                        if let Node::FunAddr(_) = self.nodes[e as usize] {
-                            if let Ty::Ptr(p) = self.tt.tys[t as usize] {
-                                if matches!(self.tt.tys[p as usize], Ty::Func(_)) {
+                        if let Node::FunAddr(_) = self.nodes[e as usize]
+                            && let Ty::Ptr(p) = self.tt.tys[t as usize]
+                                && matches!(self.tt.tys[p as usize], Ty::Func(_)) {
                                     t = p;
                                 }
-                            }
-                        }
                         t
                     };
                     self.expect(Tok::Punct(")"))?;
@@ -785,14 +782,13 @@ impl P<'_> {
     }
     fn enum_spec(&mut self) -> Result<TypeId, String> {
         let mut tag = String::new();
-        if let Some(Tok::Ident(n)) = self.toks.get(self.pos) {
-            if !self.is_type_word(n) && self.toks.get(self.pos + 1) != Some(&Tok::Punct("{"))
-                || self.toks.get(self.pos + 1) == Some(&Tok::Punct("{"))
+        if let Some(Tok::Ident(n)) = self.toks.get(self.pos)
+            && (!self.is_type_word(n) && self.toks.get(self.pos + 1) != Some(&Tok::Punct("{"))
+                || self.toks.get(self.pos + 1) == Some(&Tok::Punct("{")))
             {
                 tag = n.clone();
                 self.pos += 1;
             }
-        }
         // EXT(clang): enum tag : underlying-type (SDK malloc.h) — honor kiểu nền
         let under = if self.eat(&Tok::Punct(":")) {
             Some(self.typename()?)
@@ -859,11 +855,10 @@ impl P<'_> {
             // "extern int (*f)(...) __printflike(1,0);")
             self.asm_label = None;
             self.skip_attrs()?;
-            if let Some(l) = self.asm_label.take() {
-                if !res.0.is_empty() {
+            if let Some(l) = self.asm_label.take()
+                && !res.0.is_empty() {
                     self.renames.insert(res.0.clone(), l);
                 }
-            }
             return Ok(res);
         }
         let name = match self.toks.get(self.pos) {
@@ -920,11 +915,10 @@ impl P<'_> {
             }
         }
         // EXT(gcc): asm-label sau declarator → symbol thật khi emit (Call/FunAddr)
-        if let Some(l) = self.asm_label.take() {
-            if !name.is_empty() {
+        if let Some(l) = self.asm_label.take()
+            && !name.is_empty() {
                 self.renames.insert(name.clone(), l);
             }
-        }
         Ok((name, t))
     }
     // EXT(gcc): tên C → symbol emit; prefix \x01 = đã đủ tên, codegen không thêm '_'
@@ -1209,12 +1203,11 @@ impl P<'_> {
         // complex → real: lấy phần thực (creal của musl CHÍNH LÀ cast này);
         // real/complex → complex: temp + gán từng phần, phần ảo = 0.
         let (se, de) = (self.cplx_elem(self.ty(e)), self.cplx_elem(to));
-        if let (Some(sel), None) = (se, de) {
-            if self.tt.is_integer(to) || self.tt.is_float(to) {
+        if let (Some(sel), None) = (se, de)
+            && (self.tt.is_integer(to) || self.tt.is_float(to)) {
                 let m = self.push(Node::Member(e, 0), sel);
                 return self.cast(m, to);
             }
-        }
         if de.is_some()
             && self.in_fn
             && (se.is_some() || self.tt.is_integer(self.ty(e)) || self.tt.is_float(self.ty(e)))
@@ -2038,11 +2031,10 @@ impl P<'_> {
                     });
                     // nested function (GNU) = vendor lock-in đã BỎ (clang/MSVC không
                     // có, không app nào trong rổ đòi, đòi exec-stack): reject sạch.
-                    if let Ty::Func(_) = self.tt.tys[t as usize] {
-                        if self.peek("{") {
+                    if let Ty::Func(_) = self.tt.tys[t as usize]
+                        && self.peek("{") {
                             return Err("nested function (GNU) không hỗ trợ".into());
                         }
-                    }
                     match storage {
                         Storage::Typedef => {
                             // C99 6.7.7 + 6.5.3.4p2: typedef của variably-modified
@@ -2314,8 +2306,8 @@ impl P<'_> {
                         }
                     }
                     // GNU cổ: "a : 'A'" ≡ ".a = 'A'" (đầu phần tử, không nhầm ?:)
-                    if steps.is_empty() {
-                        if let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
+                    if steps.is_empty()
+                        && let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
                             (self.toks.get(self.pos), self.toks.get(self.pos + 1))
                         {
                             steps.push(Desig::Mem(n.clone()));
@@ -2327,7 +2319,6 @@ impl P<'_> {
                             }
                             continue;
                         }
-                    }
                     if !steps.is_empty() {
                         self.expect(Tok::Punct("="))?;
                     }
@@ -2396,7 +2387,7 @@ impl P<'_> {
                         for c in cps {
                             wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                         }
-                        wb.extend(std::iter::repeat(0).take(ew));
+                        wb.extend(std::iter::repeat_n(0, ew));
                         if n > 0 && wb.len() as u64 > n * es as u64 {
                             wb.truncate((n * es as u64) as usize);
                         }
@@ -2420,7 +2411,7 @@ impl P<'_> {
                     for c in cps {
                         wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                     }
-                    wb.extend(std::iter::repeat(0).take(ew - 1)); // .asciz bù NUL cuối
+                    wb.extend(std::iter::repeat_n(0, ew - 1)); // .asciz bù NUL cuối
                     b = wb;
                     (n + 1, if w == 2 { USHORT } else { INT })
                 } else {
@@ -2598,11 +2589,10 @@ impl P<'_> {
             let esz = self.tt.size(e);
             let hit = matches!(&init, Init::L(v) if v.len() == 1
                 && matches!(&v[0], (Desig::No, Init::S(_, w)) if esz == 1 || (*w > 1 && esz == *w as u32)));
-            if hit {
-                if let Init::L(v) = init {
+            if hit
+                && let Init::L(v) = init {
                     return v.into_iter().next().unwrap().1;
                 }
-            }
         }
         init
     }
@@ -2746,11 +2736,10 @@ impl P<'_> {
                 return Ok(GInit::StrOff(i, k));
             }
             Node::Addr(inner) => {
-                if let Node::Deref(x) = self.nodes[*inner as usize] {
-                    if let Some((i, k)) = stroff(self, x) {
+                if let Node::Deref(x) = self.nodes[*inner as usize]
+                    && let Some((i, k)) = stroff(self, x) {
                         return Ok(GInit::StrOff(i, k));
                     }
-                }
             }
             Node::LabelAddr(n) => {
                 // symbol khớp quy ước label của codegen (không gạch dưới đầu)
@@ -2794,8 +2783,8 @@ impl P<'_> {
             return Ok(GInit::Num(bits));
         }
         // hằng nguyên từ biểu thức thực: (int)1.9 v.v. — fold_f rồi truncate
-        if self.tt.is_float(self.ty(e0)) || self.tt.is_float(self.ty(e)) {
-            if let Ok(v) = self.fold_f(e) {
+        if (self.tt.is_float(self.ty(e0)) || self.tt.is_float(self.ty(e)))
+            && let Ok(v) = self.fold_f(e) {
                 // cast Rust saturate: unsigned phải đi đường u64 kẻo 1.8e19 → i64::MAX
                 let n = if self.tt.is_unsigned(t) {
                     v as u64 as i64
@@ -2804,7 +2793,6 @@ impl P<'_> {
                 };
                 return Ok(GInit::Num(n));
             }
-        }
         Ok(GInit::Num(self.fold(e0)?))
     }
     // init global/static: trả về GInit + chốt size mảng []
@@ -3029,9 +3017,9 @@ impl P<'_> {
             return self.cplx_proj(e, true);
         }
         // cast: "(" typename ")"
-        if self.peek("(") {
-            if let Some(Tok::Ident(n)) = self.toks.get(self.pos + 1) {
-                if self.is_type_word(n) || n == "__attribute__" {
+        if self.peek("(")
+            && let Some(Tok::Ident(n)) = self.toks.get(self.pos + 1)
+                && (self.is_type_word(n) || n == "__attribute__") {
                     self.pos += 1;
                     let ty = self.typename()?;
                     self.expect(Tok::Punct(")"))?;
@@ -3102,8 +3090,6 @@ impl P<'_> {
                     let e = self.unary()?;
                     return Ok(self.cast(e, ty));
                 }
-            }
-        }
         if self.eat(&Tok::Punct("-")) {
             let e = self.unary()?;
             // C99: -z trên complex → 0 - z (0.0 giữ elem để không lên double)
@@ -3191,7 +3177,7 @@ impl P<'_> {
                 }
                 self.tt.align(t)
             };
-            return Ok(self.push(Node::Num(al as i64), ULONG));
+            Ok(self.push(Node::Num(al as i64), ULONG))
         } else if self.eat_kw("sizeof") {
             // sizeof(typename) | sizeof unary
             let sz = if self.peek("(")
@@ -3219,11 +3205,10 @@ impl P<'_> {
                 // C99 6.5.3.4p2: toán hạng VLA → sizeof runtime, đọc local ẩn
                 // .vlasz: `sizeof a` (local VLA, đã decay con trỏ trong rep)
                 // qua vla_szs; `sizeof *p` (p = con trỏ tới VLA) qua vla_arrs
-                if let Node::Var(off) = self.nodes[e as usize] {
-                    if let Some(&hid) = self.vla_szs.get(&off) {
+                if let Node::Var(off) = self.nodes[e as usize]
+                    && let Some(&hid) = self.vla_szs.get(&off) {
                         return Ok(self.push(Node::Var(hid), ULONG));
                     }
-                }
                 let t = self.ty(e);
                 if let Some(&hid) = self.vla_arrs.get(&t) {
                     return Ok(self.push(Node::Var(hid), ULONG));
@@ -3423,13 +3408,11 @@ impl P<'_> {
             if n == name {
                 return Some((*t, *o));
             }
-            if n.is_empty() {
-                if let Ty::Struct(si2) = self.tt.tys[*t as usize] {
-                    if let Some((mt, mo)) = self.find_member(si2, name) {
+            if n.is_empty()
+                && let Ty::Struct(si2) = self.tt.tys[*t as usize]
+                    && let Some((mt, mo)) = self.find_member(si2, name) {
                         return Some((mt, o + mo));
                     }
-                }
-            }
         }
         None
     }
@@ -3506,7 +3489,7 @@ impl P<'_> {
                 for c in &cps {
                     wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                 }
-                wb.extend(std::iter::repeat(0).take(ew - 1));
+                wb.extend(std::iter::repeat_n(0, ew - 1));
                 self.strs.push(wb);
                 let i = (self.strs.len() - 1) as u32;
                 let elem = if wid == 2 { USHORT } else { INT };
@@ -3661,8 +3644,8 @@ impl P<'_> {
             }
             // EXT(gcc): atomics __sync_* (M12) — không phải symbol libc, hạ thẳng
             // xuống Node::Sync cho codegen phát ldaxr/stlxr; bảng tên ở ext.rs
-            if let Some((op, arity)) = crate::ext::sync_op(&n) {
-                if self.peek("(") {
+            if let Some((op, arity)) = crate::ext::sync_op(&n)
+                && self.peek("(") {
                     self.pos += 1;
                     let mut args = Vec::new();
                     for k in 0..arity {
@@ -3700,7 +3683,6 @@ impl P<'_> {
                     };
                     return Ok(self.push(Node::Sync(op, args, sz), ret));
                 }
-            }
             if let Some(&v) = self.enums.get(&n) {
                 return Ok(self.push(Node::Num(v), INT));
             }
@@ -3984,25 +3966,21 @@ impl P<'_> {
             let mut used = vec![false; funcs.len()];
             let mut queue: Vec<usize> = Vec::new();
             for (k, n) in self.nodes.iter().enumerate() {
-                if !in_weak[k] {
-                    if let Some(&i) = refname(n).and_then(|nm| weak_idx.get(nm)) {
-                        if !used[i] {
+                if !in_weak[k]
+                    && let Some(&i) = refname(n).and_then(|nm| weak_idx.get(nm))
+                        && !used[i] {
                             used[i] = true;
                             queue.push(i);
                         }
-                    }
-                }
             }
             while let Some(i) = queue.pop() {
                 for k in ranges[i].0..ranges[i].1 {
                     if let Some(&j) =
                         refname(&self.nodes[k as usize]).and_then(|nm| weak_idx.get(nm))
-                    {
-                        if !used[j] {
+                        && !used[j] {
                             used[j] = true;
                             queue.push(j);
                         }
-                    }
                 }
             }
             let mut i = 0;
@@ -4202,7 +4180,7 @@ fn f128_bytes(v: f64) -> [u8; 16] {
             let sh = m.leading_zeros() - 11; // đưa bit dẫn về vị trí 52 (hidden)
             (
                 16383 - 1022 - sh as u128,
-                ((((m as u128) << sh) & ((1 << 52) - 1)) as u128) << 60,
+                ((((m as u128) << sh) & ((1 << 52) - 1))) << 60,
             )
         }
         0x7ff => (0x7fff, (m as u128) << 60),

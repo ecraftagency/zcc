@@ -40,7 +40,7 @@ pub struct PTok {
 }
 
 // C99 6.4.6: digraphs — dài trước ngắn ("%:%:" trước "%:").
-const DIGRAPHS: [(&str, &'static str); 6] = [
+const DIGRAPHS: [(&str, &str); 6] = [
     ("%:%:", "##"),
     ("%:", "#"),
     ("<:", "["),

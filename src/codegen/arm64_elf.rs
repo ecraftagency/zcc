@@ -267,7 +267,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             }
         }
     }
-    g.va = (gp.min(8) as u32, fp.min(8) as u32, boff, f.frame);
+    g.va = (gp.min(8), fp.min(8), boff, f.frame);
 }
 
 
