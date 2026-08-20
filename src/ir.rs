@@ -568,6 +568,16 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_stmt(&mut self, n: NodeId) {
+        // Code CHẾT sau terminator (return/goto/break/continue) vẫn được Block lower.
+        // `push` drop-khi-done nhưng `t()` cấp temp vô điều kiện → một Cond bên trong
+        // dead-code `goto` hồi sinh block ⟹ def của addr rớt (done) nhưng use sống lại
+        // → temp mồ côi (csmith c0041/c0126, verify V2 bắt). Fix: mở block TƯƠI cho mỗi
+        // stmt chết để nó lower NHẤT QUÁN (mọi def push đủ); block unreachable, well-formed,
+        // backend emit vô hại; nhãn goto-đích vẫn reachable qua label_block.
+        if self.done {
+            let d = self.reserve();
+            self.goto(d);
+        }
         let a = self.a;
         match &a.nodes[n as usize] {
             Node::Block(v) => {
