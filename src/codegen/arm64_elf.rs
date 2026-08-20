@@ -20,6 +20,7 @@
 // vô danh variadic đi reg như named (AAPCS chuẩn). Return: x0 / d0.
 // Label: "L{n}" tuần tự; "LC{id}" đích case; "lg_{fn}.{tên}" label goto.
 use crate::ast::{Ast, GInit, Node, NodeId, SyncOp, Ty, TypeId, VOID};
+use crate::ir::{self, Callee, Inst, IrFunc, Op, Place, Term, Tmp, Un, Val};
 use std::fmt::Write;
 
 const EPILOGUE: &str = "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n";
@@ -49,6 +50,10 @@ struct Cg<'a> {
     fvariadic: bool,
     fhasvla: bool,
     vla_live: u32, // số VLA lexical đang sống (scope hiện tại) khi walk
+    // đường IR (migrate): base offset vùng temp-slot (= frame; temp i tại
+    // x29 − (ir_tbase + 8 + i*8)); ir_temps = bảng kiểu temp hàm hiện tại.
+    ir_tbase: u32,
+    ir_temps: Vec<TypeId>,
 }
 
 pub fn emit(ast: &Ast) -> String {
@@ -69,6 +74,8 @@ pub fn emit(ast: &Ast) -> String {
         fvariadic: false,
         fhasvla: false,
         vla_live: 0,
+        ir_tbase: 0,
+        ir_temps: Vec::new(),
     };
     // EXT(gcc): __asm__("...") cấp toàn cục (musl crt_arch.h _start) — verbatim
     for a in &ast.raw_asm {
@@ -107,167 +114,180 @@ pub fn emit(ast: &Ast) -> String {
         if f.frame > 0 {
             g.sp_adjust("sub", f.frame);
         }
-        // EXT(gcc): nested → lưu static chain (x18, do trampoline/caller nạp) vào
-        // slot; Upvar/forward-call/NlGoto đọc lại từ đây (x18 caller-saved, mất
-        // sau call). x18 chưa bị đụng ở prologue nên lưu sớm là an toàn.
-        if f.parent_uid != u32::MAX {
-            g.lea_local("x9", f.chain);
-            g.s += "\tstr x18, [x9]\n";
-        }
-        if f.variadic {
-            // register-save area AAPCS: đổ NGUYÊN 8 q-reg + 8 x-reg (kể cả phần
-            // named — thừa vô hại, đỡ phân nhánh); phải trước spill (đọc reg gốc)
-            g.sp_adjust("sub", 192);
-            g.imm("x9", (f.frame + 192) as i64);
-            g.s += "\tsub x9, x29, x9\n";
-            for i in 0..4u32 {
-                _ = writeln!(g.s, "\tstp q{}, q{}, [x9, #{}]", 2 * i, 2 * i + 1, 32 * i);
-            }
-            for i in 0..4u32 {
-                _ = writeln!(
-                    g.s,
-                    "\tstp x{}, x{}, [x9, #{}]",
-                    2 * i,
-                    2 * i + 1,
-                    128 + 16 * i
-                );
-            }
-        }
-        if f.sret != 0 {
-            g.lea_local("x9", f.sret);
-            g.s += "\tstr x8, [x9]\n";
-        }
-        // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack
-        // caller tại [x29 + 16 + boff]. AAPCS chuẩn: scalar tràn mỗi cái một
-        // slot 8 tròn, composite align 8 size tròn 8 (over-alignment aligned(16+)
-        // bị BỎ QUA — gcc arm64 verify asm: named x3,x4 / stack [sp,8], pr92904),
-        // composite tràn khóa gp=8 (C.11). PHẢI khớp từng byte với call().
-        let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
-        let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
-        for &(off, t) in &f.params {
-            // struct by value ≤16B: đến trong 1-2 GPR liên tiếp (hoặc stack)
-            if let Some((dbl, n)) = ast.tt.hfa(t) {
-                if fp + n <= 8 {
-                    g.lea_local("x9", off);
-                    for j in 0..n {
-                        if dbl {
-                            _ = writeln!(g.s, "\tstr d{}, [x9, #{}]", fp + j, 8 * j);
-                        } else {
-                            _ = writeln!(g.s, "\tstr s{}, [x9, #{}]", fp + j, 4 * j);
-                        }
-                    }
-                    fp += n;
-                } else {
-                    fp = 8; // AAPCS C.3: HFA tràn khóa v-reg còn lại
-                    let sz = ast.tt.size(t);
-                    let o = alup(boff, 8);
-                    boff = o + sz.div_ceil(8) * 8;
-                    _ = writeln!(g.s, "\tadd x11, x29, #{}", 16 + o);
-                    g.lea_local("x9", off);
-                    g.imm("x12", sz as i64);
-                    let n2 = g.labels(1);
-                    _ = writeln!(g.s, "L{n2}:");
-                    g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
-                    _ = writeln!(g.s, "\tb.ne L{n2}");
-                }
-                continue;
-            }
-            if matches!(ast.tt.tys[t as usize], Ty::Struct(_)) {
-                let sz = ast.tt.size(t);
-                if sz > 16 {
-                    // >16B: đến dưới dạng CON TRỎ (1 GPR / 1 slot) — copy về slot local
-                    if gp < 8 {
-                        _ = writeln!(g.s, "\tmov x11, x{gp}");
-                        gp += 1;
-                    } else {
-                        let o = alup(boff, 8); // con trỏ = scalar 8 byte
-                        boff = o + 8;
-                        _ = writeln!(g.s, "\tldr x11, [x29, #{}]", 16 + o);
-                    }
-                    g.lea_local("x9", off);
-                    g.imm("x12", sz as i64);
-                    let n = g.labels(1);
-                    _ = writeln!(g.s, "L{n}:");
-                    g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
-                    _ = writeln!(g.s, "\tb.ne L{n}");
-                    continue;
-                }
-                let need = if sz > 8 { 2 } else { 1 };
-                g.lea_local("x9", off);
-                if gp + need <= 8 {
-                    _ = writeln!(g.s, "\tmov x8, x{gp}");
-                    g.store_narrow(0, sz.min(8));
-                    if sz > 8 {
-                        _ = writeln!(g.s, "\tmov x8, x{}", gp + 1);
-                        g.store_narrow(8, sz - 8);
-                    }
-                    gp += need;
-                } else {
-                    let o = alup(boff, 8);
-                    boff = o + 8 * need;
-                    gp = 8; // AAPCS C.11: composite tràn stack khóa NGRN
-                    _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o);
-                    g.store_narrow(0, sz.min(8));
-                    if sz > 8 {
-                        _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o + 8);
-                        g.store_narrow(8, sz - 8);
-                    }
-                }
-                continue;
-            }
-            let fl = ast.tt.is_float(t);
-            if fl && fp < 8 {
-                g.lea_local("x9", off);
-                match ast.tt.size(t) {
-                    4 => _ = writeln!(g.s, "\tstr s{fp}, [x9]"),
-                    16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: nguyên binary128
-                    _ => _ = writeln!(g.s, "\tstr d{fp}, [x9]"),
-                }
-                fp += 1;
-            } else if !fl && gp < 8 {
-                g.lea_local("x9", off);
-                _ = match ast.tt.size(t) {
-                    1 => writeln!(g.s, "\tstrb w{gp}, [x9]"),
-                    2 => writeln!(g.s, "\tstrh w{gp}, [x9]"),
-                    4 => writeln!(g.s, "\tstr w{gp}, [x9]"),
-                    _ => writeln!(g.s, "\tstr x{gp}, [x9]"),
-                };
-                gp += 1;
-            } else {
-                // scalar trên stack caller: slot 8 tròn tại [x29 + 16 + boff]
-                // (AAPCS chuẩn); load đúng width — giá trị nằm low bytes slot
-                let sz = ast.tt.size(t);
-                if sz == 16 {
-                    // long double tràn: stack arg quad — slot 16, align 16 (AAPCS B/C)
-                    let o = alup(boff, 16);
-                    boff = o + 16;
-                    g.lea_local("x9", off);
-                    _ = writeln!(g.s, "\tldr q7, [x29, #{}]\n\tstr q7, [x9]", 16 + o);
-                    continue;
-                }
-                let o = alup(boff, 8);
-                boff = o + 8;
-                let src = 16 + o;
-                g.lea_local("x9", off);
-                if fl && sz == 4 {
-                    _ = writeln!(g.s, "\tldr s7, [x29, #{src}]\n\tstr s7, [x9]");
-                } else {
-                    _ = match sz {
-                        1 => writeln!(g.s, "\tldrb w8, [x29, #{src}]\n\tstrb w8, [x9]"),
-                        2 => writeln!(g.s, "\tldrh w8, [x29, #{src}]\n\tstrh w8, [x9]"),
-                        4 => writeln!(g.s, "\tldr w8, [x29, #{src}]\n\tstr w8, [x9]"),
-                        _ => writeln!(g.s, "\tldr x8, [x29, #{src}]\n\tstr x8, [x9]"),
-                    };
-                }
-            }
-        }
-        g.va = (gp.min(8) as u32, fp.min(8) as u32, boff, f.frame);
+        emit_params(&mut g, f);
         g.stmt(f.body);
         g.s += "\tmov x0, #0\n";
         g.s += EPILOGUE;
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
     }
+    emit_module_tail(&mut g, ast);
+    g.s
+}
+
+fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
+    let ast = g.a;
+    // EXT(gcc): nested → lưu static chain (x18, do trampoline/caller nạp) vào
+    // slot; Upvar/forward-call/NlGoto đọc lại từ đây (x18 caller-saved, mất
+    // sau call). x18 chưa bị đụng ở prologue nên lưu sớm là an toàn.
+    if f.parent_uid != u32::MAX {
+        g.lea_local("x9", f.chain);
+        g.s += "\tstr x18, [x9]\n";
+    }
+    if f.variadic {
+        // register-save area AAPCS: đổ NGUYÊN 8 q-reg + 8 x-reg (kể cả phần
+        // named — thừa vô hại, đỡ phân nhánh); phải trước spill (đọc reg gốc)
+        g.sp_adjust("sub", 192);
+        g.imm("x9", (f.frame + 192) as i64);
+        g.s += "\tsub x9, x29, x9\n";
+        for i in 0..4u32 {
+            _ = writeln!(g.s, "\tstp q{}, q{}, [x9, #{}]", 2 * i, 2 * i + 1, 32 * i);
+        }
+        for i in 0..4u32 {
+            _ = writeln!(
+                g.s,
+                "\tstp x{}, x{}, [x9, #{}]",
+                2 * i,
+                2 * i + 1,
+                128 + 16 * i
+            );
+        }
+    }
+    if f.sret != 0 {
+        g.lea_local("x9", f.sret);
+        g.s += "\tstr x8, [x9]\n";
+    }
+    // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack
+    // caller tại [x29 + 16 + boff]. AAPCS chuẩn: scalar tràn mỗi cái một
+    // slot 8 tròn, composite align 8 size tròn 8 (over-alignment aligned(16+)
+    // bị BỎ QUA — gcc arm64 verify asm: named x3,x4 / stack [sp,8], pr92904),
+    // composite tràn khóa gp=8 (C.11). PHẢI khớp từng byte với call().
+    let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
+    let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
+    for &(off, t) in &f.params {
+        // struct by value ≤16B: đến trong 1-2 GPR liên tiếp (hoặc stack)
+        if let Some((dbl, n)) = ast.tt.hfa(t) {
+            if fp + n <= 8 {
+                g.lea_local("x9", off);
+                for j in 0..n {
+                    if dbl {
+                        _ = writeln!(g.s, "\tstr d{}, [x9, #{}]", fp + j, 8 * j);
+                    } else {
+                        _ = writeln!(g.s, "\tstr s{}, [x9, #{}]", fp + j, 4 * j);
+                    }
+                }
+                fp += n;
+            } else {
+                fp = 8; // AAPCS C.3: HFA tràn khóa v-reg còn lại
+                let sz = ast.tt.size(t);
+                let o = alup(boff, 8);
+                boff = o + sz.div_ceil(8) * 8;
+                _ = writeln!(g.s, "\tadd x11, x29, #{}", 16 + o);
+                g.lea_local("x9", off);
+                g.imm("x12", sz as i64);
+                let n2 = g.labels(1);
+                _ = writeln!(g.s, "L{n2}:");
+                g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
+                _ = writeln!(g.s, "\tb.ne L{n2}");
+            }
+            continue;
+        }
+        if matches!(ast.tt.tys[t as usize], Ty::Struct(_)) {
+            let sz = ast.tt.size(t);
+            if sz > 16 {
+                // >16B: đến dưới dạng CON TRỎ (1 GPR / 1 slot) — copy về slot local
+                if gp < 8 {
+                    _ = writeln!(g.s, "\tmov x11, x{gp}");
+                    gp += 1;
+                } else {
+                    let o = alup(boff, 8); // con trỏ = scalar 8 byte
+                    boff = o + 8;
+                    _ = writeln!(g.s, "\tldr x11, [x29, #{}]", 16 + o);
+                }
+                g.lea_local("x9", off);
+                g.imm("x12", sz as i64);
+                let n = g.labels(1);
+                _ = writeln!(g.s, "L{n}:");
+                g.s += "\tldrb w13, [x11], #1\n\tstrb w13, [x9], #1\n\tsubs x12, x12, #1\n";
+                _ = writeln!(g.s, "\tb.ne L{n}");
+                continue;
+            }
+            let need = if sz > 8 { 2 } else { 1 };
+            g.lea_local("x9", off);
+            if gp + need <= 8 {
+                _ = writeln!(g.s, "\tmov x8, x{gp}");
+                g.store_narrow(0, sz.min(8));
+                if sz > 8 {
+                    _ = writeln!(g.s, "\tmov x8, x{}", gp + 1);
+                    g.store_narrow(8, sz - 8);
+                }
+                gp += need;
+            } else {
+                let o = alup(boff, 8);
+                boff = o + 8 * need;
+                gp = 8; // AAPCS C.11: composite tràn stack khóa NGRN
+                _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o);
+                g.store_narrow(0, sz.min(8));
+                if sz > 8 {
+                    _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o + 8);
+                    g.store_narrow(8, sz - 8);
+                }
+            }
+            continue;
+        }
+        let fl = ast.tt.is_float(t);
+        if fl && fp < 8 {
+            g.lea_local("x9", off);
+            match ast.tt.size(t) {
+                4 => _ = writeln!(g.s, "\tstr s{fp}, [x9]"),
+                16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: nguyên binary128
+                _ => _ = writeln!(g.s, "\tstr d{fp}, [x9]"),
+            }
+            fp += 1;
+        } else if !fl && gp < 8 {
+            g.lea_local("x9", off);
+            _ = match ast.tt.size(t) {
+                1 => writeln!(g.s, "\tstrb w{gp}, [x9]"),
+                2 => writeln!(g.s, "\tstrh w{gp}, [x9]"),
+                4 => writeln!(g.s, "\tstr w{gp}, [x9]"),
+                _ => writeln!(g.s, "\tstr x{gp}, [x9]"),
+            };
+            gp += 1;
+        } else {
+            // scalar trên stack caller: slot 8 tròn tại [x29 + 16 + boff]
+            // (AAPCS chuẩn); load đúng width — giá trị nằm low bytes slot
+            let sz = ast.tt.size(t);
+            if sz == 16 {
+                // long double tràn: stack arg quad — slot 16, align 16 (AAPCS B/C)
+                let o = alup(boff, 16);
+                boff = o + 16;
+                g.lea_local("x9", off);
+                _ = writeln!(g.s, "\tldr q7, [x29, #{}]\n\tstr q7, [x9]", 16 + o);
+                continue;
+            }
+            let o = alup(boff, 8);
+            boff = o + 8;
+            let src = 16 + o;
+            g.lea_local("x9", off);
+            if fl && sz == 4 {
+                _ = writeln!(g.s, "\tldr s7, [x29, #{src}]\n\tstr s7, [x9]");
+            } else {
+                _ = match sz {
+                    1 => writeln!(g.s, "\tldrb w8, [x29, #{src}]\n\tstrb w8, [x9]"),
+                    2 => writeln!(g.s, "\tldrh w8, [x29, #{src}]\n\tstrh w8, [x9]"),
+                    4 => writeln!(g.s, "\tldr w8, [x29, #{src}]\n\tstr w8, [x9]"),
+                    _ => writeln!(g.s, "\tldr x8, [x29, #{src}]\n\tstr x8, [x9]"),
+                };
+            }
+        }
+    }
+    g.va = (gp.min(8) as u32, fp.min(8) as u32, boff, f.frame);
+}
+
+
+// Đuôi module (globals/TLS/strings/weak/aliases/nested-stack) — dùng CHUNG
+// cho emit() (AST) và emit_ir() (IR). Chỉ đọc ast + phát vào g.s.
+fn emit_module_tail(g: &mut Cg, ast: &Ast) {
     for gl in &ast.globals {
         if gl.is_extern {
             // EXT(gcc): extern weak (musl _DYNAMIC) — ref phải là weak undef
@@ -368,7 +388,6 @@ pub fn emit(ast: &Ast) -> String {
     if ast.funcs.iter().any(|f| f.parent_uid != u32::MAX) {
         g.s += ".section .note.GNU-stack,\"x\",@progbits\n";
     }
-    g.s
 }
 
 impl Cg<'_> {
@@ -616,6 +635,19 @@ impl Cg<'_> {
                 };
             }
         }
+    }
+    // copy `sz` byte: src (x0) → dst (x1), xuôi. Để lại địa chỉ dst ở x0 (rvalue
+    // của gán struct = địa chỉ đích). Dùng chung: AST-path + IR Inst::Memcpy.
+    fn blk_copy(&mut self, sz: u32) {
+        self.s += "\tmov x4, x1\n";
+        if sz > 0 {
+            let n = self.labels(1);
+            self.imm("x2", sz as i64);
+            _ = writeln!(self.s, "L{n}:");
+            self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+            _ = writeln!(self.s, "\tb.ne L{n}");
+        }
+        self.s += "\tmov x0, x4\n"; // giá trị = địa chỉ dst
     }
     // chuyển kiểu giá trị canonical trong x0: from → to
     fn cast_op(&mut self, from: TypeId, to: TypeId) {
@@ -998,17 +1030,7 @@ impl Cg<'_> {
                 self.expr(r);
                 self.s += "\tldr x1, [sp], #16\n";
                 if matches!(self.a.tt.tys[lt as usize], Ty::Struct(_)) {
-                    // struct assign: copy từng byte src (x0) → dst (x1)
-                    let sz = self.a.tt.size(lt);
-                    self.s += "\tmov x4, x1\n";
-                    if sz > 0 {
-                        let n = self.labels(1);
-                        self.imm("x2", sz as i64);
-                        _ = writeln!(self.s, "L{n}:");
-                        self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
-                        _ = writeln!(self.s, "\tb.ne L{n}");
-                    }
-                    self.s += "\tmov x0, x4\n"; // giá trị = địa chỉ dst
+                    self.blk_copy(self.a.tt.size(lt)); // src x0 → dst x1, rvalue = dst
                 } else {
                     self.store(0, lt);
                 }
@@ -1699,4 +1721,397 @@ fn sym(n: &str) -> String {
         Some(raw) => raw.to_string(),
         None => n.to_string(),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ĐƯỜNG IR → asm (migrate, song song đường AST ở trên; bật bằng --ir). Mô hình
+// naive-stack-slot: mỗi temp một slot 8B dưới frame (x29 − (frame+8+i*8)); load
+// operand vào x0/x1, tính, str kết quả về slot. Tái dùng method value-contract
+// (load/store/cast_op/ext/imm/lea_local). Đuôi exotic: Opaque bridge re-emit
+// subtree AST cũ. Đường này sẽ THAY đường AST khi phủ hết suite (rồi xoá AST-walk).
+// ═══════════════════════════════════════════════════════════════════════════
+impl<'a> Cg<'a> {
+    fn ir_toff(&self, i: Tmp) -> u32 {
+        self.ir_tbase + 8 + i * 8
+    }
+    fn tmp_load(&mut self, i: Tmp, reg: &str) {
+        self.lea_local("x9", self.ir_toff(i));
+        _ = writeln!(self.s, "\tldr {reg}, [x9]");
+    }
+    fn tmp_store(&mut self, i: Tmp, reg: &str) {
+        self.lea_local("x9", self.ir_toff(i));
+        _ = writeln!(self.s, "\tstr {reg}, [x9]");
+    }
+    fn ld_val(&mut self, v: Val, reg: &str) {
+        match v {
+            Val::Tmp(t) => self.tmp_load(t, reg),
+            Val::Imm(x) => self.imm(reg, x),
+            Val::FImm(b) => self.imm(reg, b as i64), // bit pattern f64 trong GPR
+        }
+    }
+    fn ir_label(&self, b: u32) -> String {
+        format!(".Lir_{}_{}", self.fname, b)
+    }
+    fn val_is_float(&self, v: Val) -> bool {
+        match v {
+            Val::FImm(_) => true,
+            Val::Imm(_) => false,
+            Val::Tmp(t) => self.a.tt.is_float(self.ir_temps[t as usize]),
+        }
+    }
+    // x0 = &global (+ off). Mirror addr() nhánh GVar: TLS local-exec / GOT (extern
+    // hoặc -fPIC non-static) / adrp+:lo12: (local). Flag tra từ ast.globals theo tên.
+    fn lea_global_x0(&mut self, name: &str, off: i64) {
+        let (is_tls, is_got) = {
+            let gl = self.a.globals.iter().find(|g| g.name.as_str() == name);
+            (
+                gl.is_some_and(|g| g.is_tls),
+                gl.is_some_and(|g| g.is_extern || (self.a.pic && !g.is_static)),
+            )
+        };
+        if is_tls {
+            _ = writeln!(self.s, "\tmrs x0, tpidr_el0\n\tadd x0, x0, #:tprel_hi12:{name}, lsl #12\n\tadd x0, x0, #:tprel_lo12_nc:{name}");
+        } else if is_got {
+            _ = writeln!(self.s, "\tadrp x0, :got:{name}\n\tldr x0, [x0, :got_lo12:{name}]");
+        } else {
+            _ = writeln!(self.s, "\tadrp x0, {name}\n\tadd x0, x0, :lo12:{name}");
+        }
+        if off > 4095 {
+            self.imm("x9", off);
+            self.s += "\tadd x0, x0, x9\n";
+        } else if off > 0 {
+            _ = writeln!(self.s, "\tadd x0, x0, #{off}");
+        }
+    }
+
+    // x0 = lhs, x1 = rhs → x0 = lhs ⟨op⟩ rhs, canonical theo ct. Bản sao ngữ nghĩa
+    // của Node::Bin (dùng chung khi xoá đường AST); Op enum thay punct.
+    fn ir_bin(&mut self, op: Op, ct: TypeId) {
+        if self.a.tt.is_float(ct) {
+            self.s += "\tfmov d0, x0\n\tfmov d1, x1\n";
+            match op {
+                Op::Add => self.s += "\tfadd d0, d0, d1\n\tfmov x0, d0\n",
+                Op::Sub => self.s += "\tfsub d0, d0, d1\n\tfmov x0, d0\n",
+                Op::Mul => self.s += "\tfmul d0, d0, d1\n\tfmov x0, d0\n",
+                Op::Div => self.s += "\tfdiv d0, d0, d1\n\tfmov x0, d0\n",
+                _ => {
+                    let cond = match op {
+                        Op::Eq => "eq", Op::Ne => "ne", Op::Lt => "mi",
+                        Op::Le => "ls", Op::Gt => "gt", Op::Ge => "ge",
+                        _ => unreachable!(),
+                    };
+                    _ = writeln!(self.s, "\tfcmp d0, d1\n\tcset x0, {cond}");
+                }
+            }
+            return;
+        }
+        let u = self.a.tt.is_unsigned(ct);
+        match op {
+            Op::Add => self.s += "\tadd x0, x0, x1\n",
+            Op::Sub => self.s += "\tsub x0, x0, x1\n",
+            Op::Mul => self.s += "\tmul x0, x0, x1\n",
+            Op::Div if u => self.s += "\tudiv x0, x0, x1\n",
+            Op::Div => self.s += "\tsdiv x0, x0, x1\n",
+            Op::Rem if u => self.s += "\tudiv x2, x0, x1\n\tmsub x0, x2, x1, x0\n",
+            Op::Rem => self.s += "\tsdiv x2, x0, x1\n\tmsub x0, x2, x1, x0\n",
+            Op::And => self.s += "\tand x0, x0, x1\n",
+            Op::Or => self.s += "\torr x0, x0, x1\n",
+            Op::Xor => self.s += "\teor x0, x0, x1\n",
+            Op::Shl => self.s += "\tlsl x0, x0, x1\n",
+            Op::Shr if u => self.s += "\tlsr x0, x0, x1\n",
+            Op::Shr => self.s += "\tasr x0, x0, x1\n",
+            _ => {
+                let cond = match (op, u) {
+                    (Op::Eq, _) => "eq", (Op::Ne, _) => "ne",
+                    (Op::Lt, true) => "lo", (Op::Lt, false) => "lt",
+                    (Op::Le, true) => "ls", (Op::Le, false) => "le",
+                    (Op::Gt, true) => "hi", (Op::Gt, false) => "gt",
+                    (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
+                    _ => unreachable!(),
+                };
+                _ = writeln!(self.s, "\tcmp x0, x1\n\tcset x0, {cond}");
+                return; // 0/1, khỏi ext
+            }
+        }
+        if self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4 {
+            self.ext(ct);
+        }
+    }
+
+    // canonical hóa giá trị trả (x0) theo self.fret rồi đặt vào reg ABI (bản sao
+    // Node::Ret; dùng self.fret/self.fsret do emit_ir set).
+    fn ir_ret_conv(&mut self) {
+        match self.a.tt.tys[self.fret as usize] {
+            Ty::Double => self.s += "\tfmov d0, x0\n",
+            Ty::LDouble => self.s += "\tfmov d0, x0\n\tbl __extenddftf2\n",
+            Ty::Float => self.s += "\tfmov d0, x0\n\tfcvt s0, d0\n",
+            Ty::Struct(_) => {
+                let sz = self.a.tt.size(self.fret);
+                if let Some((dbl, n)) = self.a.tt.hfa(self.fret) {
+                    self.s += "\tmov x9, x0\n";
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(self.s, "\tldr d{j}, [x9, #{}]", 8 * j);
+                        } else {
+                            _ = writeln!(self.s, "\tldr s{j}, [x9, #{}]", 4 * j);
+                        }
+                    }
+                } else if sz > 16 {
+                    let fs = self.fsret;
+                    self.lea_local("x9", fs);
+                    self.s += "\tldr x1, [x9]\n";
+                    self.imm("x2", sz as i64);
+                    let n = self.labels(1);
+                    _ = writeln!(self.s, "L{n}:");
+                    self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+                    _ = writeln!(self.s, "\tb.ne L{n}");
+                } else {
+                    self.s += "\tmov x9, x0\n\tldr x0, [x9]\n";
+                    if sz > 8 {
+                        self.s += "\tldr x1, [x9, #8]\n";
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ir_call(&mut self, dst: &Option<Tmp>, callee: &Callee, args: &[Val]) {
+        let (mut gp, mut fp) = (0u32, 0u32);
+        for &a in args {
+            if self.val_is_float(a) && fp < 8 {
+                self.ld_val(a, "x9");
+                _ = writeln!(self.s, "\tfmov d{fp}, x9");
+                fp += 1;
+            } else if !self.val_is_float(a) && gp < 8 {
+                let r = format!("x{gp}");
+                self.ld_val(a, &r);
+                gp += 1;
+            }
+            // TODO(expand): arg tràn stack (>8) + struct/HFA by value
+        }
+        match callee {
+            Callee::Sym(name) => _ = writeln!(self.s, "\tbl {}", sym(name)),
+            Callee::Ptr(p) => {
+                self.ld_val(*p, "x9");
+                self.s += "\tblr x9\n";
+            }
+        }
+        if let Some(d) = dst {
+            let rt = self.ir_temps[*d as usize];
+            // canonical hóa return (khớp AST call): int → ext theo width (callee
+            // extern trả w0 bit-cao rác), float → f64 canonical.
+            match self.a.tt.tys[rt as usize] {
+                Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
+                Ty::Double => self.s += "\tfmov x0, d0\n",
+                Ty::LDouble => self.s += "\tbl __trunctfdf2\n\tfmov x0, d0\n",
+                Ty::Void | Ty::Struct(_) => {}
+                _ => self.ext(rt),
+            }
+            self.tmp_store(*d, "x0");
+        }
+    }
+
+    fn emit_inst(&mut self, i: &Inst) {
+        match i {
+            Inst::Copy(d, _ty, a) => {
+                self.ld_val(*a, "x0");
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Bin(d, op, ty, a, b) => {
+                self.ld_val(*a, "x0");
+                self.ld_val(*b, "x1");
+                self.ir_bin(*op, *ty);
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Un(d, u, ty, a) => {
+                self.ld_val(*a, "x0");
+                match u {
+                    Un::Neg if self.a.tt.is_float(*ty) => {
+                        self.s += "\tfmov d0, x0\n\tfneg d0, d0\n\tfmov x0, d0\n"
+                    }
+                    Un::Neg => {
+                        self.s += "\tneg x0, x0\n";
+                        self.ext(*ty);
+                    }
+                    Un::BNot => {
+                        self.s += "\tmvn x0, x0\n";
+                        self.ext(*ty);
+                    }
+                }
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Load(d, ty, a) => {
+                self.ld_val(*a, "x0");
+                self.load(*ty);
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Store(ty, a, v) => {
+                self.ld_val(*v, "x0");
+                self.ld_val(*a, "x1");
+                self.store(0, *ty);
+            }
+            Inst::Memcpy(d, s, sz) => {
+                self.ld_val(*s, "x0"); // src
+                self.ld_val(*d, "x1"); // dst
+                self.blk_copy(*sz);
+            }
+            Inst::Lea(d, p) => {
+                match p {
+                    Place::Local(off) => self.lea_local("x0", *off),
+                    Place::Upvar(off) => self.lea_chain("x0", *off), // EXT(gcc): nested
+                    Place::Global(name, off) => self.lea_global_x0(name, *off),
+                    Place::Str(i) => _ = writeln!(
+                        self.s,
+                        "\tadrp x0, l_str{0}\n\tadd x0, x0, :lo12:l_str{0}",
+                        i
+                    ),
+                }
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Cast(d, from, to, a) => {
+                self.ld_val(*a, "x0");
+                self.cast_op(*from, *to);
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Call(dst, callee, args, _nfix) => self.ir_call(dst, callee, args),
+            Inst::Opaque(dst, node) => {
+                // BRIDGE tạm: re-emit subtree AST cũ (kết quả x0), nạp vào temp.
+                match dst {
+                    Some(d) => {
+                        self.expr(*node);
+                        self.tmp_store(*d, "x0");
+                    }
+                    None => self.stmt(*node),
+                }
+            }
+        }
+    }
+
+    fn emit_term(&mut self, t: &Term) {
+        match t {
+            Term::Jmp(b) => _ = writeln!(self.s, "\tb {}", self.ir_label(*b)),
+            Term::Br(c, tb, eb) => {
+                self.ld_val(*c, "x0");
+                let (lt, le) = (self.ir_label(*tb), self.ir_label(*eb));
+                _ = writeln!(self.s, "\tcbnz x0, {lt}\n\tb {le}");
+            }
+            Term::Ret(v) => {
+                match v {
+                    Some(v) => {
+                        self.ld_val(*v, "x0");
+                        self.ir_ret_conv();
+                    }
+                    None => self.s += "\tmov x0, #0\n",
+                }
+                self.s += EPILOGUE;
+            }
+            Term::Switch(v, cases, def) => {
+                self.ld_val(*v, "x0");
+                for (k, b) in cases {
+                    self.imm("x1", *k);
+                    _ = writeln!(self.s, "\tcmp x0, x1\n\tb.eq {}", self.ir_label(*b));
+                }
+                _ = writeln!(self.s, "\tb {}", self.ir_label(*def));
+            }
+            // rơi khỏi hàm không được: chốt bằng default (giống blanket đường AST)
+            Term::Unreachable => self.s += "\tmov x0, #0\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n",
+        }
+    }
+
+    fn emit_ir_body(&mut self, irf: &IrFunc) {
+        // Temp IR sống DƯỚI khung C (và dưới vùng variadic-save 192 nếu có, do
+        // emit_params đã sub trước). Param đã nằm sẵn trong slot khung (emit_params
+        // theo ABI) → body đọc qua Var(off)→Load, KHÔNG cần param-temp.
+        self.ir_tbase = irf.frame + if self.fvariadic { 192 } else { 0 };
+        self.ir_temps = irf.temps.clone();
+        let tbytes = (irf.temps.len() as u32 * 8).next_multiple_of(16);
+        if tbytes > 0 {
+            self.sp_adjust("sub", tbytes);
+        }
+        for (bi, blk) in irf.blocks.iter().enumerate() {
+            _ = writeln!(self.s, "{}:", self.ir_label(bi as u32));
+            // EXT(gcc): nhãn C tại block này → phát `lg_fname.name:` cho computed-goto
+            // (&&label / goto *). Có nhãn ⟹ đích goto: C99 6.8.6.1 đòi SP=base mọi
+            // lối vào (goto-lùi từ trong scope VLA phải dealloc). goto CẤM nhảy VÀO
+            // scope VLA nên đích luôn ở depth ≤ hiện tại → reset base an toàn.
+            let is_label = irf.labels.iter().any(|(_, b)| *b == bi as u32);
+            for (name, _) in irf.labels.iter().filter(|(_, b)| *b == bi as u32) {
+                _ = writeln!(self.s, "lg_{}.{}:", self.fname, name);
+            }
+            if is_label && self.fhasvla {
+                self.reset_sp_base();
+            }
+            for inst in &blk.insts {
+                self.emit_inst(inst);
+            }
+            self.emit_term(&blk.term);
+        }
+    }
+}
+
+/// Điểm vào đường IR: lower(AST) → asm. Bật bằng --ir (driver). Chưa phủ hết
+/// suite — CORE (scalar/control/mem/call) chạy; đuôi exotic + global/string đang
+/// mở rộng. Khi xanh hết suite: thay emit(), xoá đường AST, đo trần ≤10k.
+pub fn emit_ir(ast: &Ast) -> String {
+    let funcs = ir::lower(ast);
+    let mut g = Cg {
+        s: String::from(".cfi_sections .eh_frame\n.text\n"),
+        a: ast,
+        lbl: 0,
+        brks: Vec::new(),
+        conts: Vec::new(),
+        fname: String::new(),
+        fret: VOID,
+        fsret: 0,
+        va: (0, 0, 0, 0),
+        fchain: 0,
+        fuid: 0,
+        fparent: u32::MAX,
+        fframe: 0,
+        fvariadic: false,
+        fhasvla: false,
+        vla_live: 0,
+        ir_tbase: 0,
+        ir_temps: Vec::new(),
+    };
+    for a in &ast.raw_asm {
+        g.s += a;
+        g.s += "\n.text\n";
+    }
+    for (fi, f) in ast.funcs.iter().enumerate() {
+        g.fname = f.name.clone();
+        g.fret = f.ret;
+        g.fsret = f.sret;
+        g.fchain = f.chain;
+        g.fuid = f.uid;
+        g.fparent = f.parent_uid;
+        g.fframe = f.frame;
+        g.fvariadic = f.variadic;
+        g.fhasvla = f.has_vla;
+        g.vla_live = 0;
+        if !f.is_static {
+            _ = writeln!(g.s, ".globl {}", f.name);
+            if f.is_inline || f.is_weak {
+                _ = writeln!(g.s, ".weak {}", f.name);
+            }
+        }
+        _ = writeln!(g.s, ".type {}, %function", f.name);
+        _ = write!(
+            g.s,
+            ".p2align 2\n{}:\n\t.cfi_startproc\n\tstp x29, x30, [sp, #-16]!\n\t.cfi_def_cfa_offset 16\n\t.cfi_offset 29, -16\n\t.cfi_offset 30, -8\n\tmov x29, sp\n\t.cfi_def_cfa_register 29\n",
+            f.name
+        );
+        if f.frame > 0 {
+            g.sp_adjust("sub", f.frame);
+        }
+        // Prologue param-ABI CHUNG với emit() (nested-chain/variadic-save/sret/
+        // spill scalar+struct+HFA) → param nằm sẵn trong slot khung cho IR body.
+        emit_params(&mut g, f);
+        g.emit_ir_body(&funcs[fi]);
+        g.s += "\t.cfi_endproc\n";
+        _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
+    }
+    emit_module_tail(&mut g, ast);
+    g.s
 }

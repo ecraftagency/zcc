@@ -21,7 +21,8 @@
 #define DBL_EPSILON 2.2204460492503131e-16
 #define DBL_MIN 2.2250738585072014e-308
 #define DBL_MAX 1.7976931348623157e+308
-/* long double = double (arm64 Darwin) */
+/* long double: ELF = binary128 tại biên ABI/memory nhưng số học vẫn double
+   (LDBL_MANT_DIG 53) — tự nhất quán C99, xem CLAUDE.md */
 #define LDBL_MANT_DIG 53
 #define LDBL_DIG 15
 #define LDBL_MIN_EXP (-1021)

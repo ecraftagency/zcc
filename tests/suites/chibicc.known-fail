@@ -1,5 +1,6 @@
-# chibicc baseline. 2026-08-20: builtin+typeof ĐẠT (bare `typeof` + ty_compat
-# so chữ ký Func). Còn string = chuỗi UTF-16/32 C11 u"/U"/u' — HOÃN tới sau khi
-# bỏ Mach-O (u"/U cần refactor bool→width qua 2 backend; bỏ Darwin xong chỉ wire
-# 1 backend ELF, rẻ hơn). Userland musl không đụng u"/U → không gấp.
-FAIL string
+# chibicc baseline: 41/41 PASS (không còn known-fail).
+# 2026-08-20: builtin+typeof ĐẠT (bare `typeof` + ty_compat so chữ ký Func).
+# string = chuỗi UTF-16/32 C11 u"/U" ĐẠT sau khi bỏ Mach-O: lexer tính sẵn
+# wide-codepoint seq (Tok::Str field 2 = (width, cps)) tách ký tự NGUỒN multibyte
+# (→1 codepoint) khỏi ESCAPE (→1 giá trị đơn) — C99 5.1.1.2 charset mapping;
+# u""→USHORT(2), L""/U""→INT(4). Chỉ wire 1 backend ELF nên rẻ.

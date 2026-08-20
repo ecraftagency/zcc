@@ -1,11 +1,7 @@
 /* limits.h — zcc đóng vai "limits.h của compiler" (như clang/gcc tự ship):
    định nghĩa ISO C rồi #include_next xuống limits.h của libc (POSIX, IOV_MAX…).
-   Darwin: limits.h của SDK tự đủ ISO → chỉ chuyển tiếp.
    Linux/glibc: glibc chỉ tự định nghĩa ISO khi !__GNUC__; với __GNUC__ nó chờ
    compiler đưa qua _GCC_LIMITS_H_ — zcc định nghĩa hộ rồi mới nhường glibc. */
-#ifdef __APPLE__
-#include_next <limits.h>
-#else
 #ifndef _ZCC_LIMITS_H
 #define _ZCC_LIMITS_H
 #define _GCC_LIMITS_H_ 1
@@ -34,4 +30,3 @@
 #define ULLONG_MAX 18446744073709551615ULL
 #endif
 #include_next <limits.h>
-#endif

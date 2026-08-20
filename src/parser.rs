@@ -14,7 +14,7 @@
 // conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
 use crate::ast::{
     AsmOp, Ast, BOOL, CHAR, DOUBLE, FLOAT, FnSig, Func, GInit, Global, INT, LDOUBLE, LONG, Node, NodeId,
-    SHORT, StructDef, SyncOp, Target, Ty, TyTab, TypeId, UCHAR, UINT, ULONG, USHORT, VOID,
+    SHORT, StructDef, SyncOp, Ty, TyTab, TypeId, UCHAR, UINT, ULONG, USHORT, VOID,
 };
 use crate::lexer::{NumK, Tok};
 use std::collections::HashMap;
@@ -39,7 +39,7 @@ enum Vloc {
 enum Init {
     E(NodeId),
     L(Vec<(Desig, Init)>),
-    S(Vec<u8>, bool), // bool = wide L".."
+    S(Vec<u8>, u8), // element width byte (1 narrow, 2 char16, 4 wchar/char32)
 }
 // designator C99 ([i] = / .m =) — clang chấp nhận trong -std=c89
 #[derive(Clone)]
@@ -57,7 +57,6 @@ enum FlatItem {
 type ItInit = std::iter::Peekable<std::vec::IntoIter<(Desig, Init)>>;
 
 struct P<'a> {
-    tgt: Target, // char signedness (plain char unsigned trên Linux arm64)
     toks: &'a [Tok],
     pos: usize,
     nodes: Vec<Node>,
@@ -528,9 +527,9 @@ impl P<'_> {
         let t = match n {
             "void" => VOID,
             "char" => {
-                // plain char: signed trên Darwin, UNSIGNED trên Linux arm64
-                // (AAPCS64); "signed char" tường minh vẫn là CHAR ở cả hai
-                if uns || (self.tgt == Target::Arm64Elf && !sgn) {
+                // plain char: UNSIGNED trên Linux arm64 (AAPCS64);
+                // "signed char" tường minh vẫn là CHAR
+                if uns || !sgn {
                     UCHAR
                 } else {
                     CHAR
@@ -538,9 +537,9 @@ impl P<'_> {
             }
             "float" => FLOAT,
             // C99 long double: ELF = binary128 TẠI BIÊN ABI/memory (số học vẫn
-            // double, float.h khai LDBL_MANT_DIG 53); Darwin ABI vốn định = double
+            // double, float.h khai LDBL_MANT_DIG 53)
             "double" => {
-                if longs > 0 && self.tgt == Target::Arm64Elf {
+                if longs > 0 {
                     LDOUBLE
                 } else {
                     DOUBLE
@@ -1613,10 +1612,7 @@ impl P<'_> {
     // GIỮ NGUYÊN để resolve upvar, chỉ truncate phần riêng của nested sau. Symbol
     // mangled "{name}.{uid}" tránh đụng. Kết quả đẩy vào self.pending.
     fn nested_funcdef(&mut self, name: String, t: TypeId, fidx: u32) -> Result<(), String> {
-        // ELF-only: trampoline đòi executable stack — Darwin W^X cấm tuyệt đối.
-        if self.tgt == Target::Arm64Darwin {
-            return Err("nested function cần executable stack — chỉ hỗ trợ ELF (Darwin W^X cấm)".into());
-        }
+        // ELF-only: trampoline đòi executable stack (GNU extension).
         let uid = self.fn_uid;
         self.fn_uid += 1;
         let sig = self.tt.fns[fidx as usize].clone();
@@ -2284,11 +2280,11 @@ impl P<'_> {
         }
         if let Some(Tok::Str(b, w)) = self.toks.get(self.pos) {
             let start = self.pos;
-            let (mut b, mut w) = (b.clone(), *w);
+            let (mut b, mut w) = (b.clone(), w.0);
             self.pos += 1;
             while let Some(Tok::Str(m, w2)) = self.toks.get(self.pos) {
                 b.extend_from_slice(m);
-                w |= *w2;
+                w = w.max(w2.0); // nối chuỗi: prefix rộng nhất thắng (C11 6.4.5p5)
                 self.pos += 1;
             }
             // string trần mới là Init::S; "abc" + 10 là biểu thức
@@ -2313,23 +2309,26 @@ impl P<'_> {
     ) -> Result<(), String> {
         let init = self.unbrace_str(t, init);
         match init {
-            Init::S(mut b, wide) => {
+            Init::S(mut b, w) => {
                 if let Ty::Array(e, n) = self.tt.tys[t as usize] {
-                    if wide && self.tt.size(e) == 4 {
-                        // wchar_t ws[] = L"..": mỗi char → 4 byte LE + NUL 4 byte
+                    let es = self.tt.size(e);
+                    if w > 1 && es == w as u32 {
+                        // wchar_t/char16_t ws[] = L".."/u"..": mỗi codepoint → es
+                        // byte LE + NUL es byte (khớp width phần tử mảng)
                         let cps = wchars(&b);
-                        let mut wb = Vec::with_capacity(cps.len() * 4 + 4);
+                        let ew = es as usize;
+                        let mut wb = Vec::with_capacity((cps.len() + 1) * ew);
                         for c in cps {
-                            wb.extend_from_slice(&c.to_le_bytes());
+                            wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                         }
-                        wb.extend_from_slice(&[0; 4]);
-                        if n > 0 && wb.len() as u64 > n * 4 {
-                            wb.truncate((n * 4) as usize);
+                        wb.extend(std::iter::repeat(0).take(ew));
+                        if n > 0 && wb.len() as u64 > n * es as u64 {
+                            wb.truncate((n * es as u64) as usize);
                         }
                         out.push((base, t, FlatItem::B(wb)));
                         return Ok(());
                     }
-                    if self.tt.size(e) == 1 {
+                    if es == 1 && w == 1 {
                         b.push(0);
                         if n > 0 && b.len() as u64 > n {
                             b.truncate(n as usize); // char s[3] = "abc" hợp lệ C89
@@ -2338,17 +2337,17 @@ impl P<'_> {
                         return Ok(());
                     }
                 }
-                // char *p = "str" / wchar_t *p = L"str"
-                let (n, st) = if wide {
+                // char *p = "str" / wchar_t *p = L"str" / char16_t *p = u"str"
+                let (n, st) = if w > 1 {
                     let cps = wchars(&b);
-                    let n = cps.len() as u32;
-                    let mut wb = Vec::with_capacity(cps.len() * 4 + 3);
+                    let (n, ew) = (cps.len() as u32, w as usize);
+                    let mut wb = Vec::with_capacity((cps.len() + 1) * ew - 1);
                     for c in cps {
-                        wb.extend_from_slice(&c.to_le_bytes());
+                        wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                     }
-                    wb.extend_from_slice(&[0, 0, 0]); // .asciz bù NUL thứ 4
+                    wb.extend(std::iter::repeat(0).take(ew - 1)); // .asciz bù NUL cuối
                     b = wb;
-                    (n + 1, INT)
+                    (n + 1, if w == 2 { USHORT } else { INT })
                 } else {
                     (b.len() as u32 + 1, CHAR)
                 };
@@ -2523,7 +2522,7 @@ impl P<'_> {
         if let Ty::Array(e, _) = self.tt.tys[t as usize] {
             let esz = self.tt.size(e);
             let hit = matches!(&init, Init::L(v) if v.len() == 1
-                && matches!(&v[0], (Desig::No, Init::S(_, w)) if esz == 1 || (*w && esz == 4)));
+                && matches!(&v[0], (Desig::No, Init::S(_, w)) if esz == 1 || (*w > 1 && esz == *w as u32)));
             if hit {
                 if let Init::L(v) = init {
                     return v.into_iter().next().unwrap().1;
@@ -2549,7 +2548,7 @@ impl P<'_> {
             (Ty::Array(e, 0), Init::S(b, w)) => {
                 // wide L"..": độ dài = số CODEPOINT decode (6.4.5), không phải
                 // byte thô — "Ä" = 1 wchar (U+00C4) chứ không 2 (bug wchar_t-1)
-                let len = if w && self.tt.size(e) == 4 {
+                let len = if w > 1 && self.tt.size(e) == w as u32 {
                     wchars(&b).len() as u64
                 } else {
                     b.len() as u64
@@ -3190,13 +3189,12 @@ impl P<'_> {
         };
         // struct >16B by value: ABI truyền GIÁN TIẾP — copy vào temp, đưa con trỏ.
         // Ngoại lệ: HFA đi by value (AAPCS B.4) — ELF kể cả anonymous (gcc pr92904
-        // f7: d0-d3); Darwin giữ anonymous gián tiếp (quy ước nội bộ va_arg macro)
-        for (i, a) in args.iter_mut().enumerate() {
+        // f7: d0-d3)
+        for a in args.iter_mut() {
             let t = self.ty(*a);
             if matches!(self.tt.tys[t as usize], Ty::Struct(_))
                 && self.tt.size(t) > 16
-                && (self.tt.hfa(t).is_none()
-                    || (self.tgt != Target::Arm64Elf && (i as u32) >= nreg))
+                && self.tt.hfa(t).is_none()
             {
                 let off = self.alloc_local(String::new(), t);
                 let tmp = self.push(Node::Var(off), t);
@@ -3387,7 +3385,7 @@ impl P<'_> {
             let v = if k != 0 { v } else { v as f32 as f64 };
             let t = match k {
                 0 => FLOAT,
-                2 if self.tgt == Target::Arm64Elf => LDOUBLE, // suffix L
+                2 => LDOUBLE, // suffix L (ELF: binary128 tại biên ABI)
                 _ => DOUBLE,
             };
             Ok(self.push(Node::FNum(v), t))
@@ -3398,26 +3396,28 @@ impl P<'_> {
             let v = if k == 0 { v as f32 as f64 } else { v };
             Ok(self.cplx_imag(v, elem))
         } else if let Some(Tok::Str(bytes, w)) = self.toks.get(self.pos) {
-            let (mut bytes, mut w) = (bytes.clone(), *w);
+            let (mut bytes, mut wid, mut cps) = (bytes.clone(), w.0, w.1.clone());
             self.pos += 1;
             while let Some(Tok::Str(more, w2)) = self.toks.get(self.pos) {
                 bytes.extend_from_slice(more); // phase 6: nối string liền kề
-                w |= *w2;
+                wid = wid.max(w2.0); // prefix rộng nhất thắng (C11 6.4.5p5)
+                cps.extend_from_slice(&w2.1);
                 self.pos += 1;
             }
-            if w {
-                // wide: mỗi ký tự → wchar_t (int) little-endian; .asciz thêm
-                // 1 NUL nên tự pad 3 — đủ terminator 4 byte
-                let cps = wchars(&bytes);
-                let n = cps.len() as u32;
-                let mut wb = Vec::with_capacity(cps.len() * 4 + 3);
-                for c in cps {
-                    wb.extend_from_slice(&c.to_le_bytes());
+            if wid > 1 {
+                // wide/char16: mỗi codepoint → wid byte little-endian; .asciz thêm
+                // 1 NUL nên tự pad wid-1 — đủ terminator wid byte. u""→USHORT(2),
+                // L""/U""→INT(4). Dùng cps (ký tự nguồn đã tách khỏi escape).
+                let (n, ew) = (cps.len() as u32, wid as usize);
+                let mut wb = Vec::with_capacity((cps.len() + 1) * ew - 1);
+                for c in &cps {
+                    wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                 }
-                wb.extend_from_slice(&[0, 0, 0]);
+                wb.extend(std::iter::repeat(0).take(ew - 1));
                 self.strs.push(wb);
                 let i = (self.strs.len() - 1) as u32;
-                let t = self.tt.add(Ty::Array(INT, n as u64 + 1));
+                let elem = if wid == 2 { USHORT } else { INT };
+                let t = self.tt.add(Ty::Array(elem, n as u64 + 1));
                 return Ok(self.push(Node::Str(i), t));
             }
             self.strs.push(bytes);
@@ -3929,10 +3929,8 @@ pub fn parse(
     toks: &[Tok],
     locs: &[(u32, u32)],
     files: &[String],
-    tgt: Target,
 ) -> Result<Ast, String> {
     let mut p = P {
-        tgt,
         toks,
         pos: 0,
         nodes: Vec::new(),
@@ -3996,7 +3994,7 @@ pub fn parse(
     // chỉ thấy `__builtin_va_list` = tên tag này, không có thân; thiếu seed thì
     // va_list local size 0 → va_start ghi 32 byte đè slot hàng xóm (vfprintf
     // musl nát con trỏ fmt). stdarg.h nhúng định nghĩa lại chỉ shadow, vô hại.
-    if tgt == Target::Arm64Elf {
+    {
         let pv = p.tt.ptr_to(VOID);
         p.tt.structs.push(crate::ast::StructDef {
             members: vec![
@@ -4078,7 +4076,6 @@ pub fn parse(
         }
     })?;
     Ok(Ast {
-        tgt: p.tgt,
         nodes: p.nodes,
         types: p.types,
         tt: p.tt,

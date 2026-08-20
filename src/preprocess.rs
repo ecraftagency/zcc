@@ -8,7 +8,6 @@
 // tra bảng header nhúng trước, rồi các thư mục -I (filesystem). Mỗi token mang
 // (file, line, hideset) — hideset theo luật chuẩn để macro không expand lặp.
 
-use crate::ast::Target;
 use crate::lexer::{NumK, PTok, Tok, lex, lex_t};
 use std::collections::HashMap;
 use std::fs;
@@ -20,29 +19,20 @@ enum Macro {
 }
 type Macros = HashMap<String, Macro>;
 
-// Header hệ thống NHÚNG vào binary (zero dependency, target lock Darwin/arm64
+// Header hệ thống NHÚNG vào binary (zero dependency, target lock arm64 ELF
 // nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-const HEADERS: [(&str, &str); 18] = [
-    ("wchar.h", include_str!("headers/wchar.h")),
-    ("inttypes.h", include_str!("headers/inttypes.h")),
-    ("sys/mman.h", include_str!("headers/sys/mman.h")),
-    (
-        "libkern/OSCacheControl.h",
-        include_str!("headers/libkern/OSCacheControl.h"),
-    ),
-    ("setjmp.h", include_str!("headers/setjmp.h")),
+// Chỉ 7 header COMPILER-OWNED freestanding (C99 4): compiler phải tự cấp vì
+// chúng khai builtin của mình (va_list, offsetof, INT_MAX...). Header library
+// (stdio/stdlib/string/math/...) do glibc box hoặc musl sysroot phục vụ trên
+// ELF — bản nhúng Darwin cũ đã xoá khi bỏ Mach-O (embed_src chặn chúng qua
+// sentinel \x01elf).
+const HEADERS: [(&str, &str); 7] = [
     ("stdbool.h", include_str!("headers/stdbool.h")),
     ("stdalign.h", include_str!("headers/stdalign.h")),
     ("stdnoreturn.h", include_str!("headers/stdnoreturn.h")),
-    ("assert.h", include_str!("headers/assert.h")),
-    ("ctype.h", include_str!("headers/ctype.h")),
     ("float.h", include_str!("headers/float.h")),
-    ("math.h", include_str!("headers/math.h")),
     ("stdarg.h", include_str!("headers/stdarg.h")),
     ("stddef.h", include_str!("headers/stddef.h")),
-    ("stdio.h", include_str!("headers/stdio.h")),
-    ("stdlib.h", include_str!("headers/stdlib.h")),
-    ("string.h", include_str!("headers/string.h")),
     ("limits.h", include_str!("headers/limits.h")),
 ];
 
@@ -51,9 +41,8 @@ pub fn preprocess(
     defs: &[String],
     undefs: &[String],
     incs: &[String],
-    tgt: Target,
 ) -> Result<(Vec<Tok>, Vec<(u32, u32)>, Vec<String>), String> {
-    let (out, files) = preprocess_pt(path, defs, undefs, incs, tgt)?;
+    let (out, files) = preprocess_pt(path, defs, undefs, incs)?;
     let locs = out.iter().map(|t| (t.file, t.line)).collect();
     Ok((out.into_iter().map(|t| t.tok).collect(), locs, files))
 }
@@ -63,44 +52,21 @@ fn preprocess_pt(
     defs: &[String],
     undefs: &[String],
     incs: &[String],
-    tgt: Target,
 ) -> Result<(Vec<PTok>, Vec<String>), String> {
     let mut macros = Macros::new();
-    // predefine chung mọi target (arm64 LP64 little-endian)
-    let mut ones = vec!["__STDC__", "__LP64__", "__arm64__", "__aarch64__"];
-    match tgt {
-        Target::Arm64Darwin => ones.extend([
-            "__APPLE__",
-            "__MACH__",
-            "__LITTLE_ENDIAN__", // EXT(apple): OSByteOrder.h chọn nhánh endian bằng nó
-        ]),
-        Target::Arm64Elf => ones.extend([
-            "__linux__",
-            "__linux", // gcc/clang định nghĩa cả bản bare; redis setproctitle.c + config.h dò `defined __linux`
-            "__gnu_linux__",
-            "__unix__",
-            "__unix", // đối xứng: gcc định nghĩa cả __unix lẫn __unix__
-
-            "__ELF__",
-            "__CHAR_UNSIGNED__", // plain char unsigned trên Linux arm64 (AAPCS)
-        ]),
-    }
+    // predefine target arm64 ELF Linux (LP64 little-endian)
+    let ones = [
+        "__STDC__", "__LP64__", "__arm64__", "__aarch64__",
+        "__linux__",
+        "__linux", // gcc/clang định nghĩa cả bản bare; redis setproctitle.c + config.h dò `defined __linux`
+        "__gnu_linux__",
+        "__unix__",
+        "__unix", // đối xứng: gcc định nghĩa cả __unix lẫn __unix__
+        "__ELF__",
+        "__CHAR_UNSIGNED__", // plain char unsigned trên Linux arm64 (AAPCS)
+    ];
     for m in ones {
         macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
-    }
-    if tgt == Target::Arm64Darwin {
-        for (m, v) in [
-            // EXT(apple): TargetConditionals.h chọn nhánh GNUC bằng
-            // defined(__GNUC__) && defined(__APPLE_CC__) — giá trị 6000 như clang
-            ("__APPLE_CC__", "6000"),
-            // EXT(apple): AvailabilityMacros.h suy __MAC_OS_X_VERSION_MAX_ALLOWED
-            // từ macro này (redis config.h dò MAC_OS_10_6 → dùng stat thường thay
-            // struct stat64 ẩn). 110000 = macOS 11, OS đầu tiên của Apple Silicon.
-            ("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__", "110000"),
-        ] {
-            let toks = lex(v).map_err(|e| e.to_string())?;
-            macros.insert(m.into(), Macro::Obj(toks));
-        }
     }
     for (m, v) in [
         // EXT(gcc): SDK Darwin CHỈ viết nhánh arm64 dưới #ifdef __GNUC__ (nhánh
@@ -161,52 +127,16 @@ fn preprocess_pt(
     }
     // __USER_LABEL_PREFIX__: glibc __REDIRECT/__ASMNAME stringize nó thành
     // prefix symbol asm (scanf → __isoc99_scanf); thiếu định nghĩa là
-    // "#__USER_LABEL_PREFIX__" dính nguyên văn vào tên symbol. ELF rỗng,
-    // Mach-O "_" (đúng quy ước từng ABI).
+    // "#__USER_LABEL_PREFIX__" dính nguyên văn vào tên symbol. ELF: rỗng.
+    macros.insert("__USER_LABEL_PREFIX__".into(), Macro::Obj(Vec::new()));
+    // __builtin_va_list: va_list = struct AAPCS (stdarg.h định nghĩa),
+    // va_start/va_arg KHÔNG macro — parser hạ xuống Node::VaStart/VaArg.
+    // typedef qua tên struct trần: hợp lệ cả khi incomplete (glibc __va_list.h
+    // typedef trước khi ai include stdarg.h).
     macros.insert(
-        "__USER_LABEL_PREFIX__".into(),
-        Macro::Obj(match tgt {
-            Target::Arm64Darwin => lex("_").map_err(|e| e.to_string())?,
-            Target::Arm64Elf => Vec::new(),
-        }),
+        "__builtin_va_list".into(),
+        Macro::Obj(lex("struct __zcc_va_list").map_err(|e| e.to_string())?),
     );
-    // __builtin_va_*: bản sao stdarg.h cho code gọi thẳng builtin (torture).
-    // Darwin: va_list = char*, va_start/va_arg là macro số học con trỏ;
-    // ELF: va_list = struct AAPCS (stdarg.h định nghĩa), va_start/va_arg KHÔNG
-    // macro — để nguyên tên cho parser hạ xuống Node::VaStart/VaArg
-    match tgt {
-        Target::Arm64Darwin => {
-            macros.insert(
-                "__builtin_va_list".into(),
-                Macro::Obj(lex("char *").map_err(|e| e.to_string())?),
-            );
-            for (m, ps, body) in [
-                (
-                    "__builtin_va_start",
-                    vec!["ap", "last"],
-                    "((ap) = (char *)__va_area__)",
-                ),
-                (
-                    "__builtin_va_arg",
-                    vec!["ap", "t"],
-                    "(*(t *)(sizeof(t) > 16 ? *(char **)(((ap) += 8) - 8) \
-                     : (((ap) += ((sizeof(t) + 7) & ~7UL)) - ((sizeof(t) + 7) & ~7UL))))",
-                ),
-            ] {
-                let toks = lex(body).map_err(|e| e.to_string())?;
-                let ps = ps.into_iter().map(String::from).collect();
-                macros.insert(m.into(), Macro::Fun(ps, false, toks));
-            }
-        }
-        Target::Arm64Elf => {
-            macros.insert(
-                "__builtin_va_list".into(),
-                // typedef qua tên struct trần: hợp lệ cả khi incomplete
-                // (glibc __va_list.h typedef trước khi ai include stdarg.h)
-                Macro::Obj(lex("struct __zcc_va_list").map_err(|e| e.to_string())?),
-            );
-        }
-    }
     // inf/nan (musl math.h GNUC>=3.3 đòi, thiếu là thành call trần): 1e10000
     // tràn parse f64 → inf đúng chuẩn; nan qua 0/0 (fold ra NaN). Function-like
     // 0 tham số vì code gọi kèm ngoặc: __builtin_inff().
@@ -282,7 +212,7 @@ fn preprocess_pt(
         macros.remove(u.as_str());
     }
     let mut files = Vec::new();
-    let pts = pp_file(path, &mut macros, 0, incs, &mut files, tgt == Target::Arm64Elf)?;
+    let pts = pp_file(path, &mut macros, 0, incs, &mut files, true)?; // ELF: char unsigned
     // C99: _Pragma("...") operator — nuốt như #pragma (SDK dùng trong macro)
     let (mut out, mut i) = (Vec::with_capacity(pts.len()), 0);
     while i < pts.len() {
@@ -308,9 +238,8 @@ pub fn preprocess_asm(
     defs: &[String],
     undefs: &[String],
     incs: &[String],
-    tgt: Target,
 ) -> Result<String, String> {
-    let (out, _) = preprocess_pt(path, defs, undefs, incs, tgt)?;
+    let (out, _) = preprocess_pt(path, defs, undefs, incs)?;
     let mut s = String::new();
     let mut cur = (u32::MAX, u32::MAX);
     for t in &out {
@@ -720,8 +649,10 @@ fn expand_at(
         return Ok(i + 1);
     }
     if name == "__FILE__" {
+        let fb = file.as_bytes().to_vec();
+        let cps = fb.iter().map(|&x| x as u32).collect();
         out.push(PTok {
-            tok: Tok::Str(file.as_bytes().to_vec(), false),
+            tok: Tok::Str(fb, (1, cps)),
             ..t.clone()
         });
         return Ok(i + 1);
@@ -899,8 +830,10 @@ fn substitute(
         if t.tok == Tok::Punct("#") {
             let p = param_of(body.get(i + 1), params)
                 .ok_or_else(|| err(file, lno, "# phải đứng trước tham số macro"))?;
+            let sb = stringize(&args[p]);
+            let cps = sb.iter().map(|&x| x as u32).collect();
             out.push(PTok {
-                tok: Tok::Str(stringize(&args[p]), false),
+                tok: Tok::Str(sb, (1, cps)),
                 bol: false,
                 ws: t.ws,
                 line: lno,

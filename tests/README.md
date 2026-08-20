@@ -82,12 +82,33 @@ Chạy TUẦN TỰ (mỗi suite ăn đủ core).
 
 | Suite | Nguồn (clone --depth 1) | Ghi chú baseline |
 |---|---|---|
-| `torture.sh` | gcc-mirror/gcc (`gcc.c-torture/execute`) | fail toàn gcc-ext ngoài scope (vector_size, _Complex, `__builtin_*`, nested-fn, VLA sâu, bitfield>int); đã bắt bug thật (pr60017, pr33631, va_arg HFA, pr92904 aligned) |
+| `torture.sh` | gcc-mirror/gcc (`gcc.c-torture/execute`) | **2-fact 3-đường** (xem dưới): PASS \| NOT-IMPL (`torture.not-impl`, nêu tên) \| FAIL. Gate = **0 FAIL**. Đã bắt bug thật (pr60017, pr33631, va_arg HFA, pr92904 aligned) |
 | `cts.sh` | c-testsuite/c-testsuite | 00162 `[const 5]`, 00219 `_Generic`, 00204 LD=fp128 (sổ nợ ELF) |
 | `nora.sh` | nlsandler/writing-a-c-compiler-tests | fall-off-main đã fix (C99 return 0) |
 | `chibicc.sh` | rui314/chibicc | 3 fail = C11/gcc-ext THUẦN: `builtin`, `typeof`, `string`(`u""`). vla rời baseline (referee arm64 NOCOMPILE→skip) |
 | `kr.sh` | caisah/K-and-R-exercises-and-examples | **referee c99**; 97 pass, 12 fail = UB CỦA CHÍNH ĐÁP ÁN (proof: valid-input → clang==gcc==zcc byte-identical, 0 bug zcc). Chi tiết `suites/kr.known-fail` |
 | `tcc.sh` | TinyCC/tinycc (tests2 trên tcc DO ZCC BUILD) | baseline rỗng |
+
+### torture 2-fact — hợp đồng phân loại (chống skip ngầm)
+
+`torture.sh` KHÔNG dùng known-fail/skip nữa. Referee = `cc -std=c99 -w -O0`
+(gcc trong box, trọng tài độc lập & native cho suite này). Mỗi case đúng 1 nhãn:
+
+- **PASS** — zcc compile chương trình C99-hợp-lệ → binary exit 0 (self-check abort()).
+- **NOT-IMPL** — không phải bug; ghi vào `torture.not-impl` NÊU ĐÍCH DANH lý do:
+  - `oracle-invalid` — referee c99 tự từ chối/không-chạy-sạch (gcc-ext, target-
+    specific, UB). Reason = dòng `error:` của gcc.
+  - `zcc-reject` — referee OK nhưng zcc in `zcc:…` rồi exit 1, KHÔNG đẻ binary,
+    KHÔNG crash (trung thực chưa cài). Reason = diagnostic zcc (`<case>:<ln>: msg`).
+- **FAIL** — zcc NUỐT C99-hợp-lệ rồi sai/crash (chỉ số phải = 0): `runtime`
+  (đẻ binary nhưng sai/abort), `backend` (exit 1 KHÔNG có `zcc:` → as/ld nghẹn
+  asm rác), `crash` (panic/signal). Đây là cái reviewer sợ: nuốt-rồi-crash thay
+  vì reject-lúc-compile.
+
+**LUẬT BẢO TOÀN** (enforce, không phải lời hứa): `pass+not-impl+fail` phải =
+số case nạp; mỗi case xuất hiện ĐÚNG 1 verdict. Case bốc hơi (worker chết/treo)
+hoặc trùng → harness TỰ ĐỎ ngay, không cho xanh giả. → verdict xanh chỉ hợp lệ
+khi đẳng thức đóng; reviewer/Vu đối chiếu 1 dòng, không cần tin Claude.
 
 ## App — musl libc (fullsuite.sh app)
 

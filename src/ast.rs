@@ -360,14 +360,9 @@ pub struct Func {
     pub has_vla: bool,
 }
 
-// Target đi qua boundary: driver chọn, frontend dùng (char signedness, va_off,
-// predefine), backend dispatch file codegen. LP64 cả hai — TyTab không đổi.
-#[derive(Clone, Copy, PartialEq)]
-pub enum Target {
-    Arm64Darwin,
-    Arm64Elf,
-}
-
+// Target duy nhất: AArch64 ELF (Linux). Hành vi ABI-specific (char signedness,
+// va, long double width) cố định ELF trong frontend; khi thêm target thứ 2 các
+// tham số đó về TyTab (không rải điều kiện) + backend file mới + nhánh IR-lowering.
 pub struct Ast {
     pub nodes: Vec<Node>,
     pub types: Vec<TypeId>, // song song với nodes
@@ -386,5 +381,4 @@ pub struct Ast {
     pub pic: bool,
     // EXT(gcc): prototype/extern mang weak — TU phát .weak để undef ref là weak
     pub weak_decls: Vec<String>,
-    pub tgt: Target,
 }

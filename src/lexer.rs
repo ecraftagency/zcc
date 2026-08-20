@@ -21,7 +21,11 @@ pub enum Tok {
     INum(f64, u8),
     Ident(String),
     Punct(&'static str),
-    Str(Vec<u8>, bool), // (bytes đã xử lý escape chưa gồm NUL cuối, wide L"..")
+    // narrow bytes (escape đã xử lý, chưa gồm NUL) + (WIDTH byte, wide-codepoint
+    // seq). WIDTH: 1 narrow/u8, 2 char16 u"", 4 wchar L""/char32 U"". cps tách
+    // ký tự NGUỒN multibyte (→1 codepoint) khỏi ESCAPE (→1 giá trị đơn), vì khi
+    // chuỗi thành wide, "あ"→0x3042 nhưng "\343\201\202"→3 phần tử (C99 5.1.1.2).
+    Str(Vec<u8>, (u8, Vec<u32>)),
 }
 
 #[derive(Clone, Debug)]
@@ -345,14 +349,18 @@ pub fn lex_t(b: &[u8], char_uns: bool) -> Result<Vec<PTok>, String> {
             continue;
         }
         let tok_start = i;
-        // wide literal L'x' / L"s": wchar = int (LP64 Darwin)
-        let wide = c == b'L' && matches!(b.get(i + 1), Some(b'\'' | b'"'));
-        let c = if wide {
-            i += 1;
-            b[i]
-        } else {
-            c
+        // Prefix literal rộng: L (wchar=int=4), u (char16=2), U (char32=4),
+        // u8 (UTF-8=1) — chỉ khi liền QUOTE, nếu không u/U/L là identifier thường.
+        // EXT(c99)/C11 6.4.5: u/U/u8 literal. sw = element width byte.
+        let (sw, adv) = match (c, b.get(i + 1), b.get(i + 2)) {
+            (b'L' | b'U', Some(b'\'' | b'"'), _) => (4u8, 1),
+            (b'u', Some(b'8'), Some(b'"')) => (1, 2),
+            (b'u', Some(b'\'' | b'"'), _) => (2, 1),
+            _ => (1, 0),
         };
+        i += adv;
+        let c = b[i];
+        let wide = sw >= 2; // giá trị char rộng: không cắt về u8
         let tok = if c.is_ascii_digit()
             || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
         {
@@ -399,7 +407,7 @@ pub fn lex_t(b: &[u8], char_uns: bool) -> Result<Vec<PTok>, String> {
             Tok::Num(v, NumK::I)
         } else if c == b'"' {
             i += 1;
-            let mut bytes = Vec::new();
+            let (mut bytes, mut cps) = (Vec::new(), Vec::<u32>::new());
             loop {
                 match *b.get(i).ok_or("string không đóng")? {
                     b'"' => break,
@@ -410,17 +418,28 @@ pub fn lex_t(b: &[u8], char_uns: bool) -> Result<Vec<PTok>, String> {
                             line += 1;
                             i += 1;
                         } else {
-                            bytes.push(escape(b, &mut i)? as u8);
+                            let e = escape(b, &mut i)?;
+                            bytes.push(e as u8);
+                            cps.push(e); // escape = 1 phần tử wide, KHÔNG UTF-8-ghép
                         }
+                    }
+                    e if e >= 0x80 => {
+                        // ký tự nguồn multibyte: 1 char nguồn → 1 codepoint;
+                        // narrow giữ nguyên byte UTF-8 (execution char set)
+                        let (cp, len) = utf8_cp(b, i);
+                        bytes.extend_from_slice(&b[i..i + len]);
+                        cps.push(cp);
+                        i += len;
                     }
                     e => {
                         bytes.push(e);
+                        cps.push(e as u32);
                         i += 1;
                     }
                 }
             }
             i += 1;
-            Tok::Str(bytes, wide)
+            Tok::Str(bytes, (sw, cps))
         } else if c == b'_' || c == b'$' || c.is_ascii_alphabetic() {
             // EXT(gcc): '$' hợp lệ trong identifier (mặc định gcc mọi target ELF/Darwin);
             // tối thiểu phải sống qua lexer để #if 0 skip được (pp-token chỉ chết ở phase 7)
