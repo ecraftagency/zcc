@@ -45,11 +45,11 @@ KHÔNG còn runner mac (static-musl trong box gần free, mac 2.7s/case codesign
 | `sci` `corpus` `app` `base` | nhóm (`base` = run.sh cases+ext, vòng nhanh) |
 | `shape` `cpp` `decay` `alg` `abi` | 1 sci-gate |
 | `cases` `ext` | 1 base differential |
-| `torture` `cts` `chibicc` `kr` `nora` `tcc` | 1 corpus suite |
+| `torture` `cts` | 1 corpus suite |
 | `musl` | app libc |
 
 **`SEEK`** (đối số 2, tùy chọn) = chuỗi con tên case → seek sâu vào TỪNG UNIT trong
-1 suite. Vd: `fullsuite.sh kr getint` (109→1 case), `fullsuite.sh cases float`.
+1 suite. Vd: `fullsuite.sh torture pr22061`, `fullsuite.sh cases float`.
 Áp cho cases/ext + mọi corpus suite (lọc `grep -F` trên danh sách file). Sci-gate
 sinh case NỘI BỘ qua gen_*.py nên chưa nhận SEEK (mở rộng sau nếu cần).
 
@@ -83,11 +83,9 @@ Chạy TUẦN TỰ (mỗi suite ăn đủ core).
 | Suite | Nguồn (clone --depth 1) | Ghi chú baseline |
 |---|---|---|
 | `torture.sh` | gcc-mirror/gcc (`gcc.c-torture/execute`) | **2-fact 3-đường** (xem dưới): PASS \| NOT-IMPL (`torture.not-impl`, nêu tên) \| FAIL. Gate = **0 FAIL**. Đã bắt bug thật (pr60017, pr33631, va_arg HFA, pr92904 aligned) |
-| `cts.sh` | c-testsuite/c-testsuite | 00162 `[const 5]`, 00219 `_Generic`, 00204 LD=fp128 (sổ nợ ELF) |
-| `nora.sh` | nlsandler/writing-a-c-compiler-tests | fall-off-main đã fix (C99 return 0) |
-| `chibicc.sh` | rui314/chibicc | 3 fail = C11/gcc-ext THUẦN: `builtin`, `typeof`, `string`(`u""`). vla rời baseline (referee arm64 NOCOMPILE→skip) |
-| `kr.sh` | caisah/K-and-R-exercises-and-examples | **referee c99**; 97 pass, 12 fail = UB CỦA CHÍNH ĐÁP ÁN (proof: valid-input → clang==gcc==zcc byte-identical, 0 bug zcc). Chi tiết `suites/kr.known-fail` |
-| `tcc.sh` | TinyCC/tinycc (tests2 trên tcc DO ZCC BUILD) | baseline rỗng |
+| `cts.sh` | c-testsuite/c-testsuite | oracle `.expected` (stdout-byte, không referee → rẻ/deterministic). 00162 `[const 5]`, 00219 `_Generic` (construct RIÊNG torture=0, Phase-3 pin), 00204 LD=fp128 (sổ nợ ELF) |
+
+**Đã BỎ (2026-08-21, coverage-diff cơ học):** `kr` (UB của đáp án — diff-invalid), `nora` (1630 case, 0 construct riêng — fingerprint dominated bởi torture mọi cột), `chibicc` (41 case, dup construct; `_Generic` đã có ở cts), `tcc` (Darwin-lock `xcrun`→zombie chết trong box ELF). Bằng chứng: torture áp đảo mọi construct 1-2 bậc; construct RIÊNG duy nhất của cả 4 = `_Generic`, giữ qua cts. Bootstrap-compiler (ý tưởng tcc) tái sinh ở tầng **third-party build** (đối trọng slimcc), không phải tầng construct-corpus.
 
 ### torture 2-fact — hợp đồng phân loại (chống skip ngầm)
 
@@ -141,7 +139,7 @@ tội, CLAUDE.md).
   `src/headers/*.h`.
 - **Stale .o thế hệ cũ** → lỗi link "ma". `make distclean` trước khi debug link.
 - **Diff tại điểm UB là vô nghĩa** — chương trình đọc stdin/argv: feed source
-  làm stdin tự tạo UB (uninit var) = gốc mọi fail kr, KHÔNG phải bug zcc.
+  làm stdin tự tạo UB (uninit var) = chính là lý do BỎ suite kr (đáp án UB).
 - **"thiếu image zcc-box" mà `docker images` VẪN liệt kê** — index tên của docker
   bị stale: `docker image inspect zcc-box` fail nhưng inspect theo ID (716e3cce…)
   OK. Vá: `docker tag <ID> zcc-box:latest` (thao tác local, không destructive).

@@ -10,10 +10,10 @@
 #     sci | corpus | app | base        — nhóm  (base = run.sh cases+ext, vòng nhanh)
 #     shape|cpp|decay|alg|abi          — 1 sci-gate (kiểm định lý)
 #     cases|ext                        — 1 base differential
-#     torture|cts|chibicc|kr|nora|tcc  — 1 corpus suite
+#     torture|cts                      — 1 corpus suite
 #     musl                             — app libc
 #   SEEK (tùy chọn) — chuỗi con tên case: SEEK sâu vào TỪNG UNIT trong 1 suite,
-#     vd:  fullsuite.sh kr getint   |   fullsuite.sh cases float
+#     vd:  fullsuite.sh torture pr22061   |   fullsuite.sh cases float
 #     (áp cho cases/ext + mọi corpus suite; gate sinh case nội bộ chưa nhận SEEK.)
 # Output GỌN: 1 dòng/stage; chi tiết -> /tmp/full-<name>.log trong container.
 set -u
@@ -43,7 +43,7 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
     run_base()   { echo "-- BASE (differential viết tay, vòng nhanh) --"; base_c; base_e ; }
     run_corpus() { echo "-- CORPUS (chứng nghiệm thực tiễn, FAIL ⊆ known-fail) --"
                    base_c; base_e
-                   for s in torture cts chibicc kr nora tcc; do suite "$s"; done ; }
+                   for s in torture cts; do suite "$s"; done ; }
     run_app()    { echo "-- APP (libc = musl, phần mềm thật cho minimal-distro) --"
                    stage musl sh "$W/tests/suites/musl-box.sh" ; }
     echo "== fullsuite (box ELF aarch64 — AUTHORITATIVE, target=$TARGET${SEEK:+ seek=$SEEK}) =="
@@ -56,7 +56,7 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
         shape|cpp|decay|alg|abi) gate "$TARGET" ;;
         cases)                   base_c ;;
         ext)                     base_e ;;
-        torture|cts|chibicc|kr|nora|tcc) suite "$TARGET" ;;
+        torture|cts)             suite "$TARGET" ;;
         musl)                    run_app ;;
         *) echo "target lạ: '$TARGET' (xem đầu file)"; exit 2 ;;
     esac
