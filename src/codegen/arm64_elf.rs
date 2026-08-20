@@ -243,7 +243,7 @@ pub fn emit(ast: &Ast) -> String {
             }
             continue;
         }
-        let (sz, al) = (ast.tt.size(gl.ty), ast.tt.align(gl.ty));
+        let (sz, al) = (ast.tt.size(gl.ty), ast.tt.data_align(gl.ty));
         let globl = if gl.is_static {
             String::new()
         } else if gl.is_weak {

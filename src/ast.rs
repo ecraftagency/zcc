@@ -128,6 +128,16 @@ impl TyTab {
             _ => self.size(t),
         }
     }
+    // gcc DATA_ALIGNMENT/LOCAL_ALIGNMENT (aarch64): aggregate (array/struct)
+    // nâng align tối thiểu 8 (BITS_PER_WORD) để tăng tốc truy cập — zcc theo cho
+    // drop-in parity: static/stack array land như gcc (đo: gcc cho char[2..64]
+    // đều 8). Scalar giữ natural.
+    pub fn data_align(&self, t: TypeId) -> u32 {
+        match self.tys[t as usize] {
+            Ty::Array(..) | Ty::Struct(_) => self.align(t).max(8),
+            _ => self.align(t),
+        }
+    }
     pub fn pointee(&self, t: TypeId) -> Option<TypeId> {
         match self.tys[t as usize] {
             Ty::Ptr(p) | Ty::Array(p, _) => Some(p),
