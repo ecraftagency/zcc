@@ -864,6 +864,28 @@ impl Cg<'_> {
             _ => unreachable!("không phải lvalue"),
         }
     }
+    // Địa chỉ hàm → x0. Dùng chung bởi AST-walk (Node::FunAddr) và IR (Inst::FunAddr)
+    // → asm BYTE-IDENTICAL. hàm static = symbol LOCAL: cấm đi GOT — gas hạ reloc local
+    // thành .text+addend, GNU ld tạo GOT entry BỎ addend → con trỏ trỏ nhầm hàm đầu
+    // section (musl libc_start_main_stage2 → nhảy vào __syscall3). Local cùng TU →
+    // adrp/add trực tiếp.
+    fn emit_funaddr(&mut self, name: &str) {
+        let sy = sym(name);
+        if self.a.funcs.iter().any(|f| f.name == name && f.is_static) {
+            _ = writeln!(self.s, "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}", sy);
+        } else {
+            _ = writeln!(self.s, "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]", sy);
+        }
+    }
+    // &&label (GNU computed-goto) → x0. Nhãn cục bộ trong hàm hiện tại.
+    fn emit_labeladdr(&mut self, name: &str) {
+        _ = writeln!(
+            self.s,
+            "\tadrp x0, lg_{0}.{1}\n\tadd x0, x0, :lo12:lg_{0}.{1}",
+            self.fname, name
+        );
+    }
+
     fn expr(&mut self, id: NodeId) {
         let t = self.a.types[id as usize];
         match &self.a.nodes[id as usize] {
@@ -881,20 +903,8 @@ impl Cg<'_> {
             }
             Node::Addr(e) => self.addr(*e),
             Node::FunAddr(name) => {
-                let sy = sym(name);
-                // hàm static = symbol LOCAL: cấm đi GOT — gas hạ reloc local
-                // thành .text+addend, GNU ld tạo GOT entry BỎ addend → con trỏ
-                // trỏ nhầm hàm đầu section (musl libc_start_main_stage2 → nhảy
-                // vào __syscall3). Local luôn cùng TU → adrp/add trực tiếp.
-                if self.a.funcs.iter().any(|f| f.name == *name && f.is_static) {
-                    _ = writeln!(self.s, "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}", sy);
-                } else {
-                    _ = writeln!(
-                        self.s,
-                        "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]",
-                        sy
-                    );
-                }
+                let name = name.clone();
+                self.emit_funaddr(&name);
             }
             Node::Alloca(e) => {
                 self.expr(*e);
@@ -902,11 +912,8 @@ impl Cg<'_> {
                 self.vla_live += 1; // VLA sống trong scope hiện tại (dealloc tại label base-level)
             }
             Node::LabelAddr(name) => {
-                _ = writeln!(
-                    self.s,
-                    "\tadrp x0, lg_{0}.{1}\n\tadd x0, x0, :lo12:lg_{0}.{1}",
-                    self.fname, name
-                );
+                let name = name.clone();
+                self.emit_labeladdr(&name);
             }
             Node::Cast(e) => {
                 let from = self.a.types[*e as usize];
@@ -1897,6 +1904,14 @@ impl<'a> Cg<'a> {
                     }
                     None => self.stmt(*node),
                 }
+            }
+            Inst::FunAddr(d, name) => {
+                self.emit_funaddr(name);
+                self.tmp_store(*d, "x0");
+            }
+            Inst::LabelAddr(d, name) => {
+                self.emit_labeladdr(name);
+                self.tmp_store(*d, "x0");
             }
         }
     }

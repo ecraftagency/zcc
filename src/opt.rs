@@ -32,7 +32,7 @@ fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
             g(a);
             g(b);
         }
-        Inst::Lea(..) | Inst::Opaque(..) => {}
+        Inst::Lea(..) | Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
                 g(p)

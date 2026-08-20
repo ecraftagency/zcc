@@ -84,6 +84,11 @@ pub enum Inst {
     Lea(Tmp, Place),                // dst = địa chỉ của Place
     Cast(Tmp, TypeId, TypeId, Val), // dst:to = cast(from → to) a  (trunc/ext/f↔i)
     Call(Option<Tmp>, Callee, Vec<Val>, u32), // dst?, callee, args, nfix (ABI variadic)
+    // ---- EXOTIC typed (thay dần Opaque; operand-free trước) ----
+    // dst = &hàm (GOT nếu extern, adrp/add nếu static). Địa chỉ hằng-symbol,
+    // KHÔNG toán hạng Val. Giữ impure (như Opaque) → không DCE/CSE → asm bất biến.
+    FunAddr(Tmp, String),   // dst = địa chỉ hàm `name`
+    LabelAddr(Tmp, String), // dst = &&label (GNU computed-goto) trong hàm hiện tại
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -142,7 +147,9 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Copy(d, ..)
         | Inst::Load(d, ..)
         | Inst::Lea(d, ..)
-        | Inst::Cast(d, ..) => Some(*d),
+        | Inst::Cast(d, ..)
+        | Inst::FunAddr(d, ..)
+        | Inst::LabelAddr(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::Opaque(d, ..) => *d,
         Inst::Store(..) | Inst::Memcpy(..) => None,
     }
@@ -167,7 +174,7 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
         }
-        Inst::Lea(..) | Inst::Opaque(..) => {}
+        Inst::Lea(..) | Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
                 v(p)
@@ -519,7 +526,20 @@ impl<'a> Lower<'a> {
                     Val::Tmp(t)
                 }
             }
-            // đuôi exotic (VaArg/Sync/Overflow/Asm/Alloca/SRet/FunAddr/…) → bridge
+            // exotic đã có Inst typed (operand-free) → hạ thẳng, không qua Opaque.
+            Node::FunAddr(name) => {
+                let name = name.clone();
+                let t = self.t(ty);
+                self.push(Inst::FunAddr(t, name));
+                Val::Tmp(t)
+            }
+            Node::LabelAddr(name) => {
+                let name = name.clone();
+                let t = self.t(ty);
+                self.push(Inst::LabelAddr(t, name));
+                Val::Tmp(t)
+            }
+            // đuôi exotic (VaArg/Sync/Overflow/Asm/Alloca/SRet/…) → bridge
             _ => self.bridge_val(n, ty),
         }
     }
@@ -1029,7 +1049,9 @@ pub(crate) mod tests {
                             reg[*d as usize] = canon(tt, f.temps[*d as usize], r);
                         }
                     }
-                    Inst::Opaque(..) => return Err("interp: opaque inst (hàm không thuần)".into()),
+                    Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {
+                        return Err("interp: địa chỉ symbol/label (hàm không thuần)".into())
+                    }
                 }
             }
             match &b.term {
