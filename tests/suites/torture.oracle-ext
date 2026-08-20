@@ -1,0 +1,22 @@
+# torture.oracle-ext — case mà TRỌNG TÀI gcc chạy một ngữ nghĩa NGOÀI strict-C99
+# (test hardcode giá trị gcc-riêng: hoặc gcc-ext reduced-precision, hoặc test-code
+# tự chứa UB rồi đòi gcc-fold). zcc làm ĐÚNG chuẩn → differential zcc↔gcc báo
+# "sai" nhưng lỗi ở ORACLE, không phải zcc. Mỗi dòng: <case> <proof>. PROOF phải
+# ĐA CHIỀU (luật suy-đoán-tội): oracle độc lập (clang, trọng tài charter trên mac)
+# + điều khoản C99. Reviewer tái lập: `clang -std=c99 -w -O0 X.c && ./a.out; echo $?`.
+# KHÔNG phải thùng rác giấu bug — chỉ nhận case đã CHỨNG MINH gcc là kẻ ngoại lệ.
+#
+# reduced-precision arithmetic trên long-long bit-field (>32 bit): GCC làm số học ở
+# ĐÚNG field-width (pr32244 `x.b<<32`→40-bit→0); C99 6.3.1.1 chỉ promote bit-field
+# _Bool/int/unsigned → long-long field GIỮ declared type → số học 64-bit. clang -std=c99
+# + zcc CÙNG abort (64-bit, exit 134); chỉ gcc trả 0. gcc outlier, zcc conforming.
+pr32244-1  reduced-precision long-long-bitfield <<: clang+zcc abort (C99 6.3.1.1, 64-bit), gcc 40-bit outlier
+pr34971    reduced-precision long-long-bitfield: clang+zcc abort (C99 6.3.1.1, 64-bit), gcc outlier
+bitfld-3   reduced-precision long-long-bitfield *,+,-: clang+zcc abort (C99 6.3.1.1, 64-bit), gcc outlier
+#
+# UB — chương trình ĐỊNH NGHĨA LẠI identifier reserved của thư viện chuẩn (C99
+# 7.1.3: tên hàm thư viện external-linkage luôn reserved; định nghĩa lại = UB).
+# gcc+clang coi tên đó là builtin và FOLD (bỏ qua định nghĩa user); zcc gọi hàm
+# user thật. Diff tại UB vô nghĩa (charter). Test tự lộ ý đồ: định nghĩa llabs
+# gọi abort() rồi kỳ vọng KHÔNG bị gọi (tức đòi fold).
+20021127-1  UB redefine reserved `llabs` (C99 7.1.3); gcc+clang fold builtin bỏ def user, zcc gọi thật → abort

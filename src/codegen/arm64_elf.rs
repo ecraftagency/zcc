@@ -1015,7 +1015,14 @@ impl Cg<'_> {
                 while let Node::Cast(i) = self.a.nodes[rr as usize] {
                     rr = i;
                 }
-                if matches!(self.a.nodes[rr as usize], Node::Alloca(_))
+                // RHS là setjmp-family (returns-twice): điểm return-lần-2 (qua
+                // longjmp) tái-thực-thi vùng SAU `bl`, nên KHÔNG được pop dest-addr
+                // từ slot đẩy TRƯỚC call — slot đó đã bị các push xen giữa ghi đè →
+                // str vào địa chỉ rác. Phải RECOMPUTE addr SAU call (như Alloca).
+                let rt2 = matches!(&self.a.nodes[rr as usize],
+                    Node::Call(n, ..) if matches!(n.as_str(),
+                        "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp" | "__setjmp"));
+                if (matches!(self.a.nodes[rr as usize], Node::Alloca(_)) || rt2)
                     && !matches!(self.a.tt.tys[lt as usize], Ty::Struct(_))
                 {
                     self.expr(r);

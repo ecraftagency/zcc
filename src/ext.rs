@@ -205,6 +205,45 @@ pub fn overflow_emit(s: &mut String, op: u8, a_sg: bool, b_sg: bool, r_sg: bool,
     }
 }
 
+// EXT(gcc): `__builtin_<f>` mà <f> là hàm thư viện C thật (abort, memcpy, printf…)
+// → GCC đổ về symbol libc; zcc strip prefix rồi gọi thẳng. DANH SÁCH TRẮNG bắt
+// buộc (default-deny): builtin nào KHÔNG có ở đây = intrinsic thuần compiler
+// (clrsb, parity, frame_address, apply, va_arg_pack, mul_overflow_p…) — strip
+// sẽ đẻ call tới symbol KHÔNG tồn tại → as/ld nghẹn (silent-miscompile). Luật
+// 2-fact: builtin lạ phải REJECT SẠCH, không được âm thầm hoá libc-call. Danh
+// sách = hàm thư viện C89/C99 + POSIX/GNU-string mà corpus THẬT đụng (test-first).
+pub fn builtin_is_libc(f: &str) -> bool {
+    // fortified `__builtin___memcpy_chk` → strip còn `__memcpy_chk` (symbol musl thật)
+    if let Some(core) = f.strip_prefix("__").and_then(|x| x.strip_suffix("_chk")) {
+        return builtin_is_libc(core);
+    }
+    matches!(
+        f,
+        // string.h + GNU string
+        "memcpy" | "memmove" | "memset" | "memcmp" | "memchr" | "mempcpy"
+        | "strcpy" | "strncpy" | "stpcpy" | "stpncpy" | "strcat" | "strncat"
+        | "strcmp" | "strncmp" | "strcoll" | "strxfrm" | "strlen" | "strnlen"
+        | "strchr" | "strrchr" | "strstr" | "strpbrk" | "strspn" | "strcspn"
+        | "strdup" | "strndup" | "strtok" | "strerror" | "memrchr"
+        | "ffs" | "ffsl" | "ffsll"  // POSIX strings.h — __builtin_ffs ≡ ffs
+        // stdio.h
+        | "printf" | "fprintf" | "sprintf" | "snprintf" | "vprintf" | "vfprintf"
+        | "vsprintf" | "vsnprintf" | "scanf" | "sscanf" | "puts" | "fputs"
+        | "putchar" | "fputc" | "putc" | "fwrite" | "fread" | "fopen" | "fflush"
+        | "perror" | "fputs_unlocked"
+        // stdlib.h
+        | "malloc" | "calloc" | "realloc" | "free" | "abort" | "exit" | "_exit"
+        | "_Exit" | "atexit" | "abs" | "labs" | "llabs" | "imaxabs" | "atoi"
+        | "atol" | "atoll" | "atof" | "qsort" | "bsearch" | "getenv"
+        | "strtol" | "strtoul" | "strtoll" | "strtoull" | "strtod"
+        // math.h (libm — driver link -lm)
+        | "fabs" | "fabsf" | "fabsl" | "sqrt" | "sqrtf" | "sqrtl"
+        | "copysign" | "copysignf" | "copysignl" | "fmax" | "fmin" | "fmod"
+        | "floor" | "ceil" | "round" | "trunc" | "pow" | "exp" | "log"
+        | "sin" | "cos" | "tan"
+    )
+}
+
 pub fn sync_op(name: &str) -> Option<(SyncOp, usize)> {
     Some(match name {
         "__sync_fetch_and_add" => (SyncOp::FetchAdd, 2),

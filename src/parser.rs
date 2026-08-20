@@ -558,9 +558,22 @@ impl P<'_> {
             }
         };
         if cplx {
-            // C99: float _Complex / double _Complex / long double _Complex
-            // (long double = double); _Complex trần = double _Complex (theo gcc)
-            let elem = if t == FLOAT { FLOAT } else { DOUBLE };
+            // C99 6.2.5: complex CHỈ float/double/long double. `_Complex int/long/
+            // char/unsigned…` = complex SỐ NGUYÊN (GNU ext, ngoài C99) → reject SẠCH
+            // thay vì âm thầm ép về double complex (mis-size: complex int 8B vs
+            // complex double 16B → miscompile, pr56837). Bare `_Complex` (không
+            // keyword base) = double complex (gcc default). long double = double (sổ).
+            let elem = if t == FLOAT {
+                FLOAT
+            } else if t == DOUBLE || t == LDOUBLE {
+                DOUBLE
+            } else if base.is_some() || short || longs > 0 || uns || sgn {
+                return Err(
+                    "_Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ".into(),
+                );
+            } else {
+                DOUBLE // _Complex trần = double _Complex
+            };
             return Ok(Some((self.cplx_of(elem), storage)));
         }
         Ok(Some((t, storage)))
@@ -713,6 +726,13 @@ impl P<'_> {
                     // wrapping cho khớp size() đã wrapping — huge array (2^62 short,
                     // 991014-1) wrap thay vì panic debug, KHÔNG crash trên input hợp lệ
                     let sz = self.tt.size(mt);
+                    // object >4GB ngoài giới hạn zcc (layout size u32 — deviation-có-sổ
+                    // ast.rs:116). Nuốt = wrap → sizeof/offset SAI (991014-1). Reject SẠCH.
+                    if self.tt.size64(mt) > u32::MAX as u64 {
+                        return Err(format!(
+                            "member '{mn}' >4GB: object vượt giới hạn size u32 của zcc"
+                        ));
+                    }
                     let al = if packed {
                         1
                     } else {
@@ -924,6 +944,24 @@ impl P<'_> {
                     let n = self.ident()?;
                     match n.as_str() {
                         "packed" | "__packed__" => packed = true,
+                        // EXT(gcc): vector_size = kiểu SIMD (GNU vector). zcc KHÔNG
+                        // cài — nuốt im attr sẽ biến typedef vector→scalar rồi
+                        // miscompile số học/khởi tạo. Luật 2-fact: reject SẠCH.
+                        "vector_size" | "__vector_size__" => {
+                            return Err(
+                                "__attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ"
+                                    .into(),
+                            );
+                        }
+                        // EXT(gcc): scalar_storage_order đảo byte-order từng scalar
+                        // trong struct. zcc không cài — nuốt im = layout sai byte →
+                        // miscompile. Luật 2-fact: reject SẠCH.
+                        "scalar_storage_order" | "__scalar_storage_order__" => {
+                            return Err(
+                                "__attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ"
+                                    .into(),
+                            );
+                        }
                         // EXT(gcc): weak/alias — bộ xương weak_alias() của musl
                         "weak" | "__weak__" => self.attr_weak = true,
                         // EXT(gcc): glibc bật union này dưới _GNU_SOURCE
@@ -1014,22 +1052,32 @@ impl P<'_> {
                     Err(_) if self.in_params > 0 => {
                         self.pos = save;
                         let mut depth = 0u32;
+                        let mut side_effect = false;
                         loop {
                             match self.toks.get(self.pos) {
                                 Some(Tok::Punct("[")) => depth += 1,
                                 Some(Tok::Punct("]")) if depth == 0 => break,
                                 Some(Tok::Punct("]")) => depth -= 1,
                                 None => return Err("mảng param thiếu ']'".into()),
-                                // C99 6.9.1: size expr của array param CÓ side-effect
-                                // (`b[a++]`) đúng ra phải eval khi HÀM ĐƯỢC GỌI. zcc
-                                // decay param về con trỏ, drop size — side-effect mất
-                                // (miscompile 970217-1/pr77767 KHI hàm bị gọi). KHÔNG
-                                // reject ở đây được: `bar(char a[2][(*x)++])` không bao
-                                // giờ gọi thì hành vi ĐÚNG (pr22061-2) — reject sẽ phá
-                                // case xanh. ⇒ HOÃN (VLA-VMT niche, charter line 31).
+                                // C99 6.9.1: size expr array-param CÓ side-effect (`b[a++]`)
+                                // đúng ra eval KHI HÀM ĐƯỢC GỌI (prologue). zcc decay param
+                                // về con trỏ, drop size — nếu size chỉ đọc (`__pmatch[n]`)
+                                // thì drop VÔ HẠI (đằng nào cũng là con trỏ). Nhưng dimension
+                                // CÓ ++/-- thì drop = MẤT side-effect → miscompile khi gọi
+                                // (970217-1/pr77767/pr22061-3,4). Không cài eval-on-entry
+                                // (VLA-VMT niche, charter 31) → reject SẠCH thay vì nuốt.
+                                Some(Tok::Punct("++")) | Some(Tok::Punct("--")) => {
+                                    side_effect = true
+                                }
                                 _ => {}
                             }
                             self.pos += 1;
+                        }
+                        if side_effect {
+                            return Err(
+                                "side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ"
+                                    .into(),
+                            );
                         }
                         0
                     }
@@ -1284,11 +1332,39 @@ impl P<'_> {
     fn mkassign(&mut self, l: NodeId, r: NodeId) -> R {
         self.check_lval(l)?;
         let lt = self.ty(l);
-        let r = if self.scalar(lt) { self.cast(r, lt) } else { r };
+        // complex là Ty::Struct → scalar()=false, nhưng gán `c = x` (scalar→complex)
+        // BẮT BUỘC qua cast() để dựng temp {re=x, im=0}; nếu không → Assign coi RHS
+        // int là ĐỊA CHỈ rồi struct-copy 16B từ đó → segfault (960512-1). cast()
+        // identity-return khi cùng type nên complex↔complex same-type vẫn struct-copy.
+        let r = if self.scalar(lt) || self.cplx_elem(lt).is_some() {
+            self.cast(r, lt)
+        } else {
+            r
+        };
         Ok(self.push(Node::Assign(l, r), lt))
     }
     // điều kiện: float phải so != 0.0 (cbz nhìn bit pattern sẽ sai với -0.0)
     fn truthy(&mut self, e: NodeId) -> R {
+        // C99 6.3.1.2: complex nonzero ⟺ re≠0 || im≠0. e là Ty::Struct nên cbz sẽ
+        // nhìn địa chỉ struct (luôn ≠0) → SAI (960512-1). Chốt temp (e có thể có
+        // side-effect: `if(c=f())`) rồi OR hai phần != 0.
+        if let Some(el) = self.cplx_elem(self.ty(e)) {
+            let ct = self.ty(e);
+            let off = self.alloc_local(String::new(), ct);
+            let tv = self.push(Node::Var(off), ct);
+            let save = self.push(Node::Assign(tv, e), ct);
+            let t1 = self.push(Node::Var(off), ct);
+            let re = self.cplx_proj(t1, false)?;
+            let z1 = self.push(Node::FNum(0.0), el);
+            let rne = self.mkbin("!=", re, z1)?;
+            let t2 = self.push(Node::Var(off), ct);
+            let im = self.cplx_proj(t2, true)?;
+            let z2 = self.push(Node::FNum(0.0), el);
+            let ine = self.mkbin("!=", im, z2)?;
+            let or = self.mkbin("|", rne, ine)?; // rne,ine ∈ {0,1} → bitwise = logic
+            let ot = self.ty(or);
+            return Ok(self.push(Node::Comma(save, or), ot));
+        }
         if self.tt.is_float(self.ty(e)) {
             let z = self.push(Node::FNum(0.0), DOUBLE);
             self.mkbin("!=", e, z)
@@ -3076,6 +3152,16 @@ impl P<'_> {
         } else if self.eat(&Tok::Punct("&&")) {
             // GNU "&&label": && ở vị trí prefix không thể là logical-and
             let n = self.ident()?;
+            // EXT(gcc): &&label trỏ __label__ của HÀM BAO (owner≠cur) — địa chỉ
+            // label phải giải qua static chain (frame khác). zcc mangle theo hàm
+            // hiện tại → symbol lệch, ld undefined. Combo cực hiếm (nested-func +
+            // labels-as-values liên-frame); real code không đụng → reject SẠCH
+            // thay vì phun ref rác (luật 2-fact).
+            if self.nl_labels.iter().any(|(u, l)| *l == n && *u != self.cur_uid) {
+                return Err(format!(
+                    "&&{n}: địa chỉ label của hàm bao qua nested function chưa hỗ trợ"
+                ));
+            }
             let t = self.tt.ptr_to(VOID);
             Ok(self.push(Node::LabelAddr(n), t))
         } else if self.eat(&Tok::Punct("&")) {
@@ -3097,9 +3183,18 @@ impl P<'_> {
             } else {
                 let save = self.nodes.len();
                 let e = self.unary()?;
+                // EXT(gcc): __alignof__(func) = alignment do __attribute__((aligned))
+                // đặt lên HÀM (align-3 đòi 256). C99 function không có alignment; zcc
+                // không track → func decay ptr, align()=8 ≠ 256 → miscompile. Reject SẠCH.
+                let is_fn = matches!(self.nodes[e as usize], Node::FunAddr(_));
                 let t = self.ty(e);
                 self.nodes.truncate(save);
                 self.types.truncate(save);
+                if is_fn {
+                    return Err(
+                        "__alignof__ của function (GNU function-alignment) chưa hỗ trợ".into(),
+                    );
+                }
                 self.tt.align(t)
             };
             return Ok(self.push(Node::Num(al as i64), ULONG));
@@ -3633,11 +3728,20 @@ impl P<'_> {
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
             if self.peek("(") {
-                // __builtin_abort... → abort (GCC builtin đổ về libc)
-                let n = n
-                    .strip_prefix("__builtin_")
-                    .map(str::to_string)
-                    .unwrap_or(n);
+                // __builtin_abort… → abort: GCC đổ builtin về symbol libc. Nhưng
+                // CHỈ khi <f> thực sự là hàm thư viện (whitelist ext::builtin_is_libc).
+                // Builtin intrinsic thuần (clrsb/parity/frame_address/apply/
+                // va_arg_pack/mul_overflow_p…) KHÔNG có symbol → strip = phun call
+                // rác → as/ld nghẹn. Luật 2-fact: reject SẠCH thay vì nuốt-rồi-phun.
+                let n = if let Some(f) = n.strip_prefix("__builtin_") {
+                    if f == "alloca" || crate::ext::builtin_is_libc(f) {
+                        f.to_string()
+                    } else {
+                        return Err(format!("__builtin_{f}: builtin chưa hỗ trợ"));
+                    }
+                } else {
+                    n
+                };
                 if n == "alloca" {
                     // không có symbol libc; sub sp trực tiếp (epilogue mov sp,x29 thu hồi)
                     self.expect(Tok::Punct("("))?;

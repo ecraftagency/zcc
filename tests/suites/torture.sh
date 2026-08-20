@@ -29,6 +29,9 @@ export DIR="$C/gcc/gcc/testsuite/gcc.c-torture/execute"
 [ -d "$DIR" ] || { echo "thiếu cache: clone sparse gcc theo tests/README.md"; exit 2; }
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
+# manifest gcc-ext: case mà TRỌNG TÀI gcc chạy ngữ nghĩa ngoài strict-C99 (proof
+# đa chiều trong file — clang oracle độc lập + C99). zcc conforming, gcc outlier.
+export OE="$(dirname "$0")/torture.oracle-ext"
 
 # LUẬT BẢO TOÀN (chống skip ngầm — Vu 2026-08-20): danh sách case được nạp
 # ghi cứng ra $D/fed; sau vòng chạy, MỖI case phải xuất hiện ĐÚNG 1 lần trong
@@ -40,6 +43,11 @@ nfed=$(wc -l < "$D/fed" | tr -d ' ')
 # mỗi worker in 1 dòng TSV: <CLASS>\t<sub>\t<case>\t<reason>
 xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c); e="$D/$b.err"
+    # ── gcc-ext gate: case đã CHỨNG MINH gcc ngoại lệ ngoài strict-C99 (proof đa
+    # chiều trong torture.oracle-ext) → oracle-invalid, KHÔNG so zcc↔gcc (gcc sai chuẩn).
+    if [ -f "$OE" ] && why=$(grep "^$b " "$OE" 2>/dev/null | head -1); [ -n "$why" ]; then
+        printf "NOTIMPL\toracle-invalid\t%s\tgcc-ext: %s\n" "$b" "$(echo "$why" | sed "s/^$b  *//")"; exit 0
+    fi
     # ── referee c99 (trọng tài độc lập) ──
     # -w tắt warning nhưng error THẬT vẫn hiện: bắt lý do reject để manifest nêu
     # tên (reviewer phân biệt gcc-ext/target-specific vs referee-quirk).
@@ -66,7 +74,27 @@ xargs -n 1 -P 8 sh -c '
         if grep -q "^zcc:" "$e"; then
             printf "NOTIMPL\tzcc-reject\t%s\t%s\n" "$b" "${r:-reject}"
         else
-            printf "FAIL\tbackend\t%s\t%s\n" "$b" "${r:-as/ld-choke}"
+            # backend: zcc exit1 KHÔNG diagnostic → as/ld nghẹn. PHÂN BIỆT nguồn
+            # cơ học (không hardcode tên): ld "undefined reference to X" mà X CÓ
+            # trong source NHƯNG VẮNG trong referee asm ⇒ referee đã DCE X (dead
+            # code); zcc -O0 (thiết kế: không optimization pass) giữ ref. Divergence
+            # THUẦN optimization ∉ scope zcc → oracle-invalid, KHÔNG phải miscompile.
+            # Ngược lại (X là symbol mangled nội bộ zcc, hoặc X thật thiếu) = FAIL.
+            syms=$(grep -oE "undefined reference to .[A-Za-z_][A-Za-z0-9_.]*" "$e" \
+                   | sed -E "s/.*to .//" | sort -u)
+            optdep=0
+            if [ -n "$syms" ] && cc -std=c99 -w -O0 -S "$f" -o "$D/$b.rs" 2>/dev/null; then
+                optdep=1
+                for sy in $syms; do
+                    grep -qw "$sy" "$f" || { optdep=0; break; }        # X phải là symbol source (không mangled)
+                    grep -qw "$sy" "$D/$b.rs" && { optdep=0; break; }  # và đã VẮNG trong referee asm (bị DCE)
+                done
+            fi
+            if [ "$optdep" = 1 ]; then
+                printf "NOTIMPL\toracle-invalid\t%s\topt-dependent: referee DCE [%s], zcc -O0 giữ ref\n" "$b" "$(echo $syms | tr "\n" " ")"
+            else
+                printf "FAIL\tbackend\t%s\t%s\n" "$b" "${r:-as/ld-choke}"
+            fi
         fi
     else
         printf "FAIL\tcrash\t%s\trc=%s %s\n" "$b" "$zrc" "$r"
