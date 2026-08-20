@@ -1010,6 +1010,13 @@ impl P<'_> {
                                 Some(Tok::Punct("]")) if depth == 0 => break,
                                 Some(Tok::Punct("]")) => depth -= 1,
                                 None => return Err("mảng param thiếu ']'".into()),
+                                // C99 6.9.1: size expr của array param CÓ side-effect
+                                // (`b[a++]`) đúng ra phải eval khi HÀM ĐƯỢC GỌI. zcc
+                                // decay param về con trỏ, drop size — side-effect mất
+                                // (miscompile 970217-1/pr77767 KHI hàm bị gọi). KHÔNG
+                                // reject ở đây được: `bar(char a[2][(*x)++])` không bao
+                                // giờ gọi thì hành vi ĐÚNG (pr22061-2) — reject sẽ phá
+                                // case xanh. ⇒ HOÃN (VLA-VMT niche, charter line 31).
                                 _ => {}
                             }
                             self.pos += 1;
@@ -2014,6 +2021,14 @@ impl P<'_> {
                     }
                     match storage {
                         Storage::Typedef => {
+                            // C99 6.7.7: typedef của variably-modified type
+                            // (`typedef int c[i+2]`) — sizeof phải eval runtime.
+                            // zcc chỉ lower VLA thành Alloca cho local object, không
+                            // có chỗ treo size-expr cho typedef ⇒ TỪ CHỐI sạch thay
+                            // vì trả sizeof=0 (miscompile: 20040411-1).
+                            if vla.is_some() {
+                                return Err("variably-modified typedef: chưa hỗ trợ (C99 6.7.7)".into());
+                            }
                             self.typedefs.insert(name, t);
                         }
                         _ if matches!(self.tt.tys[t as usize], Ty::Func(_)) => {
