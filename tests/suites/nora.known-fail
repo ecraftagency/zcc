@@ -1,2 +1,21 @@
+# nora baseline — CHỈ chứa case ORACLE-INVALID (diff tại observable unspecified/
+# implementation-defined), KHÔNG phải bug zcc. Mỗi entry kèm proof cơ học.
+#
+# ── #3 chapter_15/allocation/test_alignment (Vu 2026-08-20) ──
+# Test đòi `(unsigned long)int_arr % 16 == 0` cho array ≥16 byte.
+# C99 6.2.8p1: _Alignof(int[N]) = _Alignof(int) = 4 — 16-align KHÔNG do ISO C đòi.
+# PROOF incidental: gcc trên CÙNG mảng nhưng frame khác (thêm printf) cho %16=8,
+# KHÔNG phải 0 → 16-align chỉ là artifact stack-layout, không guarantee. zcc cho
+# 4-align (đo: arr/arr2/arr3 %4 = 0) ⇒ ĐÚNG C-required. Diff ở đây đo convention
+# layout, không đo conformance ⇒ oracle vô hiệu. Không fix (không đáng LOC, và
+# ngay gcc cũng frame-dependent), không phải hạng IR+Opt.
 FAIL chapter_15_valid_allocation_test_alignment
+#
+# ── #4 chapter_16/strings_as_initializers/test_alignment (Vu 2026-08-20) ──
+# Test đòi 16-align cho char array ≥16 byte (static + auto).
+# C99: _Alignof(char[N]) = 1. PROOF referee-self-fail: gcc-c99 CHÍNH NÓ return 3
+# (fail check_alignment(flat_auto)) — auto char array không 16-align kể cả ở
+# referee ⇒ không thể là oracle conformance (pattern chibicc self-fail). Phần
+# static: gcc over-align 16 theo convention, ISO C chỉ đòi 1. Cả hai đo
+# over-alignment convention, không đo conformance ⇒ oracle vô hiệu.
 FAIL chapter_16_valid_strings_as_initializers_test_alignment
