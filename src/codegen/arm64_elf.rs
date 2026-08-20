@@ -877,6 +877,18 @@ impl Cg<'_> {
             _ = writeln!(self.s, "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]", sy);
         }
     }
+    // memset(x0, 0, sz): zero sz byte kể từ địa chỉ đang ở x0. Dùng chung AST-walk
+    // (Node::Zero) và IR (Inst::Zero). sz==0 → no-op.
+    fn emit_zero(&mut self, sz: u32) {
+        if sz == 0 {
+            return;
+        }
+        self.imm("x2", sz as i64);
+        let n = self.labels(1);
+        _ = writeln!(self.s, "L{n}:");
+        self.s += "\tstrb wzr, [x0], #1\n\tsubs x2, x2, #1\n";
+        _ = writeln!(self.s, "\tb.ne L{n}");
+    }
     // &&label (GNU computed-goto) → x0. Nhãn cục bộ trong hàm hiện tại.
     fn emit_labeladdr(&mut self, name: &str) {
         _ = writeln!(
@@ -1374,15 +1386,8 @@ impl Cg<'_> {
             }
             Node::Zero(l, sz) => {
                 let (l, sz) = (*l, *sz);
-                self.addr(l);
-                if sz == 0 {
-                    return;
-                }
-                self.imm("x2", sz as i64);
-                let n = self.labels(1);
-                _ = writeln!(self.s, "L{n}:");
-                self.s += "\tstrb wzr, [x0], #1\n\tsubs x2, x2, #1\n";
-                _ = writeln!(self.s, "\tb.ne L{n}");
+                self.addr(l); // địa chỉ → x0
+                self.emit_zero(sz);
             }
             Node::Bin(op, l, r) => {
                 let (op, l, r) = (*op, *l, *r);
@@ -1912,6 +1917,10 @@ impl<'a> Cg<'a> {
             Inst::LabelAddr(d, name) => {
                 self.emit_labeladdr(name);
                 self.tmp_store(*d, "x0");
+            }
+            Inst::Zero(a, sz) => {
+                self.ld_val(*a, "x0"); // địa chỉ → x0
+                self.emit_zero(*sz);
             }
         }
     }

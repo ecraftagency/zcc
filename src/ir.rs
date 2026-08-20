@@ -89,6 +89,9 @@ pub enum Inst {
     // KHÔNG toán hạng Val. Giữ impure (như Opaque) → không DCE/CSE → asm bất biến.
     FunAddr(Tmp, String),   // dst = địa chỉ hàm `name`
     LabelAddr(Tmp, String), // dst = &&label (GNU computed-goto) trong hàm hiện tại
+    // memset(addr, 0, sz): zero-init struct/array (C99 6.7.8). Void, side-effect
+    // ghi bộ nhớ → impure như Store, KHÔNG dst.
+    Zero(Val, u32), // *(addr .. addr+sz) = 0
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -151,7 +154,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::FunAddr(d, ..)
         | Inst::LabelAddr(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::Opaque(d, ..) => *d,
-        Inst::Store(..) | Inst::Memcpy(..) => None,
+        Inst::Store(..) | Inst::Memcpy(..) | Inst::Zero(..) => None,
     }
 }
 
@@ -174,6 +177,7 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
         }
+        Inst::Zero(a, _) => v(a),
         Inst::Lea(..) | Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
@@ -538,6 +542,12 @@ impl<'a> Lower<'a> {
                 let t = self.t(ty);
                 self.push(Inst::LabelAddr(t, name));
                 Val::Tmp(t)
+            }
+            Node::Zero(l, sz) => {
+                let (l, sz) = (*l, *sz);
+                let addr = self.lower_addr(l);
+                self.push(Inst::Zero(addr, sz));
+                Val::Imm(0) // void
             }
             // đuôi exotic (VaArg/Sync/Overflow/Asm/Alloca/SRet/…) → bridge
             _ => self.bridge_val(n, ty),
@@ -1049,8 +1059,8 @@ pub(crate) mod tests {
                             reg[*d as usize] = canon(tt, f.temps[*d as usize], r);
                         }
                     }
-                    Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {
-                        return Err("interp: địa chỉ symbol/label (hàm không thuần)".into())
+                    Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) | Inst::Zero(..) => {
+                        return Err("interp: symbol/label/memset (hàm không thuần)".into())
                     }
                 }
             }
