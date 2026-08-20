@@ -392,8 +392,8 @@ fn pp_file(
         return Err(format!("{}: include lồng quá sâu", path));
     }
     let bytes = fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
-    let src = String::from_utf8_lossy(&bytes).into_owned();
-    let mut toks = lex_t(&src, cu).map_err(|e| format!("{}: {}", path, e))?;
+    // lex THẲNG trên byte thô — giữ nguyên byte non-UTF8 trong string literal
+    let mut toks = lex_t(&bytes, cu).map_err(|e| format!("{}: {}", path, e))?;
     files.push(path.to_string());
     let fid = files.len() as u32 - 1;
     for t in &mut toks {
@@ -591,7 +591,7 @@ fn process(
                         if !std::path::Path::new(&path).exists() {
                             if let Some(src) = embed_src(incs, &bare, skip_embedded) {
                                 let hname = format!("<{}>", bare);
-                                let mut toks = lex_t(src, cu).map_err(|e| format!("{}: {}", hname, e))?;
+                                let mut toks = lex_t(src.as_bytes(), cu).map_err(|e| format!("{}: {}", hname, e))?;
                                 files.push(hname.clone());
                                 let fid = files.len() as u32 - 1;
                                 for t in &mut toks {
@@ -618,7 +618,7 @@ fn process(
                         match embed_src(incs, &name, skip_embedded) {
                             Some(src) => {
                                 let hname = format!("<{}>", name);
-                                let mut toks = lex_t(src, cu).map_err(|e| format!("{}: {}", hname, e))?;
+                                let mut toks = lex_t(src.as_bytes(), cu).map_err(|e| format!("{}: {}", hname, e))?;
                                 files.push(hname.clone());
                                 let fid = files.len() as u32 - 1;
                                 for t in &mut toks {

@@ -54,6 +54,26 @@ const PUNCTS: [&str; 48] = [
 
 // Escape C89 đầy đủ: \n \t \r \a \b \f \v \\ \' \" \? \ooo \xhh.
 // Vào: i trỏ ngay SAU dấu '\', ra: byte giá trị + i đã nhảy qua escape.
+// Decode 1 scalar UTF-8 tại b[i] → (codepoint, số byte). Byte lỗi → (byte, 1).
+// Wide char L'Ä' = 1 multibyte source char → 1 wchar (6.4.4.4); narrow giữ byte.
+fn utf8_cp(b: &[u8], i: usize) -> (u32, usize) {
+    let c = b[i];
+    let (n, mut cp) = match c {
+        0x00..=0x7f => return (c as u32, 1),
+        0xc0..=0xdf => (2, (c & 0x1f) as u32),
+        0xe0..=0xef => (3, (c & 0x0f) as u32),
+        0xf0..=0xf7 => (4, (c & 0x07) as u32),
+        _ => return (c as u32, 1),
+    };
+    for k in 1..n {
+        match b.get(i + k) {
+            Some(&d @ 0x80..=0xbf) => cp = (cp << 6) | (d & 0x3f) as u32,
+            _ => return (c as u32, 1), // dở dang → coi byte đầu là 1 char
+        }
+    }
+    (cp, n)
+}
+
 fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
     let c = *b.get(*i).ok_or("escape cụt")?;
     *i += 1;
@@ -110,19 +130,21 @@ fn fsuffix(b: &[u8], i: &mut usize) -> (u8, bool) {
     (k, im)
 }
 
-fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
+fn number(b: &[u8], i: &mut usize) -> Result<Tok, String> {
     let s = *i;
-    if src[s..].starts_with("0b") || src[s..].starts_with("0B") {
+    // hằng số toàn ASCII → dựng &str từ subrange byte cho parse/from_str_radix
+    let sv = move |x: usize, y: usize| std::str::from_utf8(&b[x..y]).unwrap();
+    if b[s..].starts_with(b"0b") || b[s..].starts_with(b"0B") {
         // GNU: hằng nhị phân 0b1010
         *i += 2;
         let d = *i;
         while matches!(b.get(*i), Some(b'0' | b'1')) {
             *i += 1;
         }
-        let v = u64::from_str_radix(&src[d..*i], 2).map_err(|e| format!("{e}"))?;
+        let v = u64::from_str_radix(sv(d, *i), 2).map_err(|e| format!("{e}"))?;
         return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
     }
-    if src[s..].starts_with("0x") || src[s..].starts_with("0X") {
+    if b[s..].starts_with(b"0x") || b[s..].starts_with(b"0X") {
         *i += 2;
         let d = *i;
         while b.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
@@ -134,7 +156,7 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
         // differential vs cc bắt.
         if matches!(b.get(*i), Some(b'.' | b'p' | b'P')) {
             let mut v: f64 = 0.0;
-            for c in src[d..*i].bytes() {
+            for &c in &b[d..*i] {
                 v = v * 16.0 + (c as char).to_digit(16).unwrap() as f64;
             }
             if b.get(*i) == Some(&b'.') {
@@ -165,7 +187,7 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
             while b.get(*i).is_some_and(|c| c.is_ascii_digit()) {
                 *i += 1;
             }
-            let mut exp: i32 = src[e0..*i].parse().map_err(|e| format!("{e}"))?;
+            let mut exp: i32 = sv(e0, *i).parse().map_err(|e| format!("{e}"))?;
             if neg {
                 exp = -exp;
             }
@@ -179,7 +201,7 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
             let (k, im) = fsuffix(b, i);
             return Ok(if im { Tok::INum(v, k) } else { Tok::FNum(v, k) });
         }
-        let v = u64::from_str_radix(&src[d..*i], 16).map_err(|e| format!("{e}"))?;
+        let v = u64::from_str_radix(sv(d, *i), 16).map_err(|e| format!("{e}"))?;
         return Ok(Tok::Num(v as i64, suffix_kind(b, i, v, true)?));
     }
     while b.get(*i).is_some_and(|c| c.is_ascii_digit()) {
@@ -204,7 +226,7 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
                 *i += 1;
             }
         }
-        let v: f64 = src[s..*i].parse().map_err(|e| format!("{e}"))?;
+        let v: f64 = sv(s, *i).parse().map_err(|e| format!("{e}"))?;
         let (k, im) = fsuffix(b, i);
         return Ok(if im { Tok::INum(v, k) } else { Tok::FNum(v, k) });
     }
@@ -212,9 +234,8 @@ fn number(src: &str, b: &[u8], i: &mut usize) -> Result<Tok, String> {
     // "08" là pp-number hợp lệ, chỉ ill-formed khi DÙNG làm hằng (pcre2.h:
     // `#define PCRE2_DATE 2025-08-27` không ai eval) — gcc lex qua, lỗi lúc
     // convert; zcc lex eager nên hạ xuống decimal thay vì chết cả TU
-    let octal = octal && !src[s..*i].contains(['8', '9']);
-    let v =
-        u64::from_str_radix(&src[s..*i], if octal { 8 } else { 10 }).map_err(|e| format!("{e}"))?;
+    let octal = octal && !b[s..*i].iter().any(|&c| c == b'8' || c == b'9');
+    let v = u64::from_str_radix(sv(s, *i), if octal { 8 } else { 10 }).map_err(|e| format!("{e}"))?;
     Ok(Tok::Num(v as i64, suffix_kind(b, i, v, octal)?))
 }
 
@@ -269,13 +290,16 @@ fn suffix_kind(b: &[u8], i: &mut usize, v: u64, oct_hex: bool) -> Result<NumK, S
 // Wrapper cho nguồn synthetic (macro builtin, token paste) — không chứa hằng
 // ký tự ≥128 nên char signedness không chạm tới.
 pub fn lex(src: &str) -> Result<Vec<PTok>, String> {
-    lex_t(src, false)
+    lex_t(src.as_bytes(), false)
 }
 // char_uns: plain char UNSIGNED (Linux arm64, AAPCS64) — điểm chạm duy nhất
 // là GIÁ TRỊ escape ≥ 128 trong hằng ký tự ('\377' = 255 vs -1 Darwin);
 // nguồn file thật phải đi đường này với cờ theo target.
-pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
-    let b = src.as_bytes();
+// Nguồn = &[u8] THÔ (không qua &str): string literal C là chuỗi BYTE của
+// source char set (5.1.1.2 / 6.4.5) — byte ≥128 hoặc non-UTF8 (vd '\377' raw
+// trong "…") phải giữ NGUYÊN; from_utf8_lossy mangle chúng thành U+FFFD (EF BF
+// BD) → phình chuỗi (bug 20000227-1). Định lý: byte source → 1 byte exec.
+pub fn lex_t(b: &[u8], char_uns: bool) -> Result<Vec<PTok>, String> {
     let (mut i, mut toks) = (0, Vec::new());
     let (mut line, mut bol, mut ws) = (1u32, true, false);
     while i < b.len() {
@@ -302,15 +326,18 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
         }
         // Comment = whitespace; newline BÊN TRONG comment không ngắt dòng logic
         // (phase 3 thay comment bằng 1 space trước khi nhận directive).
-        if src[i..].starts_with("/*") {
-            let end = src[i + 2..].find("*/").ok_or("comment không đóng")?;
+        if b[i..].starts_with(b"/*") {
+            let end = b[i + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .ok_or("comment không đóng")?;
             line += b[i..i + end + 4].iter().filter(|&&x| x == b'\n').count() as u32;
             ws = true;
             i += end + 4;
             continue;
         }
         // "//" (C99/extension, clang chấp nhận cả trong -std=c89): đến hết dòng
-        if src[i..].starts_with("//") {
+        if b[i..].starts_with(b"//") {
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
@@ -329,7 +356,7 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
         let tok = if c.is_ascii_digit()
             || (c == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
         {
-            number(src, b, &mut i)?
+            number(b, &mut i)?
         } else if c == b'\'' {
             i += 1;
             // multi-char constant 'ab' hợp lệ C89 (3.1.3.4, giá trị impl-def) —
@@ -350,6 +377,12 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
                         } else {
                             e as u8 as i8 as i64
                         }
+                    }
+                    e if wide && e >= 0x80 => {
+                        // wide char: multibyte source char → 1 codepoint
+                        let (cp, len) = utf8_cp(b, i);
+                        i += len;
+                        cp as i64
                     }
                     e => {
                         i += 1;
@@ -395,8 +428,8 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
             while i < b.len() && (b[i] == b'_' || b[i] == b'$' || b[i].is_ascii_alphanumeric()) {
                 i += 1;
             }
-            Tok::Ident(src[s..i].to_string())
-        } else if let Some((d, p)) = DIGRAPHS.iter().find(|(d, _)| src[i..].starts_with(d)) {
+            Tok::Ident(String::from_utf8_lossy(&b[s..i]).into_owned())
+        } else if let Some((d, p)) = DIGRAPHS.iter().find(|(d, _)| b[i..].starts_with(d.as_bytes())) {
             // C99 6.4.6: digraph = spelling thay thế vô điều kiện (phase 3),
             // ánh xạ về punct chính tắc ngay tại lexer — phải đứng TRƯỚC bảng
             // PUNCTS vì "<:" sẽ bị match ngắn thành "<". Không có luật "<::"
@@ -404,7 +437,7 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
             i += d.len();
             Tok::Punct(p)
         } else {
-            match PUNCTS.iter().find(|p| src[i..].starts_with(**p)) {
+            match PUNCTS.iter().find(|p| b[i..].starts_with(p.as_bytes())) {
                 Some(p) => {
                     i += p.len();
                     Tok::Punct(p)
@@ -414,7 +447,7 @@ pub fn lex_t(src: &str, char_uns: bool) -> Result<Vec<PTok>, String> {
         };
         let raw = match tok {
             Tok::Num(..) | Tok::FNum(..) | Tok::INum(..) | Tok::Str(..) => {
-                src[tok_start..i].to_string()
+                String::from_utf8_lossy(&b[tok_start..i]).into_owned()
             }
             _ => String::new(),
         };

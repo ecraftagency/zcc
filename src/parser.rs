@@ -657,9 +657,9 @@ impl P<'_> {
                     };
                     members.push((String::new(), bt, o));
                     bits = if is_union {
-                        bits.max(sz * 8)
+                        bits.max(sz.wrapping_mul(8))
                     } else {
-                        (o + sz) * 8
+                        o.wrapping_add(sz).wrapping_mul(8)
                     };
                     mx = mx.max(al);
                 }
@@ -699,6 +699,9 @@ impl P<'_> {
                         bits = if is_union { bits.max(cb) } else { b + w };
                     }
                 } else {
+                    // layout miền u32 (object ≤4GB — deviation-có-sổ ast.rs:116);
+                    // wrapping cho khớp size() đã wrapping — huge array (2^62 short,
+                    // 991014-1) wrap thay vì panic debug, KHÔNG crash trên input hợp lệ
                     let sz = self.tt.size(mt);
                     let al = if packed {
                         1
@@ -712,9 +715,9 @@ impl P<'_> {
                     };
                     members.push((mn, mt, o));
                     bits = if is_union {
-                        bits.max(sz * 8)
+                        bits.max(sz.wrapping_mul(8))
                     } else {
-                        (o + sz) * 8
+                        o.wrapping_add(sz).wrapping_mul(8)
                     };
                     mx = mx.max(al);
                 }
@@ -2517,7 +2520,14 @@ impl P<'_> {
                 *t = self.tt.add(Ty::Array(e, n.max(1) as u64));
             }
             (Ty::Array(e, 0), Init::S(b, w)) => {
-                *t = self.tt.add(Ty::Array(e, b.len() as u64 + 1));
+                // wide L"..": độ dài = số CODEPOINT decode (6.4.5), không phải
+                // byte thô — "Ä" = 1 wchar (U+00C4) chứ không 2 (bug wchar_t-1)
+                let len = if w && self.tt.size(e) == 4 {
+                    wchars(&b).len() as u64
+                } else {
+                    b.len() as u64
+                };
+                *t = self.tt.add(Ty::Array(e, len + 1));
                 self.fill_obj(*t, 0, Init::S(b, w), &mut flat)?;
             }
             (_, init) => self.fill_obj(*t, 0, init, &mut flat)?,
