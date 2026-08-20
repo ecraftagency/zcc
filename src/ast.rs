@@ -282,17 +282,6 @@ pub enum Node {
     Asm(String, Vec<AsmOp>),
     Alloca(NodeId), // cấp phát động trên stack; epilogue mov sp,x29 tự thu hồi
     Str(u32),
-    // EXT(gcc): nested function (GNU) — chỉ ELF (trampoline đòi exec-stack, Darwin W^X cấm).
-    // Upvar: biến automatic của hàm bao, truy cập qua static chain [chain - off]
-    // (chain = x29 hàm bao, lưu trong slot Func.chain của hàm nested).
-    Upvar(u32),
-    // Tramp: tham chiếu tên nested fn làm GIÁ TRỊ (gọi/truyền) — dựng trampoline
-    // 40B runtime trên frame hiện tại tại slot `off`, patch (fn_addr, chain) rồi
-    // __clear_cache; giá trị = địa chỉ trampoline. (symbol nested, slot offset)
-    Tramp(String, u32),
-    // NlGoto: goto tới __label__ của hàm bao từ trong nested — khôi phục (x29,sp)
-    // hàm bao qua chain rồi br. (uid hàm bao sở hữu label, tên label)
-    NlGoto(u32, String),
 }
 
 // EXT(gcc): một operand asm — bề mặt musl đòi (syscall/atomic/math):
@@ -349,12 +338,6 @@ pub struct Func {
     pub is_weak: bool, // EXT(gcc): __attribute__((weak)) trên definition
     pub variadic: bool,
     pub sret: u32, // ≠0: slot giấu con trỏ x8 (trả struct >16B gián tiếp)
-    // EXT(gcc): nested function — uid duy nhất; parent_uid = uid hàm bao trực tiếp
-    // (u32::MAX = top-level); chain = offset slot lưu static chain (x18) trong
-    // prologue nested (0 với top-level). Codegen tra parent theo uid.
-    pub uid: u32,
-    pub parent_uid: u32,
-    pub chain: u32,
     // C99 6.8.6.1: có VLA → codegen phải reset SP về base tại label (goto rời
     // scope VLA phải dealloc; nếu không, VLA trong vòng lặp goto tràn stack)
     pub has_vla: bool,

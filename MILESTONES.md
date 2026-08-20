@@ -219,10 +219,53 @@ vay được không mất claim.
 Câu chuyện khác biệt: toolchain auditable — "trusting trust" cỡ một học kỳ
 sinh viên.
 
-## Chiến dịch torture — nested function (GNU) ĐẠT 2026-08-20
+## C99-đủ — bịt 3 lỗ ISO C99 cuối (VLA) 2026-08-20
 
-**+23 torture (95→72 fail, 0 NEW fail), full suite 14/14 PASS, src 9894/10000
-(KHÔNG cần bỏ Mach-O).** GNU nested function = phương ngữ vendor `EXT(gcc)`,
+**torture `1377 pass / 317 not-impl / 0 FAIL` (box, gate giữ).** Phase 2 chốt 3
+construct ISO C99 THẬT (không vendor — proof `clang -pedantic-errors` ACCEPT +
+spec), mỗi món map định lý, test-first, differential vs gcc:
+- **`pr57568` — địa chỉ-hằng 2D** (6.6p9): `gaddr` thêm nhánh `Deref(p)` khi kiểu
+  là `Array(..)` → `&arr[i][j]` là hằng địa chỉ hợp lệ (trước reject).
+- **`20040411-1` — variably-modified typedef `sizeof`** (6.7.7 + 6.5.3.4p2):
+  `typedef int c[i+2]` — size eval MỘT LẦN tại điểm khai báo, chốt byte vào local
+  ẩn `.vmtsz`; `sizeof(c)` đọc lại (trước trả 0 = silent-miscompile). Non-ISO
+  (VM-typedef ngoài mảng / đa chiều) vẫn reject sạch.
+- **`20221006-1` — VLA 2 chiều local** `int M[d0][d1]` (6.7.6.2): hạ xuống con
+  trỏ-tới-hàng-VLA `int[d1]` + `alloca(d0·d1·elem)`. TÁI DÙNG nguyên cơ chế
+  `(*p)[w]`: đăng ký row-type vào `vla_arrs` (bước-hàng runtime `d1·elem` trong
+  local ẩn `.rowsz`) → indexing `M[i][j]` tự đúng qua decay `Deref-Array`
+  (arm64_elf 867-875, không thêm codegen). Mỗi declarator sinh TypeId row riêng
+  ⇒ `M1`/`M2` khác bề rộng không đụng nhau. `vla_inner: Vec<NodeId>` gom chiều
+  trong; ≥3 chiều / chiều-trong-lồng-VLA reject sạch. Differential gcc: sum +
+  row-stride khớp kể cả chữ nhật `a≠b` (stride `= b·4` độc lập số hàng).
+
+Kèm: **VLA-in-struct** (GNU non-ISO, `-pedantic-errors` "will never be
+supported") giờ reject HONEST tại struct-body (`VLA trong struct/union chưa hỗ
+trợ`) thay vì rò state → miscompile (pr82210/20040423-1/pr41935/20040308-1/
+20041218-2/20070919-1/align-nest). `align-nest` rớt pass→not-impl: "pass" cũ là
+VACUOUS (test chỉ ghi rồi `return 0`, không kiểm giá trị nào — exit-0 vô nghĩa
+trên layout undefined) → honest-reject > vacuous-pass. Batch `src ~10124/13000`.
+
+## Chiến dịch torture — nested function (GNU) ~~ĐẠT~~ **ĐẢO ÁN: BỎ 2026-08-20**
+
+**RÚT LẠI (Vu quyết 2026-08-20, sau Phase 1 2-fact):** nested function BỊ GỠ
+HẲN — `−240 LOC src (10271→10031)`, full suite 14/14 vẫn PASS, 0 FAIL. Lý do:
+(1) **vendor lock-in không chủ nợ** — clang/MSVC đều không có, không app nào
+trong rổ (nginx/redis/git/sqlite/musl, kể cả PG18/CPython tương lai — cả hai
+cấm vì phải build MSVC) đòi; mua CHỈ để pass torture = SAI CỬA test-first
+(torture là corpus chứng nghiệm, không phải app-demand trigger — vi phạm hiến
+chương "không tính năng trước khi có file .c thật đòi"). (2) đòi **executable
+stack** (trampoline) = cờ đỏ bảo mật, ngược W^X/NX. (3) đơn giản hóa không gian
+VLA (pr22061-3/4 nested+2D-VLA tự thành GNU-ext NOT-IMPL sạch). Giá đo được: 23
+torture case PASS→NOT-IMPL (reject sạch `nested function (GNU) không hỗ trợ`) —
+gate 2-fact = 0 FAIL nên KHÔNG phá gate, chỉ giảm cột pass. Gỡ trọn: 3 Node
+(Upvar/Tramp/NlGoto) + 3 Func field (uid/parent_uid/chain) + `nested_funcdef`
++ static-chain x18 + non-local-goto + `.note.GNU-stack` note + IR `Place::Upvar`.
+`__label__` giữ parse-and-ignore (same-func label vẫn qua Goto thường).
+
+**Nội dung LỊCH SỬ (đã gỡ, giữ làm sử ký):** ~~+23 torture (95→72 fail, 0 NEW
+fail), full suite 14/14 PASS, src 9894/10000 (KHÔNG cần bỏ Mach-O).~~ GNU nested
+function = phương ngữ vendor `EXT(gcc)`,
 **chỉ ELF** (trampoline đòi executable stack — Darwin W^X từ chối tại parse).
 Rút thẳng từ gcc-14 aarch64 asm làm oracle (không đoán trí nhớ) — 3 cơ chế
 trực giao, mỗi case là tổ hợp con:

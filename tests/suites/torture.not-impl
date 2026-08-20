@@ -208,13 +208,17 @@ oracle-invalid	unroll-1	referee-reject: collect2: error: ld returned 1 exit stat
 oracle-invalid	va-arg-22	referee-reject: va-arg-22.c:43:22: error: unknown type name 'typeof'; did you mean '__typeof__'?
 oracle-invalid	va-arg-7	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	va-arg-8	referee-reject: collect2: error: ld returned 1 exit status
+zcc-reject	20000822-1	20000822-1.c:15: nested function (GNU) không hỗ trợ
+zcc-reject	20010209-1	20010209-1.c:9: nested function (GNU) không hỗ trợ
+zcc-reject	20010605-1	20010605-1.c:6: nested function (GNU) không hỗ trợ
 zcc-reject	20020411-1	20020411-1.c:13: __builtin_conjf: builtin chưa hỗ trợ
-zcc-reject	20040308-1	20040308-1.c:11: size không hằng ngoài mảng
-zcc-reject	20040411-1	20040411-1.c:6: variably-modified typedef: chưa hỗ trợ (C99 6.7.7)
-zcc-reject	20040423-1	20040423-1.c:9: variably-modified typedef: chưa hỗ trợ (C99 6.7.7)
+zcc-reject	20030501-1	20030501-1.c:11: nested function (GNU) không hỗ trợ
+zcc-reject	20040308-1	20040308-1.c:6: VLA trong struct/union (GNU) chưa hỗ trợ
+zcc-reject	20040423-1	20040423-1.c:8: VLA trong struct/union (GNU) chưa hỗ trợ
+zcc-reject	20040520-1	20040520-1.c:7: nested function (GNU) không hỗ trợ
 zcc-reject	20041124-1	20041124-1.c:4: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
 zcc-reject	20041201-1	20041201-1.c:3: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	20041218-2	20041218-2.c:7: size không hằng ngoài mảng
+zcc-reject	20041218-2	20041218-2.c:5: VLA trong struct/union (GNU) chưa hỗ trợ
 zcc-reject	20050121-1	20050121-1.c:33: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
 zcc-reject	20050316-1	20050316-1.c:7: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	20050316-2	20050316-2.c:8: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
@@ -222,20 +226,31 @@ zcc-reject	20050316-3	20050316-3.c:4: __attribute__((vector_size)): kiểu vecto
 zcc-reject	20050604-1	20050604-1.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	20050607-1	20050607-1.c:5: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	20060420-1	20060420-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20070919-1	20070919-1.c:28: size không hằng sau con trỏ: chỉ hỗ trợ (*p)[w]
-zcc-reject	20221006-1	20221006-1.c:10: VLA nhiều chiều không hằng: chưa hỗ trợ
+zcc-reject	20070919-1	20070919-1.c:28: VLA trong struct/union (GNU) chưa hỗ trợ
+zcc-reject	20090219-1	20090219-1.c:13: nested function (GNU) không hỗ trợ
 zcc-reject	20230630-2	20230630-2.c:13: __attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ
 zcc-reject	20230630-4	20230630-4.c:17: __attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ
-zcc-reject	920721-4	920721-4.c:12: &&lab1: địa chỉ label của hàm bao qua nested function chưa hỗ trợ
-zcc-reject	970217-1	970217-1.c:4: side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ
+zcc-reject	920612-2	920612-2.c:11: nested function (GNU) không hỗ trợ
+zcc-reject	920721-4	920721-4.c:9: nested function (GNU) không hỗ trợ
+zcc-reject	931002-1	931002-1.c:15: nested function (GNU) không hỗ trợ
 zcc-reject	991014-1	991014-1.c:12: member 'buf' >4GB: object vượt giới hạn size u32 của zcc
 zcc-reject	align-3	align-3.c:13: __alignof__ của function (GNU function-alignment) chưa hỗ trợ
+zcc-reject	align-nest	align-nest.c:10: VLA trong struct/union (GNU) chưa hỗ trợ
 zcc-reject	bf-pack-1	bf-pack-1.c:7: cần Punct(";"), gặp Some(Ident("__attribute__"))
 zcc-reject	built-in-setjmp	built-in-setjmp.c:13: __builtin_longjmp: builtin chưa hỗ trợ
 zcc-reject	builtin-bitops-1	builtin-bitops-1.c:189: __builtin_clrsb: builtin chưa hỗ trợ
 zcc-reject	complex-6	complex-6.c:42: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
 zcc-reject	frame-address	frame-address.c:21: __builtin_frame_address: builtin chưa hỗ trợ
+zcc-reject	nest-align-1	nest-align-1.c:26: nested function (GNU) không hỗ trợ
+zcc-reject	nest-stdar-1	nest-stdar-1.c:10: nested function (GNU) không hỗ trợ
+zcc-reject	nestfunc-1	nestfunc-1.c:20: nested function (GNU) không hỗ trợ
+zcc-reject	nestfunc-2	nestfunc-2.c:17: nested function (GNU) không hỗ trợ
+zcc-reject	nestfunc-3	nestfunc-3.c:16: nested function (GNU) không hỗ trợ
+zcc-reject	nestfunc-5	nestfunc-5.c:11: nested function (GNU) không hỗ trợ
+zcc-reject	nestfunc-6	nestfunc-6.c:15: nested function (GNU) không hỗ trợ
+zcc-reject	nestfunc-7	nestfunc-7.c:16: nested function (GNU) không hỗ trợ
 zcc-reject	packed-aligned	packed-aligned.c:3: cần kiểu tham số
+zcc-reject	pr103405	pr103405.c:25: nested function (GNU) không hỗ trợ
 zcc-reject	pr104604	pr104604.c:7: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
 zcc-reject	pr105613	pr105613.c:4: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	pr105984	pr105984.c:8: __builtin_mul_overflow_p: builtin chưa hỗ trợ
@@ -254,30 +269,30 @@ zcc-reject	pr126405	pr126405.c:9: __attribute__((vector_size)): kiểu vector SI
 zcc-reject	pr126405-2	pr126405-2.c:7: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	pr126405-3	pr126405-3.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	pr19449	pr19449.c:6: __builtin_choose_expr: builtin chưa hỗ trợ
-zcc-reject	pr22061-2	pr22061-2.c:3: side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ
-zcc-reject	pr22061-3	pr22061-3.c:7: side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ
-zcc-reject	pr22061-4	pr22061-4.c:7: side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ
+zcc-reject	pr22061-3	pr22061-3.c:7: nested function (GNU) không hỗ trợ
+zcc-reject	pr22061-4	pr22061-4.c:7: nested function (GNU) không hỗ trợ
 zcc-reject	pr23135	pr23135.c:16: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
+zcc-reject	pr24135	pr24135.c:11: nested function (GNU) không hỗ trợ
 zcc-reject	pr38151	pr38151.c:8: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
 zcc-reject	pr39120	pr39120.c:6: cần kiểu tham số
 zcc-reject	pr39228	pr39228.c:9: __builtin_isinff: builtin chưa hỗ trợ
-zcc-reject	pr41935	pr41935.c:8: variably-modified typedef: chưa hỗ trợ (C99 6.7.7)
+zcc-reject	pr41935	pr41935.c:9: VLA trong struct/union (GNU) chưa hỗ trợ
 zcc-reject	pr42833	pr42833.c:1: cần Punct(";"), gặp Some(Ident("int8_t"))
 zcc-reject	pr47237	pr47237.c:16: __builtin_apply: builtin chưa hỗ trợ
+zcc-reject	pr51447	pr51447.c:22: nested function (GNU) không hỗ trợ
 zcc-reject	pr56837	pr56837.c:2: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	pr57568	pr57568.c:4: cần biểu thức hằng
 zcc-reject	pr60003	pr60003.c:11: __builtin_longjmp: builtin chưa hỗ trợ
 zcc-reject	pr60960	pr60960.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	pr64242	pr64242.c:5: cần kiểu tham số
 zcc-reject	pr65427	pr65427.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	pr68532	pr68532.c:5: cần kiểu tham số
 zcc-reject	pr70903	pr70903.c:1: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
+zcc-reject	pr71494	pr71494.c:10: nested function (GNU) không hỗ trợ
 zcc-reject	pr71626-1	pr71626-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
 zcc-reject	pr71626-2	pr71626-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr77767	pr77767.c:4: side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ
 zcc-reject	pr80692	pr80692.c:5: biến chưa khai báo: _Decimal64
 zcc-reject	pr81588	pr81588.c:6: asm: constraint "g" chưa hỗ trợ
-zcc-reject	pr82210	pr82210.c:9: VLA nhiều chiều không hằng: chưa hỗ trợ
+zcc-reject	pr82210	pr82210.c:8: VLA trong struct/union (GNU) chưa hỗ trợ
 zcc-reject	pr84521	pr84521.c:9: __builtin_longjmp: builtin chưa hỗ trợ
 zcc-reject	pr84748	pr84748.c:3: cần Punct(";"), gặp Some(Ident("u128"))
 zcc-reject	pr85169	pr85169.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ

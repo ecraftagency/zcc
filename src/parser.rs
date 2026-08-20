@@ -86,6 +86,16 @@ struct P<'a> {
     // C99: declarator vừa gặp mảng size không hằng (VLA) — expr của size;
     // chỉ stmt() (local decl) tiêu thụ, hạ xuống con trỏ + Alloca
     vla_size: Option<NodeId>,
+    // C99 6.7.6.2: VLA đa chiều `int M[d0][d1]` — vla_size giữ chiều NGOÀI (d0),
+    // vla_inner giữ các chiều TRONG (d1, ...) theo thứ tự ngoài→trong. Chỉ
+    // stmt() tiêu thụ (2D-only hiện tại; ≥3 chiều reject sạch).
+    vla_inner: Vec<NodeId>,
+    // C99 6.7.6.2/6.9.1: dimension array-param CÓ side-effect (`array[i++]`)
+    // eval-on-entry — param decay về con trỏ nhưng side-effect của size expr
+    // PHẢI chạy khi hàm được gọi. Lưu (start,end) token-range của từng dim vì
+    // param chưa trong scope lúc parse declarator; re-parse ở prologue sau
+    // setup_params (params đã là local). Drain lúc vào funcdef; clear ở non-def.
+    param_vla_dims: Vec<(usize, usize)>,
     // đang parse param list (đếm vì lồng nhau): size mảng param không hằng
     // (glibc regex.h `__pmatch[__nmatch]` — __nmatch là param TRƯỚC, không có
     // trong scope) → bỏ qua expr, param decay về con trỏ nên size vô nghĩa
@@ -101,6 +111,11 @@ struct P<'a> {
     // local VLA, value = offset local ẩn `.vlasz` giữ số byte (chốt một lần
     // lúc khai báo). Offset tái dụng giữa các hàm → PHẢI clear mỗi hàm.
     vla_szs: HashMap<u32, u32>,
+    // C99 6.7.7 + 6.5.3.4p2: typedef của variably-modified array (`typedef int
+    // c[i+2]`) — size chốt RUNTIME lúc khai báo, sizeof(c) đọc lại. Key = TypeId
+    // Array(elem,0) (unique mỗi decl), value = offset local ẩn giữ số byte. Clear
+    // mỗi hàm như vla_szs (offset frame-local).
+    vm_typedef_sz: HashMap<TypeId, u32>,
     // C99: _Complex t (musl src/complex) hạ về struct {re, im} — layout,
     // union punning, HFA ABI (AAPCS64 coi complex như struct 2 phần tử) ăn
     // nguyên máy móc struct sẵn có. Key = elem (FLOAT/DOUBLE), value = TypeId struct.
@@ -116,18 +131,6 @@ struct P<'a> {
     // EXT(gcc): prototype mang weak (musl `extern weak hidden _DYNAMIC[]`) —
     // TU tham chiếu phải phát .weak kẻo strong undef ref làm link đòi symbol
     weak_decls: Vec<String>,
-    // EXT(gcc): nested function (GNU, chỉ ELF). fn_uid = bộ đếm cấp uid; cur_uid/
-    // cur_parent_uid = danh tính hàm ĐANG parse; upvar_base = mốc locals: index
-    // < mốc là biến hàm bao → Upvar. nested_fns: tên nguồn → (symbol mangled,
-    // parent_uid) để tham chiếu hạ về Tramp. nl_labels: (uid chủ, tên __label__)
-    // cho non-local goto. pending: nested func gom được, drain sau mỗi top-level.
-    fn_uid: u32,
-    cur_uid: u32,
-    cur_parent_uid: u32,
-    upvar_base: usize,
-    nested_fns: HashMap<String, (String, u32)>,
-    nl_labels: Vec<(u32, String)>,
-    pending: Vec<Func>,
 }
 
 type R = Result<NodeId, String>;
@@ -696,6 +699,13 @@ impl P<'_> {
                 } else {
                     self.declarator(bt, true)?
                 };
+                // C99 6.7.2.1: member mảng phải kích thước hằng — VLA-trong-struct
+                // là GNU-ext (clang -pedantic-errors: "will never be supported").
+                // Reject sạch, dọn state VLA để không rò sang biến bao ngoài.
+                if self.vla_size.take().is_some() {
+                    self.vla_inner.clear();
+                    return Err("VLA trong struct/union (GNU) chưa hỗ trợ".into());
+                }
                 if self.eat(&Tok::Punct(":")) {
                     let w = self.const_expr()? as u32;
                     let (s, al) = (self.tt.size(mt), self.tt.align(mt));
@@ -1064,8 +1074,10 @@ impl P<'_> {
                                 // về con trỏ, drop size — nếu size chỉ đọc (`__pmatch[n]`)
                                 // thì drop VÔ HẠI (đằng nào cũng là con trỏ). Nhưng dimension
                                 // CÓ ++/-- thì drop = MẤT side-effect → miscompile khi gọi
-                                // (970217-1/pr77767/pr22061-3,4). Không cài eval-on-entry
-                                // (VLA-VMT niche, charter 31) → reject SẠCH thay vì nuốt.
+                                // (970217-1/pr77767): ở ĐỊNH NGHĨA hàm (top-level, !in_fn)
+                                // lưu token-range, re-eval ở prologue (C99 6.9.1). Trong
+                                // prototype nội hàm (in_fn) dim KHÔNG được eval (6.7.6.2p5)
+                                // → drop đúng chuẩn. Param vẫn decay con trỏ như thường.
                                 Some(Tok::Punct("++")) | Some(Tok::Punct("--")) => {
                                     side_effect = true
                                 }
@@ -1073,21 +1085,21 @@ impl P<'_> {
                             }
                             self.pos += 1;
                         }
-                        if side_effect {
-                            return Err(
-                                "side-effect (++/--) trong dimension array-param: eval-on-entry chưa hỗ trợ"
-                                    .into(),
-                            );
+                        if side_effect && !self.in_fn {
+                            self.param_vla_dims.push((save, self.pos)); // [save, ']')
                         }
                         0
                     }
-                    // C99: size không hằng = VLA — giữ expr cho stmt() hạ
-                    // xuống alloca; chỉ 1 chiều không hằng (chiều trong phải hằng)
+                    // C99: size không hằng = VLA — giữ expr cho stmt() hạ xuống
+                    // alloca. Chiều NGOÀI (gặp trước) vào vla_size, chiều TRONG
+                    // (đệ quy suffixes) dồn vào vla_inner theo thứ tự ngoài→trong.
                     Err(_) => {
                         self.pos = save;
                         let e = self.expr()?;
-                        if self.vla_size.replace(e).is_some() {
-                            return Err("VLA nhiều chiều không hằng: chưa hỗ trợ".into());
+                        if self.vla_size.is_none() {
+                            self.vla_size = Some(e);
+                        } else {
+                            self.vla_inner.push(e);
                         }
                         0
                     }
@@ -1154,6 +1166,7 @@ impl P<'_> {
             let (bt, _) = self.decl_specs()?.ok_or("cần kiểu tham số")?;
             let (nm, pt) = self.declarator(bt, false)?;
             self.vla_size = None; // C99: param VLA decay về con trỏ — bỏ size
+            self.vla_inner.clear(); // 2D-param không hỗ trợ: drop (decay con trỏ)
             // điều chỉnh kiểu param: mảng → con trỏ, hàm → con trỏ hàm
             let pt = match self.tt.tys[pt as usize] {
                 Ty::Array(e, _) => self.tt.ptr_to(e),
@@ -1683,71 +1696,6 @@ impl P<'_> {
         (params, sret)
     }
 
-    // EXT(gcc): parse ĐỊNH NGHĨA nested function (GNU, chỉ ELF). Đang giữa thân
-    // hàm bao (state live) → lưu/khôi phục toàn bộ frame-state; locals hàm bao
-    // GIỮ NGUYÊN để resolve upvar, chỉ truncate phần riêng của nested sau. Symbol
-    // mangled "{name}.{uid}" tránh đụng. Kết quả đẩy vào self.pending.
-    fn nested_funcdef(&mut self, name: String, t: TypeId, fidx: u32) -> Result<(), String> {
-        // ELF-only: trampoline đòi executable stack (GNU extension).
-        let uid = self.fn_uid;
-        self.fn_uid += 1;
-        let sig = self.tt.fns[fidx as usize].clone();
-        let mangled = format!("{}.{}", name, uid);
-        self.fns.insert(name.clone(), t); // gọi/tham chiếu trong scope
-        self.nested_fns
-            .insert(name.clone(), (mangled.clone(), self.cur_uid));
-        // lưu state hàm bao (nó đang parse dở)
-        let (s_off, s_ret, s_fname, s_va, s_uid, s_puid, s_ubase) = (
-            self.cur_off,
-            self.fret,
-            std::mem::take(&mut self.fname),
-            self.va_off,
-            self.cur_uid,
-            self.cur_parent_uid,
-            self.upvar_base,
-        );
-        let s_pins = std::mem::take(&mut self.reg_pins);
-        let s_vsz = std::mem::take(&mut self.vla_szs);
-        let base = self.locals.len(); // locals < base = biến hàm bao → Upvar
-        self.cur_parent_uid = self.cur_uid;
-        self.cur_uid = uid;
-        self.upvar_base = base;
-        self.cur_off = 0;
-        self.fret = sig.ret;
-        self.fname = mangled.clone();
-        // slot đầu tiên = static chain (x18 lưu trong prologue); offset ≠ 0
-        let chain = self.alloc_local(".chain".into(), ULONG);
-        let (params, sret) = self.setup_params(&sig, &HashMap::new());
-        let body = self.stmt()?;
-        self.pending.push(Func {
-            name: mangled,
-            params,
-            frame: (self.cur_off + 15) & !15,
-            body,
-            ret: sig.ret,
-            is_static: true,
-            is_inline: false,
-            is_weak: false,
-            variadic: sig.variadic,
-            sret,
-            uid,
-            parent_uid: self.cur_parent_uid,
-            chain,
-            has_vla: !self.vla_szs.is_empty(),
-        });
-        // khôi phục state hàm bao
-        self.locals.truncate(base);
-        self.cur_off = s_off;
-        self.fret = s_ret;
-        self.fname = s_fname;
-        self.va_off = s_va;
-        self.cur_uid = s_uid;
-        self.cur_parent_uid = s_puid;
-        self.upvar_base = s_ubase;
-        self.reg_pins = s_pins;
-        self.vla_szs = s_vsz;
-        Ok(())
-    }
 
     // nhánh bị DCE có chứa label không (goto từ ngoài vào thì không được bỏ)
     fn has_label(&self, id: NodeId) -> bool {
@@ -1798,7 +1746,7 @@ impl P<'_> {
     fn check_lval(&self, l: NodeId) -> Result<(), String> {
         if matches!(
             self.nodes[l as usize],
-            Node::Var(_) | Node::Upvar(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..)
+            Node::Var(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..)
         ) {
             Ok(())
         } else {
@@ -1906,12 +1854,9 @@ impl P<'_> {
             return Ok(self.push(Node::Asm(tpl, ops), INT));
         }
         if self.eat_kw("__label__") {
-            // GNU local label declaration. Ghi (uid chủ, tên) để nested function
-            // goto vào label hàm bao hạ về NlGoto (non-local goto qua static chain).
+            // GNU local label declaration — no-op: label cùng hàm resolve qua Goto
+            // thường; non-local goto (nested func) đã bỏ nên không track gì thêm.
             loop {
-                if let Some(Tok::Ident(l)) = self.toks.get(self.pos) {
-                    self.nl_labels.push((self.cur_uid, l.clone()));
-                }
                 self.pos += 1;
                 if self.eat(&Tok::Punct(";")) {
                     break;
@@ -2046,15 +1991,6 @@ impl P<'_> {
             }
             let n = self.ident()?;
             self.expect(Tok::Punct(";"))?;
-            // EXT(gcc): goto tới __label__ của HÀM BAO (owner uid ≠ hàm hiện tại)
-            // → non-local goto qua static chain.
-            if let Some(&(owner, _)) = self
-                .nl_labels
-                .iter()
-                .find(|(u, l)| *l == n && *u != self.cur_uid)
-            {
-                return Ok(self.push(Node::NlGoto(owner, n), INT));
-            }
             Ok(self.push(Node::Goto(n), INT))
         } else if self.eat(&Tok::Punct(";")) {
             Ok(self.push(Node::Block(Vec::new()), INT))
@@ -2085,6 +2021,7 @@ impl P<'_> {
                 loop {
                     let (name, mut t) = self.declarator(bt, true)?;
                     let vla = self.vla_size.take(); // C99
+                    let vla_in = std::mem::take(&mut self.vla_inner); // chiều trong (2D)
                     // EXT(gcc): asm-label trên LOCAL = ghim reg (musl syscall
                     // `register long x8 __asm__("x8")`); gỡ khỏi renames vì
                     // local không có symbol để rename
@@ -2094,23 +2031,34 @@ impl P<'_> {
                             .and_then(|d| d.parse::<u8>().ok())
                             .filter(|&r| r < 29)
                     });
-                    // EXT(gcc): nested function definition — declarator ra Func và
-                    // "{" theo sau (không phải prototype). Là declarator DUY NHẤT.
-                    if let Ty::Func(fidx) = self.tt.tys[t as usize] {
+                    // nested function (GNU) = vendor lock-in đã BỎ (clang/MSVC không
+                    // có, không app nào trong rổ đòi, đòi exec-stack): reject sạch.
+                    if let Ty::Func(_) = self.tt.tys[t as usize] {
                         if self.peek("{") {
-                            self.nested_funcdef(name, t, fidx)?;
-                            return Ok(self.push(Node::Block(stmts), INT)); // không có ";"
+                            return Err("nested function (GNU) không hỗ trợ".into());
                         }
                     }
                     match storage {
                         Storage::Typedef => {
-                            // C99 6.7.7: typedef của variably-modified type
-                            // (`typedef int c[i+2]`) — sizeof phải eval runtime.
-                            // zcc chỉ lower VLA thành Alloca cho local object, không
-                            // có chỗ treo size-expr cho typedef ⇒ TỪ CHỐI sạch thay
-                            // vì trả sizeof=0 (miscompile: 20040411-1).
-                            if vla.is_some() {
-                                return Err("variably-modified typedef: chưa hỗ trợ (C99 6.7.7)".into());
+                            // C99 6.7.7 + 6.5.3.4p2: typedef của variably-modified
+                            // array (`typedef int c[i+2]`) — size expr eval MỘT LẦN
+                            // tại điểm khai báo, chốt số byte vào local ẩn; sizeof(c)
+                            // đọc lại (không trả 0 = miscompile 20040411-1).
+                            if let Some(w) = vla {
+                                let Ty::Array(elem, 0) = self.tt.tys[t as usize] else {
+                                    return Err("variably-modified typedef ngoài mảng: chưa hỗ trợ".into());
+                                };
+                                let esz = self.tt.size(elem);
+                                if esz == 0 {
+                                    return Err("variably-modified typedef nhiều chiều: chưa hỗ trợ".into());
+                                }
+                                let n = self.cast(w, ULONG);
+                                let szn = self.push(Node::Num(esz as i64), ULONG);
+                                let bytes = self.push(Node::Bin("*", n, szn), ULONG);
+                                let hid = self.alloc_local(format!("{name}.vmtsz"), ULONG);
+                                let hv = self.push(Node::Var(hid), ULONG);
+                                stmts.push(self.mkassign(hv, bytes)?);
+                                self.vm_typedef_sz.insert(t, hid);
                             }
                             self.typedefs.insert(name, t);
                         }
@@ -2160,6 +2108,52 @@ impl P<'_> {
                         // C99: VLA local → con trỏ + alloca(n*sizeof(elem)).
                         // Hệ quả biết trước: sizeof(vla) = 8 (size con trỏ), sai
                         // spec nhưng redis không đụng; epilogue mov sp,x29 thu hồi.
+                        // C99 6.7.6.2: VLA 2 chiều `int M[d0][d1]` → con trỏ tới
+                        // HÀNG VLA `int[d1]` + alloca(d0*d1*elem). Tái dùng nguyên
+                        // cơ chế (*p)[w]: đăng ký row-type vào vla_arrs để mkbin
+                        // scale bước-hàng runtime (d1*elem); indexing M[i][j] tự
+                        // đúng qua decay Deref-Array (867-875 arm64_elf). ≥3 chiều
+                        // hoặc chiều-trong-lồng-VLA → reject sạch (chưa hỗ trợ).
+                        _ if vla.is_some() && !vla_in.is_empty() => {
+                            if vla_in.len() != 1 {
+                                return Err("VLA >2 chiều: chưa hỗ trợ".into());
+                            }
+                            let Ty::Array(row, 0) = self.tt.tys[t as usize] else {
+                                return Err("VLA đa chiều ngoài mảng".into());
+                            };
+                            let Ty::Array(elem, 0) = self.tt.tys[row as usize] else {
+                                return Err("VLA đa chiều: chiều trong không phải mảng".into());
+                            };
+                            let esz = self.tt.size(elem);
+                            if esz == 0 {
+                                return Err("VLA >2 chiều: chưa hỗ trợ".into());
+                            }
+                            if self.peek("=") {
+                                return Err("VLA có initializer".into());
+                            }
+                            // bước-hàng = d1 * sizeof(elem) (runtime) → local ẩn
+                            let d1 = self.cast(vla_in[0], ULONG);
+                            let eszn = self.push(Node::Num(esz as i64), ULONG);
+                            let rbytes = self.push(Node::Bin("*", d1, eszn), ULONG);
+                            let hrow = self.alloc_local(format!("{name}.rowsz"), ULONG);
+                            let hrv = self.push(Node::Var(hrow), ULONG);
+                            stmts.push(self.mkassign(hrv, rbytes)?);
+                            self.vla_arrs.insert(row, hrow);
+                            // tổng byte = d0 * bước-hàng → local ẩn (sizeof + alloca)
+                            let d0 = self.cast(vla.unwrap(), ULONG);
+                            let hrv2 = self.push(Node::Var(hrow), ULONG);
+                            let total = self.push(Node::Bin("*", d0, hrv2), ULONG);
+                            let htot = self.alloc_local(format!("{name}.vlasz"), ULONG);
+                            let htv = self.push(Node::Var(htot), ULONG);
+                            stmts.push(self.mkassign(htv, total)?);
+                            let pt = self.tt.ptr_to(row);
+                            let off = self.alloc_local(name.clone(), pt);
+                            self.vla_szs.insert(off, htot);
+                            let htv2 = self.push(Node::Var(htot), ULONG);
+                            let al = self.push(Node::Alloca(htv2), pt);
+                            let v = self.push(Node::Var(off), pt);
+                            stmts.push(self.mkassign(v, al)?);
+                        }
                         _ if vla.is_some() => {
                             // con trỏ tới VLA `char (*p)[w]` (musl): KHÔNG cấp
                             // phát — chỉ ghi size byte pointee vào local ẩn để
@@ -2684,6 +2678,11 @@ impl P<'_> {
                 Node::Member(..) if matches!(self.tt.tys[self.ty(e) as usize], Ty::Array(..)) => {
                     return self.glval(e);
                 }
+                // C99 6.6p9: mảng đa chiều — `*(a+i)` kiểu mảng (int[9]) tự decay
+                // về địa chỉ = giá trị con trỏ `a+i`; &a[i][j] lồng Deref như vậy.
+                Node::Deref(p) if matches!(self.tt.tys[self.ty(e) as usize], Ty::Array(..)) => {
+                    e = *p
+                }
                 Node::Bin(op @ ("+" | "-"), l, r) => {
                     let (s, k) = self.gaddr(*l)?;
                     let d = self.fold(*r).ok()?;
@@ -3152,16 +3151,6 @@ impl P<'_> {
         } else if self.eat(&Tok::Punct("&&")) {
             // GNU "&&label": && ở vị trí prefix không thể là logical-and
             let n = self.ident()?;
-            // EXT(gcc): &&label trỏ __label__ của HÀM BAO (owner≠cur) — địa chỉ
-            // label phải giải qua static chain (frame khác). zcc mangle theo hàm
-            // hiện tại → symbol lệch, ld undefined. Combo cực hiếm (nested-func +
-            // labels-as-values liên-frame); real code không đụng → reject SẠCH
-            // thay vì phun ref rác (luật 2-fact).
-            if self.nl_labels.iter().any(|(u, l)| *l == n && *u != self.cur_uid) {
-                return Err(format!(
-                    "&&{n}: địa chỉ label của hàm bao qua nested function chưa hỗ trợ"
-                ));
-            }
             let t = self.tt.ptr_to(VOID);
             Ok(self.push(Node::LabelAddr(n), t))
         } else if self.eat(&Tok::Punct("&")) {
@@ -3214,6 +3203,10 @@ impl P<'_> {
                     let n = self.cast(w, ULONG);
                     let esz = self.push(Node::Num(self.tt.size(elem) as i64), ULONG);
                     return Ok(self.push(Node::Bin("*", n, esz), ULONG));
+                }
+                // C99 6.7.7: sizeof(tên-typedef VM array) → đọc local ẩn đã chốt
+                if let Some(&hid) = self.vm_typedef_sz.get(&t) {
+                    return Ok(self.push(Node::Var(hid), ULONG));
                 }
                 self.tt.size64(t)
             } else {
@@ -3529,11 +3522,6 @@ impl P<'_> {
             if let Some(idx) = self.locals.iter().rposition(|(l, ..)| self.in_fn && *l == n) {
                 let (t, loc) = (self.locals[idx].1, self.locals[idx].2);
                 match loc {
-                    // EXT(gcc): index < upvar_base ⟹ biến automatic của hàm bao →
-                    // Upvar (đọc qua static chain [x18 - off]), không phải Var.
-                    Vloc::Stack(off) if idx < self.upvar_base => {
-                        return Ok(self.push(Node::Upvar(off), t));
-                    }
                     Vloc::Stack(off) => return Ok(self.push(Node::Var(off), t)),
                     Vloc::Glob(gi) => return Ok(self.push(Node::GVar(gi), t)),
                     Vloc::Fn => {} // rơi xuống nhánh tra self.fns phía dưới
@@ -3717,13 +3705,6 @@ impl P<'_> {
             }
             if let Some(&t) = self.fns.get(&n) {
                 let pt = self.tt.ptr_to(t); // function designator decay
-                // EXT(gcc): tham chiếu tên nested function (gọi/truyền) → dựng
-                // trampoline trên frame hiện tại; giá trị = địa chỉ trampoline.
-                if let Some((sym, _)) = self.nested_fns.get(&n).cloned() {
-                    let tt = self.tt.add(Ty::Array(ULONG, 5)); // 40B slot
-                    let slot = self.alloc_local(format!(".tramp{}", self.nodes.len()), tt);
-                    return Ok(self.push(Node::Tramp(sym, slot), pt));
-                }
                 let n = self.funref(n); // EXT(gcc): asm-label rename
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
@@ -3812,8 +3793,13 @@ impl P<'_> {
             }
             let (name, t) = self.declarator(bt, true)?;
             if self.vla_size.take().is_some() {
+                self.vla_inner.clear();
                 return Err("VLA chỉ được là biến local".into()); // C99
             }
+            self.vla_inner.clear();
+            // C99 6.9.1: side-effect dim của param VLA eval-on-entry; drain range
+            // đã capture (chỉ có nghĩa khi là funcdef — prototype thì bỏ).
+            let pdims = std::mem::take(&mut self.param_vla_dims);
             // funcdef: declarator ra kiểu Func và theo sau là "{" hoặc old-style decl list
             if let Ty::Func(fidx) = self.tt.tys[t as usize] {
                 let is_def = self.peek("{")
@@ -3824,18 +3810,10 @@ impl P<'_> {
                     self.locals.clear();
                     self.reg_pins.clear(); // key = offset stack — hàm mới trùng offset là dính pin ma
                     self.vla_szs.clear(); // cùng lý do: key offset stack
+                    self.vm_typedef_sz.clear(); // key TypeId nhưng value = offset stack
                     self.cur_off = 0;
                     self.fret = sig.ret;
                     self.fname = name.clone();
-                    // EXT(gcc): danh tính top-level (nested def trong body đọc làm
-                    // parent_uid); nested_fns/nl_labels reset theo từng top-level.
-                    let uid = self.fn_uid;
-                    self.fn_uid += 1;
-                    self.cur_uid = uid;
-                    self.cur_parent_uid = u32::MAX;
-                    self.upvar_base = 0;
-                    self.nested_fns.clear();
-                    self.nl_labels.clear();
                     // old-style: parse decl list gán kiểu cho từng tên param
                     let mut ptypes: HashMap<String, TypeId> = HashMap::new();
                     if sig.oldstyle {
@@ -3860,7 +3838,25 @@ impl P<'_> {
                     let (params, sret) = self.setup_params(&sig, &ptypes);
                     self.in_fn = true;
                     let n0 = self.nodes.len() as u32; // range node của body (cho DCE weak)
-                    let body = self.stmt()?;
+                    // C99 6.9.1: eval side-effect dim của param VLA ở prologue (params
+                    // giờ đã trong scope). Re-parse token-range, gói làm stmt đầu body.
+                    let mut prologue = Vec::new();
+                    if !pdims.is_empty() {
+                        let bodypos = self.pos;
+                        for &(s, e) in &pdims {
+                            self.pos = s;
+                            prologue.push(self.expr()?);
+                            debug_assert!(self.pos == e);
+                        }
+                        self.pos = bodypos;
+                    }
+                    let body = if prologue.is_empty() {
+                        self.stmt()?
+                    } else {
+                        let b = self.stmt()?;
+                        prologue.push(b);
+                        self.push(Node::Block(prologue), INT)
+                    };
                     let n1 = self.nodes.len() as u32;
                     self.in_fn = false;
                     let is_static = storage == Storage::Static || self.static_fns.contains(&name);
@@ -3879,18 +3875,9 @@ impl P<'_> {
                         is_weak: weak_fn || self.attr_weak,
                         variadic: sig.variadic,
                         sret,
-                        uid,
-                        parent_uid: u32::MAX,
-                        chain: 0,
                         has_vla: !self.vla_szs.is_empty(),
                     });
                     ranges.push((n0, n1));
-                    // EXT(gcc): nested func gom trong body → xả vào funcs (static,
-                    // không DCE; range (0,0) vì is_inline=false không đọc tới).
-                    for nf in std::mem::take(&mut self.pending) {
-                        funcs.push(nf);
-                        ranges.push((0, 0));
-                    }
                     continue;
                 }
             }
@@ -4059,6 +4046,9 @@ pub fn parse(
         saw_inline: false,
         saw_thread: false,
         vla_size: None,
+        vla_inner: Vec::new(),
+        vm_typedef_sz: HashMap::new(),
+        param_vla_dims: Vec::new(),
         in_params: 0,
         reg_pins: HashMap::new(),
         vla_arrs: HashMap::new(),
@@ -4073,13 +4063,6 @@ pub fn parse(
         raw_asm: Vec::new(),
         aliases: Vec::new(),
         weak_decls: Vec::new(),
-        fn_uid: 0,
-        cur_uid: u32::MAX,
-        cur_parent_uid: u32::MAX,
-        upvar_base: 0,
-        nested_fns: HashMap::new(),
-        nl_labels: Vec::new(),
-        pending: Vec::new(),
     };
     // EXT(gcc): __uint128_t/__int128_t — CHỈ storage 16 byte align 16 (SDK mach
     // NEON state trong mcontext cần layout đúng); arithmetic không hỗ trợ.

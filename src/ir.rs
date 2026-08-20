@@ -57,7 +57,6 @@ pub enum Place {
     Local(u32),          // &biến local: offset khung fp-relative (tra frame)
     Global(String, i64), // &global ± offset byte (symbol + hằng)
     Str(u32),            // &string literal thứ i (index vào bảng strs)
-    Upvar(u32),          // EXT(gcc): &biến hàm bao (nested-func) — backend lea_chain
 }
 
 /// Đích của lời gọi.
@@ -374,13 +373,6 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Lea(t, Place::Str(i)));
                 Val::Tmp(t)
             }
-            // EXT(gcc): &biến hàm bao (nested-func) — địa chỉ qua static chain
-            Node::Upvar(off) => {
-                let off = *off;
-                let t = self.t(ULONG);
-                self.push(Inst::Lea(t, Place::Upvar(off)));
-                Val::Tmp(t)
-            }
             _ => {
                 let t = self.t(ULONG);
                 self.push(Inst::Opaque(Some(t), n));
@@ -397,7 +389,7 @@ impl<'a> Lower<'a> {
             Node::Num(v) => Val::Imm(*v),
             Node::FNum(f) => Val::FImm(f.to_bits()),
             Node::Str(_) => self.lower_addr(n), // mảng ký tự decay → con trỏ
-            Node::Var(_) | Node::GVar(_) | Node::Member(..) | Node::Deref(_) | Node::Upvar(_) => {
+            Node::Var(_) | Node::GVar(_) | Node::Member(..) | Node::Deref(_) => {
                 let addr = self.lower_addr(n);
                 if self.scalar(ty) {
                     let t = self.t(ty);
@@ -738,7 +730,7 @@ impl<'a> Lower<'a> {
                 self.seal(Term::Jmp(blk));
             }
             // computed goto / non-local goto: còn exotic (đuôi bước 2)
-            Node::GotoPtr(_) | Node::NlGoto(..) => self.push(Inst::Opaque(None, n)),
+            Node::GotoPtr(_) => self.push(Inst::Opaque(None, n)),
             // biểu thức dùng làm câu lệnh: phát side effect, bỏ kết quả
             _ => {
                 self.lower_expr(n);
@@ -914,8 +906,8 @@ mod tests {
                         // ABI zcc: địa chỉ local = x29 − off; flat-mem [0,frame) với
                         // index 0 = x29−frame ⟹ index = frame − off.
                         Place::Local(off) => reg[*d as usize] = (f.frame - *off) as i64,
-                        Place::Global(..) | Place::Str(_) | Place::Upvar(_) => {
-                            return Err("interp: địa chỉ global/str/upvar không mô hình hoá".into())
+                        Place::Global(..) | Place::Str(_) => {
+                            return Err("interp: địa chỉ global/str không mô hình hoá".into())
                         }
                     },
                     Inst::Cast(d, from, to, a) => {
