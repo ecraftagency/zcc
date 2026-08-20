@@ -1,0 +1,8 @@
+# base differential (cases) — fail đã ADJUDICATE, KHÔNG phải bug zcc.
+# float_h: lệch chuẩn CÓ CHỦ ĐÍCH CÓ SỔ (MILESTONES M15). zcc chọn
+#   `long double = double` trên ELF — HỢP LỆ C99 §5.2.4.2.2 (chỉ đòi LD ≥
+#   double; MSVC cùng lựa chọn), float.h khai LDBL_MANT_DIG=53 cho TỰ NHẤT
+#   QUÁN (memory vẫn binary128 cho ABI interop). Linux cc dùng binary128
+#   (LDBL_MANT_DIG=113) nên diff — fail khách quan DUY NHẤT trong box, đúng
+#   dự liệu. Trên mac (Darwin LD=double) case này PASS.
+float_h

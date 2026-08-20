@@ -19,7 +19,7 @@ export DIR="$C/gcc/gcc/testsuite/gcc.c-torture/execute"
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
-ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
+ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c)
     cc -std=c89 -w -O0 "$f" -o "$D/$b.cc" 2>/dev/null || { echo "skip $b"; exit 0; }
     perl -e "alarm 10; exec @ARGV" "$D/$b.cc" >/dev/null 2>&1 || { echo "skip $b"; exit 0; }

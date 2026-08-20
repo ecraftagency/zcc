@@ -24,7 +24,7 @@ export DIR="$C/nora/tests"
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
-find "$DIR" -path '*/valid/*' -name '*.c' | xargs -n 1 -P 8 sh -c '
+find "$DIR" -path '*/valid/*' -name '*.c' | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(echo "$f" | sed "s|.*/tests/||; s|/|_|g; s|\.c$||")
     cc -std=c99 -w -O0 "$f" -o "$D/$b.cc" 2>/dev/null || { echo "skip $b"; exit 0; }
     "$D/$b.cc" > "$D/$b.cout" 2>/dev/null; ec=$?

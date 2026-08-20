@@ -15,7 +15,7 @@ export DIR="$C/c-testsuite/tests/single-exec"
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
-ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
+ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c)
     # CWD = $D (ghi được): case ghi file ra CWD (00187 fopen "fred.txt","w") —
     # nếu chạy ở repo root sẽ xả rác (mac) hoặc fail vì mount read-only (box).

@@ -34,7 +34,7 @@ for cc_ in cc zcc; do
 done
 
 export REF="$D/cc/tcc" ZTCC="$D/zcc/tcc"
-ls "$SRC"/tests/tests2/*.c | xargs -n 1 -P 8 sh -c '
+ls "$SRC"/tests/tests2/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c); e="${f%.c}.expect"
     [ -f "$e" ] || { echo "skip $b"; exit 0; }
     perl -e "alarm 15; exec @ARGV" "$REF" -B "$(dirname "$REF")" \

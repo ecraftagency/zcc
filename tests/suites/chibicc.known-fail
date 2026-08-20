@@ -1,4 +1,9 @@
+# chibicc baseline — mọi FAIL đây là C11/gcc-ext THUẦN, ngoài phạm vi C99 của
+# zcc (luật decouple: extension chỉ cài khi phần mềm thật đòi). Referee gnu.
+#   builtin : __builtin_types_compatible_p + typeof + statement-expr ({...}).
+#   typeof  : toán tử typeof (gcc-ext) + statement-expr.
+#   string  : chuỗi UTF-16/32 C11  u"..." / U"..." / u'...'.
+# (vla đã rời baseline: referee arm64 tự NOCOMPILE -> skip, không còn tính fail.)
 FAIL builtin
 FAIL string
 FAIL typeof
-FAIL vla

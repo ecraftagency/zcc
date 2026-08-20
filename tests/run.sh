@@ -10,25 +10,37 @@ if [ -z "${ZCC:-}" ]; then
   ZCC=../target/debug/zcc
 fi
 DIR=${1:-cases}
+SEEK="${2:-${SEEK:-}}"   # seek 1 unit: chỉ chạy case có tên chứa chuỗi này
 STD=-std=c99
 [ "$DIR" = ext ] && STD=-std=gnu99
-mkdir -p out
+# out-dir ghi được: mặc định ./out; nếu tests/ RO (chạy trong box mount RO) -> tmp
+OUT=out
+mkdir -p "$OUT" 2>/dev/null && [ -w "$OUT" ] || OUT=$(mktemp -d)
 pass=0 fail=0
 for c in "$DIR"/*.c; do
   n=$(basename "$c" .c)
-  cc "$STD" -w -O0 "$c" -o "out/$n.ref" 2>/dev/null || { echo "SKIP $n (cc từ chối case)"; continue; }
+  [ -n "$SEEK" ] && case "$n" in *"$SEEK"*) ;; *) continue;; esac
+  cc "$STD" -w -O0 "$c" -o "$OUT/$n.ref" 2>/dev/null || { echo "SKIP $n (cc từ chối case)"; continue; }
   in=/dev/null; [ -f "$DIR/$n.in" ] && in="$DIR/$n.in"
-  "./out/$n.ref" < "$in" > "out/$n.ref.txt"; want=$?
-  if "$ZCC" "$c" -o "out/$n.bin"; then
-    "./out/$n.bin" < "$in" > "out/$n.bin.txt"; got=$?
-    if [ "$want" = "$got" ] && cmp -s "out/$n.ref.txt" "out/$n.bin.txt"; then
+  "$OUT/$n.ref" < "$in" > "$OUT/$n.ref.txt"; want=$?
+  if "$ZCC" "$c" -o "$OUT/$n.bin"; then
+    "$OUT/$n.bin" < "$in" > "$OUT/$n.bin.txt"; got=$?
+    if [ "$want" = "$got" ] && cmp -s "$OUT/$n.ref.txt" "$OUT/$n.bin.txt"; then
       pass=$((pass + 1)); echo "PASS $n"
     else
-      fail=$((fail + 1)); echo "FAIL $n (exit want=$want got=$got)"
+      fail=$((fail + 1)); fails="$fails $n"; echo "FAIL $n (exit want=$want got=$got)"
     fi
   else
-    fail=$((fail + 1)); echo "FAIL $n (compile)"
+    fail=$((fail + 1)); fails="$fails $n"; echo "FAIL $n (compile)"
   fi
 done
 echo "---- $pass pass, $fail fail"
+# Gate: FAIL ⊆ known-fail (nếu có <DIR>.known-fail); mặc định đòi 0 fail.
+kf="$DIR.known-fail"
+if [ -f "$kf" ]; then
+    new=""
+    for n in $fails; do grep -qx "$n" "$kf" || new="$new $n"; done
+    if [ -n "$new" ]; then echo "FAIL MỚI (ngoài baseline):$new"; exit 1; fi
+    echo "OK ($DIR: mọi fail ⊆ $kf)"; exit 0
+fi
 [ "$fail" = 0 ]

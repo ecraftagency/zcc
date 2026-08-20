@@ -20,7 +20,7 @@ export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
 cp "$DIR/common" "$D/zcommon.c"   # common không đuôi .c — cc coi là linker input
-ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
+ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c)
     cc -w -O0 -I"$DIR" "$f" "$D/zcommon.c" -o "$D/$b.cc" 2>/dev/null \
         || { echo "skip $b"; exit 0; }
