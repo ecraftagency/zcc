@@ -1540,6 +1540,9 @@ impl P<'_> {
             Node::Call(_, args, _) | Node::Sync(_, args, _) => {
                 args.iter().any(|&x| self.has_label(x))
             }
+            Node::Overflow(_, a, b, c) => {
+                self.has_label(*a) || self.has_label(*b) || self.has_label(*c)
+            }
             Node::Asm(_, ops) => ops.iter().any(|o| self.has_label(o.e)),
             Node::CallPtr(f, args, _) => {
                 self.has_label(*f) || args.iter().any(|&x| self.has_label(x))
@@ -3333,6 +3336,24 @@ impl P<'_> {
                 }
                 self.expect(Tok::Punct(")"))?;
                 return Ok(self.push(Node::Num(off), ULONG));
+            }
+            // EXT(gcc): __builtin_{add,sub,mul}_overflow(a, b, &res) — hạ xuống
+            // Node::Overflow; codegen phát chuỗi 128-bit (xem ext::overflow_emit).
+            // KHÔNG cast toán hạng: giữ kiểu gốc (dấu/width) đúng ngữ nghĩa GCC.
+            if let Some(oop) = match n.as_str() {
+                "__builtin_add_overflow" => Some(0u8),
+                "__builtin_sub_overflow" => Some(1u8),
+                "__builtin_mul_overflow" => Some(2u8),
+                _ => None,
+            } {
+                self.expect(Tok::Punct("("))?;
+                let a = self.assign()?;
+                self.expect(Tok::Punct(","))?;
+                let b = self.assign()?;
+                self.expect(Tok::Punct(","))?;
+                let rp = self.assign()?;
+                self.expect(Tok::Punct(")"))?;
+                return Ok(self.push(Node::Overflow(oop, a, b, rp), INT));
             }
             // EXT(gcc): atomics __sync_* (M12) — không phải symbol libc, hạ thẳng
             // xuống Node::Sync cho codegen phát ldaxr/stlxr; bảng tên ở ext.rs

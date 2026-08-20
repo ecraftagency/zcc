@@ -146,6 +146,65 @@ pub const ATOMIC_ORDERS: &[&str] = &[
     "__ATOMIC_SEQ_CST",
 ];
 
+// EXT(gcc): __builtin_{add,sub,mul}_overflow — ngữ nghĩa ℤ (spec GCC): tính
+// a∘b trong số nguyên vô hạn, *res = giá trị cắt về kiểu *res, trả 1 nếu KHÔNG
+// biểu diễn được. Nhúng mỗi toán hạng ≤64-bit thành two's-complement 128-bit
+// {hi,lo} theo dấu RIÊNG của nó ⇒ phép toán 128-bit uniform (add=adds/adc,
+// sub=subs/sbc, mul=mul/umulh/madd — bỏ term ah*bh vì ở 2^128) ⇒ test biểu
+// diễn được = đơn ánh ℤ→Tr. Toàn cset, KHÔNG nhánh. AArch64 thuần register,
+// dùng chung darwin+ELF (cùng ISA). Backend đặt sẵn: x0=al, x1=bl, x9=&res;
+// scratch x10..x15. op 0=+ 1=- 2=*; a/b_sg = toán hạng signed; r_sg,rw = *res.
+pub fn overflow_emit(s: &mut String, op: u8, a_sg: bool, b_sg: bool, r_sg: bool, rw: u32) {
+    use std::fmt::Write as _;
+    let ext = |s: &mut String, hi: &str, lo: &str, sg: bool| {
+        _ = if sg {
+            writeln!(s, "\tasr {hi}, {lo}, #63")
+        } else {
+            writeln!(s, "\tmov {hi}, #0")
+        };
+    };
+    ext(s, "x10", "x0", a_sg); // ah
+    ext(s, "x11", "x1", b_sg); // bh
+    _ = match op {
+        0 => writeln!(s, "\tadds x12, x0, x1\n\tadc x13, x10, x11"),
+        1 => writeln!(s, "\tsubs x12, x0, x1\n\tsbc x13, x10, x11"),
+        _ => writeln!(
+            s,
+            "\tmul x12, x0, x1\n\tumulh x13, x0, x1\n\tmadd x13, x0, x11, x13\n\tmadd x13, x10, x1, x13"
+        ),
+    }; // {rh:x13, rl:x12} = a∘b (128-bit)
+    _ = writeln!(
+        s,
+        "\t{}",
+        match rw {
+            8 => "str x12, [x9]",
+            4 => "str w12, [x9]",
+            2 => "strh w12, [x9]",
+            _ => "strb w12, [x9]",
+        }
+    ); // *res = rw byte thấp
+    let wb = rw * 8;
+    if !r_sg {
+        // unsigned: biểu diễn được ⟺ rh==0 ∧ (rl>>wb)==0
+        _ = writeln!(s, "\tmov x14, x13");
+        if wb < 64 {
+            _ = writeln!(s, "\torr x14, x14, x12, lsr #{wb}");
+        }
+        _ = writeln!(s, "\tcmp x14, #0\n\tcset x0, ne");
+    } else {
+        // signed: ⟺ sign-extend(rl, wb) == {rh,rl}
+        _ = if wb < 64 {
+            writeln!(s, "\tsbfx x14, x12, #0, #{wb}")
+        } else {
+            writeln!(s, "\tmov x14, x12")
+        };
+        _ = writeln!(
+            s,
+            "\tasr x15, x14, #63\n\tcmp x14, x12\n\tcset x0, ne\n\tcmp x15, x13\n\tcset x14, ne\n\torr x0, x0, x14"
+        );
+    }
+}
+
 pub fn sync_op(name: &str) -> Option<(SyncOp, usize)> {
     Some(match name {
         "__sync_fetch_and_add" => (SyncOp::FetchAdd, 2),

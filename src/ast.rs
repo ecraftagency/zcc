@@ -272,6 +272,10 @@ pub enum Node {
     // member 1 q-slot 16B, backend gather về scratch liên tục)
     VaArg(NodeId, TypeId, u32),
     Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
+    // EXT(gcc): __builtin_{add,sub,mul}_overflow(a, b, res). op 0=+ 1=- 2=*.
+    // Ngữ nghĩa ℤ: tính a∘b vô hạn hạng, *res = cắt về typeof(*res), trả 1 nếu
+    // KHÔNG biểu diễn được. Signedness/width đọc từ types[] tại codegen.
+    Overflow(u8, NodeId, NodeId, NodeId),
     // EXT(gcc): inline asm subset (xxhash/M14; musl/M17 nới constraint).
     // Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
     Asm(String, Vec<AsmOp>),

@@ -1084,6 +1084,21 @@ impl Cg<'_> {
                     SyncOp::Barrier => self.s += "\tdmb ish\n",
                 }
             }
+            // EXT(gcc): overflow builtin — eval 3 arg (x0=al, x1=bl, x9=&res), gọi ext
+            Node::Overflow(op, a, b, rp) => {
+                let (op, a, b, rp) = (*op, *a, *b, *rp);
+                self.expr(a);
+                self.s += "\tstr x0, [sp, #-16]!\n";
+                self.expr(b);
+                self.s += "\tstr x0, [sp, #-16]!\n";
+                self.expr(rp);
+                self.s += "\tmov x9, x0\n\tldr x1, [sp], #16\n\tldr x0, [sp], #16\n";
+                let a_sg = !self.a.tt.is_unsigned(self.a.types[a as usize]);
+                let b_sg = !self.a.tt.is_unsigned(self.a.types[b as usize]);
+                let rt = self.a.tt.pointee(self.a.types[rp as usize]).unwrap();
+                let (r_sg, rw) = (!self.a.tt.is_unsigned(rt), self.a.tt.size(rt));
+                crate::ext::overflow_emit(&mut self.s, op, a_sg, b_sg, r_sg, rw);
+            }
             Node::Str(i) => {
                 _ = writeln!(
                     self.s,
