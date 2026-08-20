@@ -218,3 +218,50 @@ nm/strip/objcopy/readelf KHÔNG bắt buộc cho build chain — tool chẩn đo
 vay được không mất claim.
 Câu chuyện khác biệt: toolchain auditable — "trusting trust" cỡ một học kỳ
 sinh viên.
+
+## Chiến dịch torture — nested function (GNU) ĐẠT 2026-08-20
+
+**+23 torture (95→72 fail, 0 NEW fail), full suite 14/14 PASS, src 9894/10000
+(KHÔNG cần bỏ Mach-O).** GNU nested function = phương ngữ vendor `EXT(gcc)`,
+**chỉ ELF** (trampoline đòi executable stack — Darwin W^X từ chối tại parse).
+Rút thẳng từ gcc-14 aarch64 asm làm oracle (không đoán trí nhớ) — 3 cơ chế
+trực giao, mỗi case là tổ hợp con:
+- **T trampoline**: 40B sinh RUNTIME trên stack tại slot local
+  (`bti c; ldr x17,.+20; ldr x18,.+24; br x17; dsb sy; isb; .xword fn; .xword chain`),
+  patch (fn_addr, chain) + `__clear_cache` (libgcc, driver ELF đã `-lgcc`);
+  fnptr = địa chỉ trampoline. Cần stack THỰC THI → phát `.note.GNU-stack,"x"`
+  CHỈ khi TU có nested (giữ NX cho mọi chương trình khác). MỌI tham chiếu tên
+  nested (gọi/truyền) đều hạ về `Node::Tramp`→`CallPtr(tramp)` — triệt tiêu
+  nhánh direct-call-chain, struct-sret/variadic vẫn đúng (trampoline chỉ đụng
+  x17/x18, không đụng x8).
+- **C static chain qua x18** (STATIC_CHAIN_REGNUM, zcc chưa dùng x18 nên tự do):
+  prologue nested lưu x18 vào slot `Func.chain`; upvar = `[chain - off]`, off =
+  hằng biên dịch DÙNG CHUNG (chain = x29 hàm bao, biến local hàm bao vốn địa
+  chỉ `x29-off`). chain của Tramp: cùng cha ⟹ x29, sibling ⟹ forward chain mình.
+- **G non-local goto**: `__label__` của hàm bao + `goto` từ nested → khôi phục
+  `(x29,sp)` hàm bao qua chain rồi `b lg_{parent}.{label}` (label = local symbol
+  cùng TU, adrp-reachable). sp hàm bao = x29 - frame (đúng khi không VLA).
+
+8/8 case: nestfunc-1..3,5,6,7 + nest-align-1 (over-align 16) + nest-stdar-1
+(variadic nested). Giá: +258 LOC src (ast 3 Node + 3 Func field; parser
+`nested_funcdef` + upvar/Tramp/NlGoto resolution + `setup_params` tách dùng
+chung; codegen ELF Tramp/Upvar/NlGoto + prologue chain-save + GNU-stack note).
+Depth-1 (upvar/goto tới hàm bao TRỰC TIẾP) — depth>1 chưa có case đòi, chưa làm.
+
+## Ngã rẽ chiến lược (Vu nêu 2026-08-20) — HOÃN, chưa thực thi
+
+**Ý định**: bỏ hẳn Mach-O/Darwin (arm64_darwin.rs ~1402 LOC) → dùng ngân sách
+đó dựng **1 IR layer đơn giản + vài optimization technique chứng minh đúng bằng
+toán** → zcc thành compiler "full-fledged" vẫn trong trần 10k (ELF-only).
+Phép tính: 9894 − 1402 = 8492 → ~1500 headroom; IR tuyến tính (3-address/SSA-lite)
+~300-500 + passes provable (const-fold ~50, DCE ~80, local value numbering ~120,
+copy-prop ~60, register allocation linear-scan ~300-500) ≈ 1000-1500 → khả thi.
+
+**LẬT LUẬT TỐI THƯỢNG #2** ("không optimization pass, ngữ nghĩa -O0") — kỷ luật
+mới thay thế: "mọi pass phải chứng minh semantics-preserving bằng toán" (hợp
+MATHEMATIC FOUNDATION). Thu target về ELF-only.
+
+**ĐIỀU KIỆN CỔNG (Vu chốt 2026-08-20): CHƯA PASS TORTURE SẠCH thì KHOAN đụng IR
+hay optimization.** 72 torture fail còn lại phải xử hết (fix thật hoặc chứng
+minh ngoài-scope theo luật suy đoán tội) TRƯỚC. Phiên này dừng ở nested-func +
+ghi roadmap; không code IR.

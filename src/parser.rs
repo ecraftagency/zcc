@@ -117,6 +117,18 @@ struct P<'a> {
     // EXT(gcc): prototype mang weak (musl `extern weak hidden _DYNAMIC[]`) —
     // TU tham chiếu phải phát .weak kẻo strong undef ref làm link đòi symbol
     weak_decls: Vec<String>,
+    // EXT(gcc): nested function (GNU, chỉ ELF). fn_uid = bộ đếm cấp uid; cur_uid/
+    // cur_parent_uid = danh tính hàm ĐANG parse; upvar_base = mốc locals: index
+    // < mốc là biến hàm bao → Upvar. nested_fns: tên nguồn → (symbol mangled,
+    // parent_uid) để tham chiếu hạ về Tramp. nl_labels: (uid chủ, tên __label__)
+    // cho non-local goto. pending: nested func gom được, drain sau mỗi top-level.
+    fn_uid: u32,
+    cur_uid: u32,
+    cur_parent_uid: u32,
+    upvar_base: usize,
+    nested_fns: HashMap<String, (String, u32)>,
+    nl_labels: Vec<(u32, String)>,
+    pending: Vec<Func>,
 }
 
 type R = Result<NodeId, String>;
@@ -1504,6 +1516,145 @@ impl P<'_> {
         self.locals.push((name, t, Vloc::Stack(self.cur_off)));
         self.cur_off
     }
+    // cấp slot param + mirror thuật toán spill codegen (PHẢI khớp từng byte):
+    // stack args pack — scalar natural align, composite align max(8,align) size
+    // tròn 8, tràn khóa gp=8 (C.11). Vùng arg vô danh variadic bắt đầu sau named
+    // tròn 8. Trả (params, sret slot). Dùng chung top-level & nested funcdef.
+    fn setup_params(
+        &mut self,
+        sig: &crate::ast::FnSig,
+        ptypes: &HashMap<String, TypeId>,
+    ) -> (Vec<(u32, TypeId)>, u32) {
+        let mut params = Vec::new();
+        for (i, pn) in sig.pnames.iter().enumerate() {
+            let pt = if sig.oldstyle {
+                ptypes.get(pn).copied().unwrap_or(INT)
+            } else {
+                sig.params[i]
+            };
+            let off = self.alloc_local(pn.clone(), pt);
+            params.push((off, pt));
+        }
+        let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
+        let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
+        for &(_, pt) in &params {
+            if let Some((_, n)) = self.tt.hfa(pt) {
+                if fp + n <= 8 {
+                    fp += n;
+                } else {
+                    fp = 8; // AAPCS: HFA tràn thì khóa luôn v-reg còn lại
+                    let o = alup(boff, self.tt.align(pt).max(8));
+                    boff = o + self.tt.size(pt).div_ceil(8) * 8;
+                }
+            } else if matches!(self.tt.tys[pt as usize], Ty::Struct(_)) {
+                let sz = self.tt.size(pt);
+                if sz > 16 {
+                    if gp < 8 {
+                        gp += 1;
+                    } else {
+                        boff = alup(boff, 8) + 8;
+                    }
+                } else {
+                    let need = if sz > 8 { 2 } else { 1 };
+                    if gp + need <= 8 {
+                        gp += need;
+                    } else {
+                        let o = alup(boff, self.tt.align(pt).max(8));
+                        boff = o + 8 * need;
+                        gp = 8; // AAPCS C.11
+                    }
+                }
+            } else {
+                let (fl, sz) = (self.tt.is_float(pt), self.tt.size(pt));
+                if fl && fp < 8 {
+                    fp += 1;
+                } else if !fl && gp < 8 {
+                    gp += 1;
+                } else {
+                    boff = alup(boff, sz) + sz;
+                }
+            }
+        }
+        self.va_off = 16 + ((boff + 7) & !7);
+        let sret = if matches!(self.tt.tys[sig.ret as usize], Ty::Struct(_))
+            && self.tt.size(sig.ret) > 16
+            && self.tt.hfa(sig.ret).is_none()
+        {
+            self.alloc_local(String::new(), ULONG)
+        } else {
+            0
+        };
+        (params, sret)
+    }
+
+    // EXT(gcc): parse ĐỊNH NGHĨA nested function (GNU, chỉ ELF). Đang giữa thân
+    // hàm bao (state live) → lưu/khôi phục toàn bộ frame-state; locals hàm bao
+    // GIỮ NGUYÊN để resolve upvar, chỉ truncate phần riêng của nested sau. Symbol
+    // mangled "{name}.{uid}" tránh đụng. Kết quả đẩy vào self.pending.
+    fn nested_funcdef(&mut self, name: String, t: TypeId, fidx: u32) -> Result<(), String> {
+        // ELF-only: trampoline đòi executable stack — Darwin W^X cấm tuyệt đối.
+        if self.tgt == Target::Arm64Darwin {
+            return Err("nested function cần executable stack — chỉ hỗ trợ ELF (Darwin W^X cấm)".into());
+        }
+        let uid = self.fn_uid;
+        self.fn_uid += 1;
+        let sig = self.tt.fns[fidx as usize].clone();
+        let mangled = format!("{}.{}", name, uid);
+        self.fns.insert(name.clone(), t); // gọi/tham chiếu trong scope
+        self.nested_fns
+            .insert(name.clone(), (mangled.clone(), self.cur_uid));
+        // lưu state hàm bao (nó đang parse dở)
+        let (s_off, s_ret, s_fname, s_va, s_uid, s_puid, s_ubase) = (
+            self.cur_off,
+            self.fret,
+            std::mem::take(&mut self.fname),
+            self.va_off,
+            self.cur_uid,
+            self.cur_parent_uid,
+            self.upvar_base,
+        );
+        let s_pins = std::mem::take(&mut self.reg_pins);
+        let s_vsz = std::mem::take(&mut self.vla_szs);
+        let base = self.locals.len(); // locals < base = biến hàm bao → Upvar
+        self.cur_parent_uid = self.cur_uid;
+        self.cur_uid = uid;
+        self.upvar_base = base;
+        self.cur_off = 0;
+        self.fret = sig.ret;
+        self.fname = mangled.clone();
+        // slot đầu tiên = static chain (x18 lưu trong prologue); offset ≠ 0
+        let chain = self.alloc_local(".chain".into(), ULONG);
+        let (params, sret) = self.setup_params(&sig, &HashMap::new());
+        let body = self.stmt()?;
+        self.pending.push(Func {
+            name: mangled,
+            params,
+            frame: (self.cur_off + 15) & !15,
+            body,
+            ret: sig.ret,
+            is_static: true,
+            is_inline: false,
+            is_weak: false,
+            variadic: sig.variadic,
+            sret,
+            uid,
+            parent_uid: self.cur_parent_uid,
+            chain,
+        });
+        // khôi phục state hàm bao
+        self.locals.truncate(base);
+        self.cur_off = s_off;
+        self.fret = s_ret;
+        self.fname = s_fname;
+        self.va_off = s_va;
+        self.cur_uid = s_uid;
+        self.cur_parent_uid = s_puid;
+        self.upvar_base = s_ubase;
+        self.reg_pins = s_pins;
+        self.vla_szs = s_vsz;
+        Ok(())
+    }
+
     // nhánh bị DCE có chứa label không (goto từ ngoài vào thì không được bỏ)
     fn has_label(&self, id: NodeId) -> bool {
         match &self.nodes[id as usize] {
@@ -1553,7 +1704,7 @@ impl P<'_> {
     fn check_lval(&self, l: NodeId) -> Result<(), String> {
         if matches!(
             self.nodes[l as usize],
-            Node::Var(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..)
+            Node::Var(_) | Node::Upvar(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..)
         ) {
             Ok(())
         } else {
@@ -1661,9 +1812,16 @@ impl P<'_> {
             return Ok(self.push(Node::Asm(tpl, ops), INT));
         }
         if self.eat_kw("__label__") {
-            // GNU local label declaration — label của mình vốn function-scope, nuốt
-            while !self.eat(&Tok::Punct(";")) {
+            // GNU local label declaration. Ghi (uid chủ, tên) để nested function
+            // goto vào label hàm bao hạ về NlGoto (non-local goto qua static chain).
+            loop {
+                if let Some(Tok::Ident(l)) = self.toks.get(self.pos) {
+                    self.nl_labels.push((self.cur_uid, l.clone()));
+                }
                 self.pos += 1;
+                if self.eat(&Tok::Punct(";")) {
+                    break;
+                }
             }
             return Ok(self.push(Node::Block(Vec::new()), INT));
         }
@@ -1794,6 +1952,15 @@ impl P<'_> {
             }
             let n = self.ident()?;
             self.expect(Tok::Punct(";"))?;
+            // EXT(gcc): goto tới __label__ của HÀM BAO (owner uid ≠ hàm hiện tại)
+            // → non-local goto qua static chain.
+            if let Some(&(owner, _)) = self
+                .nl_labels
+                .iter()
+                .find(|(u, l)| *l == n && *u != self.cur_uid)
+            {
+                return Ok(self.push(Node::NlGoto(owner, n), INT));
+            }
             Ok(self.push(Node::Goto(n), INT))
         } else if self.eat(&Tok::Punct(";")) {
             Ok(self.push(Node::Block(Vec::new()), INT))
@@ -1833,6 +2000,14 @@ impl P<'_> {
                             .and_then(|d| d.parse::<u8>().ok())
                             .filter(|&r| r < 29)
                     });
+                    // EXT(gcc): nested function definition — declarator ra Func và
+                    // "{" theo sau (không phải prototype). Là declarator DUY NHẤT.
+                    if let Ty::Func(fidx) = self.tt.tys[t as usize] {
+                        if self.peek("{") {
+                            self.nested_funcdef(name, t, fidx)?;
+                            return Ok(self.push(Node::Block(stmts), INT)); // không có ";"
+                        }
+                    }
                     match storage {
                         Storage::Typedef => {
                             self.typedefs.insert(name, t);
@@ -3219,14 +3394,14 @@ impl P<'_> {
             // ngoài body hàm locals là đồ thừa hàm TRƯỚC (không dọn để rẻ) —
             // cấm tra, kẻo ginit toàn cục &x ăn nhầm param cùng tên (git rm.c:
             // param index_only của check_local_mod vs global index_only)
-            if let Some((t, loc)) = self
-                .locals
-                .iter()
-                .rev()
-                .find(|(l, ..)| self.in_fn && *l == n)
-                .map(|&(_, t, o)| (t, o))
-            {
+            if let Some(idx) = self.locals.iter().rposition(|(l, ..)| self.in_fn && *l == n) {
+                let (t, loc) = (self.locals[idx].1, self.locals[idx].2);
                 match loc {
+                    // EXT(gcc): index < upvar_base ⟹ biến automatic của hàm bao →
+                    // Upvar (đọc qua static chain [x18 - off]), không phải Var.
+                    Vloc::Stack(off) if idx < self.upvar_base => {
+                        return Ok(self.push(Node::Upvar(off), t));
+                    }
                     Vloc::Stack(off) => return Ok(self.push(Node::Var(off), t)),
                     Vloc::Glob(gi) => return Ok(self.push(Node::GVar(gi), t)),
                     Vloc::Fn => {} // rơi xuống nhánh tra self.fns phía dưới
@@ -3410,6 +3585,13 @@ impl P<'_> {
             }
             if let Some(&t) = self.fns.get(&n) {
                 let pt = self.tt.ptr_to(t); // function designator decay
+                // EXT(gcc): tham chiếu tên nested function (gọi/truyền) → dựng
+                // trampoline trên frame hiện tại; giá trị = địa chỉ trampoline.
+                if let Some((sym, _)) = self.nested_fns.get(&n).cloned() {
+                    let tt = self.tt.add(Ty::Array(ULONG, 5)); // 40B slot
+                    let slot = self.alloc_local(format!(".tramp{}", self.nodes.len()), tt);
+                    return Ok(self.push(Node::Tramp(sym, slot), pt));
+                }
                 let n = self.funref(n); // EXT(gcc): asm-label rename
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
@@ -3504,6 +3686,15 @@ impl P<'_> {
                     self.cur_off = 0;
                     self.fret = sig.ret;
                     self.fname = name.clone();
+                    // EXT(gcc): danh tính top-level (nested def trong body đọc làm
+                    // parent_uid); nested_fns/nl_labels reset theo từng top-level.
+                    let uid = self.fn_uid;
+                    self.fn_uid += 1;
+                    self.cur_uid = uid;
+                    self.cur_parent_uid = u32::MAX;
+                    self.upvar_base = 0;
+                    self.nested_fns.clear();
+                    self.nl_labels.clear();
                     // old-style: parse decl list gán kiểu cho từng tên param
                     let mut ptypes: HashMap<String, TypeId> = HashMap::new();
                     if sig.oldstyle {
@@ -3525,71 +3716,7 @@ impl P<'_> {
                             self.expect(Tok::Punct(";"))?;
                         }
                     }
-                    let mut params = Vec::new();
-                    for (i, pn) in sig.pnames.iter().enumerate() {
-                        let pt = if sig.oldstyle {
-                            ptypes.get(pn).copied().unwrap_or(INT)
-                        } else {
-                            sig.params[i]
-                        };
-                        let off = self.alloc_local(pn.clone(), pt);
-                        params.push((off, pt));
-                    }
-                    // mirror thuật toán spill của codegen (PHẢI khớp từng byte):
-                    // stack args pack kiểu Apple — scalar theo natural alignment,
-                    // composite align max(8,align) size tròn 8, tràn khóa gp=8
-                    // (C.11). Vùng arg vô danh variadic bắt đầu sau named, tròn 8.
-                    let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
-                    let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
-                    for &(_, pt) in &params {
-                        if let Some((_, n)) = self.tt.hfa(pt) {
-                            if fp + n <= 8 {
-                                fp += n;
-                            } else {
-                                fp = 8; // AAPCS: HFA tràn thì khóa luôn v-reg còn lại
-                                let o = alup(boff, self.tt.align(pt).max(8));
-                                boff = o + self.tt.size(pt).div_ceil(8) * 8;
-                            }
-                        } else if matches!(self.tt.tys[pt as usize], Ty::Struct(_)) {
-                            let sz = self.tt.size(pt);
-                            if sz > 16 {
-                                // >16B: nhận CON TRỎ (scalar 8 byte)
-                                if gp < 8 {
-                                    gp += 1;
-                                } else {
-                                    boff = alup(boff, 8) + 8;
-                                }
-                            } else {
-                                let need = if sz > 8 { 2 } else { 1 };
-                                if gp + need <= 8 {
-                                    gp += need;
-                                } else {
-                                    let o = alup(boff, self.tt.align(pt).max(8));
-                                    boff = o + 8 * need;
-                                    gp = 8; // AAPCS C.11
-                                }
-                            }
-                        } else {
-                            let (fl, sz) = (self.tt.is_float(pt), self.tt.size(pt));
-                            if fl && fp < 8 {
-                                fp += 1;
-                            } else if !fl && gp < 8 {
-                                gp += 1;
-                            } else {
-                                boff = alup(boff, sz) + sz;
-                            }
-                        }
-                    }
-                    self.va_off = 16 + ((boff + 7) & !7);
-                    // trả struct >16B: giấu con trỏ đích (x8 lúc vào hàm) trong slot riêng
-                    let sret = if matches!(self.tt.tys[sig.ret as usize], Ty::Struct(_))
-                        && self.tt.size(sig.ret) > 16
-                        && self.tt.hfa(sig.ret).is_none()
-                    {
-                        self.alloc_local(String::new(), ULONG)
-                    } else {
-                        0
-                    };
+                    let (params, sret) = self.setup_params(&sig, &ptypes);
                     self.in_fn = true;
                     let n0 = self.nodes.len() as u32; // range node của body (cho DCE weak)
                     let body = self.stmt()?;
@@ -3611,8 +3738,17 @@ impl P<'_> {
                         is_weak: weak_fn || self.attr_weak,
                         variadic: sig.variadic,
                         sret,
+                        uid,
+                        parent_uid: u32::MAX,
+                        chain: 0,
                     });
                     ranges.push((n0, n1));
+                    // EXT(gcc): nested func gom trong body → xả vào funcs (static,
+                    // không DCE; range (0,0) vì is_inline=false không đọc tới).
+                    for nf in std::mem::take(&mut self.pending) {
+                        funcs.push(nf);
+                        ranges.push((0, 0));
+                    }
                     continue;
                 }
             }
@@ -3797,6 +3933,13 @@ pub fn parse(
         raw_asm: Vec::new(),
         aliases: Vec::new(),
         weak_decls: Vec::new(),
+        fn_uid: 0,
+        cur_uid: u32::MAX,
+        cur_parent_uid: u32::MAX,
+        upvar_base: 0,
+        nested_fns: HashMap::new(),
+        nl_labels: Vec::new(),
+        pending: Vec::new(),
     };
     // EXT(gcc): __uint128_t/__int128_t — CHỈ storage 16 byte align 16 (SDK mach
     // NEON state trong mcontext cần layout đúng); arithmetic không hỗ trợ.

@@ -37,6 +37,12 @@ struct Cg<'a> {
     // named, frame — save area 192B nằm NGAY DƯỚI frame: [x29-frame-192, x29-frame)
     // = VR 128B rồi GP 64B; gr_top = x29-frame, vr_top = x29-frame-64
     va: (u32, u32, u32, u32),
+    // EXT(gcc): nested function — fchain = slot static chain (0 nếu top-level),
+    // fuid/fparent = danh tính (dùng tính chain của Tramp/NlGoto: cùng cha ⟹ x29,
+    // sibling ⟹ chain forward).
+    fchain: u32,
+    fuid: u32,
+    fparent: u32,
 }
 
 pub fn emit(ast: &Ast) -> String {
@@ -50,6 +56,9 @@ pub fn emit(ast: &Ast) -> String {
         fret: VOID,
         fsret: 0,
         va: (0, 0, 0, 0),
+        fchain: 0,
+        fuid: 0,
+        fparent: u32::MAX,
     };
     // EXT(gcc): __asm__("...") cấp toàn cục (musl crt_arch.h _start) — verbatim
     for a in &ast.raw_asm {
@@ -60,6 +69,9 @@ pub fn emit(ast: &Ast) -> String {
         g.fname = f.name.clone();
         g.fret = f.ret;
         g.fsret = f.sret;
+        g.fchain = f.chain;
+        g.fuid = f.uid;
+        g.fparent = f.parent_uid;
         if !f.is_static {
             _ = writeln!(g.s, ".globl {}", f.name);
             if f.is_inline || f.is_weak {
@@ -80,6 +92,13 @@ pub fn emit(ast: &Ast) -> String {
         );
         if f.frame > 0 {
             g.sp_adjust("sub", f.frame);
+        }
+        // EXT(gcc): nested → lưu static chain (x18, do trampoline/caller nạp) vào
+        // slot; Upvar/forward-call/NlGoto đọc lại từ đây (x18 caller-saved, mất
+        // sau call). x18 chưa bị đụng ở prologue nên lưu sớm là an toàn.
+        if f.parent_uid != u32::MAX {
+            g.lea_local("x9", f.chain);
+            g.s += "\tstr x18, [x9]\n";
         }
         if f.variadic {
             // register-save area AAPCS: đổ NGUYÊN 8 q-reg + 8 x-reg (kể cả phần
@@ -329,6 +348,12 @@ pub fn emit(ast: &Ast) -> String {
         let vis = if *weak { ".weak" } else { ".globl" };
         _ = writeln!(g.s, "{} {}\n.set {}, {}", vis, new, new, old);
     }
+    // EXT(gcc): nested function → trampoline sinh runtime trên stack cần stack
+    // THỰC THI. Note "x" đẩy PT_GNU_STACK mang cờ X (ld gộp: một object đòi exec
+    // stack là đủ). CHỈ phát khi TU thật có nested — giữ NX cho mọi chương trình khác.
+    if ast.funcs.iter().any(|f| f.parent_uid != u32::MAX) {
+        g.s += ".section .note.GNU-stack,\"x\",@progbits\n";
+    }
     g.s
 }
 
@@ -426,6 +451,26 @@ impl Cg<'_> {
             self.imm("x10", off as i64);
             _ = writeln!(self.s, "\tsub {reg}, x29, x10");
         }
+    }
+    // EXT(gcc): địa chỉ upvar = static_chain - off. Chain (x29 hàm bao) đọc từ
+    // slot fchain (do prologue lưu). reg ≠ x10 (imm path xài x10).
+    fn lea_chain(&mut self, reg: &str, off: u32) {
+        self.lea_local(reg, self.fchain);
+        _ = writeln!(self.s, "\tldr {reg}, [{reg}]");
+        if off <= 4095 {
+            _ = writeln!(self.s, "\tsub {reg}, {reg}, #{off}");
+        } else {
+            self.imm("x10", off as i64);
+            _ = writeln!(self.s, "\tsub {reg}, {reg}, x10");
+        }
+    }
+    // EXT(gcc): parent_uid của nested func theo symbol (u32::MAX nếu không thấy)
+    fn parent_of(&self, sym: &str) -> u32 {
+        self.a
+            .funcs
+            .iter()
+            .find(|f| f.name == sym)
+            .map_or(u32::MAX, |f| f.parent_uid)
     }
     fn sp_adjust(&mut self, op: &str, n: u32) {
         if n <= 4095 {
@@ -731,6 +776,29 @@ impl Cg<'_> {
             Node::Break => _ = writeln!(self.s, "\tb L{}", self.brks.last().unwrap()),
             Node::Continue => _ = writeln!(self.s, "\tb L{}", self.conts.last().unwrap()),
             Node::Goto(name) => _ = writeln!(self.s, "\tb lg_{}.{}", self.fname, name),
+            // EXT(gcc): non-local goto — khôi phục (x29, sp) hàm bao qua static
+            // chain rồi br tới label của nó. chain (slot fchain) = x29 hàm bao
+            // trực tiếp = chủ label (depth-1). sp hàm bao = x29 - frame (không VLA).
+            Node::NlGoto(owner, label) => {
+                let (owner, label) = (*owner, label.clone());
+                let (pname, pframe) = self
+                    .a
+                    .funcs
+                    .iter()
+                    .find(|f| f.uid == owner)
+                    .map(|f| (f.name.clone(), f.frame))
+                    .unwrap();
+                self.lea_local("x9", self.fchain);
+                self.s += "\tldr x9, [x9]\n"; // x9 = parent x29
+                if pframe <= 4095 {
+                    _ = writeln!(self.s, "\tsub sp, x9, #{pframe}");
+                } else {
+                    self.imm("x10", pframe as i64);
+                    self.s += "\tsub sp, x9, x10\n";
+                }
+                self.s += "\tmov x29, x9\n";
+                _ = writeln!(self.s, "\tb lg_{pname}.{label}");
+            }
             Node::GotoPtr(e) => {
                 self.expr(*e);
                 self.s += "\tbr x0\n";
@@ -746,6 +814,7 @@ impl Cg<'_> {
     fn addr(&mut self, id: NodeId) {
         match &self.a.nodes[id as usize] {
             Node::Var(off) => self.lea_local("x0", *off),
+            Node::Upvar(off) => self.lea_chain("x0", *off), // EXT(gcc): biến hàm bao
             Node::GVar(i) => {
                 let gl = &self.a.globals[*i as usize];
                 if gl.is_tls {
@@ -799,7 +868,7 @@ impl Cg<'_> {
         match &self.a.nodes[id as usize] {
             Node::Num(v) => self.imm("x0", *v),
             Node::FNum(v) => self.imm("x0", v.to_bits() as i64),
-            Node::Var(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..) => {
+            Node::Var(_) | Node::Upvar(_) | Node::GVar(_) | Node::Deref(_) | Node::Member(..) => {
                 self.addr(id);
                 // mảng/struct/hàm: giá trị = địa chỉ, không load
                 if !matches!(
@@ -808,6 +877,35 @@ impl Cg<'_> {
                 ) {
                     self.load(t);
                 }
+            }
+            // EXT(gcc): tham chiếu nested function → dựng trampoline 40B runtime
+            // trên frame (slot), patch (fn_addr, static_chain) rồi __clear_cache;
+            // giá trị = địa chỉ trampoline. Template 6 lệnh:
+            //   bti c; ldr x17,.+20; ldr x18,.+24; br x17; dsb sy; isb; .xword fn; .xword chain
+            Node::Tramp(sym, slot) => {
+                let (sym, slot) = (sym.clone(), *slot);
+                self.lea_local("x9", slot); // x9 = base trampoline (giữ tới __clear_cache)
+                self.imm("x10", 0x580000B1_D503245Fu64 as i64); // [bti | ldr x17,.+20]
+                self.s += "\tstr x10, [x9]\n";
+                self.imm("x10", 0xD61F0220_580000D2u64 as i64); // [ldr x18,.+24 | br x17]
+                self.s += "\tstr x10, [x9, #8]\n";
+                self.imm("x10", 0xD5033FDF_D5033F9Fu64 as i64); // [dsb sy | isb]
+                self.s += "\tstr x10, [x9, #16]\n";
+                // fn addr (nested = symbol LOCAL → adrp/add trực tiếp)
+                _ = writeln!(self.s, "\tadrp x10, {0}\n\tadd x10, x10, :lo12:{0}", sym);
+                self.s += "\tstr x10, [x9, #24]\n";
+                // static chain: cùng cha (current LÀ hàm bao) ⟹ x29; sibling ⟹
+                // forward chain của mình (đọc slot)
+                if self.parent_of(&sym) == self.fuid {
+                    self.s += "\tmov x10, x29\n";
+                } else {
+                    self.lea_local("x10", self.fchain);
+                    self.s += "\tldr x10, [x10]\n";
+                }
+                self.s += "\tstr x10, [x9, #32]\n";
+                // đồng bộ I-cache 40B (libgcc, đã link -lgcc); x9 mất sau bl → lea lại
+                self.s += "\tmov x0, x9\n\tadd x1, x9, #40\n\tbl __clear_cache\n";
+                self.lea_local("x0", slot);
             }
             Node::Addr(e) => self.addr(*e),
             Node::FunAddr(name) => {
