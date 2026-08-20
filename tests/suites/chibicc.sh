@@ -40,6 +40,7 @@ ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
 
 p=$(grep -c '^pass' "$D/res" || true); s=$(grep -c '^skip' "$D/res" || true)
 grep '^FAIL' "$D/res" | cut -d' ' -f1-2 | sort > "$D/fails"   # bỏ suffix exit-code: UB program rác stack đổi theo run
+[ -n "${LIVE_FAILS_DIR:-}" ] && cp "$D/fails" "$LIVE_FAILS_DIR/chibicc.fails" 2>/dev/null; :
 sort "$(dirname "$0")/chibicc.known-fail" > "$D/known" 2>/dev/null || : > "$D/known"
 new=$(comm -23 "$D/fails" "$D/known" || true)
 echo "chibicc: $p pass, $s skip, $(wc -l < "$D/fails" | tr -d ' ') fail"

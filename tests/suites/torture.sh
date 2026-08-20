@@ -33,6 +33,7 @@ ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
 
 p=$(grep -c '^pass' "$D/res" || true); s=$(grep -c '^skip' "$D/res" || true)
 grep '^FAIL' "$D/res" | sort > "$D/fails"
+[ -n "${LIVE_FAILS_DIR:-}" ] && cp "$D/fails" "$LIVE_FAILS_DIR/torture.fails" 2>/dev/null; :
 sort "$(dirname "$0")/torture.known-fail" > "$D/known" 2>/dev/null || : > "$D/known"
 new=$(comm -23 "$D/fails" "$D/known" || true)
 echo "torture: $p pass, $s skip, $(wc -l < "$D/fails" | tr -d ' ') fail"

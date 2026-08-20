@@ -122,12 +122,14 @@ if [ "${1:-}" != "" ]; then
     __triage)        triage "$2" "$3" "$4" ;;
 
     # ---- TIER 3: compile app (native build lớn) ----
-    # git/nginx build trong WB=/root/wb (container-local, root sở hữu) — KHÔNG
-    # dùng $B (bind-mount): stage test chạy `su runner` để lại file uid 1000,
-    # root-in-container không rm nổi qua VirtioFS macOS → build kế chết. WB sống
-    # trọn 1 lần chạy container nên stage test tìm lại được.
+    # git/nginx build trong WB=/var/tmp/wb (container-local) — KHÔNG dùng $B
+    # (bind-mount): stage test chạy `su runner` để lại file uid 1000, root-in-
+    # container không rm nổi qua VirtioFS macOS → build kế chết. KHÔNG dùng
+    # /root/wb: /root mode 0700 nên `su runner` không traverse vào được (git-t/
+    # nginx-tests fail "can't cd"). /var/tmp world-traversable + container-local.
+    # WB sống trọn 1 lần chạy container nên stage test tìm lại được.
     __app_git_build)
-        WB=/root/wb; mkdir -p "$WB"; rm -rf "$WB/git"
+        WB=/var/tmp/wb; mkdir -p "$WB"; rm -rf "$WB/git"
         cp -r /suites/git "$WB/git" && cd "$WB/git"
         make distclean >/dev/null 2>&1 || true
         make -j"$JOBS" V=1 CC="$ZCC" NO_RUST=1 NO_GETTEXT=1 NO_TCLTK=1 NO_CURL=1 \
@@ -141,7 +143,7 @@ if [ "${1:-}" != "" ]; then
         ./src/redis-server --version
         ;;
     __app_nginx_build)
-        WB=/root/wb; mkdir -p "$WB"; rm -rf "$WB/nginx"
+        WB=/var/tmp/wb; mkdir -p "$WB"; rm -rf "$WB/nginx"
         cp -r /suites/nginx "$WB/nginx" && cd "$WB/nginx"
         rm -rf objs Makefile
         CC="$ZCC" ./auto/configure --with-http_ssl_module --with-http_v2_module \
@@ -186,7 +188,7 @@ SQL
         cp /suites/libc-test-ref/REF-FAILS.txt "$LOG/" 2>/dev/null || true
         ;;
     __suite_git_t)
-        WB=/root/wb
+        WB=/var/tmp/wb
         id runner >/dev/null 2>&1 || useradd -m runner 2>/dev/null || true
         chown -R runner "$WB/git"
         su runner -c "cd '$WB/git/t' && prove -j$JOBS t[0-9]*.sh"
@@ -195,14 +197,14 @@ SQL
         cd "$B/redis" && ./runtest --clients "$JOBS"
         ;;
     __suite_nginx_tests)
-        WB=/root/wb
+        WB=/var/tmp/wb
         id runner >/dev/null 2>&1 || useradd -m runner 2>/dev/null || true
         rm -rf "$WB/nginx-tests" && cp -r /suites/nginx-tests "$WB/nginx-tests"
         chown -R runner "$WB/nginx" "$WB/nginx-tests"
         su runner -c "cd '$WB/nginx-tests' && TEST_NGINX_BINARY='$WB/nginx/objs/nginx' prove -j$JOBS ."
         ;;
     __suite_nginx_ref)   # trọng tài gcc — CHỈ chạy khi nginx-tests fail (phân định flake vs bug)
-        WB=/root/wb
+        WB=/var/tmp/wb
         id runner >/dev/null 2>&1 || useradd -m runner 2>/dev/null || true
         rm -rf "$WB/nginx-gcc" && cp -r /suites/nginx "$WB/nginx-gcc" && cd "$WB/nginx-gcc"
         rm -rf objs Makefile

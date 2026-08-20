@@ -28,6 +28,7 @@ ls "$DIR"/*.c | xargs -n 1 -P 8 sh -c '
 
 p=$(grep -c '^pass' "$D/res" || true)
 grep '^FAIL' "$D/res" | sort > "$D/fails"
+[ -n "${LIVE_FAILS_DIR:-}" ] && cp "$D/fails" "$LIVE_FAILS_DIR/cts.fails" 2>/dev/null; :
 sort "$(dirname "$0")/cts.known-fail" > "$D/known" 2>/dev/null || : > "$D/known"
 new=$(comm -23 "$D/fails" "$D/known" || true)
 echo "c-testsuite: $p pass, $(wc -l < "$D/fails" | tr -d ' ') fail"
