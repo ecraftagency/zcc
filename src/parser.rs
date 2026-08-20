@@ -160,7 +160,7 @@ const ASSIGN_OPS: [(&str, &str); 11] = [
     ("^=", "^"),
 ];
 
-const TYPE_WORDS: [&str; 24] = [
+const TYPE_WORDS: [&str; 25] = [
     "void",
     "char",
     "short",
@@ -184,7 +184,9 @@ const TYPE_WORDS: [&str; 24] = [
     "__signed",
     "__signed__",
     "__typeof__",
-    "__typeof", // EXT(gcc): typeof trần KHÔNG nhận (va tên biến C89)
+    "__typeof",
+    "typeof", // EXT(gcc): typeof trần — kernel/coreutils/gnulib xài (rủi ro nhỏ:
+              // chương trình C89 đặt biến tên `typeof` sẽ vỡ; không code thật nào làm)
 ];
 
 impl P<'_> {
@@ -240,12 +242,21 @@ impl P<'_> {
 
     // ---- hằng ----
     // EXT(gcc): compat cấu trúc cho __builtin_types_compatible_p — TyTab không
-    // intern nên so đệ quy; Func coi như compat (đủ cho consumer hiện có)
+    // intern nên so đệ quy. Func so CHỮ KÝ (C99 6.7.5.3): return + số param +
+    // từng param + cờ variadic phải khớp (chibicc builtin.c phân biệt
+    // int(*)(float,double) ≠ int(*)(float), (...) ≠ (void)).
     fn ty_compat(&self, a: TypeId, b: TypeId) -> bool {
         match (&self.tt.tys[a as usize], &self.tt.tys[b as usize]) {
             (Ty::Ptr(x), Ty::Ptr(y)) => self.ty_compat(*x, *y),
             (Ty::Array(x, n), Ty::Array(y, m)) => n == m && self.ty_compat(*x, *y),
             (Ty::Struct(x), Ty::Struct(y)) => x == y,
+            (Ty::Func(x), Ty::Func(y)) => {
+                let (fx, fy) = (&self.tt.fns[*x as usize], &self.tt.fns[*y as usize]);
+                fx.variadic == fy.variadic
+                    && fx.params.len() == fy.params.len()
+                    && self.ty_compat(fx.ret, fy.ret)
+                    && (0..fx.params.len()).all(|i| self.ty_compat(fx.params[i], fy.params[i]))
+            }
             (x, y) => std::mem::discriminant(x) == std::mem::discriminant(y),
         }
     }
@@ -464,7 +475,7 @@ impl P<'_> {
                     continue;
                 }
                 // EXT(gcc): __typeof__(expr | typename) đứng như type-specifier
-                "__typeof__" | "__typeof" => {
+                "__typeof__" | "__typeof" | "typeof" => {
                     self.pos += 1;
                     self.expect(Tok::Punct("("))?;
                     let t = if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if self.is_type_word(n))
