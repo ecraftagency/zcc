@@ -10,7 +10,6 @@
 // Each pass is a PURE IR→IR function (mutating in place) that returns the rewrite
 // count (a convergence measure). The backend does NOT need to know which pass ran —
 // it only reads well-formed IR.
-#![allow(dead_code)] // removed once the driver wires the --O1 pipeline into emit_ir
 
 use crate::ast::{Ty, TyTab, TypeId, ULONG};
 use crate::ir::{
@@ -428,8 +427,9 @@ pub fn cse(f: &mut IrFunc) -> u32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Flow-SENSITIVE liveness (backward dataflow, THEORY §B3 fixpoint over the lattice 2^Tmp).
+/// Only live-OUT is consumed downstream (interference is built at defs, scanning tailward);
+/// live-IN is the fixpoint's working set, not exported.
 pub struct Liveness {
-    pub live_in: Vec<Vec<bool>>,
     pub live_out: Vec<Vec<bool>>,
 }
 
@@ -507,7 +507,8 @@ pub fn liveness(f: &IrFunc) -> Liveness {
             break; // fixpoint (Kleene): no set grows any further
         }
     }
-    Liveness { live_in, live_out }
+    let _ = live_in; // the fixpoint's working set; not exported (only live_out is consumed)
+    Liveness { live_out }
 }
 
 /// Interference graph: u—v ⟺ u,v are both live at some definition point (they cannot share a register).
@@ -543,78 +544,14 @@ pub fn interference(f: &IrFunc, lv: &Liveness) -> Vec<HashSet<Tmp>> {
     adj
 }
 
-/// Coloring result: color[t]=Some(r) → register r; None → spill (its own stack slot).
-pub struct Alloc {
-    pub color: Vec<Option<u32>>,
-    pub spilled: Vec<Tmp>,
-    pub k: u32,
-}
-
-pub fn color(adj: &[HashSet<Tmp>], k: u32) -> Alloc {
-    let nt = adj.len();
-    let mut removed = vec![false; nt];
-    let mut degree: Vec<usize> = adj.iter().map(|s| s.len()).collect();
-    let mut stack: Vec<Tmp> = Vec::new();
-    // SIMPLIFY: push a degree<k node onto the stack (certainly colorable); when none
-    // remain → pick the max-degree node as a potential-spill (Briggs: it may still be colorable at select).
-    for _ in 0..nt {
-        let low = (0..nt).find(|&v| !removed[v] && degree[v] < k as usize);
-        let v = match low {
-            Some(v) => v,
-            None => match (0..nt).filter(|&v| !removed[v]).max_by_key(|&v| degree[v]) {
-                Some(v) => v,
-                None => break,
-            },
-        };
-        removed[v] = true;
-        stack.push(v as u32);
-        for &nb in &adj[v] {
-            if !removed[nb as usize] {
-                degree[nb as usize] -= 1;
-            }
-        }
-    }
-    // SELECT: pop, assign the smallest color that differs from all neighbors; out of colors → an actual spill (None).
-    let mut colr = vec![None; nt];
-    let mut spilled = Vec::new();
-    while let Some(v) = stack.pop() {
-        let mut used = vec![false; k as usize];
-        for &nb in &adj[v as usize] {
-            if let Some(c) = colr[nb as usize]
-                && (c as usize) < k as usize {
-                    used[c as usize] = true;
-                }
-        }
-        match (0..k).find(|&c| !used[c as usize]) {
-            Some(c) => colr[v as usize] = Some(c),
-            None => spilled.push(v),
-        }
-    }
-    Alloc { color: colr, spilled, k }
-}
-
-/// Mechanically CHECK the interference invariant: every edge is differently colored.
-/// This is the "P-verify" of the NP solution — regalloc may be heuristic, but its correctness is cheap to check.
-pub fn verify_coloring(adj: &[HashSet<Tmp>], al: &Alloc) -> Result<(), String> {
-    for u in 0..adj.len() {
-        if let Some(cu) = al.color[u] {
-            for &v in &adj[u] {
-                if al.color[v as usize] == Some(cu) {
-                    return Err(format!("interference (t{u},t{v}) share register {cu}"));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Stage 5b — ABI-AWARE register allocation (the backend consumes this coloring).
 //
 // Extends the interference-invariant bisimulation above with the ABI (THEORY §A7,
 // §D2). A machine register belongs to one of two ABI classes (AAPCS64 §6.1.1): a
 // CALLER-saved register is clobbered by every `bl`; a CALLEE-saved register is
-// preserved across it. Hence the extra proof obligation over `verify_coloring`:
+// preserved across it. Hence the extra proof obligation of the plain interference
+// invariant:
 //   CALL-CLOBBER SET-DISJOINTNESS — a temp whose value is LIVE ACROSS a call must
 //   receive a callee-saved color, else the `bl` overwrites it (⟦·⟧ broken).
 // We model this by RESTRICTING such a temp's select-range to the callee-saved colors.
@@ -744,6 +681,8 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget) -> 
 /// Mechanically CHECK the Stage-5b obligations (the P-verify): (1) the interference
 /// invariant per class — two same-class simultaneously-live temps get distinct homes;
 /// (2) call-clobber — no call-crossing temp received a caller-saved color.
+/// Test-only: the theorem is checked over a corpus in `tests`, not on every compile.
+#[cfg(test)]
 pub fn verify_abi(
     tt: &TyTab,
     f: &IrFunc,
@@ -813,8 +752,8 @@ pub fn verify_abi(
 // (copy-prop→const-fold folds constants; CSE→copy-prop→DCE cleans up). The loop
 // terminates on "no more rewrites" (convergence) + a hard cap against runaway.
 // (Regalloc is NOT here: it produces an assignment for the BACKEND to consume, not an
-//  IR→IR transform; the backend's current spill-per-node does not yet use it — it will
-//  be wired in when the default is flipped to IR, Step B.)
+//  IR→IR transform. `abi_alloc` is wired into arm64_elf.rs (Stage 5b), gated on the same
+//  volatile-free/φ-free IR as opt; -O0 keeps the naive spill-per-node model.)
 // ─────────────────────────────────────────────────────────────────────────────
 pub fn optimize(tt: &TyTab, f: &mut IrFunc) {
     for _ in 0..32 {
@@ -2033,34 +1972,6 @@ mod tests {
         assert!(adj[0].contains(&1) && adj[1].contains(&0), "t0,t1 must interfere");
         // t2 is not live together with t0/t1 (they die when t2 is born) → no interference
         assert!(!adj[2].contains(&0) && !adj[2].contains(&1));
-    }
-
-    // Valid coloring on REAL code (K=8, ample): the interference invariant holds.
-    #[test]
-    fn reg_alloc_valid() {
-        for (nm, src) in [
-            ("a", "int g(int a,int b){int c=a+b;int d=c*a;int e=d-b;return c+d+e;}"),
-            ("b", "int s(int n){int t=0;int i;for(i=0;i<n;i=i+1)t=t+i*i;return t;}"),
-            ("c", "int m(int a,int b,int c){int x=a*b;int y=b*c;int z=a*c;return x+y+z;}"),
-        ] {
-            let (_ast, ir) = compile(nm, src);
-            for f in &ir {
-                let adj = interference(f, &liveness(f));
-                let al = color(&adj, 8);
-                verify_coloring(&adj, &al).unwrap_or_else(|e| panic!("{nm}/{}: {e}", f.name));
-            }
-        }
-    }
-
-    // K=1 (one register) + two interfering temporaries ⟹ a spill is FORCED; the
-    // coloring is still VALID (a spill = its own slot, not counted in the register invariant).
-    #[test]
-    fn reg_alloc_spill() {
-        let f = two_live();
-        let adj = interference(&f, &liveness(&f));
-        let al = color(&adj, 1);
-        assert!(!al.spilled.is_empty(), "K=1 must force a spill of ≥1 temp");
-        verify_coloring(&adj, &al).expect("the coloring (with a spill) must still be valid");
     }
 
     // Stage 5b — the ABI budgets the backend uses (arm64_elf.rs): GP = 10 callee-saved
