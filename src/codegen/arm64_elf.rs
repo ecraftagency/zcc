@@ -1622,8 +1622,124 @@ fn first_reg_slot(operands: &str) -> Option<u32> {
     tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
 }
 
+/// The register slots an instruction READS and WRITES, plus whether it ends a straight-line
+/// region (branch/call/ret/unknown/writeback-addressing ⟹ we stop reasoning). Only x/w GP
+/// registers are tracked; sp/fp/float operands are ignored (they never form a `mov x,x` we
+/// rewrite, and over-counting a read only KEEPS more moves — the safe direction).
+fn reg_uses(t: &str) -> (Vec<u32>, Vec<u32>, bool) {
+    // Writeback / pre-post-index addressing mutates the base register implicitly — rather
+    // than model it, treat the line as a region boundary (conservative = keep everything).
+    if t.contains('!') || t.contains("],") {
+        return (vec![], vec![], true);
+    }
+    let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+    let operands = t[mn.len()..].trim_start();
+    // A GP-register slot in one operand TOKEN, or None if the token is a float/vector reg
+    // (q/d/s/v/h/b), an immediate, a label, or a condition. Brackets (memory `[x0]`) stripped.
+    let slot = |tok: &str| -> Option<u32> {
+        let tok = tok.trim().trim_start_matches('[').trim_end_matches(']');
+        tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
+    };
+    // Operand tokens, POSITIONALLY (comma-split). The destination of a def-first instruction
+    // is token[0]; a memory operand like `[x0, x1]` splits into two tokens, both address READS.
+    let toks: Vec<&str> = operands.split(',').collect();
+    let gp_in = |range: &[&str]| -> Vec<u32> { range.iter().filter_map(|tk| slot(tk)).collect() };
+    const BOUNDARY: &[&str] =
+        &["b", "bl", "blr", "br", "ret", "cbz", "cbnz", "tbz", "tbnz"];
+    const NO_DEF: &[&str] =
+        &["str", "strb", "strh", "stp", "cmp", "cmn", "tst", "fcmp", "ccmp"];
+    const DEF_FIRST: &[&str] = &[
+        "mov", "movz", "movn", "add", "sub", "mul", "msub", "madd", "neg", "mvn", "and",
+        "orr", "eor", "bic", "lsl", "lsr", "asr", "sdiv", "udiv", "sxtw", "sxth", "sxtb",
+        "uxtw", "uxth", "uxtb", "cset", "csel", "csinc", "cinc", "adrp", "ldr", "ldrb",
+        "ldrh", "ldrsw", "ldrsb", "ldrsh", "fmov", "scvtf", "ucvtf", "fcvt", "fadd", "fsub",
+        "fmul", "fdiv", "fneg", "fcvtzs", "fcvtzu", "sxtl",
+    ];
+    if mn.starts_with("b.") || BOUNDARY.contains(&mn) {
+        (vec![], vec![], true)
+    } else if NO_DEF.contains(&mn) {
+        (gp_in(&toks), vec![], false) // stores/compares: every GP operand is a READ
+    } else if mn == "ldp" {
+        // token[0], token[1] are destinations; the rest are address READS.
+        let n = toks.len().min(2);
+        (gp_in(&toks[n..]), gp_in(&toks[..n]), false)
+    } else if mn == "movk" {
+        (gp_in(&toks), gp_in(&toks[..toks.len().min(1)]), false) // merge: reads its own dst too
+    } else if DEF_FIRST.contains(&mn) {
+        // token[0] is the destination POSITION. If it is a GP reg → the WRITE; if it is a
+        // float/vector reg (q0/d0/s0/…) → NO GP write, and every GP operand is a READ (the
+        // bug this fixes: `ldr q0, [x0]` / `fmov d0, x0` must NOT treat x0 as the destination).
+        match toks.split_first() {
+            Some((first, rest)) => match slot(first) {
+                Some(d) => (gp_in(rest), vec![d], false),
+                None => (gp_in(rest), vec![], false),
+            },
+            None => (vec![], vec![], false),
+        }
+    } else {
+        (vec![], vec![], true) // unknown ⟹ boundary (never mis-model)
+    }
+}
+
 /// Machine-level redundant-move elimination over one function body (see the block comment).
+/// Chained with `drop_dead_moves` — redundant round-trips first, then dead stores.
 fn peephole_moves(body: &str) -> String {
+    drop_dead_moves(&drop_redundant_moves(body))
+}
+
+/// DEAD-MOVE ELIMINATION (region-local backward liveness). A `mov xD,xS` is deleted when xD
+/// is redefined later in the same straight-line region BEFORE any read of xD — its value is
+/// never observed. The coalescer gives many short-lived temps the same home register, so the
+/// emitter stores each to that home and overwrites it before it is read: pure dead stores.
+/// Live-out at a region boundary is the conservative FULL set, so a move is dropped only when
+/// a later write within the region provably kills it. Only `mov x,x` lines are ever removed.
+fn drop_dead_moves(body: &str) -> String {
+    use std::collections::HashSet;
+    let lines: Vec<&str> = body.lines().collect();
+    let mut drop = vec![false; lines.len()];
+    let full: HashSet<u32> = (0..=30).collect();
+    let mut live = full.clone();
+    for (i, line) in lines.iter().enumerate().rev() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('.') {
+            continue; // directive/blank: no effect on register liveness
+        }
+        if t.ends_with(':') {
+            live = full.clone(); // label = region boundary above it ⟹ all live-out
+            continue;
+        }
+        let (reads, writes, boundary) = reg_uses(t);
+        if boundary {
+            live = full.clone(); // branch/call/ret/unknown ⟹ conservative live-out
+            continue;
+        }
+        if let Some((d, _s)) = parse_mov_xx(t) {
+            if !live.contains(&d) {
+                drop[i] = true; // xD is dead here ⟹ this store is never observed
+                continue; // deleted ⟹ it neither reads nor writes
+            }
+        }
+        for w in &writes {
+            if !reads.contains(w) {
+                live.remove(w); // a pure write kills the register above it
+            }
+        }
+        for r in &reads {
+            live.insert(*r);
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        if !drop[i] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Redundant round-trip elimination via per-region value-equivalence (see the block comment).
+fn drop_redundant_moves(body: &str) -> String {
     use std::collections::HashMap;
     let mut out = String::with_capacity(body.len());
     let mut eq: HashMap<u32, u64> = HashMap::new(); // register slot → value id
@@ -1846,5 +1962,80 @@ mod tests {
         let out = peephole_moves(body);
         assert_eq!(count(&out, "mov x0, x24"), 0, "redundant dropped");
         assert_eq!(count(&out, "mov x1, x25"), 1, "an unrelated move is preserved");
+    }
+
+    use super::drop_dead_moves;
+
+    // DEAD STORE: `mov x24, x0` then x24 is overwritten (`mov x24, x1`) before any read →
+    // the first store is dead and must be removed; the live second store stays.
+    #[test]
+    fn dce_drops_dead_store() {
+        let body = "\tmov x24, x0\n\tmov x24, x1\n\tmov x2, x24\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x24, x0"), 0, "the overwritten-before-read store is dead");
+        assert_eq!(count(&out, "mov x24, x1"), 1, "the store that IS read must stay");
+    }
+
+    // TEETH: a `mov x24, x0` whose value IS read before any overwrite must NOT be dropped —
+    // deleting it would lose the value. Guards against over-eager DCE (a miscompile).
+    #[test]
+    fn dce_keeps_used_store() {
+        let body = "\tmov x24, x0\n\tmov x2, x24\n\tmov x24, x1\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x24, x0"), 1, "x24 is READ before overwrite ⟹ live, keep");
+    }
+
+    // A read INSIDE a compare/store counts — `str x24,[x1]` reads x24, so the prior store is live.
+    #[test]
+    fn dce_counts_reads_in_stores() {
+        let body = "\tmov x24, x0\n\tstr x24, [x1]\n\tmov x24, x2\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x24, x0"), 1, "str reads x24 ⟹ the store is live");
+    }
+
+    // A region boundary (branch) means all registers are conservatively live-out — a store
+    // with no in-region overwrite before the branch must be KEPT (it may be read by a successor).
+    #[test]
+    fn dce_conservative_across_boundary() {
+        let body = "\tmov x24, x0\n\tcbz x1, .Lx\n\tmov x24, x2\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x24, x0"), 1, "live-out across a branch ⟹ keep");
+    }
+
+    // Writeback addressing implicitly mutates a base register — treated as a boundary, so no
+    // move is dropped across it (safety over coverage).
+    #[test]
+    fn dce_safe_on_writeback() {
+        let body = "\tmov x24, x0\n\tldr x2, [x3, #8]!\n\tmov x24, x1\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x24, x0"), 1, "writeback ⟹ boundary ⟹ conservative keep");
+    }
+
+    // REGRESSION (the stdarg-1 miscompile): a FLOAT/VECTOR destination whose ADDRESS is a GP
+    // register — `ldr q0, [x0]` READS x0, it does NOT write it. The `mov x0, xS` feeding the
+    // address must be KEPT (earlier a positional-parse bug mistook x0 for the destination and
+    // dropped it, corrupting the load address → SIGABRT).
+    #[test]
+    fn dce_keeps_addr_of_float_load() {
+        let body = "\tmov x0, x10\n\tldr q0, [x0]\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x0, x10"), 1, "x0 is the load address (read) ⟹ keep");
+    }
+
+    // Same class: `fmov d0, x0` READS x0 (int→float bitcast), does not write it.
+    #[test]
+    fn dce_keeps_src_of_fmov_to_float() {
+        let body = "\tmov x0, x10\n\tfmov d0, x0\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x0, x10"), 1, "x0 is the fmov source (read) ⟹ keep");
+    }
+
+    // The converse must still work: `fmov x0, d0` WRITES x0 (float→int), so a prior dead store
+    // to x0 IS dead and removable.
+    #[test]
+    fn dce_float_to_gp_writes_dst() {
+        let body = "\tmov x0, x10\n\tfmov x0, d0\n\tmov x1, x0\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "mov x0, x10"), 0, "fmov x0,d0 overwrites x0 ⟹ prior store dead");
     }
 }

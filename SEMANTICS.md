@@ -327,9 +327,22 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > — so no equivalence survives a value change or is assumed across control flow. Equivalences
 > are formed only by full-width `mov x,x`, so a 32-bit `w` write (which zero-extends) can never
 > be mistaken for a 64-bit copy; live-out is safe because a redundant reload is dropped only
-> when the target already holds the value. Measured: bench geomean **1.39×→1.07× vs gcc-O0**
-> (beating gcc-O0 on loops 0.75× and sieve 0.63×). Gated by 5 machine unit tests + torture
-> (0 FAIL) + opt-parity (0 DIVERGE). Toggle `ZCC_OPT_OFF=peephole`.
+> when the target already holds the value. A SECOND pass, `drop_dead_moves`, removes DEAD
+> stores: the coalescer gives many short-lived temps the same home register, so the emitter
+> writes a home and overwrites it before any read. Region-local BACKWARD liveness (live-out at
+> a boundary = the conservative FULL register set) drops a `mov xD,xS` when xD is rewritten
+> before it is read. Read/write attribution is POSITIONAL: a float/vector-destination
+> instruction (`ldr q0,[x0]`, `fmov d0,x0`) writes NO GP register, so its GP operands are
+> READS — mistaking the address x0 for the destination drops the live move feeding it. Measured:
+> bench geomean **1.39×→0.98× vs gcc-O0 — zcc now beats gcc-O0 on average** (loops 0.66×, sieve
+> 0.60×, matmul 2.44→1.68×, fib 1.39×). Gated by 16 machine unit tests + torture (0 FAIL) +
+> opt-parity (0 DIVERGE). Toggle `ZCC_OPT_OFF=peephole`.
+>
+> THE DCE-BUG LESSON (measure-before-speaking, again): all unit tests passed and the bench
+> looked excellent, yet BOX torture caught 32 FAIL (stdarg-1 SIGABRT) from the positional-parse
+> bug above. A green PERFORMANCE number on miscompiled output is worthless (clean-input law) —
+> the differential gate, not the unit proof, is what exposed it. A machine peephole's proof is
+> the soundness invariant + unit tests + the differential gate TOGETHER; none alone suffices.
 >
 > WHY THE IR PASSES REGRESS BUT THIS WINS (the LICM/phase-ordering answer): the commuting-square
 > proofs establish `⟦f⟧=⟦pass(f)⟧` — identical OUTPUT — and say NOTHING about instruction count
