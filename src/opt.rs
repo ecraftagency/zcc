@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 // A walker that MUTATES every operand (each READ Val) of an instruction — used by
 // copy/CSE to substitute uses. Does NOT touch the destination temporary (def).
 // Symmetric with ir::inst_uses (the read-only version).
-fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
+pub(crate) fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
     match i {
         Inst::Bin(_, _, _, a, b) => {
             g(a);
@@ -86,7 +86,7 @@ fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
         }
     }
 }
-fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
+pub(crate) fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
     match t {
         Term::Br(c, ..) => g(c),
         Term::Ret(Some(r)) => g(r),

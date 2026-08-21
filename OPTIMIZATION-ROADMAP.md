@@ -7,15 +7,15 @@ backend passes), and its **measured value on THIS backend**. The last column is 
 a technique is only worth its LOC if *measurement* says so — several proven-correct passes here
 are default-OFF because they don't pay on the current codegen (see LICM/SR).
 
-**Where we are (Tier-1 #1 done):** bench geomean **0.81× vs gcc-O0** (fib 1.43×, loops 0.44×,
-matmul 1.38×, sieve 0.48×) — compute-into-home (#1) removed the x0 funnel at the source and cut
-geomean 0.98×→0.81×. The one remaining gap well above 1.0 is now **fib 1.43×** (pure
-function-call overhead → #5 inlining); **matmul 1.38×** is next-attacked by #2 (addressing-mode
-fold) + #3 (madd) on the Load/index arithmetic the funnel-kill left behind.
+**Where we are (Tier-1 #1 + #2 done):** bench geomean **0.78× vs gcc-O0** (fib 1.38×, loops 0.44×,
+matmul 1.25×, sieve 0.48×) — compute-into-home (#1) cut geomean 0.98×→0.81×, addressing-mode fold
+(#2) cut matmul 1.38→1.25× → geomean 0.78×. The one remaining gap well above 1.0 is now
+**fib 1.38×** (pure function-call overhead → #5 inlining); **matmul 1.25×** is next-attacked by
+#3 (madd fusion) on the inner-product `s += a*b` the fold left as `mul; add`.
 
 **Done:** const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simplify · register-coalescing
 (biased) · LICM (off) · strength-reduction (off) · backend peephole (redundant + dead move elim)
-· **compute-into-home instruction selection (Tier-1 #1)**.
+· **compute-into-home (#1)** · **addressing-mode fold (#2)**.
 
 ---
 
@@ -39,7 +39,7 @@ payoff unlocks once values are register-resident.
 | # | Technique | Theorem / space | Proof obligation | Attacks | ~LOC |
 |---|-----------|-----------------|------------------|---------|------|
 | ~~1~~ | **Compute-into-home instruction selection** ✅ **DONE** — geomean 0.98×→0.81× | per-node simulation with a *target register* = the allocator's home, not a fixed accumulator | machine translation-validation (opt-parity **1552/0** DIVERGE) + torture **1378/0** | done for integer `Bin`/`Un`; Load/index arith remains → #2/#3 | ~90 (`ir_bin_r`/`ext_r`/`src_gp`) |
-| 2 | **Addressing-mode folding** `ldr xD,[base,idx,lsl #k]` / `[base,#imm]` | tree-pattern matching (BURS / maximal munch): `Load(Add(b, Shl(i,k)))` → one addressed load | local pattern equivalence (the folded form computes the same effective address) | matmul `A[i][k]`,`B[k][j]` — collapses ~4 insns/access | ~120 |
+| ~~2~~ | **Addressing-mode folding** `ldr xD,[base,idx]` ✅ **DONE** — matmul 1.38×→1.25× | tree-pattern matching (BURS / maximal munch): `Load(Add(b, i))`, `i` single-use → one addressed load | machine translation-validation (opt-parity **1552/0**) + torture **1378/0** | matmul `A[i][k]`,`B[k][j]` — drops the index `add`. `lsl #k`/`[base,#imm]` forms still open | ~75 (`try_fuse_addr`/`load_idx`) |
 | 3 | **Multiply-add / multiply-sub fusion** `madd/msub xD,xA,xB,xC` | pattern `Add(Mul(a,b),c)` → `madd` | local equivalence | matmul inner product `s += a*b`; any `x*y+z` | ~60 |
 | 4 | **Sign/zero-extension elimination** (the pervasive `sxtw x0,w0`) | a value already in canonical width need not be re-extended; range/def-width analysis | `⟦f⟧=⟦elim(f)⟧` (an extension of an already-canonical value is identity) | every loop counter / index (`sxtw` litters the output) | ~100 |
 | 5 | **Function inlining** | call-graph substitution + β-reduction; a cost model bounds growth | `⟦call f(args)⟧ = ⟦inline body[args/params]⟧` (the meta-enabler; unlocks const-prop across calls) | **fib 1.39× (pure call overhead) — the only fix** | ~200 |

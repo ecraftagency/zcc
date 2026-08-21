@@ -25,7 +25,7 @@
 // Labels: "L{n}" sequential; "LC{id}" case targets; "lg_{fn}.{name}" goto labels.
 use crate::ast::{Ast, GInit, SyncOp, Ty, TypeId, VOID};
 use crate::ir::{self, Callee, Inst, IrFunc, Op, Place, Term, Tmp, Un, Val};
-use crate::opt::{AbiHome, ClassBudget};
+use crate::opt::{each_use_mut, each_use_term_mut, AbiHome, ClassBudget};
 use std::fmt::Write;
 
 // Stage 5b — AAPCS64 §6.1.1 register files partitioned for `opt::abi_alloc`. The
@@ -83,6 +83,10 @@ struct Cg<'a> {
     talloc: Vec<AbiHome>,
     csave_gp: Vec<u32>,
     csave_fp: Vec<u32>,
+    // Tier-1 #2 (addressing-mode fold): function-wide READ count per temp, computed once
+    // per function via the authoritative opt::each_use visitor. A temp used exactly once is
+    // safe to fold-and-delete (its sole use is the Load whose address it computes).
+    use_count: Vec<u32>,
 }
 
 
@@ -518,6 +522,84 @@ impl Cg<'_> {
                 };
             }
         }
+    }
+    // Tier-1 #2 groundwork — simple integer/pointer/Double load INTO a home register:
+    // `ldr* xRd, [xRa]`, no x0 funnel. Byte-identical to the generic arm of `load` for
+    // rd=ra=0. GATED by `simple_gp_load_ty` (the caller): Float (fcvt-widened), LDouble
+    // (q-reg + libcall) and Bitfield (shift-extract) keep the x0 funnel. Double flows here
+    // — its 8-byte pattern is a plain GP move (SEMANTICS §1: f64 bits live in a GPR).
+    fn load_gp(&mut self, rd: u32, ra: u32, t: TypeId) {
+        let u = self.a.tt.is_unsigned(t);
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tldrsb x{rd}, [x{ra}]"),
+            (1, true) => writeln!(self.s, "\tldrb w{rd}, [x{ra}]"),
+            (2, false) => writeln!(self.s, "\tldrsh x{rd}, [x{ra}]"),
+            (2, true) => writeln!(self.s, "\tldrh w{rd}, [x{ra}]"),
+            (4, false) => writeln!(self.s, "\tldrsw x{rd}, [x{ra}]"),
+            (4, true) => writeln!(self.s, "\tldr w{rd}, [x{ra}]"),
+            _ => writeln!(self.s, "\tldr x{rd}, [x{ra}]"),
+        };
+    }
+    fn simple_gp_load_ty(&self, t: TypeId) -> bool {
+        !matches!(
+            self.a.tt.tys[t as usize],
+            Ty::Float | Ty::LDouble | Ty::Bitfield(..)
+        )
+    }
+    // Tier-1 #2 — register-offset load: x{rd} = *(x{rbase} + x{rindex}), width per t. The
+    // ARM64 `[Xn, Xm]` addressing form adds the full 64-bit Xm; it exists for every ldr
+    // variant used here (ldr/ldrb/ldrh/ldrsb/ldrsh/ldrsw). rd may alias rbase/rindex (base
+    // and index are read before rd is written — a single instruction).
+    fn load_idx(&mut self, rd: u32, rbase: u32, rindex: u32, t: TypeId) {
+        let u = self.a.tt.is_unsigned(t);
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tldrsb x{rd}, [x{rbase}, x{rindex}]"),
+            (1, true) => writeln!(self.s, "\tldrb w{rd}, [x{rbase}, x{rindex}]"),
+            (2, false) => writeln!(self.s, "\tldrsh x{rd}, [x{rbase}, x{rindex}]"),
+            (2, true) => writeln!(self.s, "\tldrh w{rd}, [x{rbase}, x{rindex}]"),
+            (4, false) => writeln!(self.s, "\tldrsw x{rd}, [x{rbase}, x{rindex}]"),
+            (4, true) => writeln!(self.s, "\tldr w{rd}, [x{rbase}, x{rindex}]"),
+            _ => writeln!(self.s, "\tldr x{rd}, [x{rbase}, x{rindex}]"),
+        };
+    }
+    // Tier-1 #2 — addressing-mode fold (BURS / maximal munch). Recognize the tree
+    // `Load(Add(base, index))` when the Add's result feeds ONLY that Load and both operands
+    // are register-resident, and emit ONE register-offset load — deleting the separate `add`.
+    //   insts[i]   = Bin(t, Add, ct, Tmp(base), Tmp(index)), ct an 8-byte (address) type
+    //   insts[i+1] = Load(d, lty, Tmp(t)), lty a simple-GP load, use_count[t] == 1
+    // Semantics: `[base+index]` is the same effective address the add computed, and the add
+    // is dead (single-use) ⟹ deleting it changes no observation. `⟦·⟧` preserved; validated
+    // by opt-parity. The 8-byte-ct gate rules out a narrowing add (an address is never
+    // narrowed); `reg_uses` counts BOTH bracket registers as reads, so the peephole that
+    // runs later cannot mistake the index for dead. Returns Some(2) on a fold, else None.
+    fn try_fuse_addr(&mut self, insts: &[Inst], i: usize) -> Option<usize> {
+        let Inst::Bin(t, Op::Add, ct, a, b) = &insts[i] else {
+            return None;
+        };
+        if self.a.tt.size(*ct) != 8 {
+            return None;
+        }
+        let (Val::Tmp(ta), Val::Tmp(tb)) = (a, b) else {
+            return None;
+        };
+        let (Some(rbase), Some(rindex)) = (self.gp_home(*ta), self.gp_home(*tb)) else {
+            return None;
+        };
+        let Some(Inst::Load(d, lty, Val::Tmp(la))) = insts.get(i + 1) else {
+            return None;
+        };
+        if *la != *t || !self.simple_gp_load_ty(*lty) {
+            return None;
+        }
+        if self.use_count.get(*t as usize).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let rd = self.gp_home(*d).unwrap_or(0);
+        self.load_idx(rd, rbase, rindex, *lty);
+        if self.gp_home(*d).is_none() {
+            self.tmp_store(*d, "x0");
+        }
+        Some(2)
     }
     // store x{reg} → [x1] per type
     fn store(&mut self, reg: u32, t: TypeId) {
@@ -1487,9 +1569,19 @@ impl<'a> Cg<'a> {
                 }
             }
             Inst::Load(d, ty, a) => {
-                self.ld_val(*a, "x0");
-                self.load(*ty);
-                self.tmp_store(*d, "x0");
+                if self.simple_gp_load_ty(*ty) {
+                    // Tier-1 #2 groundwork: address from its home, load into d's home.
+                    let ra = self.src_gp(*a, 0);
+                    let rd = self.gp_home(*d).unwrap_or(0);
+                    self.load_gp(rd, ra, *ty);
+                    if self.gp_home(*d).is_none() {
+                        self.tmp_store(*d, "x0");
+                    }
+                } else {
+                    self.ld_val(*a, "x0");
+                    self.load(*ty);
+                    self.tmp_store(*d, "x0");
+                }
             }
             Inst::Store(ty, a, v) => {
                 self.ld_val(*v, "x0");
@@ -1646,6 +1738,23 @@ impl<'a> Cg<'a> {
             self.sp_adjust("sub", self.ir_tspill);
         }
         self.save_callee(true); // spill callee-saved regs into the frame-bottom slab
+        // Tier-1 #2: function-wide temp READ counts (the authoritative opt::each_use visitor
+        // over a clone — codegen is not hot). A single-use address temp is fold-and-deletable.
+        self.use_count = vec![0u32; irf.temps.len()];
+        for blk in &irf.blocks {
+            for inst in &blk.insts {
+                each_use_mut(&mut inst.clone(), |v| {
+                    if let Val::Tmp(t) = v {
+                        self.use_count[*t as usize] += 1;
+                    }
+                });
+            }
+            each_use_term_mut(&mut blk.term.clone(), |v| {
+                if let Val::Tmp(t) = v {
+                    self.use_count[*t as usize] += 1;
+                }
+            });
+        }
         for (bi, blk) in irf.blocks.iter().enumerate() {
             _ = writeln!(self.s, "{}:", self.ir_label(bi as u32));
             // EXT(gcc): a C label at this block → emit `lg_fname.name:` for computed-goto
@@ -1660,8 +1769,14 @@ impl<'a> Cg<'a> {
             if is_label && self.fhasvla {
                 self.reset_sp_base();
             }
-            for inst in &blk.insts {
-                self.emit_inst(inst);
+            let mut ii = 0;
+            while ii < blk.insts.len() {
+                if let Some(n) = self.try_fuse_addr(&blk.insts, ii) {
+                    ii += n;
+                    continue;
+                }
+                self.emit_inst(&blk.insts[ii]);
+                ii += 1;
             }
             self.emit_term(&blk.term);
         }
@@ -1955,6 +2070,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         talloc: Vec::new(),
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
+        use_count: Vec::new(),
     };
     for a in &ast.raw_asm {
         g.s += a;
