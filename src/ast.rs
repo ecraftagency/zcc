@@ -211,7 +211,7 @@ impl TyTab {
 
 // EXT(gcc): họ builtin atomic __sync_* (M12) — bảng tên ở ext.rs, codegen phát
 // vòng LL/SC ldaxr/stlxr. Nằm ở ast.rs vì đây là boundary parser ↔ codegen.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SyncOp {
     FetchAdd, // __sync_fetch_and_add — trả giá trị CŨ
     AddFetch, // __sync_add_and_fetch — trả giá trị MỚI

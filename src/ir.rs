@@ -19,7 +19,7 @@
 // trần 10k); verifier ở đây vì nó nhẹ và là automaton kiểm ngay sau lowering.
 #![allow(dead_code)] // gỡ khi lowering (step 2) + backend IR→asm (step 3) tiêu thụ
 
-use crate::ast::{Ast, Node, NodeId, Ty, TyTab, TypeId, INT, ULONG, VOID};
+use crate::ast::{Ast, Node, NodeId, SyncOp, Ty, TyTab, TypeId, INT, ULONG, VOID};
 use std::collections::HashMap;
 
 pub type Tmp = u32; // định danh temp; đánh index vào IrFunc.temps (bảng kiểu Γ)
@@ -112,6 +112,10 @@ pub enum Inst {
     // struct, khớp lower_expr). ret = kiểu trả; sret = local slot khi ret là struct
     // (dst = &slot). Scalar-thuần vẫn đi Inst::Call (nhanh). Impure.
     CallX(Option<Tmp>, Callee, Vec<(Val, TypeId)>, TypeId, u32), // dst?, callee, (val,ty)*, ret, sret-off
+    // EXT(gcc) atomics __sync_* (C11 mượn): LL/SC ldaxr/stlxr. Operand = (ptr[, val
+    // [, val2]]) → x0/x1/x2. sz = 4|8 (width), ret = kiểu kết quả (dấu, canon x0).
+    // dst None ⟺ void (Release/Barrier). Impure (ghi mem + hàng rào).
+    Sync(Option<Tmp>, SyncOp, Vec<Val>, u32, TypeId), // dst?, op, operands, size, ret
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -177,7 +181,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
         | Inst::Alloca(d, ..) => Some(*d),
-        Inst::Call(d, ..) | Inst::Opaque(d, ..) | Inst::CallX(d, ..) => *d,
+        Inst::Call(d, ..) | Inst::Opaque(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => *d,
         Inst::Store(..)
         | Inst::Memcpy(..)
         | Inst::Zero(..)
@@ -233,6 +237,11 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
                 v(p)
             }
             for (a, _) in args {
+                v(a)
+            }
+        }
+        Inst::Sync(_, _, args, _, _) => {
+            for a in args {
                 v(a)
             }
         }
@@ -678,6 +687,19 @@ impl<'a> Lower<'a> {
                 let d = self.t(ty);
                 self.push(Inst::Alloca(d, sz));
                 Val::Tmp(d)
+            }
+            Node::Sync(op, args, sz) => {
+                let (op, sz) = (*op, *sz);
+                let args = args.clone();
+                let vals: Vec<Val> = args.iter().map(|&x| self.lower_expr(x)).collect();
+                if ty == VOID {
+                    self.push(Inst::Sync(None, op, vals, sz, ty));
+                    Val::Imm(0)
+                } else {
+                    let d = self.t(ty);
+                    self.push(Inst::Sync(Some(d), op, vals, sz, ty));
+                    Val::Tmp(d)
+                }
             }
             // GNU statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
             // tuần tự các stmt (side-effect qua lower_stmt), giá trị = giá trị của
@@ -1247,8 +1269,9 @@ pub(crate) mod tests {
                     | Inst::VaArea(..)
                     | Inst::GotoPtr(..)
                     | Inst::Alloca(..)
-                    | Inst::CallX(..) => {
-                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX — hàm không thuần)".into())
+                    | Inst::CallX(..)
+                    | Inst::Sync(..) => {
+                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX/sync — hàm không thuần)".into())
                     }
                 }
             }

@@ -2029,6 +2029,87 @@ impl<'a> Cg<'a> {
         }
     }
 
+    // EXT(gcc) atomics trên IR: PORT thân LL/SC self.expr(Node::Sync), thay arg-eval
+    // bằng ld_val (operand đã là Val). x0=ptr, x1=val, x2=val2; vòng dùng x9/x10/x11.
+    fn ir_sync(&mut self, dst: &Option<Tmp>, op: SyncOp, operands: &[Val], sz: u32, ret: TypeId) {
+        // nạp HẾT operand trước khi vòng chiếm x9 (ld_val dùng x9 làm scratch địa chỉ)
+        if let Some(v) = operands.first() {
+            self.ld_val(*v, "x0");
+        }
+        if let Some(v) = operands.get(1) {
+            self.ld_val(*v, "x1");
+        }
+        if let Some(v) = operands.get(2) {
+            self.ld_val(*v, "x2");
+        }
+        let r = if sz == 8 { "x" } else { "w" };
+        let unsigned = self.a.tt.is_unsigned(ret);
+        let canon = |s: &mut String, res: u32| {
+            _ = match (sz, unsigned) {
+                (8, _) => writeln!(s, "\tmov x0, x{res}"),
+                (_, true) => writeln!(s, "\tmov w0, w{res}"),
+                _ => writeln!(s, "\tsxtw x0, w{res}"),
+            };
+        };
+        let n = self.labels(3);
+        match op {
+            SyncOp::FetchAdd
+            | SyncOp::AddFetch
+            | SyncOp::FetchSub
+            | SyncOp::SubFetch
+            | SyncOp::FetchAnd
+            | SyncOp::FetchOr
+            | SyncOp::FetchXor => {
+                let ins = match op {
+                    SyncOp::FetchAdd | SyncOp::AddFetch => "add",
+                    SyncOp::FetchSub | SyncOp::SubFetch => "sub",
+                    SyncOp::FetchAnd => "and",
+                    SyncOp::FetchOr => "orr",
+                    _ => "eor",
+                };
+                _ = writeln!(
+                    self.s,
+                    "L{n}:\n\tldaxr {r}9, [x0]\n\t{ins} {r}10, {r}9, {r}1\n\tstlxr w11, {r}10, [x0]\n\tcbnz w11, L{n}"
+                );
+                let old = !matches!(op, SyncOp::AddFetch | SyncOp::SubFetch);
+                canon(&mut self.s, if old { 9 } else { 10 });
+            }
+            SyncOp::ValCas | SyncOp::BoolCas => {
+                _ = writeln!(
+                    self.s,
+                    "L{n}:\n\tldaxr {r}9, [x0]\n\tcmp {r}9, {r}1\n\tb.ne L{}\n\tstlxr w11, {r}2, [x0]\n\tcbnz w11, L{n}",
+                    n + 1
+                );
+                if matches!(op, SyncOp::BoolCas) {
+                    _ = writeln!(
+                        self.s,
+                        "\tmov x0, #1\n\tb L{}\nL{}:\n\tclrex\n\tmov x0, #0\nL{}:",
+                        n + 2,
+                        n + 1,
+                        n + 2
+                    );
+                } else {
+                    _ = writeln!(self.s, "\tb L{}\nL{}:\n\tclrex\nL{}:", n + 2, n + 1, n + 2);
+                }
+                if matches!(op, SyncOp::ValCas) {
+                    canon(&mut self.s, 9);
+                }
+            }
+            SyncOp::TestSet => {
+                _ = writeln!(
+                    self.s,
+                    "L{n}:\n\tldaxr {r}9, [x0]\n\tstlxr w11, {r}1, [x0]\n\tcbnz w11, L{n}"
+                );
+                canon(&mut self.s, 9);
+            }
+            SyncOp::Release => _ = writeln!(self.s, "\tstlr {r}zr, [x0]"),
+            SyncOp::Barrier => self.s += "\tdmb ish\n",
+        }
+        if let Some(d) = dst {
+            self.tmp_store(*d, "x0");
+        }
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Copy(d, _ty, a) => {
@@ -2094,6 +2175,7 @@ impl<'a> Cg<'a> {
             Inst::CallX(dst, callee, args, ret, sret) => {
                 self.ir_call_abi(dst, callee, args, *ret, *sret)
             }
+            Inst::Sync(dst, op, operands, sz, ret) => self.ir_sync(dst, *op, operands, *sz, *ret),
             Inst::Opaque(dst, node) => {
                 // BRIDGE tạm: re-emit subtree AST cũ (kết quả x0), nạp vào temp.
                 match dst {

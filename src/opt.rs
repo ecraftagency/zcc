@@ -63,6 +63,11 @@ fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
                 g(a)
             }
         }
+        Inst::Sync(_, _, args, _, _) => {
+            for a in args {
+                g(a)
+            }
+        }
     }
 }
 fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
@@ -307,7 +312,7 @@ pub fn cse(f: &mut IrFunc) -> u32 {
         // loads: khoá (địa-chỉ-enc, ty). Xoá sạch tại mọi ghi-mem.
         let mut loads: HashMap<((u8, i64), u32), Tmp> = HashMap::new();
         for i in b.insts.iter_mut() {
-            if matches!(i, Inst::Store(..) | Inst::Memcpy(..) | Inst::Call(..) | Inst::CallX(..) | Inst::Opaque(..)) {
+            if matches!(i, Inst::Store(..) | Inst::Memcpy(..) | Inst::Call(..) | Inst::CallX(..) | Inst::Sync(..) | Inst::Opaque(..)) {
                 loads.clear(); // memory-kill bảo thủ
             }
             let repl: Option<Inst> = match i {
