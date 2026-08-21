@@ -20,7 +20,7 @@ pub type TypeId = u32;
 #[derive(Clone, Copy)]
 pub enum Ty {
     Void,
-    Char, // signed on Darwin; "signed char" also maps here
+    Char, // the SIGNED char (only via explicit "signed char"); plain `char` is unsigned on AArch64 Linux → UChar
     UChar,
     Short,
     UShort,

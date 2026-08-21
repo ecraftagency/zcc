@@ -2,6 +2,12 @@
 
 zcc is a C compiler targeting strict C99 (with C89 as a subset), written in Rust. Technical terminology is kept in English throughout.
 
+> **`[ssa-qbe fork]` override — this branch only; `main` (= zcc-slim SEAL) keeps the body below verbatim.** The two-fact source model is literal: `[THEORY.md, SEMANTICS.md]` (Side I) ⊕ `[iso/os/arch/gnu specs]` (Side II) **is** the source of zcc; `src/*.rs` is its *compiled object*. This fork **is** the optimizer, so it suspends exactly two Side-II clauses of Supreme Requirement 2 — nothing else:
+> - **"-O0 semantics / no optimization pass"** → SUSPENDED. The fork's purpose is the SSA + backend optimizer (`opt.rs`, `OPTIMIZATION-ROADMAP.md`). Every pass still ships under the **CbC supreme law**: a commuting-square `⟦f⟧=⟦pass(f)⟧` (IR pass) or a machine translation-validation `opt-parity 0 DIVERGE` (backend pass) — never a pass without its proof.
+> - **"Hard ceiling 10k LOC"** → RAISED to ~15k (compiler-only). Minimal-LOC as a *value* still binds (no anticipatory abstraction, zero external crates); only the constant moved.
+>
+> Everything else — Law Zero, CbC, the debugging corollary, iteration-speed, presumption-of-guilt, the science-gate, driver drop-in, boundary = `ast.rs` — remains in **full force** on this fork.
+
 ## Foundational Law Zero — the source-decomposition theorem (if only one law is retained, retain this one. Full detail: `THEORY.md`)
 
 ```
@@ -13,7 +19,7 @@ Every line of `src/` belongs to exactly one of the two sides — there is no thi
 
 ## The two supreme requirements (every decision reduces to these)
 
-1. **Strict C99 compliance** (raised from the original C89 baseline; C89 is automatically a subset. The four remaining C99 items are acquired when M18 unfreezes — see MILESTONES "C99-complete") — semantics exactly per specification; extensions (C11 / vendor) exist only when real software requires them, retaining the `EXT(gcc/clang/apple)` markers; a `C99:` note in the code is a pedagogical annotation, not a deviation boundary. Targets achieved: AArch64 macOS Mach-O and AArch64 ELF Linux; x86_64 is deferred.
+1. **Strict C99 compliance** (raised from the original C89 baseline; C89 is automatically a subset. The four remaining C99 items are acquired when M18 unfreezes — see MILESTONES "C99-complete") — semantics exactly per specification; extensions (C11 / vendor) exist only when real software requires them, retaining the `EXT(gcc/clang/apple)` markers; a `C99:` note in the code is a pedagogical annotation, not a deviation boundary. Targets achieved: AArch64 ELF Linux (macOS serves only as the clang oracle — the Mach-O backend has been retired; `src/codegen/` is ELF-only); x86_64 is deferred.
 2. **Minimal LOC** — no optimization pass (-O0 semantics), no feature written before a real `.c` file demands it, no anticipatory abstraction, zero external crates. Hard ceiling: **10k LOC**, counting `src/` only (the compiler is the theorem and must remain readable). `tests/` is verification procedure — C code, suites, and harness scripts all live there and are *not* bounded by the ceiling (they may grow arbitrarily; they are executed, not read line-by-line).
 
 When the two requirements conflict, compliance wins over LOC.
@@ -33,8 +39,8 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), no deeply ne
 
 - Extension logic lives, with real substance, in **`src/ext.rs`**; the core only calls through `ext_*` functions.
 - Touch-points that cannot be factored into that file *must* carry a marker **`// EXT(gcc)`** / `EXT(clang)` / `EXT(apple)` / `EXT(c99)` — `grep 'EXT(' src/` must cover 100% of the deviation surface. Attribution follows the *originating* dialect.
-- Verified by excision: removing `ext.rs` and the marked branches leaves a remainder that still passes the full C89 suite. Not self-asserted.
-- Extension tests live in `tests/ext/` (with `cc` as referee, without `-std=c89`), never mixed into `tests/cases/`.
+- Verified by excision: removing `ext.rs` and the marked branches leaves a remainder that still passes the full C99 suite. Not self-asserted.
+- Extension tests live in `tests/ext/` (with `cc` as referee, without `-std=c99`), never mixed into `tests/cases/`.
 
 ## Test & proof law
 
@@ -48,15 +54,15 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32), no deeply ne
 - **Clean-input law: the ultimate source of error is bad/garbage input collected while running the suite.** A PASS/FAIL verdict is worthless if the measurement itself rests on garbage data (a referee-filter skipping wrongly, `2>/dev/null` swallowing errors, mislabeled counts, a suite that is "green" without running anything). A green verdict is valid *only* when accompanied by a *mechanical evidence trail* proving real work occurred: number of artifacts produced + checksums + observed exit codes, *not* merely a pass/fail number. Publication standard: a "torture pass" claim must carry evidence of N real ELF binaries + total codegen bytes + a deterministic re-run sample (e.g. a torture-box run of 16s producing 1377 real ELF binaries / 21MB / 1694 cases fully covered — the suspicion "16s means no-op" is refuted by the manifest). An abnormal timing (fast *or* slow) is *measured*, not guessed (macOS clang compile+run is 2.7s per invocation due to codesign/dyld; Linux static-musl is nearly free — the same suite is 19 minutes on macOS versus 16s in the box).
 - **Test-loop optimization**: during triage/fix, re-run *exactly* the case/unit that failed last time, *not* the full suite; the full suite runs only once at the end to close the books (and runs in the background, not blocking). Heavy suites run *sequentially*, not contending for cores.
 - **The argument-offset algorithm lives in three places that must agree byte-for-byte** (codegen call, codegen spill, parser va_off) — editing one means editing all three, then running `abi.sh`.
-- Compare against the reference answer at any time: `clang -S -O0 -std=c89 foo.c`.
+- Compare against the reference answer at any time: `clang -S -O0 -std=c99 foo.c`.
 - **Numeric-provenance rule**: every number / decision must be derivable from a stated premise — no magic number without provenance.
 
-## Darwin/AArch64 ABI specifics (mistakes here produce cryptic crashes — read before touching codegen)
+## AArch64 ELF (Linux) ABI specifics (mistakes here produce cryptic crashes — read before touching codegen; every bullet verified against `src/codegen/arm64_elf.rs`)
 
-- Symbols carry a leading `_`; *no* absolute addressing — globals via `adrp @PAGE` / `@PAGEOFF`, externs via GOT, TLS via `@TLVPPAGE` + `tlv_get_addr`.
-- **Variadic: anonymous parameters go *onto the stack*** (an Apple specialty, opposite to Linux ARM64); named args in x0–x7; named scalars on the stack are *packed* to natural alignment; a spilled composite locks NGRN = 8 (C.11), but a spilled HFA does *not* lock it.
-- AAPCS64: args x0–x7, return x0, floats v0–v7, sp 16-byte aligned immediately before `bl`; prologue `stp x29, x30, [sp, #-16]!`.
-- `char` is signed by default on Darwin. Sections: `__TEXT,__text` / `__TEXT,__cstring` / `__DATA,__data`.
+- **No leading `_`** on symbols (`sym()` strips only the `\x01` raw-asm marker, else identity); *no* absolute addressing — a local global via `adrp x, sym` + `add x, x, :lo12:sym`, an extern / `-fPIC` non-static via `:got:` + `:got_lo12:`, TLS (local-exec) via `mrs tpidr_el0` + `:tprel_hi12:` / `:tprel_lo12_nc:`.
+- **Variadic follows STANDARD AAPCS64, NOT darwinpcs**: anonymous arguments go **in the registers** x0–x7 / v0–v7 (spilling to the stack only past 8), saved into the **192-byte reg-save area** (128B VR `q`-regs then 64B GP) that sits directly below the frame — the *opposite* of the retired Mach-O backend's stack-only rule. Named scalars overflowing to the stack are *packed* to natural alignment; a spilled composite locks NGRN = 8 (C.11), a spilled HFA does *not*.
+- AAPCS64 core: args x0–x7, return x0 (+x1 for a 16-byte composite), floats v0–v7, sp 16-byte aligned immediately before `bl`; prologue `stp x29, x30, [sp, #-16]!`.
+- **`char` is UNSIGNED by default on AArch64 Linux** (`parser.rs`: plain `char` → unsigned; an explicit `signed char` is the signed one) — the inverse of Darwin. Sections: `.text` / `.rodata` (every string; no cstring coalescing) / `.data` / `.bss` / `.tdata` / `.tbss`.
 
 ## Index (details live in their own documents, not duplicated here)
 
