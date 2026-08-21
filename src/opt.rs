@@ -45,6 +45,11 @@ fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
             g(b);
             g(rp);
         }
+        Inst::Phi(_, _, arms) => {
+            for (_, a) in arms {
+                g(a)
+            }
+        }
         Inst::Lea(..)
         | Inst::FunAddr(..)
         | Inst::LabelAddr(..)

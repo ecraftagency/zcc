@@ -1301,6 +1301,9 @@ impl<'a> Cg<'a> {
 
     fn emit_inst(&mut self, i: &Inst) {
         match i {
+            // φ is an SSA-internal node; out_of_ssa (Stage 3) lowers every φ to copies
+            // on the predecessor edges before codegen. Reaching the backend = a bug.
+            Inst::Phi(..) => unreachable!("Inst::Phi must be eliminated by out_of_ssa before codegen"),
             Inst::Copy(d, _ty, a) => {
                 self.ld_val(*a, "x0");
                 self.tmp_store(*d, "x0");

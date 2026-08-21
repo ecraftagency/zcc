@@ -32,7 +32,8 @@ pub type BlockId = u32; // indexes into IrFunc.blocks; blocks[0] = entry
 /// tree into a sequence of assignments.
 #[derive(Clone, Copy, Debug)]
 pub enum Val {
-    Tmp(Tmp),  // the value of a temporary (SSA-free: a temporary may be reassigned)
+    Tmp(Tmp),  // the value of a temporary. Straight lowering is SSA-free (a temp may be
+               // reassigned); to_ssa (ssa-qbe fork) re-establishes single-assignment via Inst::Phi.
     Imm(i64),  // integer constant (including constant pointers, char, enum) — width is contextual
     FImm(u64), // floating-point constant as a BIT PATTERN (f32 in the low 32 bits / f64)
 }
@@ -92,6 +93,12 @@ pub enum Inst {
     Lea(Tmp, Place),                // dst = the address of Place
     Cast(Tmp, TypeId, TypeId, Val), // dst:to = cast(from → to) a  (trunc/ext/f↔i)
     Call(Option<Tmp>, Callee, Vec<Val>, u32), // dst?, callee, args, nfix (variadic ABI)
+    // φ-node (no C surface — an SSA artifact). dst = the value flowing in from whichever
+    // predecessor transferred control here; arms = [(pred BlockId, Val)]. CORE: interp
+    // selects the arm matching the taken predecessor edge. Present ONLY on the path
+    // between to_ssa (Stage 2) and out_of_ssa (Stage 3) — straight lowering never emits
+    // it, and it MUST be eliminated (φ→copies) before the backend runs.
+    Phi(Tmp, TypeId, Vec<(BlockId, Val)>),
     // ---- EXOTIC typed (gradually replacing Opaque; operand-free first) ----
     // dst = &function (GOT if extern, adrp/add if static). A constant-symbol
     // address, with NO Val operand. Kept impure (like Opaque) → no DCE/CSE → invariant asm.
@@ -205,7 +212,8 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::VaArg(d, ..)
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
-        | Inst::Alloca(d, ..) => Some(*d),
+        | Inst::Alloca(d, ..)
+        | Inst::Phi(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => *d,
         Inst::Store(..)
         | Inst::Memcpy(..)
@@ -244,6 +252,13 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
             v(rp);
+        }
+        // A φ uses every incoming value (semantically the use occurs on the predecessor
+        // edge; for def-coverage, membership is what the verifier checks).
+        Inst::Phi(_, _, arms) => {
+            for (_, a) in arms {
+                v(a)
+            }
         }
         Inst::Lea(..)
         | Inst::FunAddr(..)
@@ -346,6 +361,14 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
                 }
                 if !defined[u as usize] {
                     return Err(format!("{}: temp t{u} used but never defined", f.name));
+                }
+            }
+            // (V1) φ arms name predecessor blocks — those BlockIds must be in range.
+            if let Inst::Phi(d, _, arms) = i {
+                for (pb, _) in arms {
+                    if *pb >= nb {
+                        return Err(format!("{}: phi t{d} names block{pb} out of |blocks|={nb}", f.name));
+                    }
                 }
             }
         }
@@ -1265,6 +1288,7 @@ pub(crate) mod tests {
         };
 
         let mut cur = 0usize;
+        let mut prev: Option<usize> = None; // the predecessor edge just taken, for Phi selection
         let mut budget = 10_000_000u64; // guard against infinite loops (small tests)
         loop {
             let b = &f.blocks[cur];
@@ -1288,6 +1312,19 @@ pub(crate) mod tests {
                         reg[*d as usize] = r;
                     }
                     Inst::Copy(d, ty, a) => reg[*d as usize] = canon(tt, *ty, fetch(&reg, a)),
+                    Inst::Phi(d, ty, arms) => {
+                        // Select the arm for the predecessor edge we arrived on. φ-nodes
+                        // are parallel, but SSA freshness (φ dsts are new temps not named
+                        // by sibling φ arms) makes sequential evaluation on `reg` correct.
+                        let src = prev.ok_or_else(|| {
+                            "interp: phi in the entry block (no predecessor edge)".to_string()
+                        })?;
+                        let arm = arms
+                            .iter()
+                            .find(|(bb, _)| *bb as usize == src)
+                            .ok_or_else(|| format!("interp: phi t{d} has no arm for predecessor block{src}"))?;
+                        reg[*d as usize] = canon(tt, *ty, fetch(&reg, &arm.1));
+                    }
                     Inst::Load(d, ty, a) => {
                         let addr = fetch(&reg, a);
                         let sz = tt.size(*ty);
@@ -1356,12 +1393,14 @@ pub(crate) mod tests {
                     }
                 }
             }
+            let from = cur;
             match &b.term {
                 Term::Jmp(t) => cur = *t as usize,
                 Term::Br(c, t, e) => cur = if fetch(&reg, c) != 0 { *t } else { *e } as usize,
                 Term::Ret(v) => return Ok(v.map(|v| fetch(&reg, &v)).unwrap_or(0)),
                 Term::Unreachable => return Err("interp: reached Unreachable".into()),
             }
+            prev = Some(from);
         }
     }
 
@@ -1413,6 +1452,88 @@ pub(crate) mod tests {
         verify(&f).expect("fact well-formed");
         assert_eq!(interp(&tt, std::slice::from_ref(&f), "fact", &[5]).unwrap(), 120);
         assert_eq!(interp(&tt, std::slice::from_ref(&f), "fact", &[0]).unwrap(), 1);
+    }
+
+    // ── Theorem (SSA-1): a φ-node selects the value of the predecessor edge actually
+    // taken. Diamond: r = (n<10 ? 100 : 200), r built as φ[(then,t3),(else,t4)].
+    // Proof: verify OK + interp on BOTH edges picks the correct arm.
+    #[test]
+    fn phi_diamond() {
+        let tt = TyTab::new();
+        // t0=&n, t1=n, t2=cond, t3=then-val, t4=else-val, t5=φ
+        let f = mk(
+            "diamond",
+            vec![ULONG, INT, INT, INT, INT, INT],
+            vec![(16, INT)],
+            16,
+            INT,
+            vec![
+                Block {
+                    insts: vec![
+                        Inst::Lea(0, Place::Local(16)),
+                        Inst::Load(1, INT, Val::Tmp(0)),
+                        Inst::Bin(2, Op::Lt, INT, Val::Tmp(1), Val::Imm(10)),
+                    ],
+                    term: Term::Br(Val::Tmp(2), 1, 2),
+                },
+                Block { insts: vec![Inst::Copy(3, INT, Val::Imm(100))], term: Term::Jmp(3) },
+                Block { insts: vec![Inst::Copy(4, INT, Val::Imm(200))], term: Term::Jmp(3) },
+                Block {
+                    insts: vec![Inst::Phi(5, INT, vec![(1, Val::Tmp(3)), (2, Val::Tmp(4))])],
+                    term: Term::Ret(Some(Val::Tmp(5))),
+                },
+            ],
+        );
+        verify(&f).expect("diamond well-formed");
+        assert_eq!(interp(&tt, std::slice::from_ref(&f), "diamond", &[5]).unwrap(), 100);
+        assert_eq!(interp(&tt, std::slice::from_ref(&f), "diamond", &[50]).unwrap(), 200);
+    }
+
+    // ── Theorem (SSA-2): a φ carries a value across a LOOP back-edge (the real SSA
+    // payoff — a live value that changes each iteration is a single-assignment temp,
+    // reconciled at the header by φ). sum(1..n) via SSA induction/accumulator φs.
+    // Proof: verify OK + interp(5)=15, interp(0)=0 (`prev` tracked through the loop).
+    #[test]
+    fn phi_loop() {
+        let tt = TyTab::new();
+        // t0=&n, t1=n, t2=i(φ), t3=sum(φ), t4=cond, t5=sum', t6=i'
+        let f = mk(
+            "sum",
+            vec![ULONG, INT, INT, INT, INT, INT, INT],
+            vec![(16, INT)],
+            16,
+            INT,
+            vec![
+                // B0 entry: load n, jump to the header
+                Block {
+                    insts: vec![Inst::Lea(0, Place::Local(16)), Inst::Load(1, INT, Val::Tmp(0))],
+                    term: Term::Jmp(1),
+                },
+                // B1 header: i = φ(entry:1, body:i'), sum = φ(entry:0, body:sum'); i<=n ?
+                Block {
+                    insts: vec![
+                        Inst::Phi(2, INT, vec![(0, Val::Imm(1)), (2, Val::Tmp(6))]),
+                        Inst::Phi(3, INT, vec![(0, Val::Imm(0)), (2, Val::Tmp(5))]),
+                        Inst::Bin(4, Op::Le, INT, Val::Tmp(2), Val::Tmp(1)),
+                    ],
+                    term: Term::Br(Val::Tmp(4), 2, 3),
+                },
+                // B2 body: sum' = sum+i, i' = i+1, back to the header
+                Block {
+                    insts: vec![
+                        Inst::Bin(5, Op::Add, INT, Val::Tmp(3), Val::Tmp(2)),
+                        Inst::Bin(6, Op::Add, INT, Val::Tmp(2), Val::Imm(1)),
+                    ],
+                    term: Term::Jmp(1),
+                },
+                // B3 exit: return the accumulated sum (the header φ at loop exit)
+                Block { insts: vec![], term: Term::Ret(Some(Val::Tmp(3))) },
+            ],
+        );
+        verify(&f).expect("sum well-formed");
+        assert_eq!(interp(&tt, std::slice::from_ref(&f), "sum", &[5]).unwrap(), 15);
+        assert_eq!(interp(&tt, std::slice::from_ref(&f), "sum", &[0]).unwrap(), 0);
+        assert_eq!(interp(&tt, std::slice::from_ref(&f), "sum", &[10]).unwrap(), 55);
     }
 
     // ── Theorem 2: explicit memory (Lea/Store/Load) round-trips at the correct width.
