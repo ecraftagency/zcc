@@ -44,6 +44,11 @@ pub(crate) fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
             g(b);
             g(rp);
         }
+        Inst::Select(_, _, c, a, b) => {
+            g(c);
+            g(a);
+            g(b);
+        }
         Inst::Phi(_, _, arms) => {
             for (_, a) in arms {
                 g(a)
@@ -170,6 +175,9 @@ fn is_pure(i: &Inst) -> bool {
         // dead and may be removed — the `!used[d]` guard protects any LIVE φ. Straight
         // lowering emits no φ, so this only affects the SSA pipeline (SCCP-deadened φ).
         | Inst::Phi(..)
+        // Select (B4) is a pure data-select (cond ? a : b, no memory/control effect) —
+        // a dead Select may be removed like any pure value.
+        | Inst::Select(..)
     )
 }
 
@@ -402,6 +410,353 @@ pub fn cse(f: &mut IrFunc) -> u32 {
             if let Some(r) = repl {
                 *i = r;
                 n += 1;
+            }
+        }
+    }
+    n
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B1 — LIGHTWEIGHT ALIAS ANALYSIS (the memory oracle; the enabler for B2 load-elim).
+// [Side-I theorem — OPTIMIZATION-ROADMAP.md B1, ported from QBE `alias.c` but
+//  re-derived as a theorem in zcc's IR, not transliterated.]
+//
+// THEOREM. Aliasing is a TOTAL DECIDABLE relation over a 4-point base lattice + an
+// integer offset — no points-to graph, no fixpoint, ONE pass. Every address value
+// gets a descriptor (base, offset):
+//   Loc(off) — a stack slot at frame offset `off`  (QBE ALoc; provably local unless it escapes)
+//   Sym(k,i) — a global (k=0) / string-literal (k=1) symbol address  (QBE ASym)
+//   Con      — a pure integer-constant address, no symbolic base      (QBE ACon)
+//   Unk(t)   — unknown; the base is the temp `t` itself                (QBE AUnk)
+// plus `escaped`: the set of stack slots whose address LEAKED (passed to a call,
+// stored through a pointer, returned, or mixed into an untracked pointer). A
+// non-escaped Loc is PROVABLY disjoint from every unknown pointer — QBE's key move.
+//
+// The relation alias((p,sp),(q,sq)) ∈ {No, Must, May} (sp/sq = access widths):
+//   • two different stack slots            → No     (disjoint frame regions)
+//   • same base (slot/sym/con/unk-temp)    → overlap ? Must : No   (offsets decide)
+//   • different symbols                    → May    (conservative; QBE)
+//   • one Unknown vs a provably-local slot → No     (the local never leaked)
+//   • one Unknown vs anything else         → May    (conservative)
+//   • two disjoint kinds (loc/sym/con)     → No     (distinct memory regions)
+// where overlap = ap.off < aq.off+sq ∧ aq.off < ap.off+sp.
+//
+// SOUNDNESS (the CbC obligation, unit-tested `alias_soundness`): the oracle NEVER
+// answers No/Must when two accesses can actually alias at runtime — `May` is always a
+// safe reply, and every non-May verdict is backed by a disjointness/identity proof.
+// This is an ANALYSIS, not a transform: it emits no code, so it carries no
+// improvement obligation — its correctness IS the proof obligation (Law 3).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The base of an address value — the 4-point lattice (Side-I). `Sym` carries a kind
+/// (0 = global, 1 = string literal) so a global and a string never share an identity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ABase {
+    Loc(u32),      // stack slot @ frame offset
+    Sym(u8, u32),  // (kind, interned id)
+    Con,           // pure integer-constant address
+    Unk(Tmp),      // unknown; base is the temp itself
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Alias {
+    pub base: ABase,
+    pub off: i64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AliasR {
+    No,
+    Must,
+    May,
+}
+
+/// The alias oracle for one function: a per-temp descriptor + the escaped-slot set.
+pub(crate) struct AliasInfo {
+    a: Vec<Alias>,
+    escaped: HashSet<u32>,
+}
+
+/// getalias(Val): a temp reads its descriptor; a constant is a `Con` address at its
+/// value; a float bit-pattern is never an address (a distinct Unknown that matches
+/// nothing real).
+fn getal(a: &[Alias], v: &Val) -> Alias {
+    match v {
+        Val::Tmp(t) => a[*t as usize],
+        Val::Imm(x) => Alias { base: ABase::Con, off: *x },
+        Val::FImm(_) => Alias { base: ABase::Unk(u32::MAX), off: 0 },
+    }
+}
+
+impl AliasInfo {
+    fn get(&self, v: Val) -> Alias {
+        getal(&self.a, &v)
+    }
+    /// Is this base a PROVABLY-LOCAL stack slot (never leaked)? Such a slot cannot be
+    /// reached through any unknown pointer.
+    fn is_local(&self, b: ABase) -> bool {
+        matches!(b, ABase::Loc(off) if !self.escaped.contains(&off))
+    }
+    /// Is a Load of `addr` FAULT-FREE, hence safe to SPECULATE past a branch (B4
+    /// if-conversion)? A stack slot (`Loc`) and a symbol address (`Sym`, a global /
+    /// string) are always MAPPED — reading them cannot trap. A pure integer-constant
+    /// address (`Con`) or an unknown pointer (`Unk`) may be null/dangling ⟹ NOT safe.
+    /// (Escape is irrelevant here: an escaped local is still a valid, mapped address.)
+    pub(crate) fn fault_free(&self, addr: Val) -> bool {
+        matches!(self.get(addr).base, ABase::Loc(_) | ABase::Sym(_, _))
+    }
+    /// The decidable alias relation. `sp`/`sq` are the byte widths of the two accesses.
+    pub(crate) fn alias(&self, p: Val, sp: u32, q: Val, sq: u32) -> AliasR {
+        use ABase::*;
+        let (ap, aq) = (self.get(p), self.get(q));
+        let ovlap = ap.off < aq.off + sq as i64 && aq.off < ap.off + sp as i64;
+        let ov = |b| if b { AliasR::Must } else { AliasR::No };
+        match (ap.base, aq.base) {
+            // both stack: same slot ⟹ overlap decides; different slots are disjoint.
+            (Loc(x), Loc(y)) => {
+                if x == y {
+                    ov(ovlap)
+                } else {
+                    AliasR::No
+                }
+            }
+            // both symbolic: same symbol ⟹ overlap decides; different ⟹ conservatively May.
+            (Sym(k1, i1), Sym(k2, i2)) => {
+                if (k1, i1) != (k2, i2) {
+                    AliasR::May
+                } else {
+                    ov(ovlap)
+                }
+            }
+            (Con, Con) => ov(ovlap),
+            (Unk(x), Unk(y)) if x == y => ov(ovlap),
+            // one side unknown vs a non-provably-local base ⟹ May; otherwise the two
+            // bases are disjoint memory regions (a non-escaped local, or two distinct
+            // kinds among loc/sym/con) ⟹ No.
+            _ => {
+                if matches!(ap.base, Unk(_)) && !self.is_local(aq.base) {
+                    AliasR::May
+                } else if matches!(aq.base, Unk(_)) && !self.is_local(ap.base) {
+                    AliasR::May
+                } else {
+                    AliasR::No
+                }
+            }
+        }
+    }
+}
+
+/// Intern a symbol name → a small dense id (so equality is an integer compare).
+fn intern(syms: &mut HashMap<String, u32>, name: &str) -> u32 {
+    if let Some(&id) = syms.get(name) {
+        id
+    } else {
+        let id = syms.len() as u32;
+        syms.insert(name.to_string(), id);
+        id
+    }
+}
+
+/// Compute the alias oracle: ONE RPO pass filling per-temp descriptors and the
+/// escaped-slot set. In SSA (and in straight lowering for address computations) a def
+/// precedes its uses, so an operand's descriptor is ready when read; callers query
+/// only AFTER this returns, so the escaped set is complete before any verdict.
+pub(crate) fn alias_info(f: &IrFunc) -> AliasInfo {
+    let n = f.temps.len();
+    let mut a: Vec<Alias> = (0..n).map(|t| Alias { base: ABase::Unk(t as Tmp), off: 0 }).collect();
+    let mut escaped: HashSet<u32> = HashSet::new();
+    let mut syms: HashMap<String, u32> = HashMap::new();
+
+    // Mark the stack slot behind a Val as escaped (leaked). Non-Loc values carry no slot.
+    let esc = |escaped: &mut HashSet<u32>, a: &[Alias], v: &Val| {
+        if let Val::Tmp(t) = v {
+            if let ABase::Loc(off) = a[*t as usize].base {
+                escaped.insert(off);
+            }
+        }
+    };
+
+    for b in rpo(f) {
+        let blk = &f.blocks[b as usize];
+        for i in &blk.insts {
+            // 1. the descriptor of the destination (if any).
+            match i {
+                Inst::Lea(d, Place::Local(off)) => {
+                    a[*d as usize] = Alias { base: ABase::Loc(*off), off: 0 }
+                }
+                Inst::Lea(d, Place::Global(name, off)) => {
+                    let id = intern(&mut syms, name);
+                    a[*d as usize] = Alias { base: ABase::Sym(0, id), off: *off }
+                }
+                Inst::Lea(d, Place::Str(s)) => {
+                    a[*d as usize] = Alias { base: ABase::Sym(1, *s), off: 0 }
+                }
+                Inst::Copy(d, _, v) => a[*d as usize] = getal(&a, v), // propagate
+                // pointer ± constant offset stays on the SAME base (a ring identity on
+                // the address); pointer + variable / pointer + pointer is untrackable.
+                Inst::Bin(d, Op::Add, _, x, y) => {
+                    let (ax, ay) = (getal(&a, x), getal(&a, y));
+                    a[*d as usize] = if ax.base == ABase::Con {
+                        Alias { base: ay.base, off: ay.off.wrapping_add(ax.off) }
+                    } else if ay.base == ABase::Con {
+                        Alias { base: ax.base, off: ax.off.wrapping_add(ay.off) }
+                    } else {
+                        Alias { base: ABase::Unk(*d), off: 0 }
+                    };
+                }
+                Inst::Bin(d, Op::Sub, _, x, y) => {
+                    let (ax, ay) = (getal(&a, x), getal(&a, y));
+                    a[*d as usize] = if ay.base == ABase::Con {
+                        Alias { base: ax.base, off: ax.off.wrapping_sub(ay.off) }
+                    } else {
+                        Alias { base: ABase::Unk(*d), off: 0 }
+                    };
+                }
+                _ => {
+                    if let Some(d) = inst_def(i) {
+                        a[d as usize] = Alias { base: ABase::Unk(d), off: 0 }
+                    }
+                }
+            }
+            // 2. escape: an instruction whose result is NOT a tracked base leaks its
+            // pointer operands — EXCEPT a bare dereference (load/store through an
+            // address does not leak the address; a store leaks the stored VALUE only).
+            let leaks = match inst_def(i) {
+                None => true,
+                Some(d) => matches!(a[d as usize].base, ABase::Unk(_)),
+            };
+            if leaks {
+                match i {
+                    Inst::Load(..) => {} // addr dereferenced, not leaked
+                    Inst::Store(_, _addr, val) => esc(&mut escaped, &a, val),
+                    _ => {
+                        let mut us = Vec::new();
+                        inst_uses(i, &mut us);
+                        for u in us {
+                            esc(&mut escaped, &a, &Val::Tmp(u));
+                        }
+                    }
+                }
+            }
+        }
+        // a pointer flowing out through the terminator (return value / branch) leaks.
+        let mut tu = Vec::new();
+        term_uses(&blk.term, &mut tu);
+        for u in tu {
+            esc(&mut escaped, &a, &Val::Tmp(u));
+        }
+    }
+    AliasInfo { a, escaped }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// B2 — LOAD ELIMINATION / STORE→LOAD FORWARDING (gated by the B1 alias oracle).
+// [Side-I theorem — OPTIMIZATION-ROADMAP.md B2, ported from QBE `load.c`.]
+//
+// THEOREM. Within a straight-line block, a `Load` from `a` (width sa) whose value is
+// already available in memory — because a preceding `Store` wrote a MUST-alias
+// address with the same width, with NO intervening MAY-alias store — equals that
+// stored value ⟹ forward it (Load → Copy). A load whose value was produced by an
+// earlier same-width must-alias load is likewise redundant. The alias oracle also
+// lets an available value SURVIVE a store it provably does-not-alias (block-local
+// `cse` conservatively kills every load at any store; the oracle keeps NoAlias ones).
+//
+// This is BLOCK-LOCAL: within one block the instruction sequence is executed in order
+// with no incoming edges mid-block, so "preceding" = "dominating on the only path" and
+// no dominance machinery is needed. Floats are excluded (a `float`(4) store rounds to
+// f32 on the way to memory, but `Copy` does not round — forwarding would skip the
+// rounding). Any opaque memory writer (call / memcpy / zero / exotic) conservatively
+// clears the available set.
+//
+// PROOF OBLIGATION (Law 3):
+//   • correctness — the commuting square `⟦f⟧=⟦load-elim(f)⟧` via `equiv`: interp's
+//     per-frame `mem` models intra-function store→load, so a forwarded local load is
+//     machine-validated; global/unknown loads are unmodeled → `equiv` SKIP, correct
+//     by the B1 soundness theorem (the oracle proved must/no-alias) + the box torture.
+//   • improvement — the emitted `.s` has strictly FEWER `ldr` (each forwarded load
+//     becomes a register copy the peephole then folds). Statically visible, no race.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Is the stored value `val` guaranteed to be in BACKEND-CANONICAL form for a `ty`
+/// access — i.e. does forwarding it (a register `Copy`) reproduce what the memory
+/// round-trip (`str`+`ldr`, which sign/zero-extends to `ty`) would yield?
+///
+/// [Side-II fact — the arm64 backend's canonicalization timing.] A temp's REGISTER
+/// value is canonical to its type only for width ≥ 4 (`ir_bin_r` ext-s width-4 results;
+/// loads ext all widths — but width-1/2 arithmetic results are left wide, canonicalized
+/// lazily at the `strb`/`ldrb` boundary). A store→load forward that assumes canonicity
+/// on a width-1/2 value would skip that truncation (GCC torture pr81913: `u8 d--`
+/// forwarded as a full-width `-1` instead of the wrapped `255`). interp canonicalizes
+/// EAGERLY at every `Bin`, so `equiv` is blind to this — the box torture is the oracle.
+/// Constants forward when they already fit `ty` (the backend materializes the same bits).
+fn fwd_canonical(tt: &TyTab, ty: TypeId, val: Val) -> bool {
+    if tt.is_float(ty) || matches!(tt.tys[ty as usize], Ty::Bitfield(..)) {
+        return false;
+    }
+    match val {
+        Val::FImm(_) => false,
+        Val::Imm(x) => canon(tt, ty, x) == x, // an in-range constant round-trips identically
+        Val::Tmp(_) => tt.size(ty) >= 4,      // width-4/8 def is register-canonical; width-1/2 is not
+    }
+}
+
+/// Does this instruction potentially WRITE memory (⟹ clear the available set)? The
+/// allowlist is the pure, memory-read-or-less set; anything else (incl. a future
+/// exotic) kills by default — never silently retaining a value across an unknown write.
+fn pure_mem(i: &Inst) -> bool {
+    matches!(
+        i,
+        Inst::Bin(..)
+            | Inst::Un(..)
+            | Inst::Copy(..)
+            | Inst::Load(..)
+            | Inst::Lea(..)
+            | Inst::Cast(..)
+            | Inst::FunAddr(..)
+            | Inst::LabelAddr(..)
+            | Inst::VaArea(..)
+            | Inst::Phi(..)
+    )
+}
+
+pub fn load_elim(tt: &TyTab, f: &mut IrFunc) -> u32 {
+    let ai = alias_info(f);
+    let mut n = 0u32;
+    for b in f.blocks.iter_mut() {
+        // available memory contents, in program order: (address, byte width, type, value).
+        let mut avail: Vec<(Val, u32, TypeId, Val)> = Vec::new();
+        for i in b.insts.iter_mut() {
+            match i {
+                Inst::Store(ty, addr, v) => {
+                    let sz = tt.size(*ty);
+                    // a store INVALIDATES every value it may-alias (Must or May); keep
+                    // only the provably-disjoint (NoAlias) entries.
+                    let (addr, v, ty) = (*addr, *v, *ty);
+                    avail.retain(|(a2, s2, _, _)| ai.alias(addr, sz, *a2, *s2) == AliasR::No);
+                    if !tt.is_float(ty) {
+                        avail.push((addr, sz, ty, v)); // this exact address now holds `v`
+                    }
+                }
+                Inst::Load(d, ty, addr) => {
+                    let (d, ty, addr) = (*d, *ty, *addr);
+                    let sz = tt.size(ty);
+                    // forward a must-alias, same-width, same-type available value —
+                    // only when its register form is canonical for `ty` (see fwd_canonical).
+                    let hit = avail.iter().find(|(a2, s2, t2, v)| {
+                        *t2 == ty
+                            && *s2 == sz
+                            && fwd_canonical(tt, ty, *v)
+                            && ai.alias(addr, sz, *a2, *s2) == AliasR::Must
+                    });
+                    if let Some(&(_, _, _, val)) = hit {
+                        *i = Inst::Copy(d, ty, val);
+                        n += 1;
+                    } else if !tt.is_float(ty) {
+                        avail.push((addr, sz, ty, Val::Tmp(d))); // this load's value is now cached
+                    }
+                }
+                other if !pure_mem(other) => avail.clear(), // opaque memory writer
+                _ => {}                                      // pure non-memory op
             }
         }
     }
@@ -2220,6 +2575,7 @@ fn each_def_mut(i: &mut Inst, mut g: impl FnMut(&mut Tmp)) {
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
         | Inst::Alloca(d, ..)
+        | Inst::Select(d, ..)
         | Inst::Phi(d, ..) => g(d),
         Inst::Call(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => {
             if let Some(d) = d {
@@ -2449,12 +2805,15 @@ pub struct Passes {
     pub copy_prop: bool,
     pub gvn: bool,
     pub cse: bool,
+    pub load_elim: bool, // B2: alias-aware store→load forwarding + NoAlias load survival
     pub dce: bool,
     pub cfg_simplify: bool,
     pub licm: bool,
     pub strength_reduce: bool,
     pub coalesce: bool, // register coalescing (biased coloring, inside abi_alloc)
     pub peephole: bool, // backend machine-level redundant-move elimination (arm64_elf)
+    pub ldst_pair: bool, // B4: backend adjacent load/store → ldp/stp pairing (arm64_elf)
+    pub if_convert: bool, // B4: side-effect-free diamond → Select (csel); runs before out_of_ssa
     pub inline: bool,   // Tier-1 #5: whole-program depth-1 inlining (runs before to_ssa)
 }
 
@@ -2466,12 +2825,15 @@ impl Default for Passes {
             copy_prop: true,
             gvn: true,
             cse: true,
+            load_elim: true, // B2: alias-gated, proven (equiv commuting square) — default-ON
             dce: true,
             cfg_simplify: true,
             licm: false, // proven-correct but measured-negative on the naive-slot backend
             strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
             coalesce: true,
             peephole: true, // measured win: removes the x0-funnel redundant reg-reg moves
+            ldst_pair: true, // B4: adjacent str/ldr → stp/ldp; static win, translation-validated
+            if_convert: true, // B4: diamond → csel; proven (equiv), B1-licensed load speculation
             inline: true, // Tier-1 #5: β-reduction; proven (equiv) — measured on the bench before ship
         }
     }
@@ -2491,12 +2853,15 @@ impl Passes {
             "copy_prop" | "copy" => self.copy_prop = v,
             "gvn" => self.gvn = v,
             "cse" => self.cse = v,
+            "load_elim" | "loadelim" | "le" => self.load_elim = v,
             "dce" => self.dce = v,
             "cfg_simplify" | "cfg" => self.cfg_simplify = v,
             "licm" => self.licm = v,
             "strength_reduce" | "strength" | "sr" => self.strength_reduce = v,
             "coalesce" => self.coalesce = v,
             "peephole" | "peep" => self.peephole = v,
+            "ldst_pair" | "ldp" | "stp" | "pair" => self.ldst_pair = v,
+            "if_convert" | "ifconv" | "csel" => self.if_convert = v,
             "inline" => self.inline = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
@@ -2518,6 +2883,170 @@ impl Passes {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — IF-CONVERSION (B4; branch → data-select).
+//
+// Theorem (control→data): a DIAMOND
+//     h: … ; Br(c, T, E)
+//     T: s_T ; Jmp M          E: s_E ; Jmp M          M: φ(d,[(T,vT),(E,vE)]) …
+// where every instruction of the two arms s_T, s_E is PURE and NON-FAULTING is
+// semantically equal to executing BOTH arms unconditionally (speculation) and then
+// selecting per c:  ⟦diamond⟧ = ⟦ h;s_T;s_E ; Select(d,c,vT,vE) ; M∖φ ⟧.
+// Justification: a pure, non-faulting instruction has NO observable effect when its
+// result is unused (Law-1 Side-I: ⟦·⟧ is a function of the live result only) — so
+// running the not-taken arm is invisible, and the φ (which picks the value of the
+// edge actually taken) becomes exactly `c ? vT : vE`. The commuting square
+// ⟦f⟧ = ⟦if_convert(f)⟧ is unit-tested (`if_convert_semantics`).
+//
+// NON-FAULTING (the speculation-safety side-condition, the ONLY subtle premise):
+//   • Bin(Div|Rem) on an INTEGER type traps on /0 → NOT speculatable.
+//   • Load(addr) faults on a bad address → speculatable ONLY when B1's oracle proves
+//     `addr` is a mapped location (a stack slot or a symbol) — `fault_free`. THIS is
+//     where B4 consumes B1 (the ★★★★★ enabler): without the alias oracle no ternary
+//     over memory could be if-converted.
+//   • Store/Call/Memcpy/Zero/Va*/Sync/Asm/Alloca/GotoPtr — side effects → NOT arms.
+// The produced Select is restricted to NON-FLOAT scalars (the backend lowers it to
+// integer `csel`); a float φ keeps its branch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Is `i` safe to hoist out of a conditional arm (pure AND cannot trap)? `al` is the
+/// function's alias oracle, consulted for Load fault-safety.
+fn speculatable(tt: &TyTab, al: &AliasInfo, i: &Inst) -> bool {
+    match i {
+        Inst::Bin(_, Op::Div | Op::Rem, ty, _, _) => tt.is_float(*ty), // int /0 traps
+        Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Cast(..) | Inst::Lea(..) => true,
+        Inst::Load(_, _, addr) => al.fault_free(*addr),
+        _ => false, // Store/Call/Phi/… — a side effect or a control artifact
+    }
+}
+
+pub fn if_convert(tt: &TyTab, f: &mut IrFunc) -> u32 {
+    let al = alias_info(f);
+    let preds = predecessors(f);
+    let mut n = 0u32;
+    // One linear scan over heads; each rewrite is local (h, T, E, M) and never creates a
+    // new diamond, so a single pass suffices (nested ternaries fold bottom-up across the
+    // optimize_ssa fixpoint's earlier cfg_simplify — here we take one layer).
+    for h in 0..f.blocks.len() {
+        let Term::Br(cond, t_id, e_id) = f.blocks[h].term.clone() else { continue };
+        let (t, e) = (t_id as usize, e_id as usize);
+        if t == h || e == h || t == e {
+            continue;
+        }
+        // Arms must be private to this diamond: single predecessor = h.
+        if preds[t] != [h as BlockId] || preds[e] != [h as BlockId] {
+            continue;
+        }
+        // Both arms converge on the same merge M by an unconditional Jmp.
+        let (Term::Jmp(mt), Term::Jmp(me)) = (f.blocks[t].term.clone(), f.blocks[e].term.clone()) else { continue };
+        if mt != me {
+            continue;
+        }
+        let m_id = mt;
+        let m = mt as usize;
+        if m == t || m == e || m == h {
+            continue;
+        }
+        // M's ONLY predecessors are the two arms (else its φs have arms we cannot fold).
+        let mut mp = preds[m].clone();
+        mp.sort_unstable();
+        let mut want = [t_id, e_id];
+        want.sort_unstable();
+        if mp != want {
+            continue;
+        }
+        // The MERGE temps: this IR keeps a diamond's result as a register temp assigned
+        // in BOTH arms (to_ssa φ-ifies only promoted memory), reconciled after the join —
+        // NOT a φ. A merge temp is one defined in both T and E; that pair of defs is what
+        // becomes a Select. `defs(blk)` = the set of temps the block defines.
+        let defs = |blk: usize| -> HashSet<Tmp> {
+            f.blocks[blk].insts.iter().filter_map(inst_def).collect()
+        };
+        let (dt, de) = (defs(t), defs(e));
+        let merge: Vec<Tmp> = { let mut v: Vec<Tmp> = dt.intersection(&de).copied().collect(); v.sort_unstable(); v };
+        if merge.is_empty() {
+            continue; // no value to select — a pure diamond with no reconciled result
+        }
+        // Every merge temp must be NON-FLOAT (backend csel) and reconciled by a plain
+        // Copy in EACH arm (so its per-arm contribution is a Val we can drop into Select).
+        // `src(blk, r)` = the Val copied into r in that arm, or None if r is not Copy-defined there.
+        let src = |blk: usize, r: Tmp| -> Option<Val> {
+            f.blocks[blk].insts.iter().find_map(|i| match i {
+                Inst::Copy(d, _, v) if *d == r => Some(*v),
+                _ => None,
+            })
+        };
+        let merge_ok = merge.iter().all(|&r| {
+            !tt.is_float(f.temps[r as usize]) && src(t, r).is_some() && src(e, r).is_some()
+        });
+        if !merge_ok {
+            continue;
+        }
+        // Every NON-merge instruction of each arm must be speculatable (pure + non-faulting)
+        // — it will run unconditionally. (The merge Copies are dropped, not hoisted.)
+        let arm_pure = |blk: usize| {
+            f.blocks[blk].insts.iter().all(|i| match inst_def(i) {
+                Some(d) if merge.contains(&d) => matches!(i, Inst::Copy(..)), // the merge reconciler
+                _ => speculatable(tt, &al, i),
+            })
+        };
+        if !arm_pure(t) || !arm_pure(e) {
+            continue;
+        }
+        // M may ALSO hold φ nodes (a promoted-memory merge, e.g. a ternary over an
+        // address-taken local): each such φ has arms exactly {T,E} (M's only preds).
+        // Rewiring h→M would leave those φs with no arm for h — so we convert them TOO,
+        // in place. Refuse the diamond if any leading φ is float (backend csel is
+        // integer) or (defensively) not a plain 2-arm (T,E) φ.
+        let phis_ok = f.blocks[m].insts.iter().take_while(|i| matches!(i, Inst::Phi(..))).all(|i| {
+            let Inst::Phi(_, ty, arms) = i else { return false };
+            !tt.is_float(*ty)
+                && arms.len() == 2
+                && arms.iter().any(|(b, _)| *b == t_id)
+                && arms.iter().any(|(b, _)| *b == e_id)
+        });
+        if !phis_ok {
+            continue;
+        }
+        // ---- COMMIT the rewrite (all guards passed) ----
+        // Extract each merge temp's per-arm source BEFORE mutating the blocks.
+        let sels: Vec<(Tmp, Val, Val)> =
+            merge.iter().map(|&r| (r, src(t, r).unwrap(), src(e, r).unwrap())).collect();
+        // 1. Hoist every NON-merge-Copy instruction of both arms into h, in order (their
+        //    defs are arm-private, distinct, and — once unconditional — dominate M). The
+        //    merge Copies are dropped; their role is taken by the Selects below.
+        let hoist = |blk: &mut Block, merge: &[Tmp]| -> Vec<Inst> {
+            std::mem::take(&mut blk.insts).into_iter()
+                .filter(|i| !matches!(inst_def(i), Some(d) if merge.contains(&d)))
+                .collect()
+        };
+        let ht = hoist(&mut f.blocks[t], &merge);
+        let he = hoist(&mut f.blocks[e], &merge);
+        let hb = &mut f.blocks[h];
+        hb.insts.extend(ht);
+        hb.insts.extend(he);
+        // 2. One Select per merge temp: r = (cond ≠ 0) ? src_T : src_E. Appended AFTER the
+        //    hoisted computations, so every referenced value is already in scope.
+        for (r, vt, ve) in sels {
+            hb.insts.push(Inst::Select(r, f.temps[r as usize], cond, vt, ve));
+            n += 1;
+        }
+        hb.term = Term::Jmp(m_id);
+        // 3. Convert every leading φ of M into a Select (in place). φ arms reference values
+        //    live on the T / E edges — defined in the arms (now hoisted into h) or above —
+        //    so they dominate M. φs never reference sibling-φ dsts, so in-place rewrite is sound.
+        for i in f.blocks[m].insts.iter_mut() {
+            let Inst::Phi(d, ty, arms) = i else { break };
+            let vt = arms.iter().find(|(b, _)| *b == t_id).unwrap().1;
+            let ve = arms.iter().find(|(b, _)| *b == e_id).unwrap().1;
+            *i = Inst::Select(*d, *ty, cond, vt, ve);
+            n += 1;
+        }
+        // The arms T,E are now unreachable (no preds) and empty; cfg_simplify drops them.
+    }
+    n
+}
+
 pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
     to_ssa(tt, f);
     for _ in 0..32 {
@@ -2537,6 +3066,9 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
         if p.cse {
             n += cse(f); // block-local load reuse (GVN skips memory)
         }
+        if p.load_elim {
+            n += load_elim(tt, f); // B2: alias-aware store→load forwarding + NoAlias survival
+        }
         if p.dce {
             n += dce(f); // reclaim the temps the above passes deadened (incl. φ)
         }
@@ -2551,6 +3083,15 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
         }
         if n == 0 {
             break; // fixpoint
+        }
+    }
+    if p.if_convert {
+        // B4: while still in SSA (φs intact), fold side-effect-free diamonds to Select.
+        // Runs ONCE after the fixpoint: it consumes SSA form, and the branches it removes
+        // were already exposed by cfg_simplify. dce+cfg_simplify reclaim the now-dead arms.
+        if if_convert(tt, f) > 0 {
+            dce(f);
+            cfg_simplify(f);
         }
     }
     out_of_ssa(f); // φ → edge copies (swap/critical-edge safe) → executable IR
@@ -2813,6 +3354,261 @@ mod tests {
                 verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
             }
             equiv(&ast.tt, &ir, &opt, entry).unwrap_or_else(|e| panic!("{nm}: {e}"));
+        }
+    }
+
+    // ── B1 alias oracle — verdict unit tests + the soundness property.
+    // One function exercises every arm of the decidable relation; the descriptors are
+    // built by `alias_info` (one RPO pass) and queried post-hoc.
+    #[test]
+    fn alias_verdicts() {
+        // t0=&A(loc16)  t1=&B(loc32)  t2=A+4  t3=load(A) [value, ⟹ Unk]
+        // t4=&g  t5=&g  t6=&h  t7=&C(loc48)  t8=load(g) [unknown pointer]
+        // Store *A = &C  ⟹ slot C escapes (its address is stored through a pointer).
+        let f = mk(
+            "f",
+            vec![ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG, ULONG],
+            vec![],
+            64,
+            ULONG,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Local(16)),
+                    Inst::Lea(1, Place::Local(32)),
+                    Inst::Bin(2, Op::Add, ULONG, Val::Tmp(0), Val::Imm(4)),
+                    Inst::Load(3, ULONG, Val::Tmp(0)),
+                    Inst::Lea(4, Place::Global("g".into(), 0)),
+                    Inst::Lea(5, Place::Global("g".into(), 0)),
+                    Inst::Lea(6, Place::Global("h".into(), 0)),
+                    Inst::Lea(7, Place::Local(48)),
+                    Inst::Load(8, ULONG, Val::Tmp(4)),
+                    Inst::Store(ULONG, Val::Tmp(0), Val::Tmp(7)), // *A = &C ⟹ C escapes
+                ],
+                term: Term::Ret(None),
+            }],
+        );
+        verify(&f).expect("well-formed");
+        let ai = alias_info(&f);
+        use AliasR::*;
+        let al = |p, q| ai.alias(Val::Tmp(p), 4, Val::Tmp(q), 4);
+        // same slot, overlapping offsets ⟹ MustAlias.
+        assert_eq!(al(0, 0), Must);
+        // same slot, disjoint offsets (0 vs 4, width 4) ⟹ NoAlias.
+        assert_eq!(al(0, 2), No);
+        // distinct stack slots ⟹ NoAlias.
+        assert_eq!(al(0, 1), No);
+        // same symbol ⟹ MustAlias (overlap); different symbol ⟹ conservatively MayAlias.
+        assert_eq!(al(4, 5), Must);
+        assert_eq!(al(4, 6), May);
+        // a stack slot vs a symbol are disjoint regions ⟹ NoAlias.
+        assert_eq!(al(0, 4), No);
+        // an UNKNOWN pointer (t8) vs a provably-local, non-escaped slot (A) ⟹ NoAlias
+        // (A's address never leaked). vs an ESCAPED slot (C) ⟹ MayAlias.
+        assert_eq!(al(8, 0), No);
+        assert_eq!(al(8, 7), May);
+        // an unknown pointer vs another unknown ⟹ MayAlias.
+        let t9load = mk(
+            "g",
+            vec![ULONG, ULONG, ULONG],
+            vec![],
+            16,
+            ULONG,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Global("p".into(), 0)),
+                    Inst::Load(1, ULONG, Val::Tmp(0)),
+                    Inst::Load(2, ULONG, Val::Tmp(0)),
+                ],
+                term: Term::Ret(None),
+            }],
+        );
+        let ai2 = alias_info(&t9load);
+        assert_eq!(ai2.alias(Val::Tmp(1), 8, Val::Tmp(2), 8), May);
+        // offset overlap at sub-object granularity: A+0 (width 8) vs A+4 (width 4) DO
+        // overlap ⟹ MustAlias (the wider access straddles the narrower).
+        assert_eq!(ai.alias(Val::Tmp(0), 8, Val::Tmp(2), 4), Must);
+    }
+
+    // SOUNDNESS: on a battery of hand-built access pairs whose TRUE aliasing is known,
+    // the oracle must NEVER answer No/Must when they actually alias (May is the only
+    // safe imprecise reply). This is the CbC obligation for an analysis (Law 3).
+    #[test]
+    fn alias_soundness() {
+        // Build accesses over ONE stack slot at three offsets + one truly-unknown
+        // pointer. Ground truth is computed directly from (base-identity, offset).
+        let f = mk(
+            "f",
+            vec![ULONG, ULONG, ULONG, ULONG, ULONG],
+            vec![],
+            64,
+            ULONG,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Local(32)),                       // &S+0
+                    Inst::Bin(1, Op::Add, ULONG, Val::Tmp(0), Val::Imm(2)), // &S+2
+                    Inst::Bin(2, Op::Add, ULONG, Val::Tmp(0), Val::Imm(8)), // &S+8
+                    Inst::Lea(3, Place::Global("g".into(), 0)),          // &g (escapes below)
+                    Inst::Load(4, ULONG, Val::Tmp(3)),                   // unknown pointer
+                ],
+                term: Term::Ret(None),
+            }],
+        );
+        let ai = alias_info(&f);
+        // (temp, offset-from-its-base) for the stack accesses; the unknown is separate.
+        let stack = [(0u32, 0i64), (1, 2), (2, 8)];
+        for &(pa, oa) in &stack {
+            for &(pb, ob) in &stack {
+                for &sa in &[1u32, 2, 4, 8] {
+                    for &sb in &[1u32, 2, 4, 8] {
+                        let truth_overlap = oa < ob + sb as i64 && ob < oa + sa as i64;
+                        match ai.alias(Val::Tmp(pa), sa, Val::Tmp(pb), sb) {
+                            AliasR::No => assert!(!truth_overlap, "No but they overlap"),
+                            AliasR::Must => assert!(truth_overlap, "Must but they are disjoint"),
+                            AliasR::May => {} // always safe
+                        }
+                    }
+                }
+            }
+        }
+        // The unknown pointer could alias ANYTHING that escaped or is non-local: the
+        // stack slot S here never escaped ⟹ NoAlias is SOUND (its address never leaked,
+        // so no unknown pointer derived elsewhere can equal it).
+        for &(p, _) in &stack {
+            assert_eq!(ai.alias(Val::Tmp(4), 8, Val::Tmp(p), 8), AliasR::No);
+        }
+    }
+
+    // ── B2 load-elim — store→load forwarding fires (Load → Copy of the stored value).
+    #[test]
+    fn load_elim_forwards_store() {
+        let tt = TyTab::new();
+        // frame[16..20] ← 42 (INT); reload the same slot ⟹ forward to Copy(42).
+        let f = mk(
+            "f",
+            vec![ULONG, INT],
+            vec![],
+            16,
+            INT,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Local(16)),
+                    Inst::Store(INT, Val::Tmp(0), Val::Imm(42)),
+                    Inst::Load(1, INT, Val::Tmp(0)),
+                ],
+                term: Term::Ret(Some(Val::Tmp(1))),
+            }],
+        );
+        let mut opt = f.clone();
+        assert_eq!(load_elim(&tt, &mut opt), 1, "one load forwarded");
+        assert!(matches!(opt.blocks[0].insts[2], Inst::Copy(1, _, Val::Imm(42))), "load → Copy(42)");
+        equiv(&tt, std::slice::from_ref(&f), std::slice::from_ref(&opt), "f")
+            .expect("store→load forwarding preserves ⟦·⟧");
+    }
+
+    // ── B2 — a cached value SURVIVES a provably-disjoint (NoAlias) store; plain `cse`
+    // would kill it. Two distinct slots A,B: load A, store B, load A ⟹ BOTH A-loads
+    // resolve to the stored value 7 (the store to B does not invalidate A).
+    #[test]
+    fn load_elim_survives_nonalias_store() {
+        let tt = TyTab::new();
+        let f = mk(
+            "f",
+            vec![ULONG, ULONG, INT, INT, INT],
+            vec![],
+            32,
+            INT,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Local(32)),                 // &A (index 0)
+                    Inst::Lea(1, Place::Local(16)),                 // &B (index 16, distinct slot)
+                    Inst::Store(INT, Val::Tmp(0), Val::Imm(7)),     // A = 7
+                    Inst::Load(2, INT, Val::Tmp(0)),                // load A ⟹ forward 7
+                    Inst::Store(INT, Val::Tmp(1), Val::Imm(9)),     // B = 9 (NoAlias A)
+                    Inst::Load(3, INT, Val::Tmp(0)),                // load A ⟹ STILL 7
+                    Inst::Bin(4, Op::Add, INT, Val::Tmp(2), Val::Tmp(3)),
+                ],
+                term: Term::Ret(Some(Val::Tmp(4))),
+            }],
+        );
+        let mut opt = f.clone();
+        assert_eq!(load_elim(&tt, &mut opt), 2, "both A-loads forwarded across the B-store");
+        equiv(&tt, std::slice::from_ref(&f), std::slice::from_ref(&opt), "f")
+            .expect("NoAlias survival preserves ⟦·⟧");
+    }
+
+    // ── B2 commuting square over real C with address-taken locals (arrays stay in
+    // memory ⟹ real Store/Load to forward). interp models per-frame memory.
+    #[test]
+    fn load_elim_semantics_preserved() {
+        for (nm, src, entry) in [
+            ("a", "int f(int a){int x[3]; x[1]=a; x[2]=a+1; return x[1]+x[2];}", "f"),
+            ("b", "int g(int a){int s=0; int x[2]; x[0]=a; x[1]=a; s=x[0]+x[1]; return s;}", "g"),
+        ] {
+            let (ast, ir) = compile(nm, src);
+            let mut opt = ir.clone();
+            for f in opt.iter_mut() {
+                to_ssa(&ast.tt, f);
+                load_elim(&ast.tt, f);
+                out_of_ssa(f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
+            }
+            equiv(&ast.tt, &ir, &opt, entry).unwrap_or_else(|e| panic!("{nm}: {e}"));
+        }
+    }
+
+    // ── B4 commuting square: ⟦f⟧ = ⟦if_convert(to_ssa f)⟧ over a ternary/min-max
+    // battery. A pure diamond folds to a Select; interp evaluates Select as a data-select,
+    // so before (branch) and after (csel) MUST agree. `fired` proves the pass actually
+    // triggers (a green identity would be vacuous).
+    #[test]
+    fn if_convert_semantics() {
+        let mut fired = 0;
+        for (nm, src, entry) in [
+            ("sel", "int f(int c,int x,int y){return c?x:y;}", "f"),
+            ("min", "int f(int a,int b){return a<b?a:b;}", "f"),
+            ("max", "long f(long a,long b){return a>b?a:b;}", "f"),
+            ("abs", "int f(int a){return a<0?-a:a;}", "f"),
+            ("mix", "int f(int a,int b){return (a+1)>b?(a-b):(b-a);}", "f"),
+            ("nest", "int f(int a,int b,int c){return a?(b?10:20):(c?30:40);}", "f"),
+        ] {
+            let (ast, ir) = compile(nm, src);
+            let mut opt = ir.clone();
+            for f in opt.iter_mut() {
+                to_ssa(&ast.tt, f);
+                fired += if_convert(&ast.tt, f);
+                dce(f);
+                cfg_simplify(f);
+                out_of_ssa(f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
+            }
+            equiv(&ast.tt, &ir, &opt, entry).unwrap_or_else(|e| panic!("{nm}: {e}"));
+        }
+        assert!(fired > 0, "if_convert must fire on the pure-select battery");
+    }
+
+    // ── B4 SAFETY (the speculation side-condition): a diamond whose arm has a SIDE
+    // EFFECT (Store/Call) or a FAULTABLE load (through an unknown pointer, not a local
+    // slot) MUST NOT be if-converted — running the not-taken arm would be observable /
+    // could trap. Asserts if_convert leaves these untouched (n == 0).
+    #[test]
+    fn if_convert_refuses_unsafe() {
+        for (nm, src) in [
+            ("store", "int f(int a,int b){int x=0; if(a)x=1; else x=b; return x+ (a?({int*p=&x;*p=9;x;}):0);}"),
+            ("ptr", "int f(int a,int *p,int *q){return a?*p:*q;}"), // faultable loads (Unk base)
+            ("call", "int g(int);int f(int a){return a?g(1):g(2);}"), // side-effecting calls
+        ] {
+            let (ast, ir) = compile(nm, src);
+            let mut opt = ir.clone();
+            let mut n = 0;
+            for f in opt.iter_mut() {
+                to_ssa(&ast.tt, f);
+                n += if_convert(&ast.tt, f);
+            }
+            assert_eq!(n, 0, "{nm}: an unsafe/side-effecting diamond must NOT be if-converted");
         }
     }
 

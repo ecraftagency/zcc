@@ -51,10 +51,22 @@ judged on this arm64 backend at geomean 0.69× (fib 1.05 / loops 0.37 / matmul *
 
 | # | item | theorem (Side-I) — total & decidable | reward here | cplx | ~LOC | ratio |
 |---|------|------------------|-------------|------|------|-------|
-| **B1** | **Lightweight alias analysis** (port `alias.c`) | aliasing = 4-point base lattice {Con,Sym,Loc,Unk} + integer offset intervals; NoAlias/MustAlias/MayAlias is a **decidable relation**, one RPO pass, no fixpoint. Escape (`AEsc`) falls out free | **enabler** (unlocks B2; roadmap #9/#21) | LOW | ~120 | ★★★★★ |
-| **B2** | **Load-elim / store→load forwarding** (port `load.c`) | a `Load` from `a` dominated by a `Store` to a **must-alias** `a` with no intervening may-alias store = the stored value ⟹ forward. `⟦f⟧=⟦load-elim(f)⟧` validated by `equiv` (interp's per-frame `mem` already models intra-function store/load) | **HIGH** — attacks **matmul 1.22×** (the one gap >1.0) + general reloads | MED | ~200 | ★★★★☆ |
-| **B3** | **#4 sxtw / extension elimination** | an extension of an already-canonical-width value is the identity; width is a decidable static property. `⟦f⟧=⟦elim(f)⟧` | MED — loop-counter `sxtw` litter | LOW | ~100 | ★★★★☆ |
-| **B4** | **`csel` if-conversion (#24) + `ldp`/`stp` pairing (#23)** | a side-effect-free diamond `Br(c)?a:b` = `csel(c,a,b)` (a `⟦·⟧`-identity); two accesses to `[base,#o]`,`[base,#o+sz]` (o a spec-range multiple) = one pair op. Both gated by a **structural/static** test, no heuristic | MED — sieve/branchy; halves prologue/copy mem-ops | LOW-MED | ~120 | ★★★☆☆ |
+| **B1 ✅DONE** | **Lightweight alias analysis** (`alias.c` re-derived) | aliasing = 4-point base lattice {Con,Sym,Loc,Unk} + integer offset intervals; NoAlias/MustAlias/MayAlias is a **decidable relation**, one RPO pass, no fixpoint. Escape (`AEsc`) falls out free | **enabler** (unlocks B2 + B4; roadmap #9/#21) | LOW | ~120 | ★★★★★ |
+| **B2 ✅DONE** | **Load-elim / store→load forwarding** (`load.c`) | a `Load` from `a` dominated by a `Store` to a **must-alias** `a` with no intervening may-alias store = the stored value ⟹ forward. `⟦f⟧=⟦load-elim(f)⟧` validated by `equiv` (interp's per-frame `mem` already models intra-function store/load) | attacks reload-heavy shapes (flat on the 4 kernels — no hot store→reload) | MED | ~200 | ★★★★☆ |
+| **B3 ⏸DEFERRED** | **#4 sxtw / extension elimination** | an extension of an already-canonical-width value is the identity; width is a decidable static property. `⟦f⟧=⟦elim(f)⟧` | LOW here — the backend already ext's at def (width≥4) so redundant `sxtw` is rare; HIGH miscompile risk (the lazy width<4 canonicalization the pr81913 load-elim bug already tripped). Reward < LOC/complexity tax ⟹ deferred (same basis as its Tier-1 #4 deferral) | LOW | ~100 | ★★★★☆ |
+| **B4 ✅DONE** | **`csel` if-conversion (#24) + `ldp`/`stp` pairing (#23)** | a side-effect-free / speculatable diamond `Br(c)?a:b` = `Select(c,a,b)` (a `⟦·⟧`-identity, gated on B1's `fault_free` for arm loads); two accesses to `[base,#o]`,`[base,#o+sz]` (o a spec-range multiple) = one pair op. Both gated by a **structural/static** test, no heuristic | MED — branchy code reaches PAR with gcc-O0 (2 csel, cond-branch 3→1); pairs the callee-save slab | LOW-MED | ~230 | ★★★☆☆ |
+
+**BATCH RESULT (2026-08-22): B1 · B2 · B4 shipped, B3 deferred.** Gates all green with the full
+stack default-ON: cargo **96/96** · torture **1378 pass / 0 FAIL** · opt-parity **1552 PARITY / 0
+DIVERGE**. Bench geomean **0.69× vs gcc-O0**, unchanged from the B1 baseline — the 4 compute kernels
+(fib 1.06 / loops 0.37 / matmul 1.20 / sieve 0.49) exercise neither store→load forwarding nor
+if-convertible diamonds in their hot loops, so B2/B4 are flat *there* by construction (Law-3 predicted).
+B4-csel's win was measured **in isolation on its target shape** (a two-ternary hot loop): 2 `csel`,
+cond-branches 3→1, zcc reaches PAR with gcc-O0. New CORE IR inst `Select` (pure/total) carries the
+if-conversion; `AliasInfo::fault_free` (B1) licenses arm-load speculation. Two box-only regressions
+were caught by torture that `equiv` was blind to — the recurring Law-3 lesson (the eager-canon interp
+model cannot see backend lazy-canonicalization nor out_of_ssa's φ-arm bookkeeping); both were Side-I
+fixes (`fwd_canonical` gate for B2; convert-M's-φs-too for B4), never a test edit.
 
 **Kept because zcc already EXCEEDS QBE (free wins past the 70% line):** GVN · CSE · LICM(off) ·
 strength-reduction(off) · **inlining** — QBE has none of these.

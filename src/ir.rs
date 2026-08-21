@@ -99,6 +99,12 @@ pub enum Inst {
     // between to_ssa (Stage 2) and out_of_ssa (Stage 3) — straight lowering never emits
     // it, and it MUST be eliminated (φ→copies) before the backend runs.
     Phi(Tmp, TypeId, Vec<(BlockId, Val)>),
+    // if-conversion product (B4): dst = (cond ≠ 0) ? a : b, interpreted in TypeId.
+    // Pure and total (both operands already evaluated — the semantics is a data select,
+    // NOT control flow). Created ONLY by opt::if_convert on a side-effect-free /
+    // speculatable diamond, AFTER all SSA opts, BEFORE out_of_ssa. The backend lowers it
+    // to `cmp; csel`. (cond, a, b)
+    Select(Tmp, TypeId, Val, Val, Val),
     // ---- EXOTIC typed (gradually replacing Opaque; operand-free first) ----
     // dst = &function (GOT if extern, adrp/add if static). A constant-symbol
     // address, with NO Val operand. Kept impure (like Opaque) → no DCE/CSE → invariant asm.
@@ -213,6 +219,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
         | Inst::Alloca(d, ..)
+        | Inst::Select(d, ..)
         | Inst::Phi(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => *d,
         Inst::Store(..)
@@ -252,6 +259,11 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
             v(rp);
+        }
+        Inst::Select(_, _, c, a, b) => {
+            v(c);
+            v(a);
+            v(b);
         }
         // A φ uses every incoming value (semantically the use occurs on the predecessor
         // edge; for def-coverage, membership is what the verifier checks).
@@ -1352,6 +1364,10 @@ pub(crate) mod tests {
                         reg[*d as usize] = r;
                     }
                     Inst::Copy(d, ty, a) => reg[*d as usize] = canon(tt, *ty, fetch(&reg, a)),
+                    Inst::Select(d, ty, c, a, b) => {
+                        let chosen = if fetch(&reg, c) != 0 { fetch(&reg, a) } else { fetch(&reg, b) };
+                        reg[*d as usize] = canon(tt, *ty, chosen);
+                    }
                     Inst::Phi(d, ty, arms) => {
                         // Select the arm for the predecessor edge we arrived on. φ-nodes
                         // are parallel, but SSA freshness (φ dsts are new temps not named

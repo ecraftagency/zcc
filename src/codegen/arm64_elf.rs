@@ -1570,6 +1570,18 @@ impl<'a> Cg<'a> {
                 self.ld_val(*a, "x0");
                 self.tmp_store(*d, "x0");
             }
+            // B4 if-conversion: dst = (cond ≠ 0) ? a : b. Home-independent x0/x1/x2 funnel
+            // (opt::if_convert produces only non-float scalar Selects). `csel` copies the
+            // full 64-bit selected operand; ext_r re-canonicalizes to the result width,
+            // mirroring interp's canon(ty, chosen) exactly.
+            Inst::Select(d, ty, c, a, b) => {
+                self.ld_val(*c, "x0");
+                self.ld_val(*a, "x1");
+                self.ld_val(*b, "x2");
+                self.s += "\tcmp x0, #0\n\tcsel x0, x1, x2, ne\n";
+                self.ext_r(0, *ty);
+                self.tmp_store(*d, "x0");
+            }
             Inst::Bin(d, op, ty, a, b) => {
                 if self.a.tt.is_float(*ty) {
                     self.ld_val(*a, "x0");
@@ -1939,6 +1951,98 @@ fn peephole_moves(body: &str) -> String {
     drop_dead_moves(&drop_redundant_moves(body))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// B4 — LOAD/STORE PAIR FORMATION (`ldp`/`stp`). [Side-I structural theorem —
+// OPTIMIZATION-ROADMAP.md B4 / Tier-5 #23.]
+//
+// THEOREM. Two ADJACENT same-class accesses to `[base,#o]` and `[base,#o+sz]` (sz the
+// access width) have the SAME memory effect as one pair op `ldp/stp rA,rB,[base,#o]`
+// — the paired form transfers exactly the two words at the two addresses. Merging two
+// consecutive lines introduces no reordering (nothing executes between them) and the
+// disjoint word addresses make the store order immaterial. Emitted-`.s`-level
+// (machine translation-validation via opt-parity + torture), NOT IR `equiv` — it is a
+// pure output rewrite the backend model already trusts (like the move peephole).
+//
+// IMPROVEMENT (static, no race): the memory-op count HALVES on every run of ≥2
+// adjacent same-base accesses — the callee-save slab (every non-leaf function),
+// struct copies, HFA/param spills.
+//
+// SOUNDNESS FENCES (each a constrained-unpredictable/aliasing hazard avoided):
+//   • same load/store direction, same register class (x/w/d/s), same base symbol;
+//   • the second offset is EXACTLY first + sz, and `o` is a legal scaled imm7
+//     (multiple of sz, o/sz ∈ [-64,63]);
+//   • the base register is not one of the two transferred GP/W registers (its value
+//     must survive to address the pair — a `ldr xBase,[xBase,..]` mustn't be paired);
+//   • `ldp` forbids the two destinations being identical.
+// Only plain `ldr`/`str` (full-width, non-extending) parse; `ldrb`/`ldrsw`/`q`-regs
+// are skipped (different scaling / no pairing form).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse `str|ldr {x|w|d|s}N, [<base>[, #<off>]]` → (is_load, class byte, reg#, base, off).
+fn parse_ldst(line: &str) -> Option<(bool, u8, u32, String, i64)> {
+    let t = line.trim();
+    let (is_load, rest) = if let Some(r) = t.strip_prefix("ldr ") {
+        (true, r)
+    } else if let Some(r) = t.strip_prefix("str ") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let (reg_s, mem) = rest.split_once(", [")?;
+    let mem = mem.strip_suffix(']')?;
+    let cls = reg_s.as_bytes().first().copied()?;
+    if !matches!(cls, b'x' | b'w' | b'd' | b's') {
+        return None;
+    }
+    let reg: u32 = reg_s.get(1..)?.parse().ok()?;
+    let (base, off) = match mem.split_once(", #") {
+        Some((b, o)) => (b.to_string(), o.parse::<i64>().ok()?),
+        None => (mem.to_string(), 0),
+    };
+    Some((is_load, cls, reg, base, off))
+}
+
+/// Fuse consecutive adjacent accesses into `ldp`/`stp`. Runs AFTER the move peephole
+/// (which may delete lines between two accesses, exposing the adjacency).
+fn pair_ldst(body: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 1 < lines.len() {
+            if let (Some((la, ca, ra, ba, oa)), Some((lb, cb, rb, bb, ob))) =
+                (parse_ldst(lines[i]), parse_ldst(lines[i + 1]))
+            {
+                let sz: i64 = if ca == b'x' || ca == b'd' { 8 } else { 4 };
+                let scaled = oa % sz == 0 && (oa / sz) >= -64 && (oa / sz) <= 63;
+                // an x/w transfer register aliases the 64-bit x base; d/s live in the
+                // separate FP file and never clash.
+                let base_clash = matches!(ca, b'x' | b'w')
+                    && (ba == format!("x{ra}") || ba == format!("x{rb}"));
+                if la == lb
+                    && ca == cb
+                    && ba == bb
+                    && ob == oa + sz
+                    && scaled
+                    && !base_clash
+                    && !(la && ra == rb) // ldp destinations must differ
+                {
+                    let mn = if la { "ldp" } else { "stp" };
+                    let c = ca as char;
+                    let addr = if oa == 0 { format!("[{ba}]") } else { format!("[{ba}, #{oa}]") };
+                    _ = writeln!(out, "\t{mn} {c}{ra}, {c}{rb}, {addr}");
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// DEAD-MOVE ELIMINATION (region-local backward liveness). A `mov xD,xS` is deleted when xD
 /// is redefined later in the same straight-line region BEFORE any read of xD — its value is
 /// never observed. The coalescer gives many short-lived temps the same home register, so the
@@ -2167,9 +2271,15 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.emit_ir_body(&funcs[fi]);
         // Phase C — machine-level redundant-move elimination over just this body (the region
         // begins fresh: entered from the prologue, so an empty equivalence model is sound).
-        if passes.peephole && regalloc {
-            let body = g.s.split_off(body_start);
-            g.s.push_str(&peephole_moves(&body));
+        if regalloc && (passes.peephole || passes.ldst_pair) {
+            let mut body = g.s.split_off(body_start);
+            if passes.peephole {
+                body = peephole_moves(&body); // redundant/dead moves first…
+            }
+            if passes.ldst_pair {
+                body = pair_ldst(&body); // …then the exposed adjacent accesses → ldp/stp
+            }
+            g.s.push_str(&body);
         }
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
@@ -2180,10 +2290,46 @@ pub fn emit_ir(ast: &Ast) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::peephole_moves;
+    use super::{pair_ldst, peephole_moves};
 
     fn count(s: &str, needle: &str) -> usize {
         s.lines().filter(|l| l.trim().starts_with(needle)).count()
+    }
+
+    // B4 ldp/stp — the callee-save slab pattern: consecutive same-base 8-byte stores fuse.
+    #[test]
+    fn pair_fuses_callee_save_slab() {
+        let body = "\tstr x23, [x9, #0]\n\tstr x19, [x9, #8]\n\tstr x20, [x9, #16]\n\tstr x21, [x9, #32]\n";
+        let out = pair_ldst(body);
+        // (0,8)→stp, (16) has no #24 partner (next is #32) → stays str; #32 alone.
+        assert_eq!(count(&out, "stp"), 1, "one pair formed");
+        assert!(out.contains("stp x23, x19, [x9]"), "first two paired: {out}");
+        assert_eq!(count(&out, "str"), 2, "the two unpaired stores remain");
+    }
+
+    #[test]
+    fn pair_fuses_ldp_and_offsets() {
+        let out = pair_ldst("\tldr x20, [x9, #16]\n\tldr x21, [x9, #24]\n");
+        assert!(out.contains("ldp x20, x21, [x9, #16]"), "{out}");
+    }
+
+    // SOUNDNESS fences — none of these may fuse.
+    #[test]
+    fn pair_respects_fences() {
+        // non-adjacent offsets (#0 then #16, gap of 16 ≠ 8)
+        assert!(!pair_ldst("\tstr x0, [x9, #0]\n\tstr x1, [x9, #16]\n").contains("stp"));
+        // different base
+        assert!(!pair_ldst("\tstr x0, [x9, #0]\n\tstr x1, [x10, #8]\n").contains("stp"));
+        // mixed class (x then d)
+        assert!(!pair_ldst("\tstr x0, [x9, #0]\n\tstr d1, [x9, #8]\n").contains("stp"));
+        // ldp base clash: ldr into the base register
+        assert!(!pair_ldst("\tldr x9, [x9, #0]\n\tldr x1, [x9, #8]\n").contains("ldp"));
+        // ldp identical destinations
+        assert!(!pair_ldst("\tldr x0, [x9, #0]\n\tldr x0, [x9, #8]\n").contains("ldp"));
+        // misaligned scaled offset (#4 for an 8-byte x access)
+        assert!(!pair_ldst("\tstr x0, [x9, #4]\n\tstr x1, [x9, #12]\n").contains("stp"));
+        // mixed direction (str then ldr)
+        assert!(!pair_ldst("\tstr x0, [x9, #0]\n\tldr x1, [x9, #8]\n").contains("stp"));
     }
 
     // The core case: `mov xH, x0` then `mov x0, xH` — the second reload is redundant
