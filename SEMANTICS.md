@@ -125,9 +125,13 @@ canon_τ(v) = v                          if float(τ) ∨ size(τ) ≥ 8
 ### 3.3 `⟦cast⟧_{σ→τ} : 𝕍 → 𝕍`  (`ir.rs::eval_cast`), per C99 6.3.1.2 / 6.3.1.4
 ```
 int→int    : _Bool ⟹ (v ≠ 0);   otherwise canon_τ(v)        (truncate / extend)
-int→float  : (float)v            (unsigned uses u64→f64)
+int→float  : fnarrow_τ((float)v)  (unsigned uses u64→f64; fnarrow if size(τ)=4)
 float→int  : _Bool ⟹ (f ≠ 0);   otherwise canon_τ(⌊f⌋)      (truncate toward zero)
-float→float: v                   (f64 is canonical for both)
+float→float: fnarrow_τ(v)         (f64 in-register; rounds to f32 if size(τ)=4)
+
+where  fnarrow_τ(v) = bits((f32)f64(v))  if size(τ)=4 else v   — a float(size 4)
+destination rounds its result to f32 (C99 6.3.1.5 / FLT_EVAL_METHOD=0); the
+backend realizes it as `fcvt s,d; fcvt d,s`.
 ```
 
 ---
@@ -165,6 +169,15 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > is dropped, and joins get φ; everything else stays in memory. The transform carries
 > no new denotation — its whole content is the theorem **`⟦f⟧ = ⟦to_ssa(f)⟧`** (§4
 > semantics unchanged), gated mechanically by `equiv`, never trusted.
+>
+> **Float(size 4) promotion — the store∘load round-trip is not identity.** For an
+> integer cell, `⟦Store⟧` then `⟦Load⟧` = identity (values are kept `canon_τ`), so a
+> promoted `Load` is a plain `Copy`. But for a `float` cell of size 4, `Store` narrows
+> f64→f32 and `Load` widens f32→f64 (§4), so the round-trip is `fnarrow` (round to f32),
+> **not** identity. Eliding both — as naive mem2reg does — would drop that rounding and
+> leave illegal f64 precision in the promoted temp. So a promoted `Load` of a float(size 4)
+> cell becomes a self-`Cast(d,τ,τ,·)` (which `fnarrow`s, §3.3), not a `Copy`. This is
+> what preserves `⟦f⟧ = ⟦to_ssa(f)⟧` on float locals (`opt.rs` `Act::Load`).
 >
 > **`out_of_ssa` (Stage 3, `opt::out_of_ssa`, φ-destruction).** The inverse: a φ has
 > no machine form, so before the backend runs each `Phi(d,τ,[(bᵢ,vᵢ)])` becomes an

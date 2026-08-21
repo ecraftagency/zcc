@@ -1120,7 +1120,19 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
                 Act::Store(var, val) => s.write_var(var, bi, val),
                 Act::Load(d, ty, var) => {
                     let v = s.read_var(var, bi);
-                    new_insts.push(Inst::Copy(d, ty, v));
+                    // A Store into a float(size 4) cell narrows to f32 and the matching
+                    // Load widens f32→f64 (ir.rs Store/Load, backend store_narrow / `fcvt
+                    // d,s`), so the store∘load round-trip = round-to-f32, NOT identity.
+                    // mem2reg elides both, so that narrowing must be restored explicitly —
+                    // else the promoted value keeps illegal f64 precision (C99 6.3.1.5).
+                    // A self-Cast float→float narrows (eval_cast / backend `fcvt s,d;fcvt
+                    // d,s`). Integer cells round-trip as identity (temps are kept canon'd
+                    // to their type), so a plain Copy stays faithful there.
+                    if tt.is_float(ty) && tt.size(ty) == 4 {
+                        new_insts.push(Inst::Cast(d, ty, ty, v));
+                    } else {
+                        new_insts.push(Inst::Copy(d, ty, v));
+                    }
                 }
                 Act::Keep => new_insts.push(inst),
             }
@@ -2451,6 +2463,38 @@ mod tests {
             equiv(&ast.tt, &ir, &bad, "f").is_err(),
             "a mis-wired φ (swapped predecessor edges) MUST be caught (else the gate is blind)"
         );
+    }
+
+    // Float(size 4) promotion regression (C99 6.3.1.5 / FLT_EVAL_METHOD=0). A `float`
+    // local's Store narrows f64→f32 and its Load widens back, so Store∘Load = round-to-f32,
+    // NOT identity. A naive mem2reg (promoted Load → plain Copy) DROPS that rounding, leaving
+    // illegal f64 precision — ⟦f⟧≠⟦to_ssa(f)⟧. The promoted Load must be a self-narrowing Cast.
+    #[test]
+    fn to_ssa_narrows_promoted_float() {
+        // x = 123456.78f * 9.87f : a float×float whose f64 product is NOT f32-representable,
+        // so the store-narrow is observable. x is a scalar non-address-taken local ⟹ promoted.
+        let (ast, ir) = compile("fnar", "float f(void){ float x = 123456.78f * 9.87f; return x; }");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        for f in &ssa {
+            verify(f).unwrap();
+        }
+        // TEETH #1 (structural): the promoted float(size 4) Load must appear as a
+        // self-narrowing Cast (from == to == float, size 4), never a plain Copy.
+        let has_narrow_cast = ssa.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts).any(
+            |i| matches!(i, Inst::Cast(_, from, to, _) if from == to && ast.tt.is_float(*from) && ast.tt.size(*from) == 4),
+        );
+        assert!(has_narrow_cast, "a promoted float(size 4) Load must narrow via a self-Cast");
+        // ⟦f⟧ = ⟦to_ssa(f)⟧ (interp narrows at the Store; the promoted form at the Cast).
+        equiv(&ast.tt, &ir, &ssa, "f").expect("float promotion must commute");
+        // TEETH #2 (value): the result is the f32-narrowed product, NOT the raw f64 one —
+        // a plain-Copy promotion would return the second, distinct, bit pattern.
+        let (a, b) = (123456.78f32 as f64, 9.87f32 as f64);
+        let got = interp(&ast.tt, &ssa, "f", &[]).unwrap();
+        assert_eq!(got, ((a * b) as f32 as f64).to_bits() as i64, "must be f32-narrowed");
+        assert_ne!(got, (a * b).to_bits() as i64, "must NOT keep the raw f64 product");
     }
 
     // ═════════════════════════════════════════════════════════════════════════

@@ -1198,6 +1198,9 @@ pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
         }
         (false, true) => {
             let f = if tt.is_unsigned(from) { (v as u64) as f64 } else { v as f64 };
+            // A float(size 4) destination rounds to f32 (C99 6.3.1.5 / FLT_EVAL_METHOD=0);
+            // the backend emits `fcvt s,d;fcvt d,s` (arm64_elf: false,true arm). Match it.
+            let f = if tt.size(to) == 4 { (f as f32) as f64 } else { f };
             f.to_bits() as i64
         }
         (true, false) => {
@@ -1208,7 +1211,16 @@ pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
                 canon(tt, to, f as i64) // truncate toward 0 (C99 6.3.1.4)
             }
         }
-        (true, true) => v, // f64 is canonical for both
+        // f64 is the in-register form of both; a float(size 4) destination still rounds
+        // to f32 (C99 6.3.1.5) — the backend narrows via `fcvt s,d;fcvt d,s` (true,true
+        // arm). A double(size 8) destination passes through unchanged.
+        (true, true) => {
+            if tt.size(to) == 4 {
+                ((f64::from_bits(v as u64) as f32) as f64).to_bits() as i64
+            } else {
+                v
+            }
+        }
     }
 }
 
