@@ -120,12 +120,6 @@ pub enum Inst {
     // input / địa chỉ mem nạp vào reg; wb = địa chỉ writeback cho output non-mem).
     // Void, impure (ghi mem qua output/mem-operand + có thể clobber). KHÔNG dst.
     Asm(String, Vec<AsmIrOp>),
-    // ---- OPAQUE ----
-    // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
-    // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
-    // kết quả (nếu là biểu thức) nạp vào Tmp. Pass KHÔNG đụng; interp coi hàm chứa
-    // nó là "không thuần" (Err) — nằm ngoài không gian commuting-square CORE.
-    Opaque(Option<Tmp>, NodeId), // (dst?, node AST)
 }
 
 /// Operand inline-asm đã hạ về IR: metadata ràng buộc (giữ nguyên từ AsmOp) + kiểu
@@ -201,7 +195,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
         | Inst::Alloca(d, ..) => Some(*d),
-        Inst::Call(d, ..) | Inst::Opaque(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => *d,
+        Inst::Call(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => *d,
         Inst::Store(..)
         | Inst::Memcpy(..)
         | Inst::Zero(..)
@@ -241,7 +235,6 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(rp);
         }
         Inst::Lea(..)
-        | Inst::Opaque(..)
         | Inst::FunAddr(..)
         | Inst::LabelAddr(..)
         | Inst::VaArea(..) => {}
@@ -790,8 +783,9 @@ impl<'a> Lower<'a> {
                     self.lower_expr(last)
                 }
             }
-            // đuôi exotic (Sync/Asm/…) → bridge
-            _ => self.bridge_val(n, ty),
+            // Mọi node biểu-thức C99 đã có arm typed (chứng cứ: probe 0 bridge-hit trên
+            // 3748 file thật). Node câu-LỆNH không lọt vào lower_expr (đi lower_stmt).
+            _ => unreachable!("lower_expr: node không phải biểu thức đã seal"),
         }
     }
 
@@ -813,18 +807,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Bridge một node exotic → Opaque (backend re-emit subtree AST). VOID: bỏ kết
-    /// quả; còn lại: kết quả x0 → temp mới.
-    fn bridge_val(&mut self, n: NodeId, ty: TypeId) -> Val {
-        if ty == VOID {
-            self.push(Inst::Opaque(None, n));
-            Val::Imm(0)
-        } else {
-            let t = self.t(ty);
-            self.push(Inst::Opaque(Some(t), n));
-            Val::Tmp(t)
-        }
-    }
 
     /// Call cần bridge sang self.call (ABI automaton C.1–C.11) thay vì Inst::Call
     /// thuần-scalar? Đúng khi: (a) return composite, (b) có tham số composite
@@ -1322,8 +1304,7 @@ pub(crate) mod tests {
                             reg[*d as usize] = canon(tt, f.temps[*d as usize], r);
                         }
                     }
-                    Inst::Opaque(..)
-                    | Inst::FunAddr(..)
+                    Inst::FunAddr(..)
                     | Inst::LabelAddr(..)
                     | Inst::Zero(..)
                     | Inst::VaStart(..)

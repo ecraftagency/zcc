@@ -56,7 +56,8 @@ fn drive() -> ExitCode {
     let mut pic = false; // -fPIC → backend ELF đi GOT cho global non-static
     let (mut nostdinc, mut bundle) = (false, false);
     let mut export_dyn = false; // -rdynamic → ld --export-dynamic (backtrace_symbols resolve tên hàm)
-    let mut ir_mode = false; // --ir: đi đường IR (migrate); mặc định vẫn AST-walk
+    // IR→ops→asm là đường DUY NHẤT (đã phủ trọn suite/csmith/musl). --ir giữ như
+    // no-op cho back-compat script/wrapper; AST-walk emit() đã xoá (seal-ir-10k).
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,7 +95,7 @@ fn drive() -> ExitCode {
             // flag Darwin có đối số rời (không dùng trên ELF) — nuốt CẢ CẶP kẻo
             // đối số bị coi là input file ("-undefined dynamic_lookup", "--target …")
             "-undefined" | "--target" | "-target" => i += 1,
-            "--ir" => ir_mode = true, // migrate: lower→IR→asm thay AST-walk
+            "--ir" => {} // no-op: IR là đường mặc định & duy nhất
             "-nostdinc" => nostdinc = true, // musl: chỉ dùng -I, bỏ header nhúng + SDK
             "-MMD" | "-MD" => depgen = true, // .d chỉ chứa header thật (nhúng <..> bỏ)
             "-MP" => {}                     // deps của mình đều 1 dòng, phony khỏi cần
@@ -150,7 +151,7 @@ fn drive() -> ExitCode {
             },
         ) {
             Ok((ast, files)) => {
-                let asm = if ir_mode { codegen::emit_ir(&ast) } else { codegen::emit(&ast) };
+                let asm = codegen::emit_ir(&ast);
                 Some((asm, files))
             }
             Err(e) => {
