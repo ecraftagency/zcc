@@ -275,14 +275,10 @@ fn emit_module_tail(g: &mut Cg, ast: &Ast) {
     }
     if !ast.strs.is_empty() {
         for (i, bytes) in ast.strs.iter().enumerate() {
-            // __cstring bị linker dedup theo nội-dung-đến-NUL — string chứa
-            // NUL nhúng ("\0abc") phải qua __const kẻo bị merge nhầm
-            // ELF: .rodata trơn cho mọi string (không có mergeable-dedup phải né)
-            g.s += if bytes.contains(&0) {
-                ".section .rodata\n"
-            } else {
-                ".section .rodata\n"
-            };
+            // ELF: .rodata trơn cho MỌI string — không có mergeable-dedup theo
+            // nội-dung-đến-NUL phải né (khác Darwin __cstring, nơi string chứa NUL
+            // nhúng "\0abc" phải tách qua __const kẻo linker merge nhầm).
+            g.s += ".section .rodata\n";
             _ = write!(g.s, "l_str{}:\n\t.asciz \"", i);
             for &b in bytes {
                 match b {
