@@ -1930,6 +1930,14 @@ impl<'a> Cg<'a> {
                 self.emit_overflow(*op, *ta, *tb, *rt);
                 self.tmp_store(*d, "x0");
             }
+            Inst::VaArea(d, off) => {
+                _ = writeln!(self.s, "\tadd x0, x29, #{off}");
+                self.tmp_store(*d, "x0");
+            }
+            Inst::GotoPtr(a) => {
+                self.ld_val(*a, "x0");
+                self.s += "\tbr x0\n";
+            }
         }
     }
 

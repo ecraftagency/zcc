@@ -99,6 +99,10 @@ pub enum Inst {
     // EXT(gcc) __builtin_*_overflow: dst = (a op b tràn?); ghi kết quả vào *(rp).
     // op = mã u8; ta/tb = kiểu toán hạng (dấu), rt = kiểu *(rp) (dấu+rộng). Impure.
     Overflow(Tmp, u8, TypeId, TypeId, TypeId, Val, Val, Val), // dst,op,ta,tb,rt,a,b,rp
+    VaArea(Tmp, u32), // builtin __va_area__: dst = x29 + off (đầu vùng arg vô danh)
+    // GNU computed-goto "goto *e": br qua giá trị. Kết thúc khối theo runtime (block
+    // IR sau nó là dead — như Opaque cũ). Impure, KHÔNG dst.
+    GotoPtr(Val),
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -161,9 +165,14 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::FunAddr(d, ..)
         | Inst::LabelAddr(d, ..)
         | Inst::VaArg(d, ..)
-        | Inst::Overflow(d, ..) => Some(*d),
+        | Inst::Overflow(d, ..)
+        | Inst::VaArea(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::Opaque(d, ..) => *d,
-        Inst::Store(..) | Inst::Memcpy(..) | Inst::Zero(..) | Inst::VaStart(..) => None,
+        Inst::Store(..)
+        | Inst::Memcpy(..)
+        | Inst::Zero(..)
+        | Inst::VaStart(..)
+        | Inst::GotoPtr(..) => None,
     }
 }
 
@@ -186,13 +195,17 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
         }
-        Inst::Zero(a, _) | Inst::VaStart(a) | Inst::VaArg(_, a, _, _) => v(a),
+        Inst::Zero(a, _) | Inst::VaStart(a) | Inst::VaArg(_, a, _, _) | Inst::GotoPtr(a) => v(a),
         Inst::Overflow(_, _, _, _, _, a, b, rp) => {
             v(a);
             v(b);
             v(rp);
         }
-        Inst::Lea(..) | Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {}
+        Inst::Lea(..)
+        | Inst::Opaque(..)
+        | Inst::FunAddr(..)
+        | Inst::LabelAddr(..)
+        | Inst::VaArea(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
                 v(p)
@@ -586,6 +599,12 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Overflow(d, op, ta, tb, rt, va, vb, vrp));
                 Val::Tmp(d)
             }
+            Node::VaArea(off) => {
+                let off = *off;
+                let d = self.t(ty);
+                self.push(Inst::VaArea(d, off));
+                Val::Tmp(d)
+            }
             // đuôi exotic (VaArg/Sync/Overflow/Asm/Alloca/SRet/…) → bridge
             _ => self.bridge_val(n, ty),
         }
@@ -808,7 +827,11 @@ impl<'a> Lower<'a> {
                 self.seal(Term::Jmp(blk));
             }
             // computed goto / non-local goto: còn exotic (đuôi bước 2)
-            Node::GotoPtr(_) => self.push(Inst::Opaque(None, n)),
+            Node::GotoPtr(e) => {
+                let e = *e;
+                let target = self.lower_expr(e);
+                self.push(Inst::GotoPtr(target));
+            }
             // biểu thức dùng làm câu lệnh: phát side effect, bỏ kết quả
             _ => {
                 self.lower_expr(n);
@@ -1102,8 +1125,10 @@ pub(crate) mod tests {
                     | Inst::Zero(..)
                     | Inst::VaStart(..)
                     | Inst::VaArg(..)
-                    | Inst::Overflow(..) => {
-                        return Err("interp: exotic (symbol/va/overflow — hàm không thuần)".into())
+                    | Inst::Overflow(..)
+                    | Inst::VaArea(..)
+                    | Inst::GotoPtr(..) => {
+                        return Err("interp: exotic (symbol/va/overflow/goto — hàm không thuần)".into())
                     }
                 }
             }
