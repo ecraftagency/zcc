@@ -1490,9 +1490,17 @@ pub fn emit_ir(ast: &Ast) -> String {
     // before asserting; verify rejects broken IR). has_volatile disables opt: the IR does not
     // model volatile (6.7.3), so ⟦·⟧-preservation is proven only for volatile-free input — opt
     // runs WITHIN the preserved theorem fragment.
-    if std::env::var_os("ZCC_OPT").is_some() && !ast.has_volatile {
+    // ZCC_OPT=1 → the non-SSA pipeline (optimize); ZCC_OPT=ssa → the QBE-level SSA
+    // pipeline (optimize_ssa: to_ssa ▸ sccp/gvn/… ▸ out_of_ssa), which returns φ-free IR
+    // the naive-slot backend consumes unchanged (each SSA/edge temp gets its own slot).
+    if let Some(mode) = std::env::var("ZCC_OPT").ok().filter(|_| !ast.has_volatile) {
+        let ssa = mode == "ssa";
         for f in funcs.iter_mut() {
-            crate::opt::optimize(&ast.tt, f);
+            if ssa {
+                crate::opt::optimize_ssa(&ast.tt, f);
+            } else {
+                crate::opt::optimize(&ast.tt, f);
+            }
             debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
         }
     }

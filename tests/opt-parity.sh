@@ -27,8 +27,8 @@ for f in "$DIR"/*.c; do
 
     # noopt
     if ! "$ZCC" "$f" -o "$D/a" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
-    # opt
-    if ! ZCC_OPT=1 "$ZCC" "$f" -o "$D/b" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
+    # opt (ZCC_OPT_MODE=1 → non-SSA pipeline; =ssa → the SSA/QBE pipeline)
+    if ! ZCC_OPT="${ZCC_OPT_MODE:-1}" "$ZCC" "$f" -o "$D/b" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
 
     timeout 5 "$D/a" >/dev/null 2>&1; ra=$?
     timeout 5 "$D/b" >/dev/null 2>&1; rb=$?
