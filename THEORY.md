@@ -288,6 +288,8 @@ Where they live: **`ast.rs` TyTab** (`size/align/data_align`). Changing the mode
 | callee-saved | x19–x28, x29(fp), x30(lr) | §6.1.1 |
 | composite overflow locks NGRN=8 (C.11); HFA overflow does NOT lock | — | §6.8 rule C.11 |
 | prologue | `stp x29,x30,[sp,#-16]!` | §6.2.2 |
+| **variadic anon args go in registers** x0–x7/v0–v7 (standard AAPCS64, NOT darwinpcs stack-only), saved to a 192B reg-save area (128B VR + 64B GP) below the frame | — | §6.4 / `arm64_elf.rs` |
+| **plain `char` is UNSIGNED** (explicit `signed char` = signed) | inverse of Darwin | AArch64 Linux / `parser.rs` |
 
 Where it lives: **`codegen/arm64_elf.rs`**. The argument-offset algorithm lives in
 **three places that must agree byte-for-byte** (codegen call / codegen spill / parser
