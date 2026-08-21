@@ -141,6 +141,15 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > being left). φ-nodes are *parallel* at a join, but SSA freshness (a φ dst is a
 > new temp never named by a sibling φ arm) makes left-to-right evaluation over `ρ`
 > faithful. This is the `Inst::Phi` arm of `interp` and the `prev` variable.
+>
+> **`to_ssa` (Stage 2, `opt::to_ssa`, Braun 2013).** These φ are now *produced* by
+> mem2reg: a local is PROMOTABLE ⟺ scalar (int/float/pointer, LP64) ∧ type-consistent
+> ∧ not a parameter (params live in ABI-seeded frame slots) ∧ not address-taken (every
+> `Lea` of it feeds only Load/Store addresses — no escape). A promotable local's
+> `Store` becomes `writeVariable`, its `Load` a `Copy` of `readVariable`, its `Lea`
+> is dropped, and joins get φ; everything else stays in memory. The transform carries
+> no new denotation — its whole content is the theorem **`⟦f⟧ = ⟦to_ssa(f)⟧`** (§4
+> semantics unchanged), gated mechanically by `equiv`, never trusted.
 
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,

@@ -147,7 +147,7 @@ target file (Side II); everything else is Side I.
 | stage | theorem (proof obligation) | status |
 |---|---|---|
 | φ-node semantics | interp selects the arm of the taken predecessor edge (denotational ⟦φ⟧) | **DONE (Stage 1)** — `phi_diamond`/`phi_loop` |
-| SSA construction (Braun 2013, on-the-fly, no dominance frontier) | `⟦f⟧ = ⟦to_ssa(f)⟧` (semantics-preserving promotion of non-address-taken locals) | PLANNED (Stage 2) |
+| SSA construction (Braun 2013, on-the-fly, no dominance frontier) | `⟦f⟧ = ⟦to_ssa(f)⟧` (semantics-preserving promotion of non-address-taken locals) | **DONE (Stage 2)** — `opt::to_ssa`; proven by `to_ssa_semantics_preserved` (312 exprs × equiv), `to_ssa_diamond_and_loop`, `to_ssa_respects_address_taken`, `to_ssa_gate_has_teeth` |
 | out-of-SSA / φ-destruction (parallel-copy, swap/lost-copy handled) | `⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧` | PLANNED (Stage 3) |
 | SCCP (Wegman–Zadeck sparse conditional constant prop) | lattice ⊤/const/⊥ over CFG-reachability; `⟦f⟧=⟦sccp(f)⟧` | PLANNED (Stage 4) |
 | wired register allocation (consume Chaitin coloring in the backend) | interference-invariant bisimulation + `⟦·⟧` unchanged | PLANNED (Stage 5) |

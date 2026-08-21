@@ -12,10 +12,10 @@
 // it only reads well-formed IR.
 #![allow(dead_code)] // removed once the driver wires the --O1 pipeline into emit_ir
 
-use crate::ast::{TyTab, ULONG};
+use crate::ast::{Ty, TyTab, TypeId, ULONG};
 use crate::ir::{
-    canon, eval_bin, eval_cast, inst_def, inst_uses, term_targets, term_uses, Callee, Inst, IrFunc,
-    Op, Place, Term, Tmp, Un, Val,
+    canon, eval_bin, eval_cast, inst_def, inst_uses, term_targets, term_uses, BlockId, Callee, Inst,
+    IrFunc, Op, Place, Term, Tmp, Un, Val,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -627,6 +627,396 @@ pub fn optimize(tt: &TyTab, f: &mut IrFunc) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SSA CONSTRUCTION — mem2reg (Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau,
+// "Simple and Efficient Construction of Static Single Assignment Form", CC 2013).
+// On-the-fly, NO dominance frontier / dom-tree (§2) — slimmer than classic Cytron.
+//
+// GOVERNING THEOREM (CbC, supreme over the QBE projection): `⟦f⟧ = ⟦to_ssa(f)⟧` —
+// a semantics-preserving rewrite, MEASURED by `equiv` over the input battery
+// (translation validation), never trusted by reasoning.
+//
+// It promotes PROMOTABLE locals — scalar, type-consistent, non-parameter, and
+// non-address-taken — out of frame MEMORY (Lea/Load/Store) into SSA temporaries
+// reconciled at join points by Inst::Phi. Anything else stays in memory untouched;
+// the analysis is conservative (when in doubt, leave in memory), so promotion never
+// changes observable behavior — only which values live in temps vs the stack.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Predecessor lists — the inverse of `successors` (the CFG read backwards).
+fn predecessors(f: &IrFunc) -> Vec<Vec<BlockId>> {
+    let mut preds = vec![Vec::new(); f.blocks.len()];
+    for (bi, ss) in successors(f).iter().enumerate() {
+        for &s in ss {
+            preds[s as usize].push(bi as BlockId);
+        }
+    }
+    preds
+}
+
+/// Reverse post-order from the entry (DFS finish order, reversed): a forward edge's
+/// source precedes its target, so a join block is filled after all its forward
+/// predecessors. Blocks unreachable from the entry are appended last (interp never
+/// visits them). Iterative DFS (no host-stack recursion on the CFG).
+fn rpo(f: &IrFunc) -> Vec<BlockId> {
+    let n = f.blocks.len();
+    let succ = successors(f);
+    let mut seen = vec![false; n];
+    let mut post = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new(); // (block, next-successor index)
+    if n > 0 {
+        seen[0] = true;
+        stack.push((0, 0));
+    }
+    while let Some(&(b, i)) = stack.last() {
+        if i < succ[b].len() {
+            stack.last_mut().unwrap().1 += 1;
+            let s = succ[b][i] as usize;
+            if !seen[s] {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+        } else {
+            post.push(b as BlockId);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    for b in 0..n {
+        if !seen[b] {
+            post.push(b as BlockId);
+        }
+    }
+    post
+}
+
+/// Does temp `u` appear in `i` ONLY as the ADDRESS operand of a Load/Store? Any
+/// other appearance (an arithmetic operand, a call arg, a stored VALUE, …) means the
+/// address escaped ⟹ the local it points at is not promotable.
+fn is_addr_use(i: &Inst, u: Tmp) -> bool {
+    match i {
+        Inst::Load(_, _, Val::Tmp(a)) => *a == u,
+        // the address slot only; if `u` is ALSO the stored value it escapes.
+        Inst::Store(_, Val::Tmp(a), v) => *a == u && !matches!(v, Val::Tmp(t) if *t == u),
+        _ => false,
+    }
+}
+
+/// Record the access type of a local; a second, DIFFERENT type (type punning via a
+/// union / reinterpretation) makes it non-promotable (an SSA value has one type).
+fn note_ty(ty_of: &mut HashMap<u32, TypeId>, escaped: &mut HashSet<u32>, off: u32, ty: TypeId) {
+    match ty_of.get(&off) {
+        Some(&prev) if prev != ty => {
+            escaped.insert(off);
+        }
+        None => {
+            ty_of.insert(off, ty);
+        }
+        _ => {}
+    }
+}
+
+/// What to do with one instruction during the fill walk (computed WITHOUT holding a
+/// borrow of the instruction, so the `Keep` arm can move it).
+enum Act {
+    Drop,                     // a dead Lea of a promoted local
+    Keep,                     // untouched
+    Store(usize, Val),        // writeVariable(var, block, val); delete the Store
+    Load(Tmp, TypeId, usize), // dst = readVariable(var, block); Load → Copy(dst, ty, ·)
+}
+
+/// Braun's incremental-construction state (per function).
+struct Ssa {
+    var_ty: Vec<TypeId>,                     // [var] → the local's scalar type (φ / Copy type)
+    current_def: Vec<HashMap<BlockId, Val>>, // [var][block] → the reaching value (Braun's currentDef)
+    sealed: Vec<bool>,                       // [block] → all predecessors known?
+    incomplete: Vec<Vec<(usize, Tmp)>>,      // [block] → (var, φ) awaiting operands until sealed
+    preds: Vec<Vec<BlockId>>,
+    phi_block: HashMap<Tmp, BlockId>,       // φ temp → the block it heads
+    phi_var: HashMap<Tmp, usize>,           // φ temp → the variable it reconciles
+    phi_arms: HashMap<Tmp, Vec<(BlockId, Val)>>, // φ temp → [(pred, value)]
+    base: u32,                              // first fresh temp id (= |temps| before construction)
+    new_temps: Vec<TypeId>,                 // types of the φ temps appended to Γ
+}
+
+impl Ssa {
+    fn new_temp(&mut self, ty: TypeId) -> Tmp {
+        let t = self.base + self.new_temps.len() as u32;
+        self.new_temps.push(ty);
+        t
+    }
+    fn new_phi(&mut self, var: usize, block: BlockId) -> Tmp {
+        let ty = self.var_ty[var];
+        let t = self.new_temp(ty);
+        self.phi_block.insert(t, block);
+        self.phi_var.insert(t, var);
+        self.phi_arms.insert(t, Vec::new());
+        t
+    }
+    fn write_var(&mut self, var: usize, block: BlockId, val: Val) {
+        self.current_def[var].insert(block, val);
+    }
+    /// readVariable (Braun §2): the value of `var` reaching the START-or-here of
+    /// `block`, following the local definition first, else recursing over the CFG.
+    fn read_var(&mut self, var: usize, block: BlockId) -> Val {
+        if let Some(v) = self.current_def[var].get(&block) {
+            return *v;
+        }
+        self.read_var_recursive(var, block)
+    }
+    fn read_var_recursive(&mut self, var: usize, block: BlockId) -> Val {
+        let val = if !self.sealed[block as usize] {
+            // CFG still incomplete here: place an operandless φ, filled at seal time.
+            let phi = self.new_phi(var, block);
+            self.incomplete[block as usize].push((var, phi));
+            Val::Tmp(phi)
+        } else if self.preds[block as usize].len() == 1 {
+            let p = self.preds[block as usize][0];
+            self.read_var(var, p) // no join ⟹ no φ needed (minimal SSA)
+        } else {
+            // ≥2 predecessors: a φ is required. Write it FIRST to break loops.
+            let phi = self.new_phi(var, block);
+            self.write_var(var, block, Val::Tmp(phi));
+            self.add_phi_operands(var, phi)
+        };
+        self.write_var(var, block, val);
+        val
+    }
+    fn add_phi_operands(&mut self, var: usize, phi: Tmp) -> Val {
+        let block = self.phi_block[&phi];
+        for p in self.preds[block as usize].clone() {
+            let v = self.read_var(var, p);
+            self.phi_arms.get_mut(&phi).unwrap().push((p, v));
+        }
+        Val::Tmp(phi)
+    }
+    fn seal(&mut self, block: BlockId) {
+        if self.sealed[block as usize] {
+            return;
+        }
+        for (var, phi) in std::mem::take(&mut self.incomplete[block as usize]) {
+            self.add_phi_operands(var, phi);
+        }
+        self.sealed[block as usize] = true;
+    }
+}
+
+pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
+    // ── 1. Promotability analysis ────────────────────────────────────────────
+    // Parameters live in ABI-seeded frame slots (never Stored in the body) → keep
+    // them in memory. Every Lea(t, Local(off)) makes t a "pointer to off".
+    let mut escaped: HashSet<u32> = f.params.iter().map(|&(off, _)| off).collect();
+    let mut lea_off: HashMap<Tmp, u32> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Lea(t, Place::Local(off)) = i {
+                lea_off.insert(*t, *off);
+            }
+        }
+    }
+    // An offset escapes if any Lea of it is used other than as a Load/Store address;
+    // its type is the (single) type of its scalar accesses.
+    let mut ty_of: HashMap<u32, TypeId> = HashMap::new();
+    let mut has_mem: HashSet<u32> = HashSet::new();
+    let mut uses = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            match i {
+                Inst::Load(_, ty, Val::Tmp(a)) => {
+                    if let Some(&off) = lea_off.get(a) {
+                        note_ty(&mut ty_of, &mut escaped, off, *ty);
+                        has_mem.insert(off);
+                    }
+                }
+                Inst::Store(ty, Val::Tmp(a), _) => {
+                    if let Some(&off) = lea_off.get(a) {
+                        note_ty(&mut ty_of, &mut escaped, off, *ty);
+                        has_mem.insert(off);
+                    }
+                }
+                _ => {}
+            }
+            uses.clear();
+            inst_uses(i, &mut uses);
+            for &u in &uses {
+                if let Some(&off) = lea_off.get(&u) {
+                    if !is_addr_use(i, u) {
+                        escaped.insert(off);
+                    }
+                }
+            }
+        }
+        uses.clear();
+        term_uses(&b.term, &mut uses);
+        for &u in &uses {
+            if let Some(&off) = lea_off.get(&u) {
+                escaped.insert(off);
+            }
+        }
+    }
+    // The promotable set: scalar (int/float/pointer, per LP64 TyTab), has real
+    // memory traffic, not escaped. A dense var index gives φ/currentDef arrays.
+    let mut promotable: Vec<u32> = ty_of
+        .iter()
+        .filter_map(|(&off, &ty)| {
+            let scalar = tt.is_integer(ty)
+                || tt.is_float(ty)
+                || matches!(tt.tys[ty as usize], Ty::Ptr(_));
+            (!escaped.contains(&off) && has_mem.contains(&off) && scalar).then_some(off)
+        })
+        .collect();
+    if promotable.is_empty() {
+        return; // no promotion possible ⟹ identity transform (zero perf change)
+    }
+    promotable.sort_unstable();
+    let off2var: HashMap<u32, usize> = promotable.iter().enumerate().map(|(i, &o)| (o, i)).collect();
+    let var_ty: Vec<TypeId> = promotable.iter().map(|o| ty_of[o]).collect();
+
+    let nb = f.blocks.len();
+    let mut s = Ssa {
+        var_ty,
+        current_def: vec![HashMap::new(); promotable.len()],
+        sealed: vec![false; nb],
+        incomplete: vec![Vec::new(); nb],
+        preds: predecessors(f),
+        phi_block: HashMap::new(),
+        phi_var: HashMap::new(),
+        phi_arms: HashMap::new(),
+        base: f.temps.len() as u32,
+        new_temps: Vec::new(),
+    };
+
+    // ── 2. Fill (RPO) — Store→writeVar (delete), Load→Copy(readVar), dead Lea→drop.
+    // Seal a block on entry once all its predecessors are filled (forward joins seal
+    // eagerly ⟹ minimal φ); a loop header's back-edge predecessor is still unfilled,
+    // so it stays unsealed and its reads create incomplete φ, resolved in step 3.
+    let order = rpo(f);
+    let mut filled = vec![false; nb];
+    for &bi in &order {
+        let blk = bi as usize;
+        if !s.sealed[blk] && s.preds[blk].iter().all(|&p| filled[p as usize]) {
+            s.seal(bi);
+        }
+        let mut new_insts: Vec<Inst> = Vec::with_capacity(f.blocks[blk].insts.len());
+        for inst in std::mem::take(&mut f.blocks[blk].insts) {
+            let act = match &inst {
+                Inst::Lea(_, Place::Local(off)) if off2var.contains_key(off) => Act::Drop,
+                Inst::Store(_, Val::Tmp(a), val)
+                    if lea_off.get(a).is_some_and(|o| off2var.contains_key(o)) =>
+                {
+                    Act::Store(off2var[&lea_off[a]], *val)
+                }
+                Inst::Load(d, ty, Val::Tmp(a))
+                    if lea_off.get(a).is_some_and(|o| off2var.contains_key(o)) =>
+                {
+                    Act::Load(*d, *ty, off2var[&lea_off[a]])
+                }
+                _ => Act::Keep,
+            };
+            match act {
+                Act::Drop => {}
+                Act::Store(var, val) => s.write_var(var, bi, val),
+                Act::Load(d, ty, var) => {
+                    let v = s.read_var(var, bi);
+                    new_insts.push(Inst::Copy(d, ty, v));
+                }
+                Act::Keep => new_insts.push(inst),
+            }
+        }
+        f.blocks[blk].insts = new_insts;
+        filled[blk] = true;
+    }
+
+    // ── 3. Seal any remaining blocks (loop headers) — now every predecessor is
+    // filled, so incomplete φ get their operands.
+    for bi in 0..nb as BlockId {
+        s.seal(bi);
+    }
+
+    // ── 4. Extend Γ with the φ temporaries, then materialize Inst::Phi at each
+    // block head (deterministic order by temp id).
+    f.temps.extend(s.new_temps.iter().copied());
+    let mut per_block: Vec<Vec<(Tmp, TypeId, Vec<(BlockId, Val)>)>> = vec![Vec::new(); nb];
+    for (&phi, &blk) in &s.phi_block {
+        let ty = s.var_ty[s.phi_var[&phi]];
+        per_block[blk as usize].push((phi, ty, s.phi_arms[&phi].clone()));
+    }
+    for blk in 0..nb {
+        let mut ps = std::mem::take(&mut per_block[blk]);
+        ps.sort_by_key(|(t, _, _)| *t);
+        let mut ni: Vec<Inst> =
+            ps.into_iter().map(|(t, ty, arms)| Inst::Phi(t, ty, arms)).collect();
+        ni.append(&mut f.blocks[blk].insts);
+        f.blocks[blk].insts = ni;
+    }
+
+    // ── 5. Trivial-φ elimination (Braun §3.1): a φ whose operands (excluding
+    // self-references) are one single value V carries V on every edge → replace it
+    // by V everywhere and remove it. Semantics-preserving; cascades to a fixpoint.
+    remove_trivial_phis(f);
+}
+
+fn val_eq(a: Val, b: Val) -> bool {
+    match (a, b) {
+        (Val::Tmp(x), Val::Tmp(y)) => x == y,
+        (Val::Imm(x), Val::Imm(y)) => x == y,
+        (Val::FImm(x), Val::FImm(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn remove_trivial_phis(f: &mut IrFunc) {
+    loop {
+        // Find one trivial φ: its arms, minus self-references, reduce to a single value.
+        let mut trivial: Option<(Tmp, Val)> = None;
+        'scan: for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Phi(d, _, arms) = i {
+                    let mut uniq: Option<Val> = None;
+                    let mut same = true;
+                    for (_, v) in arms {
+                        if matches!(v, Val::Tmp(t) if *t == *d) {
+                            continue; // a self-reference does not count
+                        }
+                        match uniq {
+                            None => uniq = Some(*v),
+                            Some(u) => {
+                                if !val_eq(u, *v) {
+                                    same = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // uniq==None ⟹ only self-refs (undefined / unreachable): leave it.
+                    if same {
+                        if let Some(u) = uniq {
+                            trivial = Some((*d, u));
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        let Some((d, v)) = trivial else { break };
+        for b in f.blocks.iter_mut() {
+            b.insts.retain(|i| !matches!(i, Inst::Phi(dd, ..) if *dd == d));
+            for i in b.insts.iter_mut() {
+                each_use_mut(i, |x| {
+                    if matches!(x, Val::Tmp(t) if *t == d) {
+                        *x = v;
+                    }
+                });
+            }
+            each_use_term_mut(&mut b.term, |x| {
+                if matches!(x, Val::Tmp(t) if *t == d) {
+                    *x = v;
+                }
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,6 +1568,138 @@ mod tests {
         assert!(
             equiv(&ast.tt, &ir, &bad, "f").is_err(),
             "the Store-removal mutation MUST be caught by the commuting square (else the harness is blind)"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // SSA construction — the Stage-2 theorem: ⟦f⟧ = ⟦to_ssa(f)⟧ (Braun 2013).
+    // Same mechanical translation-validation as the pass squares above: to_ssa is
+    // one arrow, and it must commute with the reference semantics over 𝔼_struct.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn count_phis(ir: &[IrFunc]) -> usize {
+        ir.iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Phi(..)))
+            .count()
+    }
+
+    #[test]
+    fn to_ssa_semantics_preserved() {
+        // ∀ e ∈ 𝔼_struct: ⟦lower(e)⟧ = ⟦to_ssa(lower(e))⟧, and the result is
+        // well-formed. Anti-vacuous: the loop/branch shapes MUST actually introduce
+        // φ (a no-op to_ssa would trivially "commute" and prove nothing).
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        let mut with_phi = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("ssa", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+            }
+            for f in &ssa {
+                verify(f).unwrap_or_else(|e| panic!("verify to_ssa {src}: {e}"));
+            }
+            equiv(&ast.tt, &ir, &ssa, "f")
+                .unwrap_or_else(|e| panic!("⟦f⟧ ≠ ⟦to_ssa(f)⟧ for {src}: {e}"));
+            proven += 1;
+            if count_phis(&ssa) > 0 {
+                with_phi += 1;
+            }
+        }
+        assert_eq!(proven, 312, "must prove to_ssa over the whole generated space");
+        // The 36 loop shapes each reconcile a mutated accumulator + index at the
+        // header ⟹ φ. (gen_ptr's locals are address-taken → stay in memory, no φ.)
+        assert!(with_phi >= 36, "loop/branch shapes must introduce φ (anti-vacuous), got {with_phi}");
+        eprintln!("to_ssa theorem: {proven} exprs proven ⟦f⟧=⟦to_ssa(f)⟧; {with_phi} introduced φ");
+    }
+
+    #[test]
+    fn to_ssa_diamond_and_loop() {
+        // Diamond: r written in both arms → one φ at the merge; the promoted value
+        // is selected per the edge taken.
+        let (ast, ir) = compile("ssad", "int f(int a){int r;if(a<10)r=100;else r=200;return r;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        for f in &ssa {
+            verify(f).unwrap();
+        }
+        assert!(count_phis(&ssa) >= 1, "the diamond merge needs a φ");
+        equiv(&ast.tt, &ir, &ssa, "f").expect("diamond: ⟦f⟧=⟦to_ssa(f)⟧");
+        assert_eq!(interp(&ast.tt, &ssa, "f", &[5]).unwrap(), 100);
+        assert_eq!(interp(&ast.tt, &ssa, "f", &[50]).unwrap(), 200);
+
+        // Loop: an accumulator mutated across the back-edge → φ at the header.
+        // mem2reg removes the promoted scalars' Load/Store (only the param `n`
+        // — kept in memory by design — still Loads).
+        let (a2, ir2) =
+            compile("ssal", "int f(int n){int s=0;int i;for(i=1;i<=n;i=i+1)s=s+i;return s;}");
+        let mut ssa2 = ir2.clone();
+        for f in ssa2.iter_mut() {
+            to_ssa(&a2.tt, f);
+        }
+        for f in &ssa2 {
+            verify(f).unwrap();
+        }
+        assert!(count_phis(&ssa2) >= 1, "the loop header needs a φ");
+        assert!(count_loads(&ssa2) < count_loads(&ir2), "promotion must remove Loads");
+        equiv(&a2.tt, &ir2, &ssa2, "f").expect("loop: ⟦f⟧=⟦to_ssa(f)⟧");
+        assert_eq!(interp(&a2.tt, &ssa2, "f", &[5]).unwrap(), 15);
+        assert_eq!(interp(&a2.tt, &ssa2, "f", &[10]).unwrap(), 55);
+    }
+
+    #[test]
+    fn to_ssa_respects_address_taken() {
+        // &x escapes ⟹ x is NOT promoted (stays in memory); to_ssa still commutes.
+        let (ast, ir) = compile("ssaesc", "int f(int a){int x=a;int*p=&x;*p=*p+5;return x;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        for f in &ssa {
+            verify(f).unwrap();
+        }
+        equiv(&ast.tt, &ir, &ssa, "f").expect("address-taken: ⟦f⟧=⟦to_ssa(f)⟧");
+        assert_eq!(interp(&ast.tt, &ssa, "f", &[7]).unwrap(), 12);
+    }
+
+    // Self-proof (clean-input law): the to_ssa gate must have TEETH on φ. Corrupt a
+    // φ's predecessor→value mapping (swap the two arms' BlockIds) so the wrong value
+    // is selected on each edge; equiv MUST catch it. If this is green, every to_ssa
+    // "pass" verdict above is worthless.
+    #[test]
+    fn to_ssa_gate_has_teeth() {
+        let (ast, ir) = compile("ssateeth", "int f(int a){int r;if(a<10)r=100;else r=200;return r;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        equiv(&ast.tt, &ir, &ssa, "f").expect("correct to_ssa must commute");
+        let mut bad = ssa.clone();
+        let mut mutated = false;
+        'o: for f in bad.iter_mut() {
+            for b in f.blocks.iter_mut() {
+                for i in b.insts.iter_mut() {
+                    if let Inst::Phi(_, _, arms) = i {
+                        if arms.len() == 2 && !val_eq(arms[0].1, arms[1].1) {
+                            let b0 = arms[0].0; // swap which predecessor feeds which value
+                            arms[0].0 = arms[1].0;
+                            arms[1].0 = b0;
+                            mutated = true;
+                            break 'o;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(mutated, "a 2-arm φ with distinct values must exist to mutate");
+        assert!(
+            equiv(&ast.tt, &ir, &bad, "f").is_err(),
+            "a mis-wired φ (swapped predecessor edges) MUST be caught (else the gate is blind)"
         );
     }
 }
