@@ -2110,6 +2110,107 @@ impl<'a> Cg<'a> {
         }
     }
 
+    // EXT(gcc) inline asm trên IR: PORT thân self.expr(Node::Asm). Operand đã materialize
+    // (op.inp = giá trị/địa chỉ; op.wb = địa chỉ writeback) → thay expr/addr bằng ld_val.
+    fn ir_asm(&mut self, tpl: &str, ops: &[crate::ir::AsmIrOp]) {
+        // gán reg: pin > tied > pool (GP x9.., FP v16.. — caller-saved); mem dùng pool GP
+        let (mut gp, mut vp) = (9u32, 16u32);
+        let mut regs: Vec<u32> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let r = if let Some(p) = op.pin {
+                p as u32
+            } else if let Some(t) = op.tied {
+                regs[t as usize]
+            } else if op.fp {
+                vp += 1;
+                vp - 1
+            } else {
+                gp += 1;
+                gp - 1
+            };
+            regs.push(r);
+        }
+        let sizes: Vec<u32> = ops.iter().map(|o| self.a.tt.size(o.ty)).collect();
+        // phase 1: nạp input/mem-addr lên stack (pure output = inp None → bỏ qua)
+        let mut pushed: Vec<usize> = Vec::new();
+        for (k, op) in ops.iter().enumerate() {
+            if let Some(v) = op.inp {
+                self.ld_val(v, "x0");
+                self.s += "\tstr x0, [sp, #-16]!\n";
+                pushed.push(k);
+            }
+        }
+        // phase 2: pop ngược vào reg đích (FP: bit double → demote s nếu size4)
+        for &k in pushed.iter().rev() {
+            if ops[k].fp {
+                _ = writeln!(self.s, "\tldr d{}, [sp], #16", regs[k]);
+                if sizes[k] == 4 {
+                    _ = writeln!(self.s, "\tfcvt s{0}, d{0}", regs[k]);
+                }
+            } else {
+                _ = writeln!(self.s, "\tldr x{}, [sp], #16", regs[k]);
+            }
+        }
+        // template substitution: %[xwsd]k → reg, %% → %
+        let mut sub = String::new();
+        let cs: Vec<char> = tpl.chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == '%' && i + 1 < cs.len() {
+                let (mut j, mut m) = (i + 1, ' ');
+                match cs[j] {
+                    'x' | 'w' | 's' | 'd' => {
+                        m = cs[j];
+                        j += 1;
+                    }
+                    '%' => {
+                        sub.push('%');
+                        i = j + 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if let Some(d) = cs.get(j).and_then(|c| c.to_digit(10)) {
+                    let d = d as usize;
+                    let (r, op) = (regs[d], &ops[d]);
+                    if op.mem {
+                        _ = write!(sub, "[x{r}]");
+                    } else if op.fp || m == 's' || m == 'd' {
+                        let sgl = m == 's' || (m == ' ' && sizes[d] == 4);
+                        _ = write!(sub, "{}{}", if sgl { 's' } else { 'd' }, r);
+                    } else {
+                        let w = m == 'w' || (m == ' ' && sizes[d] < 8);
+                        _ = write!(sub, "{}{}", if w { 'w' } else { 'x' }, r);
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+            sub.push(cs[i]);
+            i += 1;
+        }
+        if !sub.is_empty() {
+            _ = writeln!(self.s, "\t{}", sub.replace('\n', "\n\t"));
+        }
+        // writeback output non-mem (mem tự ghi qua [xN]): giá trị lên stack trước
+        let wb: Vec<usize> = (0..ops.len()).filter(|&k| ops[k].wb.is_some()).collect();
+        for &k in &wb {
+            if ops[k].fp {
+                if sizes[k] == 4 {
+                    _ = writeln!(self.s, "\tfcvt d{0}, s{0}", regs[k]);
+                }
+                _ = writeln!(self.s, "\tstr d{}, [sp, #-16]!", regs[k]);
+            } else {
+                _ = writeln!(self.s, "\tstr x{}, [sp, #-16]!", regs[k]);
+            }
+        }
+        for &k in wb.iter().rev() {
+            self.ld_val(ops[k].wb.unwrap(), "x0"); // địa chỉ đích
+            self.s += "\tmov x1, x0\n\tldr x2, [sp], #16\n";
+            self.store(2, ops[k].ty);
+        }
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Copy(d, _ty, a) => {
@@ -2176,6 +2277,7 @@ impl<'a> Cg<'a> {
                 self.ir_call_abi(dst, callee, args, *ret, *sret)
             }
             Inst::Sync(dst, op, operands, sz, ret) => self.ir_sync(dst, *op, operands, *sz, *ret),
+            Inst::Asm(tpl, ops) => self.ir_asm(tpl, ops),
             Inst::Opaque(dst, node) => {
                 // BRIDGE tạm: re-emit subtree AST cũ (kết quả x0), nạp vào temp.
                 match dst {

@@ -116,12 +116,32 @@ pub enum Inst {
     // [, val2]]) → x0/x1/x2. sz = 4|8 (width), ret = kiểu kết quả (dấu, canon x0).
     // dst None ⟺ void (Release/Barrier). Impure (ghi mem + hàng rào).
     Sync(Option<Tmp>, SyncOp, Vec<Val>, u32, TypeId), // dst?, op, operands, size, ret
+    // EXT(gcc) inline asm: template + operand đã materialize thành Val (inp = giá trị
+    // input / địa chỉ mem nạp vào reg; wb = địa chỉ writeback cho output non-mem).
+    // Void, impure (ghi mem qua output/mem-operand + có thể clobber). KHÔNG dst.
+    Asm(String, Vec<AsmIrOp>),
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
     // kết quả (nếu là biểu thức) nạp vào Tmp. Pass KHÔNG đụng; interp coi hàm chứa
     // nó là "không thuần" (Err) — nằm ngoài không gian commuting-square CORE.
     Opaque(Option<Tmp>, NodeId), // (dst?, node AST)
+}
+
+/// Operand inline-asm đã hạ về IR: metadata ràng buộc (giữ nguyên từ AsmOp) + kiểu
+/// + Val đã tính. inp = giá trị input / địa chỉ (mem) nạp vào reg phase-1 (None = pure
+/// output). wb = địa chỉ ghi ngược cho output non-mem (None = không ghi ngược).
+#[derive(Clone, Debug)]
+pub struct AsmIrOp {
+    pub out: bool,
+    pub rw: bool,
+    pub mem: bool,
+    pub fp: bool,
+    pub tied: Option<u8>,
+    pub pin: Option<u8>,
+    pub ty: TypeId,
+    pub inp: Option<Val>,
+    pub wb: Option<Val>,
 }
 
 /// Terminator — chuyển điều khiển rời block. Automaton hữu hạn trên tập BlockId.
@@ -186,7 +206,8 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Memcpy(..)
         | Inst::Zero(..)
         | Inst::VaStart(..)
-        | Inst::GotoPtr(..) => None,
+        | Inst::GotoPtr(..)
+        | Inst::Asm(..) => None,
     }
 }
 
@@ -243,6 +264,16 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
         Inst::Sync(_, _, args, _, _) => {
             for a in args {
                 v(a)
+            }
+        }
+        Inst::Asm(_, ops) => {
+            for op in ops {
+                if let Some(x) = &op.inp {
+                    v(x)
+                }
+                if let Some(x) = &op.wb {
+                    v(x)
+                }
             }
         }
     }
@@ -700,6 +731,39 @@ impl<'a> Lower<'a> {
                     self.push(Inst::Sync(Some(d), op, vals, sz, ty));
                     Val::Tmp(d)
                 }
+            }
+            // EXT(gcc) inline asm (void): materialize từng operand → Val. mem = địa chỉ;
+            // pure output = None (chỉ ghi ngược); input/rw = giá trị (+ địa chỉ wb nếu out).
+            Node::Asm(tpl, ops) => {
+                let (tpl, ops) = (tpl.clone(), ops.clone());
+                let irops: Vec<AsmIrOp> = ops
+                    .iter()
+                    .map(|op| {
+                        let oty = a.types[op.e as usize];
+                        let (inp, wb) = if op.mem {
+                            (Some(self.lower_addr(op.e)), None)
+                        } else if op.out && !op.rw {
+                            (None, Some(self.lower_addr(op.e)))
+                        } else {
+                            let v = self.lower_expr(op.e);
+                            let wb = op.out.then(|| self.lower_addr(op.e));
+                            (Some(v), wb)
+                        };
+                        AsmIrOp {
+                            out: op.out,
+                            rw: op.rw,
+                            mem: op.mem,
+                            fp: op.fp,
+                            tied: op.tied,
+                            pin: op.pin,
+                            ty: oty,
+                            inp,
+                            wb,
+                        }
+                    })
+                    .collect();
+                self.push(Inst::Asm(tpl, irops));
+                Val::Imm(0) // asm expr = void
             }
             // GNU statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
             // tuần tự các stmt (side-effect qua lower_stmt), giá trị = giá trị của
@@ -1270,8 +1334,9 @@ pub(crate) mod tests {
                     | Inst::GotoPtr(..)
                     | Inst::Alloca(..)
                     | Inst::CallX(..)
-                    | Inst::Sync(..) => {
-                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX/sync — hàm không thuần)".into())
+                    | Inst::Sync(..)
+                    | Inst::Asm(..) => {
+                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX/sync/asm — hàm không thuần)".into())
                     }
                 }
             }
