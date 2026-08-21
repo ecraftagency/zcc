@@ -1121,11 +1121,18 @@ pub(crate) fn canon(tt: &TyTab, ty: TypeId, v: i64) -> i64 {
     if tt.is_float(ty) {
         return v;
     }
-    let sz = tt.size(ty);
-    if sz >= 8 {
+    // A bitfield's value is truncated to its DECLARED width `w` (per the container's
+    // signedness), not the container's storage width — the value of `(l.m = v)` is `v`
+    // after that truncation (C99 6.7.2.1). Mirrors the backend `ext` (lsl #(64−w); asr/lsr
+    // #(64−w)); without it const-fold reads an un-truncated field. GCC torture 921016-1,
+    // 20031211-2. is_unsigned(Bitfield) already forwards to the container's signedness.
+    let bits = match tt.tys[ty as usize] {
+        Ty::Bitfield(_, _, w) => w,
+        _ => tt.size(ty) * 8,
+    };
+    if bits >= 64 {
         return v;
     }
-    let bits = sz * 8;
     let masked = (v as u64) & ((1u64 << bits) - 1);
     if tt.is_unsigned(ty) {
         masked as i64

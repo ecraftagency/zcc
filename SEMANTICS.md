@@ -104,10 +104,16 @@ interpreter cannot diverge: `⟦fold(e)⟧ = ⟦e⟧` holds *by construction*
 
 ### 3.1 `canon_τ : ℤ → 𝕍`  (`ir.rs::canon`)
 ```
-canon_τ(v) = v                          if float(τ) ∨ size(τ) ≥ 8
-           = sext_w( v mod 2^w )         if τ is a signed integer,   w = size(τ)·8
+canon_τ(v) = v                          if float(τ) ∨ w ≥ 64
+           = sext_w( v mod 2^w )         if τ is a signed integer
            = ( v mod 2^w )               if τ is an unsigned integer
+where w = width(τ):  a bitfield `b:k` has w = k (its DECLARED width, per the
+container b's signedness — C99 6.7.2.1); every other integer type has w = size(τ)·8.
 ```
+A bitfield's value is truncated to its declared width, not the storage width — `(l.m = v)`
+denotes `v` after that truncation. Mirrors the backend `ext` (`lsl #(64−w); asr/lsr #(64−w)`);
+without it, promoting the field's source to a constant lets const-fold read an un-truncated
+value (GCC torture 921016-1, 20031211-2).
 
 ### 3.2 `⟦op⟧_τ : 𝕍 × 𝕍 → 𝕍 ∪ {⊥}`  (`ir.rs::eval_bin`)
 - **float(τ):** decode bits to f64, apply op ∈ {+, −, ×, ÷} in 𝔽₆₄ (IEEE-754);
@@ -178,6 +184,21 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > leave illegal f64 precision in the promoted temp. So a promoted `Load` of a float(size 4)
 > cell becomes a self-`Cast(d,τ,τ,·)` (which `fnarrow`s, §3.3), not a `Copy`. This is
 > what preserves `⟦f⟧ = ⟦to_ssa(f)⟧` on float locals (`opt.rs` `Act::Load`).
+>
+> **Two soundness preconditions on the CFG and on definedness** (`opt.rs::cfg_complete`,
+> `read_var`). (a) *CFG-completeness.* Braun's construction — and every dominance /
+> reachability pass (`gvn`, `sccp`) — trusts the block-terminator CFG. A computed goto
+> (`GotoPtr`, EXT gcc) jumps to a data-dependent address-taken label, an edge NO terminator
+> models, so a loop closed only by `goto *p` looks acyclic; promoting a loop-carried local
+> across that invisible back-edge would drop its φ. These passes therefore **bail** (identity
+> transform, all locals stay in memory) whenever the function contains a `GotoPtr` — the
+> naive -O0 backend consumes it unchanged (GCC torture 920302-1, 920501-3). (b) *Undefined
+> reads.* When `readVariable` recurses to a block with no predecessor (the entry, or an
+> unreachable block) without finding a definition, the variable is read before any write
+> on that path — UB (C99 6.3.2.1p2, an address-not-taken object with an indeterminate
+> value). Building a φ there would be malformed (a φ needs a predecessor edge); instead
+> `read_var` yields a deterministic `Imm(0)` (as LLVM lowers `undef`), keeping the SSA
+> well-formed. Any value is legal under the UB (GCC torture pr43629).
 >
 > **`out_of_ssa` (Stage 3, `opt::out_of_ssa`, φ-destruction).** The inverse: a φ has
 > no machine form, so before the backend runs each `Phi(d,τ,[(bᵢ,vᵢ)])` becomes an

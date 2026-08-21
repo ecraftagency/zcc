@@ -972,6 +972,15 @@ impl Ssa {
             let phi = self.new_phi(var, block);
             self.incomplete[block as usize].push((var, phi));
             Val::Tmp(phi)
+        } else if self.preds[block as usize].is_empty() {
+            // Undefined read: the recursion reached a block with NO predecessor (the entry,
+            // or an unreachable block) without finding a definition — the variable is read
+            // before any write on this path. The C program has UB (C99 6.3.2.1p2: an
+            // indeterminate value of an object whose address is never taken). Building a φ
+            // here would be malformed (a φ needs a predecessor edge) ⟹ broken IR. Any value
+            // is permissible under the UB, so materialize a deterministic, well-formed 0
+            // (as LLVM lowers `undef`). GCC torture pr43629.
+            Val::Imm(0)
         } else if self.preds[block as usize].len() == 1 {
             let p = self.preds[block as usize][0];
             self.read_var(var, p) // no join ⟹ no φ needed (minimal SSA)
@@ -1003,7 +1012,23 @@ impl Ssa {
     }
 }
 
+/// CFG-completeness precondition (shared by every dominance/reachability-based pass).
+/// A computed goto (`GotoPtr`, EXT gcc) transfers to a data-dependent address-taken
+/// label; its edges are NOT modeled by any block terminator (the IR block after it is a
+/// dead-end `Ret`). So `predecessors`/`rpo`/`dominators`/reachability see an INCOMPLETE
+/// CFG — e.g. a loop closed only by `goto *p` looks acyclic. Any transform that trusts the
+/// CFG (mem2reg φ-placement, GVN dominance, SCCP reachability) is then UNSOUND. Passes
+/// bail on such a function ⟹ identity transform, leaving it for the naive -O0 backend.
+/// GCC torture 920302-1, 920501-3 (mem2reg dropped a loop φ / GVN pruned a live block →
+/// wild GotoPtr → SIGSEGV).
+fn cfg_complete(f: &IrFunc) -> bool {
+    !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::GotoPtr(..))))
+}
+
 pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
+    if !cfg_complete(f) {
+        return;
+    }
     // ── 1. Promotability analysis ────────────────────────────────────────────
     // Parameters live in ABI-seeded frame slots (never Stored in the body) → keep
     // them in memory. Every Lea(t, Local(off)) makes t a "pointer to off".
@@ -1426,6 +1451,9 @@ fn lat_meet(a: Lat, b: Lat) -> Lat {
 }
 
 pub fn sccp(tt: &TyTab, f: &mut IrFunc) -> u32 {
+    if !cfg_complete(f) {
+        return 0; // CFG-reachability is unsound with computed goto — see cfg_complete
+    }
     let nt = f.temps.len();
     let nb = f.blocks.len();
     // Float temps are never folded (rounding / hardware register); seed them Bot.
@@ -1655,6 +1683,9 @@ fn dominators(f: &IrFunc) -> Vec<HashSet<BlockId>> {
 }
 
 pub fn gvn(f: &mut IrFunc) -> u32 {
+    if !cfg_complete(f) {
+        return 0; // dominance is unsound with computed goto — see cfg_complete
+    }
     let dom = dominators(f);
     let reach = reachable_blocks(f);
     let order: Vec<BlockId> = rpo(f).into_iter().filter(|&b| reach[b as usize]).collect();
@@ -2495,6 +2526,72 @@ mod tests {
         let got = interp(&ast.tt, &ssa, "f", &[]).unwrap();
         assert_eq!(got, ((a * b) as f32 as f64).to_bits() as i64, "must be f32-narrowed");
         assert_ne!(got, (a * b).to_bits() as i64, "must NOT keep the raw f64 product");
+    }
+
+    // Bitfield truncation through const-fold (C99 6.7.2.1). GCC torture 921016-1:
+    // signed m:11, `(l.m = 1081)` wraps to −967 (1081 > 2^10−1), so `== 1081` is FALSE.
+    // to_ssa promotes j to the constant 1081, exposing the bitfield Cast to const-fold;
+    // `canon` must truncate to the DECLARED width (11), not the container's 32 bits.
+    #[test]
+    fn sccp_truncates_signed_bitfield() {
+        let (ast, ir) = compile(
+            "bf11",
+            "int f(void){ struct { signed int m : 11; } l; int j = 1081; return (l.m = j) == j; }",
+        );
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            optimize_ssa(&ast.tt, f);
+        }
+        for f in &ssa {
+            verify(f).unwrap();
+        }
+        equiv(&ast.tt, &ir, &ssa, "f").expect("bitfield fold must commute");
+        // 1081 truncated to signed:11 = −967 ≠ 1081 ⟹ 0. A 32-bit-wide canon would keep
+        // 1081 == 1081 ⟹ 1 (the miscompile).
+        assert_eq!(interp(&ast.tt, &ssa, "f", &[]).unwrap(), 0, "signed:11 wraps 1081→−967");
+    }
+
+    // Undefined-variable read must yield WELL-FORMED IR (not a predecessor-less φ). GCC
+    // torture pr43629: `int x; if(flag) x=-1; else x&=0xff;` reads x uninitialized on the
+    // else path — UB (C99 6.3.2.1p2, address-not-taken). Regression: read_var built a φ in
+    // the entry block ⟹ a use with no def ⟹ `verify` rejected it and the compiler panicked.
+    #[test]
+    fn to_ssa_undefined_read_is_wellformed() {
+        let (ast, ir) =
+            compile("undef", "int f(int flag){ int x; if(flag) x=-1; else x&=0xff; return x & ~0xff; }");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        // TEETH: the crux — this `verify` panicked before the fix (broken SSA).
+        for f in &ssa {
+            verify(f).expect("to_ssa on an undefined read must produce well-formed IR");
+        }
+        // The read-before-write x resolves to a deterministic 0 on the else path ⟹
+        // 0 & ~0xff = 0. (UB ⟹ any value legal; 0 is the well-formed choice.)
+        assert_eq!(interp(&ast.tt, &ssa, "f", &[0]).unwrap(), 0);
+    }
+
+    // CFG-completeness guard: mem2reg/GVN/SCCP must bail on a computed goto (its edges to
+    // address-taken labels are unmodeled ⟹ incomplete CFG). GCC torture 920501-3 / 920302-1:
+    // a loop closed by `goto *p` looks acyclic, so a loop-carried local would be promoted
+    // with no φ → miscompile / SIGSEGV. Teeth: the local stays in MEMORY (unpromoted).
+    #[test]
+    fn to_ssa_bails_on_computed_goto() {
+        let (ast, ir) =
+            compile("cgoto", "int f(int n){ int x=0; void*t=&&L; L: x++; if(x<n) goto *t; return x; }");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        for f in &ssa {
+            verify(f).unwrap();
+        }
+        let gotoptr = ssa.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts).any(|i| matches!(i, Inst::GotoPtr(..)));
+        assert!(gotoptr, "test must actually contain a computed goto (guard precondition)");
+        // Bailed ⟹ identity: the Stores stay (x/t in memory), no promotion happened.
+        let stores = ssa.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Store(..))).count();
+        assert!(stores >= 1, "a computed-goto function must be left in memory (unpromoted)");
     }
 
     // ═════════════════════════════════════════════════════════════════════════
