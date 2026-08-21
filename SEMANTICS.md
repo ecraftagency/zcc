@@ -150,6 +150,20 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > is dropped, and joins get φ; everything else stays in memory. The transform carries
 > no new denotation — its whole content is the theorem **`⟦f⟧ = ⟦to_ssa(f)⟧`** (§4
 > semantics unchanged), gated mechanically by `equiv`, never trusted.
+>
+> **`out_of_ssa` (Stage 3, `opt::out_of_ssa`, φ-destruction).** The inverse: a φ has
+> no machine form, so before the backend runs each `Phi(d,τ,[(bᵢ,vᵢ)])` becomes an
+> explicit `Copy(d,τ,vᵢ)` on the control edge from `bᵢ`. This makes the auxiliary `π`
+> unnecessary — `interp` reads `d` straight from `ρ`, the value the taken edge deposited.
+> Two classic miscompiles are handled by construction: (1) a *critical edge* (the
+> predecessor `bᵢ` has ≥2 successors and the φ-block has ≥2 preds) is SPLIT — a fresh
+> block on the edge holds the copies, so they never leak onto `bᵢ`'s other edge;
+> (2) the *swap / lost-copy* problem — φ at a join are PARALLEL, so on one edge the
+> copy set `{d ← v}` may be mutually referential (`{a←b, b←a}`); `seq_pcopy`
+> (Boissinot sequentialization) emits a leaf whose dst no pending copy reads, and
+> breaks a residual cycle by saving one value to a fresh temp. Its whole content is
+> the theorem **`⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧`**, gated by `equiv`. The
+> result is φ-free (backend-consumable) but no longer single-assignment.
 
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,

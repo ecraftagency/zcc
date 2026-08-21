@@ -14,8 +14,8 @@
 
 use crate::ast::{Ty, TyTab, TypeId, ULONG};
 use crate::ir::{
-    canon, eval_bin, eval_cast, inst_def, inst_uses, term_targets, term_uses, BlockId, Callee, Inst,
-    IrFunc, Op, Place, Term, Tmp, Un, Val,
+    canon, eval_bin, eval_cast, inst_def, inst_uses, term_targets, term_uses, Block, BlockId, Callee,
+    Inst, IrFunc, Op, Place, Term, Tmp, Un, Val,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1017,6 +1017,161 @@ fn remove_trivial_phis(f: &mut IrFunc) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OUT-OF-SSA — φ-destruction (Stage 3). The INVERSE of to_ssa's join reconciliation:
+// every Inst::Phi is replaced by explicit Inst::Copy on the incoming control edges,
+// leaving IR the backend can consume directly (φ is an SSA artifact with no machine
+// form — see ir.rs Inst::Phi).
+//
+// GOVERNING THEOREM (CbC, supreme over the QBE projection): `⟦f⟧ = ⟦out_of_ssa(f)⟧`
+// for f in SSA form — MEASURED by `equiv` (translation validation), never trusted.
+// Composed with Stage 2 this closes the round trip ⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧.
+//
+// TWO CLASSIC MISCOMPILE TRAPS (csmith bait), both handled by construction:
+//   • critical edges — a φ-block has ≥2 preds; if a predecessor also has ≥2
+//     successors, copies appended to it would leak onto its OTHER edge. Such an edge
+//     is SPLIT: a fresh block on the edge holds the copies (`split_edge`).
+//   • the swap / lost-copy problem — φ-nodes at a block are PARALLEL (simultaneous).
+//     Sequentializing {a←b, b←a} naively yields a=b; b=b. `seq_pcopy` orders the
+//     copies (a leaf whose dst is read by no pending copy is emitted first) and breaks
+//     any remaining cycle by saving one value into a fresh temp.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sequentialize a PARALLEL copy set {dst ← src} (dsts distinct) into an ordered list
+/// of copies with identical net effect. `fresh(ty)` mints a temp to break cycles.
+fn seq_pcopy(pc: &[(Tmp, TypeId, Val)], fresh: &mut impl FnMut(TypeId) -> Tmp) -> Vec<(Tmp, TypeId, Val)> {
+    // Identity copies (d ← d) carry no information — drop them.
+    let mut pending: Vec<(Tmp, TypeId, Val)> =
+        pc.iter().cloned().filter(|(d, _, s)| !matches!(s, Val::Tmp(t) if t == d)).collect();
+    let mut out = Vec::new();
+    while !pending.is_empty() {
+        // A copy is safe to emit now iff its dst is read by no OTHER pending copy
+        // (emitting it cannot clobber a value still needed by the parallel set).
+        let leaf = pending
+            .iter()
+            .position(|(d, _, _)| !pending.iter().any(|(d2, _, s)| d2 != d && matches!(s, Val::Tmp(t) if t == d)));
+        match leaf {
+            Some(i) => out.push(pending.remove(i)),
+            None => {
+                // All remaining copies form cycles (each dst is read by another): break
+                // one by saving the current value of a dst into a fresh temp, then
+                // redirect readers to it — the cycle becomes a chain.
+                let (d, ty, _) = pending[0];
+                let t = fresh(ty);
+                out.push((t, ty, Val::Tmp(d))); // t ← d (preserve d's incoming value)
+                for (_, _, s) in pending.iter_mut() {
+                    if matches!(s, Val::Tmp(x) if *x == d) {
+                        *s = Val::Tmp(t);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Replace, in a terminator, the target BlockId `from` by `to` (edge redirection).
+fn retarget(term: &mut Term, from: BlockId, to: BlockId) {
+    match term {
+        Term::Jmp(t) => {
+            if *t == from {
+                *t = to;
+            }
+        }
+        Term::Br(_, a, b) => {
+            if *a == from {
+                *a = to;
+            }
+            if *b == from {
+                *b = to;
+            }
+        }
+        Term::Ret(_) | Term::Unreachable => {}
+    }
+}
+
+pub fn out_of_ssa(f: &mut IrFunc) {
+    let preds = predecessors(f);
+    let succ_cnt: Vec<usize> = successors(f).iter().map(|s| s.len()).collect();
+
+    // Copies to append at the END of a single-successor predecessor (before its term).
+    let mut append_to: HashMap<BlockId, Vec<(Tmp, TypeId, Val)>> = HashMap::new();
+    // Critical edges to split: (pred, φ-block, the parallel copy set on that edge).
+    let mut splits: Vec<(BlockId, BlockId, Vec<(Tmp, TypeId, Val)>)> = Vec::new();
+
+    for b in 0..f.blocks.len() as BlockId {
+        // The φ-nodes heading this block (dst, ty, arms), in program order.
+        let phis: Vec<(Tmp, TypeId, Vec<(BlockId, Val)>)> = f.blocks[b as usize]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Phi(d, ty, arms) => Some((*d, *ty, arms.clone())),
+                _ => None,
+            })
+            .collect();
+        if phis.is_empty() {
+            continue;
+        }
+        // For each DISTINCT predecessor edge, gather the parallel copy set {dst ← arm(P)}.
+        let mut seen: HashSet<BlockId> = HashSet::new();
+        for &p in &preds[b as usize] {
+            if !seen.insert(p) {
+                continue; // a multi-edge (Br to the same block twice) — copies are identical
+            }
+            let pc: Vec<(Tmp, TypeId, Val)> = phis
+                .iter()
+                .map(|(d, ty, arms)| {
+                    let v = arms
+                        .iter()
+                        .find(|(pp, _)| *pp == p)
+                        .map(|(_, v)| *v)
+                        .expect("out_of_ssa: φ missing an arm for a predecessor");
+                    (*d, *ty, v)
+                })
+                .collect();
+            if succ_cnt[p as usize] == 1 {
+                append_to.entry(p).or_default().extend(pc); // safe: p's only edge is p→b
+            } else {
+                splits.push((p, b, pc)); // critical edge → split
+            }
+        }
+    }
+
+    // Fresh temps for cycle-breaking are appended to Γ.
+    let mut new_temps: Vec<TypeId> = Vec::new();
+    let base = f.temps.len() as u32;
+    let mut fresh = |ty: TypeId| -> Tmp {
+        let t = base + new_temps.len() as u32;
+        new_temps.push(ty);
+        t
+    };
+
+    // Apply single-successor appends: insert the sequentialized copies before the term.
+    for (p, pc) in append_to {
+        let seq = seq_pcopy(&pc, &mut fresh);
+        let insts = &mut f.blocks[p as usize].insts;
+        for (d, ty, s) in seq {
+            insts.push(Inst::Copy(d, ty, s));
+        }
+    }
+
+    // Apply critical-edge splits: a new block E = {copies; Jmp(b)} on the edge p→b.
+    for (p, b, pc) in splits {
+        let seq = seq_pcopy(&pc, &mut fresh);
+        let insts = seq.into_iter().map(|(d, ty, s)| Inst::Copy(d, ty, s)).collect();
+        let e = f.blocks.len() as BlockId;
+        f.blocks.push(Block { insts, term: Term::Jmp(b) });
+        retarget(&mut f.blocks[p as usize].term, b, e);
+    }
+
+    f.temps.extend(new_temps);
+
+    // Every φ has been replaced by edge copies — remove them all.
+    for b in f.blocks.iter_mut() {
+        b.insts.retain(|i| !matches!(i, Inst::Phi(..)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1701,5 +1856,157 @@ mod tests {
             equiv(&ast.tt, &ir, &bad, "f").is_err(),
             "a mis-wired φ (swapped predecessor edges) MUST be caught (else the gate is blind)"
         );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 3 — out_of_ssa / φ-destruction. THEOREM ⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn roundtrip(tt: &TyTab, f: &IrFunc) -> IrFunc {
+        let mut g = f.clone();
+        to_ssa(tt, &mut g);
+        out_of_ssa(&mut g);
+        g
+    }
+
+    #[test]
+    fn out_of_ssa_semantics_preserved() {
+        // ∀ e ∈ 𝔼_struct: ⟦to_ssa(lower e)⟧ = ⟦out_of_ssa(to_ssa(lower e))⟧, and the
+        // result is well-formed AND φ-free (the backend can consume it). Anti-vacuous:
+        // the same ≥36 loop/branch shapes that grew φ in Stage 2 must round-trip.
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        let mut had_phi = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("oos", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+            }
+            let phis_before = count_phis(&ssa);
+            let mut back = ssa.clone();
+            for f in back.iter_mut() {
+                out_of_ssa(f);
+            }
+            for f in &back {
+                verify(f).unwrap_or_else(|e| panic!("verify out_of_ssa {src}: {e}"));
+            }
+            assert_eq!(count_phis(&back), 0, "out_of_ssa must remove every φ for {src}");
+            // The theorem: SSA form ≡ destructed form (the round trip preserves ⟦·⟧).
+            equiv(&ast.tt, &ssa, &back, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦out_of_ssa(to_ssa(f))⟧ for {src}: {e}"));
+            // And end-to-end vs the original (transitivity, guarding against a shared bug).
+            equiv(&ast.tt, &ir, &back, "f")
+                .unwrap_or_else(|e| panic!("⟦f⟧ ≠ ⟦out_of_ssa(to_ssa(f))⟧ for {src}: {e}"));
+            proven += 1;
+            if phis_before > 0 {
+                had_phi += 1;
+            }
+        }
+        assert_eq!(proven, 312, "must prove out_of_ssa over the whole generated space");
+        assert!(had_phi >= 36, "loop/branch shapes must exercise φ-destruction (anti-vacuous), got {had_phi}");
+        eprintln!("out_of_ssa theorem: {proven} exprs proven ⟦to_ssa(f)⟧=⟦out_of_ssa(to_ssa(f))⟧; {had_phi} had φ");
+    }
+
+    #[test]
+    fn out_of_ssa_diamond_and_loop() {
+        // Diamond: φ at the merge → one copy on each arm's edge.
+        let (ast, ir) = compile("oosd", "int f(int a){int r;if(a<10)r=100;else r=200;return r;}");
+        let back = roundtrip(&ast.tt, &ir[0]);
+        verify(&back).unwrap();
+        assert_eq!(count_phis(std::slice::from_ref(&back)), 0);
+        let bk = vec![back];
+        equiv(&ast.tt, &ir, &bk, "f").expect("diamond round trip");
+        assert_eq!(interp(&ast.tt, &bk, "f", &[5]).unwrap(), 100);
+        assert_eq!(interp(&ast.tt, &bk, "f", &[50]).unwrap(), 200);
+
+        // Loop: the header φ (accumulator + index) → copies on the entry edge and the
+        // back-edge; the sum must still be correct.
+        let (a2, ir2) =
+            compile("oosl", "int f(int n){int s=0;int i;for(i=1;i<=n;i=i+1)s=s+i;return s;}");
+        let back2 = vec![roundtrip(&a2.tt, &ir2[0])];
+        verify(&back2[0]).unwrap();
+        assert_eq!(count_phis(&back2), 0);
+        equiv(&a2.tt, &ir2, &back2, "f").expect("loop round trip");
+        assert_eq!(interp(&a2.tt, &back2, "f", &[5]).unwrap(), 15);
+        assert_eq!(interp(&a2.tt, &back2, "f", &[10]).unwrap(), 55);
+    }
+
+    // The swap / lost-copy trap (csmith bait): two variables PERMUTED across a loop
+    // back-edge produce mutually-referential φ (a←…,b←… where a's back-arm is b and
+    // b's back-arm is a). Naive sequential copies corrupt the swap; seq_pcopy must
+    // break the cycle. If out_of_ssa were wrong here, the fib-style values would diverge.
+    #[test]
+    fn out_of_ssa_swap() {
+        let (ast, ir) =
+            compile("oosw", "int f(int n){int a=0,b=1,i=0;while(i<n){int t=a+b;a=b;b=t;i=i+1;}return a;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        // The header reconciles a, b, i via φ — the a/b permutation is the swap.
+        assert!(count_phis(std::slice::from_ref(&ssa)) >= 2, "the fib loop header needs ≥2 φ");
+        let mut back = ssa.clone();
+        out_of_ssa(&mut back);
+        verify(&back).unwrap();
+        assert_eq!(count_phis(std::slice::from_ref(&back)), 0);
+        let (ssa_v, back_v) = (vec![ssa], vec![back]);
+        equiv(&ast.tt, &ssa_v, &back_v, "f").expect("swap: ⟦to_ssa(f)⟧=⟦out_of_ssa(·)⟧");
+        // Concrete Fibonacci check (n → F(n)): 10 → 55, guards against a silent swap bug.
+        for (n, fib) in [(0, 0), (1, 1), (2, 1), (5, 5), (10, 55)] {
+            assert_eq!(interp(&ast.tt, &back_v, "f", &[n]).unwrap(), fib, "F({n})");
+        }
+    }
+
+    // Critical edge: a Br whose taken side lands on a multi-pred φ-block. Copies must
+    // NOT be appended to the shared predecessor (they would leak onto its other edge)
+    // — the edge is split. Here `m` is assigned only under the if, so the merge φ has a
+    // critical edge from the condition block.
+    #[test]
+    fn out_of_ssa_critical_edge() {
+        let (ast, ir) =
+            compile("oosc", "int f(int a,int b){int m=a;if(a<b)m=b;m=m+1;return m;}");
+        let ssa = {
+            let mut g = ir[0].clone();
+            to_ssa(&ast.tt, &mut g);
+            g
+        };
+        let blocks_before = ssa.blocks.len();
+        let mut back = ssa.clone();
+        out_of_ssa(&mut back);
+        verify(&back).unwrap();
+        assert_eq!(count_phis(std::slice::from_ref(&back)), 0);
+        // A split introduces a new block on the critical edge (evidence the trap fired).
+        assert!(back.blocks.len() >= blocks_before, "edge split may add a block");
+        let (ssa_v, back_v) = (vec![ssa], vec![back]);
+        equiv(&ast.tt, &ssa_v, &back_v, "f").expect("critical edge round trip");
+        assert_eq!(interp(&ast.tt, &back_v, "f", &[3, 7]).unwrap(), 8); // max(3,7)+1
+        assert_eq!(interp(&ast.tt, &back_v, "f", &[9, 2]).unwrap(), 10); // max(9,2)+1
+    }
+
+    // Self-proof (clean-input law): the out_of_ssa gate must have TEETH. A parallel
+    // copy sequentialized WRONG (dropping the cycle break) corrupts a swap; equiv must
+    // catch such a divergence. We test seq_pcopy directly against a reference.
+    #[test]
+    fn seq_pcopy_swap_is_faithful() {
+        // Parallel {t0←t1, t1←t0} over an initial register file must swap.
+        let pc = vec![(0u32, INT, Val::Tmp(1)), (1u32, INT, Val::Tmp(0))];
+        let mut next = 2u32;
+        let seq = seq_pcopy(&pc, &mut |_ty| {
+            let t = next;
+            next += 1;
+            t
+        });
+        assert!(next > 2, "a 2-cycle swap MUST allocate a fresh temp (else it corrupts)");
+        // Execute the sequential copies on a register file and confirm the swap.
+        let mut reg = vec![0i64; next as usize];
+        reg[0] = 10;
+        reg[1] = 20;
+        for (d, _, s) in &seq {
+            reg[*d as usize] = match s {
+                Val::Tmp(t) => reg[*t as usize],
+                Val::Imm(x) => *x,
+                Val::FImm(b) => *b as i64,
+            };
+        }
+        assert_eq!((reg[0], reg[1]), (20, 10), "seq_pcopy must realize the parallel swap");
     }
 }
