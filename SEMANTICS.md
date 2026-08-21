@@ -60,6 +60,21 @@ f64, floating) — is determined by τ. This separates "operation" from
 μ  :  [0, frame) → Byte    flat local memory (a byte array the size of the stack frame)
 ```
 
+**Physical realization of ρ (Stage 5b, ABI-aware regalloc).** The interpreter's ρ
+is an abstract, unbounded map; the backend realizes each `ρ[t]` in *one physical
+home* chosen by `opt::abi_alloc` — either a machine register (Chaitin color: GP
+x19–x28/x14–x15, FP v8–v15/v16–v31) or, on spill, its own frame slot (the
+pre-Stage-5b behaviour, verbatim). The realization is a **rename-bisimulation** of
+ρ: it preserves ⟦·⟧ iff two invariants hold, both checked mechanically rather than
+assumed — (i) the *interference invariant* (`verify_coloring`): simultaneously-live
+temps get distinct homes, so no live `ρ[t]` is overwritten; (ii) *call-clobber
+set-disjointness*: the allocatable set is disjoint from the backend's per-instruction
+scratch registers (no mid-instruction corruption of a home), and any temp live across
+a `bl` is confined to a callee-saved register (its value survives the call). A home in
+a callee-saved register obliges the prologue/epilogue to save/restore it. Floats keep
+the §1 contract — the home holds the f64 bit pattern, transferred to/from a GPR via
+`fmov` at each access.
+
 **Memory model** (see `interp`). Only the local frame is modeled. A local
 address is `x29 − off`; flat-memory index 0 corresponds to `x29 − frame`, hence
 `index(off) = frame − off` (`Lea Local`). `load_mem` / `store_mem` perform

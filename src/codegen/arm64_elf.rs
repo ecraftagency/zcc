@@ -25,7 +25,26 @@
 // Labels: "L{n}" sequential; "LC{id}" case targets; "lg_{fn}.{name}" goto labels.
 use crate::ast::{Ast, GInit, SyncOp, Ty, TypeId, VOID};
 use crate::ir::{self, Callee, Inst, IrFunc, Op, Place, Term, Tmp, Un, Val};
+use crate::opt::{AbiHome, ClassBudget};
 use std::fmt::Write;
+
+// Stage 5b — AAPCS64 §6.1.1 register files partitioned for `opt::abi_alloc`. The
+// SPEC-TABLE side of the pass (the algorithm lives in opt.rs): a color index maps to a
+// physical register here. A color ≥ ncaller is callee-saved ⟹ obliges a prologue/
+// epilogue save/restore.
+//   GP: NO caller-saved register is free — the emitter's scratch set spans x0–x15 across
+//   BOTH arm64_elf.rs AND ext.rs (overflow_emit uses x14/x15), x16–x18 are ABI-reserved
+//   — so the GP pool is exactly the callee-saved file x19–x28 (ncaller=0). (Measured the
+//   hard way: pr64006 hung when x14/x15 were pooled — ext.rs was outside the first grep.)
+//   FP: caller-saved v16–v31 then callee-saved v8–v15 (only d8–d15 preserved across a bl).
+const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0 };
+const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16 };
+fn gp_phys(idx: u32) -> u32 {
+    19 + idx // x19–x28 (ncaller=0 ⟹ every GP color is callee-saved)
+}
+fn fp_phys(idx: u32) -> u32 {
+    if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
+}
 
 const EPILOGUE: &str = "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n";
 
@@ -54,6 +73,15 @@ struct Cg<'a> {
     // returns above the temp region and the next VLA's `sub sp` overwrites temps
     // (GCC PR43220). 0 in AST mode → untouched.
     ir_tspill: u32,
+    // Stage 5b — register allocation. `regalloc` gates it (on ⟺ the opt pipeline ran).
+    // `talloc[t]` = temp t's home: Some((is_fp, color)) in a physical register, or None
+    // = spill (its ir_toff slot — the pre-Stage-5b path). `csave_gp`/`csave_fp` = the
+    // distinct CALLEE-saved physical registers used → saved into a frame-bottom slab
+    // (the lowest bytes of the temp region, below the slots) and restored before each ret.
+    regalloc: bool,
+    talloc: Vec<AbiHome>,
+    csave_gp: Vec<u32>,
+    csave_fp: Vec<u32>,
 }
 
 
@@ -751,13 +779,48 @@ impl<'a> Cg<'a> {
     fn ir_toff(&self, i: Tmp) -> u32 {
         self.ir_tbase + 8 + i * 8
     }
+    // Stage 5b — a temp's home is a physical register (Chaitin color) or a spill slot.
+    // `reg` is always a 64-bit GPR (verified: every call site passes an x-form); an
+    // FP-homed temp holds the f64 bit pattern (SEMANTICS §1), moved via `fmov` GPR↔d-reg.
     fn tmp_load(&mut self, i: Tmp, reg: &str) {
-        self.lea_local("x9", self.ir_toff(i));
-        _ = writeln!(self.s, "\tldr {reg}, [x9]");
+        match self.talloc.get(i as usize).copied().flatten() {
+            Some((true, idx)) => _ = writeln!(self.s, "\tfmov {reg}, d{}", fp_phys(idx)),
+            Some((false, idx)) => _ = writeln!(self.s, "\tmov {reg}, x{}", gp_phys(idx)),
+            None => {
+                self.lea_local("x9", self.ir_toff(i));
+                _ = writeln!(self.s, "\tldr {reg}, [x9]");
+            }
+        }
     }
     fn tmp_store(&mut self, i: Tmp, reg: &str) {
-        self.lea_local("x9", self.ir_toff(i));
-        _ = writeln!(self.s, "\tstr {reg}, [x9]");
+        match self.talloc.get(i as usize).copied().flatten() {
+            Some((true, idx)) => _ = writeln!(self.s, "\tfmov d{}, {reg}", fp_phys(idx)),
+            Some((false, idx)) => _ = writeln!(self.s, "\tmov x{}, {reg}", gp_phys(idx)),
+            None => {
+                self.lea_local("x9", self.ir_toff(i));
+                _ = writeln!(self.s, "\tstr {reg}, [x9]");
+            }
+        }
+    }
+    // Save (`store=true`) or restore the callee-saved registers used by this function
+    // into/from the frame-bottom slab. x29-relative (stable under VLA sp movement); the
+    // slab occupies the lowest `ir_tspill` bytes, so `reset_sp_base` keeps it above sp.
+    fn save_callee(&mut self, store: bool) {
+        let (gp, fp) = (self.csave_gp.clone(), self.csave_fp.clone());
+        if gp.is_empty() && fp.is_empty() {
+            return;
+        }
+        self.lea_local("x9", self.ir_tbase + self.ir_tspill); // x9 = slab bottom (= sp at base)
+        let op = if store { "str" } else { "ldr" };
+        let mut j = 0u32;
+        for r in gp {
+            _ = writeln!(self.s, "\t{op} x{r}, [x9, #{}]", 8 * j);
+            j += 1;
+        }
+        for r in fp {
+            _ = writeln!(self.s, "\t{op} d{r}, [x9, #{}]", 8 * j);
+            j += 1;
+        }
     }
     fn ld_val(&mut self, v: Val, reg: &str) {
         match v {
@@ -1440,10 +1503,15 @@ impl<'a> Cg<'a> {
                     }
                     None => self.s += "\tmov x0, #0\n",
                 }
+                self.save_callee(false); // restore callee-saved regs before `mov sp,x29`
                 self.s += EPILOGUE;
             }
             // falling off the end of a function is not allowed: seal with a default (like the AST-path blanket)
-            Term::Unreachable => self.s += "\tmov x0, #0\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n",
+            Term::Unreachable => {
+                self.s += "\tmov x0, #0\n";
+                self.save_callee(false);
+                self.s += "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n";
+            }
         }
     }
 
@@ -1453,11 +1521,39 @@ impl<'a> Cg<'a> {
         // slots (emit_params, per ABI) → the body reads them via Var(off)→Load, needing NO param-temp.
         self.ir_tbase = irf.frame + if self.fvariadic { 192 } else { 0 };
         self.ir_temps = irf.temps.clone();
-        let tbytes = (irf.temps.len() as u32 * 8).next_multiple_of(16);
-        self.ir_tspill = tbytes; // reset_sp_base (VLA-dealloc) must also subtract this region
-        if tbytes > 0 {
-            self.sp_adjust("sub", tbytes);
+        // Stage 5b: assign each temp a home. regalloc off ⟹ all-spill = the memory model.
+        self.talloc = if self.regalloc {
+            crate::opt::abi_alloc(&self.a.tt, irf, &GP_BUDGET, &FP_BUDGET)
+        } else {
+            vec![None; irf.temps.len()]
+        };
+        // collect the distinct CALLEE-saved physical registers used (color ≥ ncaller)
+        self.csave_gp.clear();
+        self.csave_fp.clear();
+        for h in self.talloc.clone() {
+            match h {
+                Some((true, idx)) if idx >= FP_BUDGET.ncaller => {
+                    let r = fp_phys(idx);
+                    if !self.csave_fp.contains(&r) {
+                        self.csave_fp.push(r);
+                    }
+                }
+                Some((false, idx)) if idx >= GP_BUDGET.ncaller => {
+                    let r = gp_phys(idx);
+                    if !self.csave_gp.contains(&r) {
+                        self.csave_gp.push(r);
+                    }
+                }
+                _ => {}
+            }
         }
+        let tbytes = (irf.temps.len() as u32 * 8).next_multiple_of(16);
+        let csave = ((self.csave_gp.len() + self.csave_fp.len()) as u32 * 8).next_multiple_of(16);
+        self.ir_tspill = tbytes + csave; // reset_sp_base (VLA-dealloc) must also subtract this region
+        if self.ir_tspill > 0 {
+            self.sp_adjust("sub", self.ir_tspill);
+        }
+        self.save_callee(true); // spill callee-saved regs into the frame-bottom slab
         for (bi, blk) in irf.blocks.iter().enumerate() {
             _ = writeln!(self.s, "{}:", self.ir_label(bi as u32));
             // EXT(gcc): a C label at this block → emit `lg_fname.name:` for computed-goto
@@ -1493,7 +1589,8 @@ pub fn emit_ir(ast: &Ast) -> String {
     // ZCC_OPT=1 → the non-SSA pipeline (optimize); ZCC_OPT=ssa → the QBE-level SSA
     // pipeline (optimize_ssa: to_ssa ▸ sccp/gvn/… ▸ out_of_ssa), which returns φ-free IR
     // the naive-slot backend consumes unchanged (each SSA/edge temp gets its own slot).
-    if let Some(mode) = std::env::var("ZCC_OPT").ok().filter(|_| !ast.has_volatile) {
+    let opt_on = std::env::var("ZCC_OPT").ok().filter(|_| !ast.has_volatile);
+    if let Some(mode) = &opt_on {
         let ssa = mode == "ssa";
         for f in funcs.iter_mut() {
             if ssa {
@@ -1504,6 +1601,10 @@ pub fn emit_ir(ast: &Ast) -> String {
             debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
         }
     }
+    // Stage 5b — wire ABI-aware regalloc on the SAME gate as opt (φ-free, volatile-free
+    // IR). Off ⟹ the naive all-spill memory model (default -O0), unchanged. ZCC_NOREGALLOC
+    // is an A/B isolation knob (opt WITH vs WITHOUT register homes) for measurement.
+    let regalloc = opt_on.is_some() && std::env::var("ZCC_NOREGALLOC").is_err();
     let mut g = Cg {
         s: String::from(".cfi_sections .eh_frame\n.text\n"),
         a: ast,
@@ -1518,6 +1619,10 @@ pub fn emit_ir(ast: &Ast) -> String {
         ir_tbase: 0,
         ir_temps: Vec::new(),
         ir_tspill: 0,
+        regalloc,
+        talloc: Vec::new(),
+        csave_gp: Vec::new(),
+        csave_fp: Vec::new(),
     };
     for a in &ast.raw_asm {
         g.s += a;

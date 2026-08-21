@@ -609,6 +609,204 @@ pub fn verify_coloring(adj: &[HashSet<Tmp>], al: &Alloc) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Stage 5b — ABI-AWARE register allocation (the backend consumes this coloring).
+//
+// Extends the interference-invariant bisimulation above with the ABI (THEORY §A7,
+// §D2). A machine register belongs to one of two ABI classes (AAPCS64 §6.1.1): a
+// CALLER-saved register is clobbered by every `bl`; a CALLEE-saved register is
+// preserved across it. Hence the extra proof obligation over `verify_coloring`:
+//   CALL-CLOBBER SET-DISJOINTNESS — a temp whose value is LIVE ACROSS a call must
+//   receive a callee-saved color, else the `bl` overwrites it (⟦·⟧ broken).
+// We model this by RESTRICTING such a temp's select-range to the callee-saved colors.
+// Colors within a class are ordered [caller … | callee …]; `ncaller` marks the split.
+// A non-crossing temp prefers the low (caller) colors (a callee-saved home costs a
+// prologue save/restore); a crossing temp is confined to [ncaller, k).
+pub struct ClassBudget {
+    pub k: u32,       // total colors in the class
+    pub ncaller: u32, // colors [0,ncaller) are caller-saved; [ncaller,k) callee-saved
+}
+
+/// Chaitin simplify/select over ONE register class (`in_class` selects its temps;
+/// interference edges to out-of-class temps are ignored — the two files are disjoint).
+/// A `crossing` temp may only take a callee-saved color. Result: per-temp color, None = spill.
+pub fn color_abi(
+    adj: &[HashSet<Tmp>],
+    in_class: &[bool],
+    b: &ClassBudget,
+    crossing: &[bool],
+) -> Vec<Option<u32>> {
+    let nt = adj.len();
+    let k = b.k as usize;
+    // class-local degree: count only in-class, not-yet-removed neighbors
+    let mut degree: Vec<usize> = (0..nt)
+        .map(|v| {
+            if in_class[v] {
+                adj[v].iter().filter(|&&u| in_class[u as usize]).count()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let mut removed = vec![false; nt];
+    let mut stack: Vec<Tmp> = Vec::new();
+    for _ in 0..nt {
+        // SIMPLIFY: prefer a class-degree<k node (certainly colorable); else max-degree (potential spill)
+        let low = (0..nt).find(|&v| in_class[v] && !removed[v] && degree[v] < k);
+        let v = match low.or_else(|| {
+            (0..nt)
+                .filter(|&v| in_class[v] && !removed[v])
+                .max_by_key(|&v| degree[v])
+        }) {
+            Some(v) => v,
+            None => break,
+        };
+        removed[v] = true;
+        stack.push(v as u32);
+        for &nb in &adj[v] {
+            if in_class[nb as usize] && !removed[nb as usize] {
+                degree[nb as usize] -= 1;
+            }
+        }
+    }
+    // SELECT: smallest free color in the temp's allowed range; out of range → spill.
+    let mut colr = vec![None; nt];
+    while let Some(v) = stack.pop() {
+        let mut used = vec![false; k];
+        for &nb in &adj[v as usize] {
+            if in_class[nb as usize]
+                && let Some(c) = colr[nb as usize]
+            {
+                used[c as usize] = true;
+            }
+        }
+        let lo = if crossing[v as usize] { b.ncaller } else { 0 };
+        colr[v as usize] = (lo..b.k).find(|&c| !used[c as usize]);
+    }
+    colr
+}
+
+/// A temp's HOME after ABI allocation: (is_fp, color-within-class), or None = spill (memory slot).
+pub type AbiHome = Option<(bool, u32)>;
+
+/// Stage 5b entry — partition temps by ABI file (GP int/ptr vs FP float), color each
+/// against its budget, confining call-crossing temps to callee-saved. Falls back to
+/// ALL-SPILL for a function containing inline asm (`Inst::Asm`): its operand pool grows
+/// over x9../v16.. without bound and can clobber ANY allocatable register, defeating the
+/// disjointness invariant — so no home is safe (the pre-Stage-5b memory model, verbatim).
+pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget) -> Vec<AbiHome> {
+    let nt = f.temps.len();
+    let mut home: Vec<AbiHome> = vec![None; nt];
+    if f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Asm(..))) {
+        return home; // conservative all-spill
+    }
+    let lv = liveness(f);
+    let adj = interference(f, &lv);
+    // crossing[t]: t ∈ live-out(call) \ {def(call)} for some call ⟹ its value must survive the bl.
+    let mut crossing = vec![false; nt];
+    let mut buf = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let mut live = lv.live_out[bi].clone();
+        buf.clear();
+        term_uses(&b.term, &mut buf);
+        for &u in &buf {
+            live[u as usize] = true;
+        }
+        for i in b.insts.iter().rev() {
+            // `live` == live-OUT(i) at this point (before the backward transfer)
+            if matches!(i, Inst::Call(..) | Inst::CallX(..)) {
+                let d = inst_def(i);
+                for (t, &alive) in live.iter().enumerate() {
+                    if alive && Some(t as u32) != d {
+                        crossing[t] = true;
+                    }
+                }
+            }
+            if let Some(d) = inst_def(i) {
+                live[d as usize] = false;
+            }
+            buf.clear();
+            inst_uses(i, &mut buf);
+            for &u in &buf {
+                live[u as usize] = true;
+            }
+        }
+    }
+    let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
+    let gp_in: Vec<bool> = is_fp.iter().map(|&b| !b).collect();
+    let gc = color_abi(&adj, &gp_in, gp, &crossing);
+    let fc = color_abi(&adj, &is_fp, fp, &crossing);
+    for t in 0..nt {
+        home[t] = if is_fp[t] { fc[t] } else { gc[t] }.map(|c| (is_fp[t], c));
+    }
+    home
+}
+
+/// Mechanically CHECK the Stage-5b obligations (the P-verify): (1) the interference
+/// invariant per class — two same-class simultaneously-live temps get distinct homes;
+/// (2) call-clobber — no call-crossing temp received a caller-saved color.
+pub fn verify_abi(
+    tt: &TyTab,
+    f: &IrFunc,
+    home: &[AbiHome],
+    gp: &ClassBudget,
+    fp: &ClassBudget,
+) -> Result<(), String> {
+    let lv = liveness(f);
+    let adj = interference(f, &lv);
+    for u in 0..adj.len() {
+        if let Some((fu, cu)) = home[u] {
+            for &v in &adj[u] {
+                if let Some((fv, cv)) = home[v as usize]
+                    && fu == fv
+                    && cu == cv
+                {
+                    return Err(format!("interference (t{u},t{v}) share {}-reg {cu}", if fu { "fp" } else { "gp" }));
+                }
+            }
+        }
+    }
+    // recompute crossing and check no caller-saved home for a crossing temp
+    let mut crossing = vec![false; f.temps.len()];
+    let mut buf = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let mut live = lv.live_out[bi].clone();
+        buf.clear();
+        term_uses(&b.term, &mut buf);
+        for &x in &buf {
+            live[x as usize] = true;
+        }
+        for i in b.insts.iter().rev() {
+            if matches!(i, Inst::Call(..) | Inst::CallX(..)) {
+                let d = inst_def(i);
+                for (t, &al) in live.iter().enumerate() {
+                    if al && Some(t as u32) != d {
+                        crossing[t] = true;
+                    }
+                }
+            }
+            if let Some(d) = inst_def(i) {
+                live[d as usize] = false;
+            }
+            buf.clear();
+            inst_uses(i, &mut buf);
+            for &x in &buf {
+                live[x as usize] = true;
+            }
+        }
+    }
+    let _ = tt;
+    for (t, &h) in home.iter().enumerate() {
+        if let Some((is_fp, c)) = h {
+            let ncaller = if is_fp { fp.ncaller } else { gp.ncaller };
+            if crossing[t] && c < ncaller {
+                return Err(format!("call-crossing t{t} got caller-saved {}-color {c}", if is_fp { "fp" } else { "gp" }));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ORCHESTRATOR — the IR→IR pipeline (passes 1-4) run to a FIXPOINT. Each pass
 // preserves ⟦·⟧ (proved individually), so their composition preserves ⟦·⟧ too (closed
 // under composition). Iterate because one pass opens opportunities for another
@@ -1820,6 +2018,68 @@ mod tests {
         let al = color(&adj, 1);
         assert!(!al.spilled.is_empty(), "K=1 must force a spill of ≥1 temp");
         verify_coloring(&adj, &al).expect("the coloring (with a spill) must still be valid");
+    }
+
+    // Stage 5b — the ABI budgets the backend uses (arm64_elf.rs): GP = 10 callee-saved
+    // (x19–x28), NO caller-saved (the emitter's scratch spans x0–x15); FP = 16 caller
+    // (v16–v31) ⊕ 8 callee (v8–v15).
+    fn gp_budget() -> ClassBudget {
+        ClassBudget { k: 10, ncaller: 0 }
+    }
+    fn fp_budget() -> ClassBudget {
+        ClassBudget { k: 24, ncaller: 16 }
+    }
+
+    // ABI allocation VALIDATES over a corpus mixing calls (crossing temps) and floats:
+    // both Stage-5b obligations (interference invariant + call-clobber) hold.
+    #[test]
+    fn abi_alloc_valid() {
+        for (nm, src) in [
+            ("a", "int g(int a,int b){int c=a+b;int d=c*a;int e=d-b;return c+d+e;}"),
+            ("call", "int h(int);int f(int a){int x=a*a;int y=a+7;return h(a)+x-y;}"),
+            ("flt", "double f(double a,double b){double c=a*b;double d=c+a;return d-b;}"),
+            ("loop", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1)s=s+i*i;return s;}"),
+        ] {
+            let (ast, ir) = compile(nm, src);
+            for f in &ir {
+                let home = abi_alloc(&ast.tt, f, &gp_budget(), &fp_budget());
+                verify_abi(&ast.tt, f, &home, &gp_budget(), &fp_budget())
+                    .unwrap_or_else(|e| panic!("{nm}/{}: {e}", f.name));
+            }
+        }
+    }
+
+    // TEETH for call-clobber: with ZERO callee-saved colors (k==ncaller), a value LIVE
+    // ACROSS a call has no legal register → it MUST spill, never silently occupy a
+    // caller-saved reg the `bl` would clobber. Proves the restriction actually bites.
+    #[test]
+    fn abi_alloc_no_clobber() {
+        let gp = ClassBudget { k: 2, ncaller: 2 }; // all caller-saved, no callee-saved
+        let fp = ClassBudget { k: 16, ncaller: 16 };
+        let (ast, ir) = compile("x", "int h(int);int f(int a){int x=a*a;return h(a)+x;}");
+        let f = ir.iter().find(|f| f.name == "f").unwrap();
+        let home = abi_alloc(&ast.tt, f, &gp, &fp);
+        verify_abi(&ast.tt, f, &home, &gp, &fp).expect("no-callee budget must still verify (via spills)");
+        assert!(
+            home.iter().any(|h| h.is_none()),
+            "a call-crossing temp must SPILL when no callee-saved register exists"
+        );
+    }
+
+    // asm ⟹ conservative all-spill: its operand pool (x9../v16..) can clobber any
+    // allocatable register, so no register home is safe — regalloc disables per function.
+    #[test]
+    fn abi_alloc_asm_all_spill() {
+        let (ast, ir) = compile(
+            "s",
+            "int f(int a){int b=0; __asm__(\"lsl %w0, %w1, #1\" : \"=r\"(b) : \"r\"(a)); return b;}",
+        );
+        let f = ir.iter().find(|f| f.name == "f").unwrap();
+        let home = abi_alloc(&ast.tt, f, &gp_budget(), &fp_budget());
+        assert!(
+            home.iter().all(|h| h.is_none()),
+            "a function containing inline asm must fall back to all-spill"
+        );
     }
 
     fn count_insts(ir: &[IrFunc]) -> usize {
