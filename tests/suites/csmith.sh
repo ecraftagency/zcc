@@ -5,7 +5,7 @@
 # the box). For each .c pre-cached at /suites/csmith/*.c:
 #   gcc  compile+run  → reference checksum (if gcc fails/timeouts → SKIP: junk sample)
 #   zcc  compile      → COMPILE-FAIL = NOT-IMPL (named, out of scope — completeness)
-#   zcc  run (noopt)  + zcc ZCC_OPT=1 run  → compare stdout against gcc
+#   zcc  run (-O0, ZCC_O0=1)  + zcc default-opt run  → compare stdout against gcc
 # PARITY = gcc==zcc==zcc-opt (checksum strings match). DIVERGE = compiles+runs but
 # DIFFERS from gcc ⟹ MISCOMPILE (0 DIVERGE is the invariant; printed for diagnosis by
 # decomposition). Being UB-free, "diff at UB" CANNOT be invoked — every DIVERGE is a
@@ -33,13 +33,13 @@ work='
   timeout 15 "$d/g" > "$d/go" 2>&1; grc=$?
   # gcc did not COMPLETE normally (124=timeout, >127=signal) → junk reference → SKIP
   { [ "$grc" = 124 ] || [ "$grc" -gt 127 ]; } && { printf "SKIP\t%s\t0\tgcc-run\n" "$b"; exit 0; }
-  # zcc noopt — compile-fail = NOT-IMPL (completeness gap, named)
-  if ! "$ZCC" -I"$INC" "$f" -o "$d/z" 2>"$d/ze"; then
+  # zcc -O0 (optimizer off) — compile-fail = NOT-IMPL (completeness gap, named)
+  if ! ZCC_O0=1 "$ZCC" -I"$INC" "$f" -o "$d/z" 2>"$d/ze"; then
       printf "NOTIMPL\t%s\t0\t%s\n" "$b" "$(head -1 "$d/ze" | cut -c1-40)"; exit 0; fi
   bytes=$(wc -c < "$d/z")
   timeout 60 "$d/z" > "$d/zo" 2>&1; zrc=$?
-  # zcc opt
-  if ! ZCC_OPT=1 "$ZCC" -I"$INC" "$f" -o "$d/zp" 2>/dev/null; then
+  # zcc default optimizer (SSA + regalloc, no env)
+  if ! "$ZCC" -I"$INC" "$f" -o "$d/zp" 2>/dev/null; then
       printf "DIVERGE\t%s\t%s\tOPT-COMPILE-FAIL\n" "$b" "$bytes"; exit 0; fi
   timeout 60 "$d/zp" > "$d/zpo" 2>&1; prc=$?
   # zcc did not COMPLETE (124=timeout, >127=signal) → NOT a checksum divergence.

@@ -1580,31 +1580,25 @@ impl<'a> Cg<'a> {
 /// full suite/csmith/musl; the AST-walk emit() has been removed. The backend simulates per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
     let mut funcs = ir::lower(ast);
-    // Optimization pass pipeline (const-fold→copy-prop→CSE→DCE to a fixpoint). Each pass
-    // is proven ⟦·⟧-preserving at the IR→IR level (opt.rs::tests, commuting-square equivalence).
-    // Gated by ZCC_OPT for A/B testing in the box before being enabled by default (measure
-    // before asserting; verify rejects broken IR). has_volatile disables opt: the IR does not
-    // model volatile (6.7.3), so ⟦·⟧-preservation is proven only for volatile-free input — opt
-    // runs WITHIN the preserved theorem fragment.
-    // ZCC_OPT=1 → the non-SSA pipeline (optimize); ZCC_OPT=ssa → the QBE-level SSA
-    // pipeline (optimize_ssa: to_ssa ▸ sccp/gvn/… ▸ out_of_ssa), which returns φ-free IR
-    // the naive-slot backend consumes unchanged (each SSA/edge temp gets its own slot).
-    let opt_on = std::env::var("ZCC_OPT").ok().filter(|_| !ast.has_volatile);
-    if let Some(mode) = &opt_on {
-        let ssa = mode == "ssa";
+    // Optimization is DEFAULT-ON on this branch (the ssa-qbe fork IS the optimizing
+    // compiler): optimize_ssa = to_ssa ▸ sccp/gvn/const-fold/copy-prop/cse/dce ▸ out_of_ssa,
+    // returning φ-free IR the naive-slot backend consumes unchanged. Every pass is proven
+    // ⟦·⟧-preserving (opt.rs::tests, commuting-square); verify rejects broken IR.
+    // Two guards, both MANDATORY (not A/B scaffolding):
+    //   (1) has_volatile — the IR does not model volatile (6.7.3), so ⟦·⟧-preservation is
+    //       proven only for volatile-free input; a volatile function keeps the naive -O0 path.
+    //   (2) ZCC_O0 — the -O0 escape (debug + the bench baseline), the sole knob that turns
+    //       the optimizer off. Default (unset) = full SSA optimization + regalloc.
+    let opt_on = !ast.has_volatile && std::env::var("ZCC_O0").is_err();
+    if opt_on {
         for f in funcs.iter_mut() {
-            if ssa {
-                crate::opt::optimize_ssa(&ast.tt, f);
-            } else {
-                crate::opt::optimize(&ast.tt, f);
-            }
+            crate::opt::optimize_ssa(&ast.tt, f);
             debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
         }
     }
-    // Stage 5b — wire ABI-aware regalloc on the SAME gate as opt (φ-free, volatile-free
-    // IR). Off ⟹ the naive all-spill memory model (default -O0), unchanged. ZCC_NOREGALLOC
-    // is an A/B isolation knob (opt WITH vs WITHOUT register homes) for measurement.
-    let regalloc = opt_on.is_some() && std::env::var("ZCC_NOREGALLOC").is_err();
+    // Stage 5b — ABI-aware regalloc runs whenever opt runs (φ-free, volatile-free IR);
+    // off ⟹ the naive all-spill memory model (the -O0 baseline).
+    let regalloc = opt_on;
     let mut g = Cg {
         s: String::from(".cfi_sections .eh_frame\n.text\n"),
         a: ast,

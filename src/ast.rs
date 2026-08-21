@@ -382,8 +382,8 @@ pub struct Ast {
     pub weak_decls: Vec<String>,
     // C99 6.7.3: the TU contains volatile. The IR does not model volatile (the
     // qualifier is dropped), so ⟦·⟧-preservation of the opt pass is only proven
-    // for volatile-free input → the ZCC_OPT gate disables opt when this flag is
-    // set (opt then runs WITHIN the fragment the theorem covers). Sound by
+    // for volatile-free input → this flag disables the (default-on) optimizer, so
+    // a volatile function runs WITHIN the fragment the theorem covers. Sound by
     // construction.
     pub has_volatile: bool,
 }

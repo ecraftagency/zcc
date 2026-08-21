@@ -16,7 +16,9 @@
 set -u
 export ZCC="${ZCC:-/usr/local/bin/zcc}"
 DIR="$(dirname "$0")"
-OPT="${ZCC_BENCH_OPT:-ssa}"          # ssa | 1 | 0  (which zcc pipeline to time)
+# zcc optimization is DEFAULT-ON (SSA + Stage-5b regalloc). BENCH_O0=1 times the -O0
+# baseline instead (ZCC_O0 disables the optimizer) — the A/B "what did opt buy" run.
+Z0="${BENCH_O0:+ZCC_O0=1}"; LBL="$([ -n "${BENCH_O0:-}" ] && echo O0 || echo ssa+ra)"
 
 ns() { date +%s%N; }
 best3() {                             # $1 = binary → echoes min ns of 3 runs
@@ -34,7 +36,7 @@ for c in "$DIR"/*.c; do
     b=$(basename "$c" .c)
     d=$(mktemp -d)
     gcc -O0 -w "$c" -o "$d/g" 2>/dev/null || { printf '%-10s gcc-compile-FAIL\n' "$b"; rm -rf "$d"; continue; }
-    if ! ZCC_OPT="$OPT" "$ZCC" "$c" -o "$d/z" 2>"$d/ze"; then
+    if ! env $Z0 "$ZCC" "$c" -o "$d/z" 2>"$d/ze"; then
         printf '%-10s zcc-compile-FAIL: %s\n' "$b" "$(head -1 "$d/ze")"; rm -rf "$d"; continue; fi
     # CORRECTNESS GATE — identical stdout, else abort this case (miscompile, not a timing)
     "$d/g" >"$d/go" 2>&1; "$d/z" >"$d/zo" 2>&1
@@ -48,4 +50,4 @@ for c in "$DIR"/*.c; do
     prod=$(awk "BEGIN{print $prod * $zt/$gt}"); n=$((n + 1))
     rm -rf "$d"
 done
-[ "$n" -gt 0 ] && awk "BEGIN{printf \"GEOMEAN zcc/gcc-O0 (opt=$OPT, n=$n): %.2fx\n\", exp(log($prod)/$n)}"
+[ "$n" -gt 0 ] && awk "BEGIN{printf \"GEOMEAN zcc/gcc-O0 (zcc=$LBL, n=$n): %.2fx\n\", exp(log($prod)/$n)}"
