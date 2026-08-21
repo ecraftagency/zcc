@@ -321,8 +321,15 @@ pub fn cse(f: &mut IrFunc) -> u32 {
         // loads: khoá (địa-chỉ-enc, ty). Xoá sạch tại mọi ghi-mem.
         let mut loads: HashMap<((u8, i64), u32), Tmp> = HashMap::new();
         for i in b.insts.iter_mut() {
-            if matches!(i, Inst::Store(..) | Inst::Memcpy(..) | Inst::Call(..) | Inst::CallX(..) | Inst::Sync(..) | Inst::Asm(..)) {
-                loads.clear(); // memory-kill bảo thủ
+            // memory-kill BY-CONSTRUCTION: giữ load-cache CHỈ qua inst chứng-minh-KHÔNG-
+            // ghi-mem; mọi thứ khác xoá. Đảo allowlist-writer cũ (correct-by-vigilance:
+            // sót Overflow/Zero/VaStart/VaArg — đều ghi mem → dùng lại load cũ = miscompile
+            // pr84169). Inst exotic mới mặc định kill → an toàn, không âm thầm giữ load.
+            if !matches!(i,
+                Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Load(..) | Inst::Lea(..)
+                | Inst::Cast(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) | Inst::VaArea(..)
+            ) {
+                loads.clear(); // ghi-mem (hoặc không rõ) → memory-kill bảo thủ
             }
             let repl: Option<Inst> = match i {
                 Inst::Bin(d, op, ty, a, bb) => {

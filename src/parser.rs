@@ -126,6 +126,7 @@ struct P<'a> {
     attr_weak: bool,            // EXT(gcc): __attribute__((weak)) (musl)
     attr_transp: bool,          // EXT(gcc): transparent_union (glibc sockaddr arg)
     attr_alias: Option<String>, // EXT(gcc): __attribute__((alias("sym"))) (musl weak_alias)
+    attr_mode: Option<(u32, bool)>, // EXT(gcc): mode(M) → (width-byte, is_float); remap type
     raw_asm: Vec<String>,       // EXT(gcc): __asm__("...") cấp toàn cục (musl crt)
     aliases: Vec<(String, String, bool)>, // (mới, cũ, weak)
     // EXT(gcc): prototype mang weak (musl `extern weak hidden _DYNAMIC[]`) —
@@ -419,6 +420,7 @@ impl P<'_> {
         self.attr_weak = false;
         self.attr_transp = false;
         self.attr_alias = None;
+        self.attr_mode = None;
         let mut storage = Storage::None;
         let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
         let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
@@ -562,6 +564,7 @@ impl P<'_> {
                 }
             }
         };
+        let t = self.apply_mode(t)?; // EXT(gcc): mode(M) ở specifier-position
         if cplx {
             // C99 6.2.5: complex CHỈ float/double/long double. `_Complex int/long/
             // char/unsigned…` = complex SỐ NGUYÊN (GNU ext, ngoài C99) → reject SẠCH
@@ -900,6 +903,7 @@ impl P<'_> {
                 t = self.tt.add(Ty::Struct(self.tt.structs.len() as u32 - 1));
             }
         }
+        t = self.apply_mode(t)?; // EXT(gcc): mode(M) trailing (glibc register_t)
         // EXT(gcc): transparent_union — call truyền arg theo ABI của member ĐẦU
         // (gcc doc). Trong scope chỉ gặp ở PROTOTYPE glibc (bind/connect… dưới
         // _GNU_SOURCE), không ai định nghĩa hàm nhận nó → thay thẳng type =
@@ -940,6 +944,32 @@ impl P<'_> {
     }
     // nuốt __attribute__((...)) / __asm__("..") — extension, không ảnh hưởng ngữ nghĩa
     // nuốt __attribute__/__asm__; hiểu packed + aligned(n)
+    // EXT(gcc): áp mode(M) đã ghi ở attr_mode — remap t sang kiểu vô hạng width M,
+    // giữ signedness/floatness (int mode(word)→long; unsigned int mode(QI)→uchar).
+    // Bảng width Vế-II (gcc machmode.def). No-op nếu không có mode.
+    fn apply_mode(&mut self, t: TypeId) -> Result<TypeId, String> {
+        let (w, is_f) = match self.attr_mode.take() {
+            Some(m) => m,
+            None => return Ok(t),
+        };
+        Ok(if is_f || self.tt.is_float(t) {
+            match w {
+                4 => FLOAT,
+                8 => DOUBLE,
+                16 => LDOUBLE,
+                _ => return Err(format!("mode float width {w} chưa hỗ trợ")),
+            }
+        } else {
+            let uns = self.tt.is_unsigned(t);
+            match w {
+                1 => if uns { UCHAR } else { CHAR },
+                2 => if uns { USHORT } else { SHORT },
+                4 => if uns { UINT } else { INT },
+                8 => if uns { ULONG } else { LONG },
+                _ => return Err(format!("mode int width {w} chưa hỗ trợ")),
+            }
+        })
+    }
     fn skip_attrs(&mut self) -> Result<(bool, Option<u32>), String> {
         let (mut packed, mut aligned) = (false, None);
         loop {
@@ -970,6 +1000,28 @@ impl P<'_> {
                                 "__attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ"
                                     .into(),
                             );
+                        }
+                        // EXT(gcc): mode(M) ép width kiểu theo machine-mode (gcc
+                        // machmode.def). glibc `register_t __mode__(word)` + int8_t họ.
+                        // Nuốt im = giữ width khai báo → sizeof sai (đo: mode(QI) 1→4).
+                        // Bảng width Vế-II; remap giữ signedness ở decl_specs.
+                        "mode" | "__mode__" => {
+                            self.expect(Tok::Punct("("))?;
+                            let m = self.ident()?;
+                            self.expect(Tok::Punct(")"))?;
+                            self.attr_mode = Some(match m.trim_matches('_') {
+                                "QI" | "byte" => (1, false),
+                                "HI" => (2, false),
+                                "SI" => (4, false),
+                                "DI" | "word" | "pointer" | "Pmode" => (8, false),
+                                "SF" => (4, true),
+                                "DF" => (8, true),
+                                "TF" => (16, true),
+                                // TI(int128)/XF(x87-80b)/vector: không kiểu zcc → reject SẠCH
+                                _ => return Err(format!(
+                                    "__attribute__((mode({m}))): machine-mode chưa hỗ trợ"
+                                )),
+                            });
                         }
                         // EXT(gcc): weak/alias — bộ xương weak_alias() của musl
                         "weak" | "__weak__" => self.attr_weak = true,
@@ -4041,6 +4093,7 @@ pub fn parse(
         renames: HashMap::new(),
         fname: String::new(),
         attr_weak: false,
+        attr_mode: None,
         attr_transp: false,
         attr_alias: None,
         raw_asm: Vec::new(),
@@ -4156,6 +4209,11 @@ pub fn parse(
         aliases: p.aliases,
         pic: false,
         weak_decls: p.weak_decls,
+        // C99 6.7.3: quét 1 lần — bất kỳ token volatile nào ⟹ khoá opt (sound-by-
+        // construction: IR không mang volatile nên chỉ opt mảnh volatile-free).
+        has_volatile: p.toks.iter().any(|t| {
+            matches!(t, Tok::Ident(n) if matches!(n.as_str(), "volatile" | "__volatile" | "__volatile__"))
+        }),
     })
 }
 

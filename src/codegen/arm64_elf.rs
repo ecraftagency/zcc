@@ -1477,7 +1477,9 @@ pub fn emit_ir(ast: &Ast) -> String {
     // Pipeline pass tối ưu (const-fold→copy-prop→CSE→DCE tới fixpoint). Mỗi pass đã
     // chứng bảo-toàn-⟦·⟧ ở IR→IR (opt.rs::tests, equiv commuting-square). Gate ZCC_OPT
     // để A/B trong box trước khi bật mặc định (đo-trước-khi-tuyên; verify chặn IR hỏng).
-    if std::env::var_os("ZCC_OPT").is_some() {
+    // has_volatile khoá opt: IR không mô hình volatile (6.7.3) nên ⟦·⟧-preservation
+    // chỉ chứng cho input volatile-free — opt chạy TRONG mảnh định lý giữ.
+    if std::env::var_os("ZCC_OPT").is_some() && !ast.has_volatile {
         for f in funcs.iter_mut() {
             crate::opt::optimize(&ast.tt, f);
             debug_assert!(ir::verify(f).is_ok(), "opt sinh IR hỏng: {}", f.name);

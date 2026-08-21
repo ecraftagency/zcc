@@ -364,4 +364,8 @@ pub struct Ast {
     pub pic: bool,
     // EXT(gcc): prototype/extern mang weak — TU phát .weak để undef ref là weak
     pub weak_decls: Vec<String>,
+    // C99 6.7.3: TU có volatile. IR không mô hình volatile (qualifier bị nuốt) nên
+    // ⟦·⟧-preservation của opt-pass chỉ chứng cho input volatile-free → gate ZCC_OPT
+    // bỏ opt khi cờ này bật (opt chạy TRONG mảnh định lý giữ). Sound-by-construction.
+    pub has_volatile: bool,
 }
