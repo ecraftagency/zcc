@@ -448,10 +448,17 @@ impl Cg<'_> {
         self.lea_local("x9", off);
         _ = writeln!(self.s, "\tmov sp, x9");
     }
-    // Re-canonicalize x0 per type (after a 32-bit op / narrowing)
+    // Re-canonicalize x0 per type (after a 32-bit op / narrowing). Funnel default.
     fn ext(&mut self, t: TypeId) {
+        self.ext_r(0, t);
+    }
+    // Register-parametric re-canonicalization: x{r} = canon(x{r}) per the declared width
+    // read from TyTab. r=0 is the x0-funnel default; the compute-into-home path (Tier-1 #1)
+    // passes the destination's HOME register so the extension lands in place, no x0 detour.
+    // Byte-identical to the old `ext` when r=0 (verified: same mnemonics, same order).
+    fn ext_r(&mut self, r: u32, t: TypeId) {
         if matches!(self.a.tt.tys[t as usize], Ty::Bool) {
-            self.s += "\tcmp x0, #0\n\tcset x0, ne\n";
+            _ = writeln!(self.s, "\tcmp x{r}, #0\n\tcset x{r}, ne");
             return;
         }
         // Bitfield: truncate to w bits per the base's signedness — the value of (l.m = v)
@@ -463,17 +470,17 @@ impl Cg<'_> {
             } else {
                 "asr"
             };
-            _ = writeln!(self.s, "\tlsl x0, x0, #{sh}\n\t{op} x0, x0, #{sh}");
+            _ = writeln!(self.s, "\tlsl x{r}, x{r}, #{sh}\n\t{op} x{r}, x{r}, #{sh}");
             return;
         }
         let u = self.a.tt.is_unsigned(t);
-        self.s += match (self.a.tt.size(t), u) {
-            (1, false) => "\tsxtb x0, w0\n",
-            (1, true) => "\tuxtb w0, w0\n", // writing w → the upper 32 bits are auto-zeroed
-            (2, false) => "\tsxth x0, w0\n",
-            (2, true) => "\tuxth w0, w0\n",
-            (4, false) => "\tsxtw x0, w0\n",
-            (4, true) => "\tmov w0, w0\n",
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tsxtb x{r}, w{r}"),
+            (1, true) => writeln!(self.s, "\tuxtb w{r}, w{r}"), // writing w → upper 32 bits auto-zeroed
+            (2, false) => writeln!(self.s, "\tsxth x{r}, w{r}"),
+            (2, true) => writeln!(self.s, "\tuxth w{r}, w{r}"),
+            (4, false) => writeln!(self.s, "\tsxtw x{r}, w{r}"),
+            (4, true) => writeln!(self.s, "\tmov w{r}, w{r}"),
             _ => return,
         };
     }
@@ -830,6 +837,26 @@ impl<'a> Cg<'a> {
             Val::FImm(b) => self.imm(reg, b as i64), // f64 bit pattern in a GPR
         }
     }
+    // Tier-1 #1 (compute-into-home) source resolution: the GP register that already HOLDS
+    // integer value `v`. A GP-homed temp is read from its home directly (no x0 funnel);
+    // anything else (spilled temp / immediate) is materialized into `scratch` and returned.
+    // Only ever called on the integer Bin/Un path ⟹ v is an integer value, never FP-homed.
+    fn src_gp(&mut self, v: Val, scratch: u32) -> u32 {
+        if let Val::Tmp(t) = v {
+            if let Some((false, idx)) = self.talloc.get(t as usize).copied().flatten() {
+                return gp_phys(idx);
+            }
+        }
+        self.ld_val(v, &format!("x{scratch}"));
+        scratch
+    }
+    // The GP home register of temp `d` if it is GP-register-resident, else None (spilled).
+    fn gp_home(&self, d: Tmp) -> Option<u32> {
+        match self.talloc.get(d as usize).copied().flatten() {
+            Some((false, idx)) => Some(gp_phys(idx)),
+            _ => None,
+        }
+    }
     fn ir_label(&self, b: u32) -> String {
         format!(".Lir_{}_{}", self.fname, b)
     }
@@ -916,6 +943,52 @@ impl<'a> Cg<'a> {
         }
         if self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4 {
             self.ext(ct);
+        }
+    }
+
+    // Tier-1 #1 — compute-into-home: x{rd} = x{ra} ⟨op⟩ x{rb}, canonical per ct, with NO
+    // x0/x1 funnel. A register-parametric transcription of the integer arm of ir_bin: for
+    // rd=ra=0,rb=1 it emits BYTE-IDENTICAL asm to `ir_bin` (the x0-funnel), so the -O0 path
+    // (all temps spilled ⟹ rd=ra=0,rb=1) is unchanged; only the register-resident path skips
+    // the copies. Correctness = ir_bin's (same mnemonic per Op); validated by opt-parity.
+    // x2 is a fixed scratch for rem's quotient (never a home: homes are x19–x28); msub reads
+    // all sources before writing rd, so rd may alias ra/rb (the allocator only coalesces when
+    // the aliased source is dead here). No ext on the compare path (cset yields a clean 0/1).
+    fn ir_bin_r(&mut self, op: Op, ct: TypeId, rd: u32, ra: u32, rb: u32) {
+        let u = self.a.tt.is_unsigned(ct);
+        match op {
+            Op::Add => _ = writeln!(self.s, "\tadd x{rd}, x{ra}, x{rb}"),
+            Op::Sub => _ = writeln!(self.s, "\tsub x{rd}, x{ra}, x{rb}"),
+            Op::Mul => _ = writeln!(self.s, "\tmul x{rd}, x{ra}, x{rb}"),
+            Op::Div if u => _ = writeln!(self.s, "\tudiv x{rd}, x{ra}, x{rb}"),
+            Op::Div => _ = writeln!(self.s, "\tsdiv x{rd}, x{ra}, x{rb}"),
+            Op::Rem if u => {
+                _ = writeln!(self.s, "\tudiv x2, x{ra}, x{rb}\n\tmsub x{rd}, x2, x{rb}, x{ra}")
+            }
+            Op::Rem => {
+                _ = writeln!(self.s, "\tsdiv x2, x{ra}, x{rb}\n\tmsub x{rd}, x2, x{rb}, x{ra}")
+            }
+            Op::And => _ = writeln!(self.s, "\tand x{rd}, x{ra}, x{rb}"),
+            Op::Or => _ = writeln!(self.s, "\torr x{rd}, x{ra}, x{rb}"),
+            Op::Xor => _ = writeln!(self.s, "\teor x{rd}, x{ra}, x{rb}"),
+            Op::Shl => _ = writeln!(self.s, "\tlsl x{rd}, x{ra}, x{rb}"),
+            Op::Shr if u => _ = writeln!(self.s, "\tlsr x{rd}, x{ra}, x{rb}"),
+            Op::Shr => _ = writeln!(self.s, "\tasr x{rd}, x{ra}, x{rb}"),
+            _ => {
+                let cond = match (op, u) {
+                    (Op::Eq, _) => "eq", (Op::Ne, _) => "ne",
+                    (Op::Lt, true) => "lo", (Op::Lt, false) => "lt",
+                    (Op::Le, true) => "ls", (Op::Le, false) => "le",
+                    (Op::Gt, true) => "hi", (Op::Gt, false) => "gt",
+                    (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
+                    _ => unreachable!(),
+                };
+                _ = writeln!(self.s, "\tcmp x{ra}, x{rb}\n\tcset x{rd}, {cond}");
+                return; // 0/1, no ext needed
+            }
+        }
+        if self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4 {
+            self.ext_r(rd, ct);
         }
     }
 
@@ -1373,27 +1446,45 @@ impl<'a> Cg<'a> {
                 self.tmp_store(*d, "x0");
             }
             Inst::Bin(d, op, ty, a, b) => {
-                self.ld_val(*a, "x0");
-                self.ld_val(*b, "x1");
-                self.ir_bin(*op, *ty);
-                self.tmp_store(*d, "x0");
-            }
-            Inst::Un(d, u, ty, a) => {
-                self.ld_val(*a, "x0");
-                match u {
-                    Un::Neg if self.a.tt.is_float(*ty) => {
-                        self.s += "\tfmov d0, x0\n\tfneg d0, d0\n\tfmov x0, d0\n"
-                    }
-                    Un::Neg => {
-                        self.s += "\tneg x0, x0\n";
-                        self.ext(*ty);
-                    }
-                    Un::BNot => {
-                        self.s += "\tmvn x0, x0\n";
-                        self.ext(*ty);
+                if self.a.tt.is_float(*ty) {
+                    self.ld_val(*a, "x0");
+                    self.ld_val(*b, "x1");
+                    self.ir_bin(*op, *ty);
+                    self.tmp_store(*d, "x0");
+                } else {
+                    // Tier-1 #1: read operands from their homes, compute into d's home.
+                    // Sources first (x0/x1 scratch for spilled/imm), THEN pick rd — if d is
+                    // spilled, rd=0 (x0) and the result is stored after; a/b are already
+                    // consumed into their own scratch/home so x0-as-rd cannot clobber them.
+                    let ra = self.src_gp(*a, 0);
+                    let rb = self.src_gp(*b, 1);
+                    let rd = self.gp_home(*d).unwrap_or(0);
+                    self.ir_bin_r(*op, *ty, rd, ra, rb);
+                    if self.gp_home(*d).is_none() {
+                        self.tmp_store(*d, "x0");
                     }
                 }
-                self.tmp_store(*d, "x0");
+            }
+            Inst::Un(d, u, ty, a) => {
+                // Float neg keeps the x0 funnel (fmov round-trip). Integer neg/not is the
+                // Tier-1 #1 compute-into-home path: read a from its home, write d's home,
+                // ext in place. rd=ra=0 ⟹ byte-identical to the old `neg x0,x0; ext` path.
+                if matches!(u, Un::Neg) && self.a.tt.is_float(*ty) {
+                    self.ld_val(*a, "x0");
+                    self.s += "\tfmov d0, x0\n\tfneg d0, d0\n\tfmov x0, d0\n";
+                    self.tmp_store(*d, "x0");
+                } else {
+                    let ra = self.src_gp(*a, 0);
+                    let rd = self.gp_home(*d).unwrap_or(0);
+                    match u {
+                        Un::Neg => _ = writeln!(self.s, "\tneg x{rd}, x{ra}"),
+                        Un::BNot => _ = writeln!(self.s, "\tmvn x{rd}, x{ra}"),
+                    }
+                    self.ext_r(rd, *ty);
+                    if self.gp_home(*d).is_none() {
+                        self.tmp_store(*d, "x0");
+                    }
+                }
             }
             Inst::Load(d, ty, a) => {
                 self.ld_val(*a, "x0");
