@@ -498,11 +498,10 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Lea(t, Place::Str(i)));
                 Val::Tmp(t)
             }
-            _ => {
-                let t = self.t(ULONG);
-                self.push(Inst::Opaque(Some(t), n));
-                Val::Tmp(t)
-            }
+            // lvalue exotic (SRet/Comma/Assign-struct/Cond/Block stmt-expr): giá trị
+            // kiểu-aggregate CHÍNH LÀ địa chỉ (mô hình by-ref) — khớp AST-walk
+            // addr()=expr(). Scalar-assign-làm-lvalue là invalid C nên không tới đây.
+            _ => self.lower_expr(n),
         }
     }
 
