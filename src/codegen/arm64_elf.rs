@@ -97,7 +97,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
         // named portion — harmless redundancy that avoids branching); must precede
         // parameter spilling (which reads the original registers)
         g.sp_adjust("sub", 192);
-        g.imm("x9", (f.frame + 192) as i64);
+        g.imm("x9", (g.fframe + 192) as i64);
         g.s += "\tsub x9, x29, x9\n";
         for i in 0..4u32 {
             _ = writeln!(g.s, "\tstp q{}, q{}, [x9, #{}]", 2 * i, 2 * i + 1, 32 * i);
@@ -241,7 +241,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             }
         }
     }
-    g.va = (gp.min(8), fp.min(8), boff, f.frame);
+    g.va = (gp.min(8), fp.min(8), boff, g.fframe);
 }
 
 
@@ -2089,6 +2089,17 @@ pub fn emit_ir(ast: &Ast) -> String {
     // abi_alloc, so it is stashed on Cg.
     let passes = crate::opt::Passes::from_env();
     if opt_on {
+        // Tier-1 #5: whole-program inlining runs FIRST (it is interprocedural — it reads
+        // the whole `funcs` set), on straight-lowered IR; the per-function SSA passes then
+        // clean up the spliced copies + β-substitute across the inline (const-prop, DCE).
+        if passes.inline {
+            // A variadic / VLA caller must not be inlined INTO: the callee frame is
+            // appended into its reg-save / dynamic-SP region (see opt::inline). funcs[i]
+            // ↔ ast.funcs[i] by construction (ir::lower pushes one per AST func, in order).
+            let caller_ok: Vec<bool> =
+                ast.funcs.iter().map(|f| !f.variadic && !f.has_vla).collect();
+            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok);
+        }
         for f in funcs.iter_mut() {
             crate::opt::optimize_ssa(&ast.tt, f, &passes);
             debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
@@ -2126,7 +2137,12 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.fname = f.name.clone();
         g.fret = f.ret;
         g.fsret = f.sret;
-        g.fframe = f.frame;
+        // Use the IR func's frame (line 1100: lowered == AST pre-inline), which INLINING
+        // may have GROWN by the appended callee frames. Every frame-derived offset (the
+        // C-frame SP reservation below, the temp base ir_tbase, the va-save region, the
+        // VLA reset base) must read this ONE grown value or the temp/callee-save slab
+        // lands below sp → stack corruption (the inline segfault: gcc pr40668).
+        g.fframe = funcs[fi].frame;
         g.fvariadic = f.variadic;
         g.fhasvla = f.has_vla;
         if !f.is_static {
@@ -2141,8 +2157,8 @@ pub fn emit_ir(ast: &Ast) -> String {
             ".p2align 2\n{}:\n\t.cfi_startproc\n\tstp x29, x30, [sp, #-16]!\n\t.cfi_def_cfa_offset 16\n\t.cfi_offset 29, -16\n\t.cfi_offset 30, -8\n\tmov x29, sp\n\t.cfi_def_cfa_register 29\n",
             f.name
         );
-        if f.frame > 0 {
-            g.sp_adjust("sub", f.frame);
+        if g.fframe > 0 {
+            g.sp_adjust("sub", g.fframe);
         }
         // Prologue parameter-ABI SHARED with emit() (nested-chain/variadic-save/sret/
         // spill scalar+struct+HFA) → parameters sit ready in frame slots for the IR body.

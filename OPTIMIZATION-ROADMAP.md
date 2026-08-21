@@ -7,16 +7,16 @@ backend passes), and its **measured value on THIS backend**. The last column is 
 a technique is only worth its LOC if *measurement* says so — several proven-correct passes here
 are default-OFF because they don't pay on the current codegen (see LICM/SR).
 
-**Where we are (Tier-1 #1 + #2 + #3 done):** bench geomean **0.74× vs gcc-O0** (fib 1.38×,
-loops 0.37×, matmul 1.23×, sieve 0.48×). Cumulative: #1 compute-into-home 0.98→0.81×, #2 addr-fold
-0.81→0.78×, #3 madd 0.78→0.74×. The matmul inner loop is now essentially optimal
-(`ldrsw;ldrsw;madd`) — its residual 1.23× is **memory/cache** (needs #14 scalar-replacement or
-tiling, Tier-3), not per-instruction. The one gap Tier-1 still owns is **fib 1.38×** (call
-overhead → #5 inlining); **#4 sxtw-elim** trims the remaining loop-counter extension litter.
+**Where we are (Tier-1 #1 + #2 + #3 + #5 done):** bench geomean **0.69× vs gcc-O0** (fib **1.05×**,
+loops 0.37×, matmul 1.22×, sieve 0.48×). Cumulative: #1 compute-into-home 0.98→0.81×, #2 addr-fold
+0.81→0.78×, #3 madd 0.78→0.74×, **#5 inlining 0.74→0.69× (fib 1.38→1.05×)**. The matmul inner loop
+is now essentially optimal (`ldrsw;ldrsw;madd`) — its residual 1.22× is **memory/cache** (needs #14
+scalar-replacement or tiling, Tier-3), not per-instruction. The fib call-overhead gap is now closed;
+the remaining Tier-1 item is **#4 sxtw-elim** (trims loop-counter extension litter).
 
 **Done:** const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simplify · register-coalescing
 (biased) · LICM (off) · strength-reduction (off) · backend peephole (redundant + dead move elim)
-· **compute-into-home (#1)** · **addressing-mode fold (#2)** · **madd fusion (#3)**.
+· **compute-into-home (#1)** · **addressing-mode fold (#2)** · **madd fusion (#3)** · **inlining (#5)**.
 
 ---
 
@@ -43,7 +43,7 @@ payoff unlocks once values are register-resident.
 | ~~2~~ | **Addressing-mode folding** `ldr xD,[base,idx]` ✅ **DONE** — matmul 1.38×→1.25× | tree-pattern matching (BURS / maximal munch): `Load(Add(b, i))`, `i` single-use → one addressed load | machine translation-validation (opt-parity **1552/0**) + torture **1378/0** | matmul `A[i][k]`,`B[k][j]` — drops the index `add`. `lsl #k`/`[base,#imm]` forms still open | ~75 (`try_fuse_addr`/`load_idx`) |
 | ~~3~~ | **Multiply-add fusion** `madd xD,xA,xB,xC` ✅ **DONE** — geomean 0.78×→0.74× | pattern `Add(Mul(a,b),c)`, mul single-use → `madd` | machine translation-validation (opt-parity **1552/0**) + torture **1378/0** | matmul inner product `s += a*b`; loops. `msub` still open | ~45 (`try_fuse_madd`) |
 | 4 | **Sign/zero-extension elimination** (the pervasive `sxtw x0,w0`) | a value already in canonical width need not be re-extended; range/def-width analysis | `⟦f⟧=⟦elim(f)⟧` (an extension of an already-canonical value is identity) | every loop counter / index (`sxtw` litters the output) | ~100 |
-| 5 | **Function inlining** | call-graph substitution + β-reduction; a cost model bounds growth | `⟦call f(args)⟧ = ⟦inline body[args/params]⟧` (the meta-enabler; unlocks const-prop across calls) | **fib 1.39× (pure call overhead) — the only fix** | ~200 |
+| ~~5~~ | **Function inlining** ✅ **DONE** — geomean 0.74→0.69× (**fib 1.38→1.05×**) | call-graph β-reduction; depth-1 (self-recursion → 1-level unroll); callee frame APPENDED below the caller's (one offset law shared by interp + `lea_local`); cost model (leaf ≤16 / self ≤40 insts) bounds growth | commuting square `⟦f⟧=⟦inline f⟧` (`inline_leaf/void/self_recursion` — `equiv` recurses through residual `Call(Sym)`) + torture **1378/0** + bench. Restricted to **scalar-only params + scalar/void return** (aggregate byval/sret needs Memcpy the scalar store-seed can't model); **variadic/VLA callers excluded** (frame append would clobber their reg-save/VLA region) | fib call overhead closed; opens IPA-CP (#18) | ~220 (`inline`/`splice`/`inline_ok`) |
 
 ## Tier 2 — classical IR passes, payoff unlocks once values are register-resident
 
@@ -102,8 +102,9 @@ To close the two remaining gaps toward QBE-class:
 - **matmul 1.68×** → Tier-1 #2 (addressing-mode fold) + #3 (madd) + #1 (home-register selection)
   attack the inner-product address arithmetic directly. #14 (scalar replacement of `s`/rows) is the
   cache-level follow-up. Tiling (#15) is the -O3 ceiling but a large, dependence-analysis project.
-- **fib 1.39×** → Tier-1 #5 (**inlining**) is the *only* lever; no per-instruction pass touches
-  call/return overhead. TCO (#17) does not apply (fib is not tail-recursive).
+- **fib 1.38× → 1.05× (CLOSED)** → Tier-1 #5 (**inlining**) was the *only* lever; no per-instruction
+  pass touches call/return overhead. Depth-1 self-unroll halves the `bl`/prologue traffic. TCO (#17)
+  does not apply (fib is not tail-recursive). Residual 1.05× is at par with gcc-O0.
 - **Global** → Tier-1 #1 (compute-into-home) removes the x0 funnel at its source rather than
   peepholing its symptoms — the single change with the widest blast radius, and the point at which
   the default-OFF IR passes (LICM, SR, PRE) would start to pay.

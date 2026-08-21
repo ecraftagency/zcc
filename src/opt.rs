@@ -11,7 +11,7 @@
 // count (a convergence measure). The backend does NOT need to know which pass ran —
 // it only reads well-formed IR.
 
-use crate::ast::{Ty, TyTab, TypeId, ULONG};
+use crate::ast::{Ty, TyTab, TypeId, ULONG, VOID};
 use crate::ir::{
     canon, eval_bin, eval_cast, inst_def, inst_uses, term_targets, term_uses, Block, BlockId, Callee,
     Inst, IrFunc, Op, Place, Term, Tmp, Un, Val,
@@ -2180,6 +2180,242 @@ pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass — FUNCTION INLINING (Tier-1 #5; β-reduction across the call graph).
+//
+// Theorem (call-substitution / β-reduction): in any context,
+//   ⟦Call f(args)⟧ = ⟦ body_f with params bound to args, each Ret v → (dst := v; goto cont) ⟧.
+// Proof obligation = the standard commuting square ⟦prog⟧ = ⟦inline(prog)⟧ on the
+// ENTRY; `equiv` recurses through the residual Call(Sym), so before/after are compared
+// whole-program (the self-recursive case included: a depth-1 unroll returns the same
+// value, only fewer frames).
+//
+// The one non-obvious Side-II fact is the FRAME MODEL (ir.rs interp + arm64_elf
+// lea_local): a local at offset `off` lives at index (frame − off) / address (x29 −
+// off) — ONE offset law shared by the interpreter and the emitter. To merge a callee's
+// frame into the caller's WITHOUT disturbing the caller's own offsets we APPEND the
+// callee frame below: a callee local off_k relocates to off_k + frame_base (frame_base
+// = the caller frame at splice time) and the merged frame grows by the callee frame.
+// Then caller and every clone occupy DISJOINT regions under both (frame − off) and
+// (x29 − off), so the single relocation is correct for the semantics AND the backend.
+//
+// Bound: at most ONE level — only call sites in the caller's ORIGINAL blocks are
+// expanded; a clone's own calls stay calls — so recursion is finite and self-recursion
+// is a depth-1 unroll (the fib lever: halves prologue/`bl` traffic, no unbounded
+// growth). Cost model = a static instruction-count ceiling; only a SMALL callee pays.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The mutable-def companion to ir::inst_def — used to relocate a clone's destination
+// temporary into the caller's temp space (mirror of the read-only each_use_mut).
+fn each_def_mut(i: &mut Inst, mut g: impl FnMut(&mut Tmp)) {
+    match i {
+        Inst::Bin(d, ..)
+        | Inst::Un(d, ..)
+        | Inst::Copy(d, ..)
+        | Inst::Load(d, ..)
+        | Inst::Lea(d, ..)
+        | Inst::Cast(d, ..)
+        | Inst::FunAddr(d, ..)
+        | Inst::LabelAddr(d, ..)
+        | Inst::VaArg(d, ..)
+        | Inst::Overflow(d, ..)
+        | Inst::VaArea(d, ..)
+        | Inst::Alloca(d, ..)
+        | Inst::Phi(d, ..) => g(d),
+        Inst::Call(d, ..) | Inst::CallX(d, ..) | Inst::Sync(d, ..) => {
+            if let Some(d) = d {
+                g(d)
+            }
+        }
+        Inst::Store(..)
+        | Inst::Memcpy(..)
+        | Inst::Zero(..)
+        | Inst::VaStart(..)
+        | Inst::GotoPtr(..)
+        | Inst::Asm(..) => {}
+    }
+}
+
+// Relocate one cloned instruction into the caller: temp uses/def += tb, and a static
+// local address += fb (the only raw frame offset among the whitelisted kinds).
+fn relocate_inst(i: &mut Inst, tb: Tmp, fb: u32) {
+    each_use_mut(i, |v| {
+        if let Val::Tmp(t) = v {
+            *t += tb
+        }
+    });
+    each_def_mut(i, |d| *d += tb);
+    if let Inst::Lea(_, Place::Local(off)) = i {
+        *off += fb;
+    }
+}
+fn relocate_term(t: &mut Term, tb: Tmp, bb: BlockId) {
+    each_use_term_mut(t, |v| {
+        if let Val::Tmp(x) = v {
+            *x += tb
+        }
+    });
+    match t {
+        Term::Jmp(x) => *x += bb,
+        Term::Br(_, a, b) => {
+            *a += bb;
+            *b += bb;
+        }
+        Term::Ret(_) | Term::Unreachable => {}
+    }
+}
+
+// A scalar type = one that lives in a single register/slot (int / float / pointer). A
+// scalar param is seeded by exactly ONE `Store(pty, &slot, arg)` — the same instruction
+// the prologue uses to spill the incoming arg register — so its β-substitution is
+// provably the ABI. An AGGREGATE (struct/union/array) param is passed byval/indirect
+// and copied by Memcpy, NOT a scalar store; seeding it with one Store miscompiles.
+fn scalar_ty(tt: &TyTab, ty: TypeId) -> bool {
+    tt.is_integer(ty) || tt.is_float(ty) || matches!(tt.tys[ty as usize], Ty::Ptr(_))
+}
+
+// May a callee be inlined? Whitelist the instruction kinds whose relocation is a pure
+// temp/frame shift. Rejects va*, alloca/VLA, computed goto (and any callee carrying
+// label symbols), inline asm, atomics, overflow builtins, and CallX (its sret slot is
+// a second frame offset) — each would need identity-/state-aware fix-up we don't do.
+// Also requires every PARAMETER to be scalar and the RETURN to be scalar-or-void: an
+// aggregate param/return uses byval/sret ABI copying the scalar store-seed can't model
+// (the struct-by-value miscompiles: gcc 20000706-1 / pr20621-1).
+fn inline_ok(tt: &TyTab, callee: &IrFunc) -> bool {
+    callee.labels.is_empty()
+        && callee.params.iter().all(|&(_, pty)| scalar_ty(tt, pty))
+        && (callee.ret == VOID || scalar_ty(tt, callee.ret))
+        && callee.blocks.iter().flat_map(|b| &b.insts).all(|i| {
+            matches!(
+                i,
+                Inst::Bin(..)
+                    | Inst::Un(..)
+                    | Inst::Copy(..)
+                    | Inst::Load(..)
+                    | Inst::Store(..)
+                    | Inst::Memcpy(..)
+                    | Inst::Lea(..)
+                    | Inst::Cast(..)
+                    | Inst::Call(..)
+                    | Inst::Zero(..)
+                    | Inst::FunAddr(..)
+            )
+        })
+}
+
+fn inst_count(f: &IrFunc) -> usize {
+    f.blocks.iter().map(|b| b.insts.len()).sum()
+}
+
+// Splice `callee` into `caller` at block `b`, instruction `k` (a direct Call). The
+// call site block is split: [0..k] + param-seeding stores → jump to the clone entry;
+// the clone's returns write the call's dst and jump to a continuation block holding
+// [k+1..] + the block's original terminator.
+fn splice(caller: &mut IrFunc, b: BlockId, k: usize, callee: &IrFunc) {
+    let tb = caller.temps.len() as Tmp; // clone temps land here
+    let fb = caller.frame; // clone frame appended below the caller's
+    let bb = caller.blocks.len() as BlockId; // clone entry = first appended block
+    let nk = callee.blocks.len() as BlockId;
+    let cont = bb + nk; // continuation = appended just after the clone blocks
+
+    let (dst, args) = match &caller.blocks[b as usize].insts[k] {
+        Inst::Call(d, Callee::Sym(_), a, _) => (*d, a.clone()),
+        _ => unreachable!("splice: not a direct call"),
+    };
+    let ret_ty = callee.ret;
+
+    // 1. Grow the caller's Γ + frame by the callee's (the frame-append law above).
+    caller.temps.extend_from_slice(&callee.temps);
+    caller.frame += callee.frame;
+
+    // 2. Clone + relocate the callee blocks; Ret v → (dst := v) ; goto cont.
+    for blk in &callee.blocks {
+        let mut nb = blk.clone();
+        for i in nb.insts.iter_mut() {
+            relocate_inst(i, tb, fb);
+        }
+        relocate_term(&mut nb.term, tb, bb);
+        if let Term::Ret(v) = &nb.term {
+            let v = *v; // Option<Val> is Copy; already relocated by relocate_term
+            if let Some(d) = dst {
+                // void-return path in a value fn is unreachable → Imm(0) keeps dst defined.
+                let rv = v.unwrap_or(Val::Imm(0));
+                nb.insts.push(Inst::Copy(d, ret_ty, rv));
+            }
+            nb.term = Term::Jmp(cont);
+        }
+        caller.blocks.push(nb);
+    }
+
+    // 3. Detach the tail (everything AFTER the call) + the block's old terminator.
+    let tail = caller.blocks[b as usize].insts.split_off(k + 1);
+    let old_term = std::mem::replace(&mut caller.blocks[b as usize].term, Term::Jmp(bb));
+    caller.blocks[b as usize].insts.pop(); // drop the Call now at index k
+
+    // 4. Seed the callee params: Store arg → the relocated param slot (off + fb).
+    for (idx, &(poff, pty)) in callee.params.iter().enumerate() {
+        let arg = args.get(idx).copied().unwrap_or(Val::Imm(0));
+        let addr = caller.temps.len() as Tmp;
+        caller.temps.push(ULONG); // a local-address temp
+        caller.blocks[b as usize].insts.push(Inst::Lea(addr, Place::Local(poff + fb)));
+        caller.blocks[b as usize].insts.push(Inst::Store(pty, Val::Tmp(addr), arg));
+    }
+
+    caller.blocks.push(Block { insts: tail, term: old_term });
+}
+
+/// Whole-program inlining (Tier-1 #5). Depth-1: expands only the call sites present in
+/// each caller's ORIGINAL blocks, against a SNAPSHOT taken before any mutation — so a
+/// non-recursive callee is substituted once and a self-recursive callee is unrolled
+/// exactly one level (its clone's recursive calls survive). Terminates trivially.
+///
+/// `caller_ok[ci]` = may func ci be inlined INTO (false for variadic / VLA callers): the
+/// splice appends the callee frame into [caller.frame, caller.frame+cf), which for a
+/// variadic caller is exactly the AAPCS64 reg-save area and for a VLA caller confuses the
+/// dynamic-SP reset base — both need va/VLA-aware placement this pass does not do. Callee
+/// eligibility (scalar-only, no va/alloca/asm/…) is separately gated by `inline_ok`.
+pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool]) -> u32 {
+    const LEAF_MAX: usize = 16; // a non-recursive callee this small is a pure win to inline
+    const SELF_MAX: usize = 40; // a self-recursive callee: depth-1 unroll if this small
+    let snapshot: Vec<IrFunc> = funcs.to_vec();
+    let by_name: HashMap<&str, usize> =
+        snapshot.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+    let mut total = 0u32;
+    for ci in 0..funcs.len() {
+        if !caller_ok.get(ci).copied().unwrap_or(true) {
+            continue;
+        }
+        let start_nc = funcs[ci].blocks.len();
+        // Original-block call sites eligible under the cost model, with their snapshot index.
+        let mut sites: Vec<(BlockId, usize, usize)> = Vec::new();
+        for b in 0..start_nc {
+            for (k, inst) in funcs[ci].blocks[b].insts.iter().enumerate() {
+                if let Inst::Call(_, Callee::Sym(name), _, _) = inst {
+                    let Some(&gi) = by_name.get(name.as_str()) else { continue };
+                    let g = &snapshot[gi];
+                    if !inline_ok(tt, g) {
+                        continue;
+                    }
+                    let n = inst_count(g);
+                    let ok = if gi == ci { n <= SELF_MAX } else { n <= LEAF_MAX };
+                    if ok {
+                        sites.push((b as BlockId, k, gi));
+                    }
+                }
+            }
+        }
+        // Per block, splice HIGHER indices first: lower call sites keep their (b,k)
+        // valid (split_off only detaches the tail above k), so the whole original
+        // worklist can be applied without recomputation.
+        sites.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        for (b, k, gi) in sites {
+            splice(&mut funcs[ci], b, k, &snapshot[gi]);
+            total += 1;
+        }
+    }
+    total
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
 // point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
 // return to executable (φ-free) IR and do a final non-SSA cleanup.
@@ -2219,6 +2455,7 @@ pub struct Passes {
     pub strength_reduce: bool,
     pub coalesce: bool, // register coalescing (biased coloring, inside abi_alloc)
     pub peephole: bool, // backend machine-level redundant-move elimination (arm64_elf)
+    pub inline: bool,   // Tier-1 #5: whole-program depth-1 inlining (runs before to_ssa)
 }
 
 impl Default for Passes {
@@ -2235,6 +2472,7 @@ impl Default for Passes {
             strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
             coalesce: true,
             peephole: true, // measured win: removes the x0-funnel redundant reg-reg moves
+            inline: true, // Tier-1 #5: β-reduction; proven (equiv) — measured on the bench before ship
         }
     }
 }
@@ -2259,6 +2497,7 @@ impl Passes {
             "strength_reduce" | "strength" | "sr" => self.strength_reduce = v,
             "coalesce" => self.coalesce = v,
             "peephole" | "peep" => self.peephole = v,
+            "inline" => self.inline = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -4027,6 +4266,92 @@ mod tests {
             if matches!(nm, "arith" | "cfold") {
                 assert!(count_insts(&opt) < before, "{nm}: pipeline must reduce ({before}→{})", count_insts(&opt));
             }
+        }
+    }
+
+    // Count direct Sym-calls to `name` across a program (the inline convergence measure).
+    fn count_sym_calls(ir: &[IrFunc], name: &str) -> usize {
+        ir.iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Call(_, Callee::Sym(s), ..) if s == name))
+            .count()
+    }
+
+    // ── Tier-1 #5 (inline): a NON-RECURSIVE callee is substituted β-reduced and the
+    // commuting square holds. Two call sites in one block (exercises descending-k splice)
+    // + one call feeding an expression (dst live in the continuation).
+    #[test]
+    fn inline_leaf_commutes() {
+        let (ast, ir) = compile(
+            "inl",
+            "static int add(int a,int b){return a+b;}\
+             int f(int x){return add(x,3)+add(x,x);}",
+        );
+        assert_eq!(count_sym_calls(&ir, "add"), 2, "baseline: two calls to add");
+        let mut inl = ir.clone();
+        let ok = vec![true; inl.len()];
+        inline(&ast.tt, &mut inl, &ok);
+        for g in &inl {
+            verify(g).unwrap_or_else(|e| panic!("verify after inline: {e}"));
+        }
+        assert_eq!(count_sym_calls(&inl, "add"), 0, "both add() sites must be inlined");
+        equiv(&ast.tt, &ir, &inl, "f").expect("⟦f⟧ = ⟦inline f⟧ (leaf)");
+        // Value spot-check through the interp (independent of equiv's battery).
+        assert_eq!(interp(&ast.tt, &inl, "f", &[7]).unwrap(), 24, "add(7,3)+add(7,7)=10+14");
+    }
+
+    // ── A VOID call with an unused result inlines cleanly (dst = None → no Copy back).
+    #[test]
+    fn inline_void_commutes() {
+        let (ast, ir) = compile(
+            "inlv",
+            "static void put(int *p,int v){*p=v;}\
+             int f(int x){int a; put(&a,x*2); return a+1;}",
+        );
+        let mut inl = ir.clone();
+        let ok = vec![true; inl.len()];
+        inline(&ast.tt, &mut inl, &ok);
+        for g in &inl {
+            verify(g).unwrap_or_else(|e| panic!("verify: {e}"));
+        }
+        assert_eq!(count_sym_calls(&inl, "put"), 0, "put() inlined");
+        // NOTE — no whole-program equiv here: a void call's only observable effect crosses
+        // the frame boundary (here `put` stores through &a into f's frame), and interp
+        // models each function's frame as ISOLATED memory, so the PRE-inline program is
+        // outside interp's modeled space (it silently reads back 0, not an Err → equiv
+        // can't SKIP it). Inlining is exactly what folds the store into f's own frame, so
+        // the POST-inline form IS modeled — we validate the dst=None splice path directly
+        // on it: right value + no residual call. (Same oracle limit as any pointer/global
+        // side effect; the leaf/self tests carry the ⟦f⟧=⟦inline f⟧ proof.)
+        assert_eq!(interp(&ast.tt, &inl, "f", &[5]).unwrap(), 11, "put(&a,10) inlined ⇒ a=10, a+1=11");
+        assert_eq!(interp(&ast.tt, &inl, "f", &[-6]).unwrap(), -11, "put(&a,-12) inlined ⇒ a=-12, a+1=-11");
+    }
+
+    // ── SELF-RECURSION: fib inlines to a DEPTH-1 unroll — the clone's own recursive
+    // calls survive (2 original sites → 4 residual calls), and the value is unchanged
+    // (equiv recurses through the residual Call(Sym)). This is the fib call-overhead lever.
+    #[test]
+    fn inline_self_recursion_depth1() {
+        let (ast, ir) = compile(
+            "inls",
+            "static long fib(int n){ if(n<2) return n; return fib(n-1)+fib(n-2);}\
+             int f(int n){ return (int)fib(n); }",
+        );
+        assert_eq!(count_sym_calls(&ir, "fib"), 3, "2 inside fib + 1 in f");
+        let mut inl = ir.clone();
+        let ok = vec![true; inl.len()];
+        inline(&ast.tt, &mut inl, &ok);
+        for g in &inl {
+            verify(g).unwrap_or_else(|e| panic!("verify after self-inline: {e}"));
+        }
+        // fib's own 2 sites each become a clone carrying 2 calls → 4; f's single call is
+        // also inlined (fib ≤ SELF/LEAF), bringing another unrolled body (2 more) → ≥ 4.
+        assert!(count_sym_calls(&inl, "fib") > 3, "depth-1 unroll multiplies residual calls");
+        equiv(&ast.tt, &ir, &inl, "fib").expect("⟦fib⟧ = ⟦inline fib⟧ (self, depth-1)");
+        for n in 0..12 {
+            let (a, b) = (interp(&ast.tt, &ir, "fib", &[n]).unwrap(), interp(&ast.tt, &inl, "fib", &[n]).unwrap());
+            assert_eq!(a, b, "fib({n}): {a} vs {b}");
         }
     }
 }

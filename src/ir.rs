@@ -1274,14 +1274,29 @@ pub(crate) mod tests {
 
     /// Run the IR: interp(entry, args) → the return value. Recurses through Call(Sym).
     pub(crate) fn interp(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64]) -> Result<i64, String> {
-        interp_d(tt, funcs, entry, args, 0)
+        // ONE step budget shared across the WHOLE recursion (not per-frame): the depth
+        // guard alone bounds only a deep *spine*, never a shallow-but-EXPONENTIAL call
+        // tree (e.g. fib(255) bottoms out at depth ~253 yet has ~10^53 nodes). Without a
+        // global cap such an input runs effectively forever — an input needing more than
+        // this many total steps is "outside the modeled space" (→ equiv SKIP), exactly
+        // like too-deep recursion. Chosen large enough that every well-defined small case
+        // still completes, small enough that no input can hang the suite.
+        let steps = std::cell::Cell::new(50_000_000u64);
+        interp_d(tt, funcs, entry, args, 0, &steps)
     }
 
     /// interp with DEPTH COUNTING: interp uses Rust recursion for Call, so an input
     /// forcing deep recursion (e.g. fact(2^31)) would overflow the HOST stack — not an
     /// IR bug. Hitting the bound → Err (an input "outside the modeled space" → equiv
     /// SKIP, like UB). The bound is chosen many times lower than the real stack for safety.
-    fn interp_d(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64], depth: u32) -> Result<i64, String> {
+    fn interp_d(
+        tt: &TyTab,
+        funcs: &[IrFunc],
+        entry: &str,
+        args: &[i64],
+        depth: u32,
+        steps: &std::cell::Cell<u64>,
+    ) -> Result<i64, String> {
         if depth > 500 {
             return Err("interp: recursion too deep (input outside the modeled space)".into());
         }
@@ -1308,13 +1323,19 @@ pub(crate) mod tests {
 
         let mut cur = 0usize;
         let mut prev: Option<usize> = None; // the predecessor edge just taken, for Phi selection
-        let mut budget = 10_000_000u64; // guard against infinite loops (small tests)
         loop {
+            // Charge one step per block visit too, so an EMPTY-block cycle (0 insts,
+            // terminator jumping back) also hits the budget instead of spinning free.
+            match steps.get().checked_sub(1) {
+                Some(n) => steps.set(n),
+                None => return Err("interp: step budget exceeded (infinite loop / input outside the modeled space)".into()),
+            }
             let b = &f.blocks[cur];
             for inst in &b.insts {
-                budget -= 1;
-                if budget == 0 {
-                    return Err("interp: step budget exceeded (infinite loop?)".into());
+                // Shared global budget (guards infinite loops AND exponential recursion trees).
+                match steps.get().checked_sub(1) {
+                    Some(n) => steps.set(n),
+                    None => return Err("interp: step budget exceeded (infinite loop / input outside the modeled space)".into()),
                 }
                 match inst {
                     Inst::Bin(d, op, ty, a, bb) => {
@@ -1391,7 +1412,7 @@ pub(crate) mod tests {
                             return Err("interp: indirect call not modeled".into());
                         };
                         let av: Vec<i64> = args.iter().map(|v| fetch(&reg, v)).collect();
-                        let r = interp_d(tt, funcs, name, &av, depth + 1)?;
+                        let r = interp_d(tt, funcs, name, &av, depth + 1, steps)?;
                         if let Some(d) = d {
                             reg[*d as usize] = canon(tt, f.temps[*d as usize], r);
                         }
