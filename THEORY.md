@@ -116,8 +116,7 @@ mọi hằng layout/ABI sống trong TyTab + file target (vế II); phần còn 
 > ⟦A⟧≡⟦P(A)⟧ trên battery vét-cạn-miền-nhỏ + biên) + `verify`; regalloc (liveness
 > dataflow-fixpoint → interference → Chaitin coloring → `verify_coloring`) gate bằng
 > BẤT BIẾN GIAO THOA (bisimulation-đổi-tên). Orchestrator `optimize()` = fixpoint 1-4,
-> wire vào `--ir` sau cờ `ZCC_OPT` (đo box: torture opt≡noopt end-to-end). Backend tiêu
-> thụ regalloc + flip mặc định = Bước B (chưa).
+> chạy sau cờ `ZCC_OPT` trên đường IR mặc định (đo box: torture opt≡noopt end-to-end).
 | khái niệm/định lý | mô tả |
 |---|---|
 | Denotational semantics ⟦·⟧:State→State | pass đúng ⟺ ⟦f⟧=⟦f'⟧ |

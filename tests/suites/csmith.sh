@@ -4,7 +4,7 @@
 # ĐỘC LẬP = gcc (oracle ELF cùng arch trong box). Với mỗi .c cache sẵn ở
 # /suites/csmith/*.c:
 #   gcc  compile+run  → checksum tham chiếu (nếu gcc fail/timeout → SKIP: mẫu rác)
-#   zcc  --ir         → COMPILE-FAIL = NOT-IMPL (nêu tên, ngoài phạm vi — completeness)
+#   zcc  compile      → COMPILE-FAIL = NOT-IMPL (nêu tên, ngoài phạm vi — completeness)
 #   zcc  run (noopt)  + zcc ZCC_OPT=1 run  → so stdout với gcc
 # PARITY = gcc==zcc==zcc-opt (chuỗi checksum khớp). DIVERGE = compile+run được mà KHÁC
 # gcc ⟹ MISCOMPILE (0 DIVERGE là bất biến; in ra để trị theo phân rã). Vì UB-free nên
@@ -34,14 +34,14 @@ for f in "$DIR"/*.c; do
     [ "$grc" -gt 127 ] && { skip=$((skip+1)); continue; } # gcc-binary crash/timeout: mẫu loại
 
     # zcc noopt — compile-fail = NOT-IMPL (completeness gap, nêu tên)
-    if ! "$ZCC" --ir -I"$INC" "$f" -o "$D/z" 2>"$D/ze"; then
+    if ! "$ZCC" -I"$INC" "$f" -o "$D/z" 2>"$D/ze"; then
         ni=$((ni+1)); nilist="$nilist $b:$(head -1 "$D/ze" | cut -c1-40)"; continue
     fi
     bytes=$((bytes + $(wc -c < "$D/z")))
     timeout 15 "$D/z" > "$D/zo" 2>&1; zrc=$?
 
     # zcc opt
-    if ! ZCC_OPT=1 "$ZCC" --ir -I"$INC" "$f" -o "$D/zp" 2>/dev/null; then
+    if ! ZCC_OPT=1 "$ZCC" -I"$INC" "$f" -o "$D/zp" 2>/dev/null; then
         div=$((div+1)); divlist="$divlist $b(OPT-COMPILE-FAIL)"; continue
     fi
     timeout 15 "$D/zp" > "$D/zpo" 2>&1; prc=$?

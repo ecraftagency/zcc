@@ -1,7 +1,7 @@
 #!/bin/sh
 # opt-parity.sh — ĐO cơ học (differential tự thân): với mỗi torture execute .c,
-# compile bằng `zcc --ir` HAI lần — KHÔNG opt (ZCC_OPT unset) vs CÓ opt (ZCC_OPT=1) —
-# chạy cả hai, so exit code. Đường --ir-không-opt đã ở parity với referee (đo trước),
+# compile HAI lần — KHÔNG opt (ZCC_OPT unset) vs CÓ opt (ZCC_OPT=1) —
+# chạy cả hai, so exit code. Đường noopt đã ở parity với referee (đo trước),
 # nên opt≡noopt trên MỌI case ⟹ pipeline pass (const-fold/copy-prop/CSE/DCE) đúng
 # bắc-cầu, end-to-end trên ELF THẬT. DIVERGE = bug pass (in ra để trị). SKIP = case
 # một trong hai không compile (exotic/reject) — ngoài phạm vi đo passes.
@@ -24,9 +24,9 @@ for f in "$DIR"/*.c; do
     [ "$LIM" -gt 0 ] && [ "$n" -gt "$LIM" ] && { n=$((n-1)); break; }
 
     # noopt
-    if ! "$ZCC" --ir "$f" -o "$D/a" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
+    if ! "$ZCC" "$f" -o "$D/a" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
     # opt
-    if ! ZCC_OPT=1 "$ZCC" --ir "$f" -o "$D/b" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
+    if ! ZCC_OPT=1 "$ZCC" "$f" -o "$D/b" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
 
     timeout 5 "$D/a" >/dev/null 2>&1; ra=$?
     timeout 5 "$D/b" >/dev/null 2>&1; rb=$?

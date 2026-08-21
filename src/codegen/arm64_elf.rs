@@ -724,11 +724,11 @@ fn sym(n: &str) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ĐƯỜNG IR → asm (migrate, song song đường AST ở trên; bật bằng --ir). Mô hình
+// ĐƯỜNG IR → asm — đường DUY NHẤT (AST-walk đã xoá, seal-ir-10k). Mô hình
 // naive-stack-slot: mỗi temp một slot 8B dưới frame (x29 − (frame+8+i*8)); load
 // operand vào x0/x1, tính, str kết quả về slot. Tái dùng method value-contract
-// (load/store/cast_op/ext/imm/lea_local). Đuôi exotic: Opaque bridge re-emit
-// subtree AST cũ. Đường này sẽ THAY đường AST khi phủ hết suite (rồi xoá AST-walk).
+// (load/store/cast_op/ext/imm/lea_local). Mọi construct C99 lower thành typed Inst;
+// không còn Opaque bridge — không node nào tái-emit subtree AST.
 // ═══════════════════════════════════════════════════════════════════════════
 // Slot AAPCS cho ir_call_abi (bản độc lập của Slot cục bộ trong self.call — sẽ là
 // bản DUY NHẤT khi Stage D xoá AST-walk). G=x-reg, F=v-reg float(4B cần fcvt),
@@ -1474,9 +1474,8 @@ impl<'a> Cg<'a> {
     }
 }
 
-/// Điểm vào đường IR: lower(AST) → asm. Bật bằng --ir (driver). Chưa phủ hết
-/// suite — CORE (scalar/control/mem/call) chạy; đuôi exotic + global/string đang
-/// mở rộng. Khi xanh hết suite: thay emit(), xoá đường AST, đo trần ≤10k.
+/// Điểm vào backend — đường DUY NHẤT: lower(AST) → IR → passes → asm. Phủ trọn
+/// suite/csmith/musl; AST-walk emit() đã xoá (seal-ir-10k). Backend simulate per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
     let mut funcs = ir::lower(ast);
     // Pipeline pass tối ưu (const-fold→copy-prop→CSE→DCE tới fixpoint). Mỗi pass đã
