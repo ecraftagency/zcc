@@ -68,7 +68,7 @@ xargs -n 1 -P 8 sh -c '
     fi
     # ── zcc ──
     "$ZCC" "$f" -o "$D/$b.z" 2>"$e"; zrc=$?
-    # the manifest must be STABLE + reveal the right construct: strip the driver's
+    # the manifest must be STABLE + reveal the right construct: strip the driver
     # "zcc: <path>: ", collapse every box-specific ".../execute/" path → leaving
     # only "<case>.c:<ln>: msg"
     r=$(sed -n "1p" "$e" 2>/dev/null | sed -e "s|^zcc: [^:]*: ||" -e "s|/[^ ]*/execute/||g" | tr "\t" " ")
@@ -86,8 +86,8 @@ xargs -n 1 -P 8 sh -c '
             # backend: zcc exit1 WITHOUT a diagnostic → as/ld chokes. DISTINGUISH the
             # source mechanically (do not hardcode names): ld "undefined reference to
             # X" where X IS in the source BUT ABSENT from the referee asm ⇒ the
-            # referee has DCE'd X (dead code); zcc -O0 (by design: no optimization
-            # pass) keeps the ref. A PURELY optimization divergence ∉ zcc's scope →
+            # referee has DCE-removed X (dead code); zcc -O0 (by design: no optimization
+            # pass) keeps the ref. A PURELY optimization divergence is outside zcc scope →
             # oracle-invalid, NOT a miscompile. Otherwise (X is a zcc-internal mangled
             # symbol, or X really is missing) = FAIL.
             syms=$(grep -oE "undefined reference to .[A-Za-z_][A-Za-z0-9_.]*" "$e" \
@@ -97,7 +97,7 @@ xargs -n 1 -P 8 sh -c '
                 optdep=1
                 for sy in $syms; do
                     grep -qw "$sy" "$f" || { optdep=0; break; }        # X must be a source symbol (not mangled)
-                    grep -qw "$sy" "$D/$b.rs" && { optdep=0; break; }  # and ABSENT from the referee asm (DCE'd)
+                    grep -qw "$sy" "$D/$b.rs" && { optdep=0; break; }  # and ABSENT from the referee asm (DCE-removed)
                 done
             fi
             if [ "$optdep" = 1 ]; then

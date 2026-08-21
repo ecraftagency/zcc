@@ -1420,7 +1420,14 @@ impl<'a> Cg<'a> {
             Term::Br(c, tb, eb) => {
                 self.ld_val(*c, "x0");
                 let (lt, le) = (self.ir_label(*tb), self.ir_label(*eb));
-                _ = writeln!(self.s, "\tcbnz x0, {lt}\n\tb {le}");
+                // Branch relaxation: cbnz/b.cond encode only a ±1MB displacement (imm19),
+                // but the two IR block labels can sit arbitrarily far apart in a very large
+                // function (e.g. -O0 output of an arithmetic fuzzer, hundreds of thousands
+                // of instructions). Reach each target with an unconditional `b` (±128MB,
+                // imm26), gated by a conditional skip to an ADJACENT local label that is
+                // always within range. c!=0 → then; c==0 → skip to else.
+                let n = self.labels(1);
+                _ = writeln!(self.s, "\tcbz x0, L{n}\n\tb {lt}\nL{n}:\n\tb {le}");
             }
             Term::Ret(v) => {
                 match v {
