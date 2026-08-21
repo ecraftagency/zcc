@@ -165,11 +165,21 @@ Nói cách khác biểu đồ sau GIAO HOÁN với mọi `e ∈ 𝔼_struct`:
 ```
 
 **Kiểm cơ học:** `opt.rs::tests::commuting_square_structural_exhaustion`.
-`𝔼_struct` = `POOL³` (216 op-triple × template giàu kích đủ 4 pass CÙNG LÚC) +
-`POOL²×{/,%}` (12, nhánh UB-skip đối xứng + fold-từ-chối-div0) = **228 biểu thức**;
-× 5 pass = **1140 ô commuting-square** đóng xanh. `⟦·⟧` = `interp`; equiv so trên
-`battery` (vét-cạn-miền-nhỏ [−6,6]ⁿ + biên INT_MAX/MIN, ir.rs::battery). Evidence
-trail cơ học (số expr + số ô) assert cứng — cấm "pass rỗng" (luật input-sạch).
+`𝔼_struct` = hợp **năm HỌ shape**, mỗi họ vét cạn op trên một cấu trúc riêng ⟹ phủ
+mọi loại Inst (Bin/Un/Copy/Load/Store/Lea/Cast) + cả hai loại Term (Jmp/Br):
+
+| họ | shape | cỡ | kích pass/Inst |
+|---|---|---|---|
+| A | arith straight-line (`POOL³`) | 216 | fold+CSE+copy+DCE, Bin |
+| B | div/mod (`POOL×{/,%}`) | 12 | UB-skip đối xứng, fold-từ-chối-div0 |
+| C | shift (`POOL×{<<,>>}`) | 12 | Shl/Shr (>> xét dấu) |
+| D | con trỏ/bộ nhớ (`POOL²`) | 36 | Lea/Load/Store, **memory-kill CSE** (pr84169) |
+| E | vòng lặp/CFG (`POOL²`) | 36 | Br/Jmp back-edge, copy-prop/DCE qua biên block |
+
+Tổng **312 biểu thức** × 5 pass = **1560 ô commuting-square** đóng xanh. `⟦·⟧` =
+`interp`; equiv so trên `battery` (vét-cạn-miền-nhỏ [−6,6]ⁿ + biên INT_MAX/MIN,
+ir.rs::battery). Họ E dùng trip-count `b&7` ⟹ interp LUÔN dừng (non-vacuous).
+Evidence trail cơ học (số expr + số ô) assert cứng — cấm "pass rỗng" (luật input-sạch).
 
 **Anti-blindness:** `commuting_square_selfproof` đột biến (xoá một `Store` → mất
 ghi-mem) và đòi commuting-square PHẢI bắt — nếu equiv mù thì mọi verdict vô giá

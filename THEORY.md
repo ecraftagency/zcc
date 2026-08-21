@@ -187,7 +187,7 @@ không "tối ưu tuyệt đối"; nhưng *đúng-màu* verify được trong P)
 | `decay` | dẫn xuất kiểu | type-derivation lattice |
 | `alg` | UAC + fold | join-semilattice + commuting-square fold↔runtime |
 | `abi` | ABI classify + link | finite automaton + cross-link cancellation |
-| `ir` *(`cargo test`)* | IR + 5 pass + ref-semantics | reference semantics ⟦·⟧ (`SEMANTICS.md`, NẤC-1) + ĐỊNH LÝ executable commuting-square vét-cạn 𝔼_struct (228 expr×5 pass=1140 ô) + interference-invariant (regalloc) |
+| `ir` *(`cargo test`)* | IR + 5 pass + ref-semantics | reference semantics ⟦·⟧ (`SEMANTICS.md`, NẤC-1) + ĐỊNH LÝ executable commuting-square vét-cạn 𝔼_struct (312 expr×5 pass=1560 ô) + interference-invariant (regalloc) |
 
 ---
 

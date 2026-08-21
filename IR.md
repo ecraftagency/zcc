@@ -127,7 +127,7 @@ Chạy IR trực tiếp (không qua asm) → kết quả quan sát được. Dù
 Pass đúng ⟺ giao hoán với interp. Đây là commuting-square fold↔runtime (đã có ở
 `alg.sh`) nâng lên tầng IR — bắt bug NGAY tại pass đẻ ra nó, không chờ end-to-end.
 **Nâng thành ĐỊNH LÝ EXECUTABLE (NẤC-1, xong):** `opt.rs::commuting_square_
-structural_exhaustion` vét cạn `𝔼_struct` (228 biểu thức × 5 pass = 1140 ô) chứng
+structural_exhaustion` vét cạn `𝔼_struct` (312 biểu thức (5 họ shape) × 5 pass = 1560 ô) chứng
 ∀e giao hoán, + `commuting_square_selfproof` (anti-blindness). Phát biểu: SEMANTICS §5.
 
 ## 4. Lowering (nơi correctness sống)
