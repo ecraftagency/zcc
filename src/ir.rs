@@ -319,6 +319,30 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
 // backend bridge re-emit đường cũ (step 3 thay dần bằng lowering thật).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Element CUỐI của stmt-expr có phải câu-LỆNH VÔ-GIÁ-TRỊ (→ value = void) không?
+/// Node::Block KHÔNG thuộc đây: `{…}` compound-statement cuối là void nhưng
+/// `({…})` stmt-expr LỒNG mang value — hai cái CÙNG Node::Block, không phân biệt
+/// được bằng kiểu node, nên luôn recurse qua lower_expr (Block arm) để propagate
+/// value nếu có; value thừa của compound-statement vô hại (không ai đọc).
+/// Mirror phần còn lại các arm tường minh của lower_stmt; đồng bộ khi thêm stmt mới.
+fn is_stmt_node(n: &Node) -> bool {
+    matches!(
+        n,
+        Node::Ret(_)
+            | Node::If(..)
+            | Node::While(..)
+            | Node::For(..)
+            | Node::Do(..)
+            | Node::Break
+            | Node::Continue
+            | Node::Switch(..)
+            | Node::Case(_)
+            | Node::Label(..)
+            | Node::Goto(_)
+            | Node::GotoPtr(_)
+    )
+}
+
 fn map_op(s: &str) -> Op {
     match s {
         "+" => Op::Add, "-" => Op::Sub, "*" => Op::Mul, "/" => Op::Div, "%" => Op::Rem,
@@ -605,7 +629,33 @@ impl<'a> Lower<'a> {
                 self.push(Inst::VaArea(d, off));
                 Val::Tmp(d)
             }
-            // đuôi exotic (VaArg/Sync/Overflow/Asm/Alloca/SRet/…) → bridge
+            // GNU statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
+            // tuần tự các stmt (side-effect qua lower_stmt), giá trị = giá trị của
+            // stmt CUỐI nếu nó là expr-statement (C99-EXT gcc), ngược lại void.
+            // KHÔNG cần Inst mới — stmt-expr chỉ là "statements + 1 value" trong IR.
+            Node::Block(v) => {
+                let v = v.clone();
+                let Some((&last, init)) = v.split_last() else {
+                    return Val::Imm(0); // `({ })` — void
+                };
+                for &s in init {
+                    self.lower_stmt(s);
+                }
+                if is_stmt_node(&a.nodes[last as usize]) {
+                    self.lower_stmt(last);
+                    Val::Imm(0)
+                } else {
+                    if self.done {
+                        // stmt cuối nằm trong dead-code (stmt trước seal terminator):
+                        // mở block tươi để value-expr lower nhất quán (mọi def push đủ),
+                        // tránh temp mồ côi (cùng lớp bug orphan-temp lower_stmt).
+                        let d = self.reserve();
+                        self.goto(d);
+                    }
+                    self.lower_expr(last)
+                }
+            }
+            // đuôi exotic (Sync/Asm/Alloca/SRet/composite-Call/…) → bridge
             _ => self.bridge_val(n, ty),
         }
     }
