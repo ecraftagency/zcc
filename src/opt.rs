@@ -649,7 +649,7 @@ pub type AbiHome = Option<(bool, u32)>;
 /// ALL-SPILL for a function containing inline asm (`Inst::Asm`): its operand pool grows
 /// over x9../v16.. without bound and can clobber ANY allocatable register, defeating the
 /// disjointness invariant — so no home is safe (the pre-Stage-5b memory model, verbatim).
-pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget) -> Vec<AbiHome> {
+pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coalesce: bool) -> Vec<AbiHome> {
     let nt = f.temps.len();
     let mut home: Vec<AbiHome> = vec![None; nt];
     if f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Asm(..))) {
@@ -689,16 +689,19 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget) -> 
     }
     // Conservative coalescing candidates: a Copy whose dst/src are distinct temps that
     // do NOT interfere (their live ranges are disjoint) can share a register. Same class
-    // by construction (a Copy preserves type); the per-class select filters anyway.
+    // by construction (a Copy preserves type); the per-class select filters anyway. Empty
+    // when coalescing is toggled off ⟹ the plain Stage-5b coloring.
     let mut move_adj: Vec<Vec<Tmp>> = vec![Vec::new(); nt];
-    for b in &f.blocks {
-        for i in &b.insts {
-            if let Inst::Copy(d, _, Val::Tmp(s)) = i
-                && d != s
-                && !adj[*d as usize].contains(s)
-            {
-                move_adj[*d as usize].push(*s);
-                move_adj[*s as usize].push(*d);
+    if coalesce {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Copy(d, _, Val::Tmp(s)) = i
+                    && d != s
+                    && !adj[*d as usize].contains(s)
+                {
+                    move_adj[*d as usize].push(*s);
+                    move_adj[*s as usize].push(*d);
+                }
             }
         }
     }
@@ -1814,29 +1817,320 @@ pub fn cfg_simplify(f: &mut IrFunc) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// LOOP INFRASTRUCTURE + LICM (Phase B) — LOOP-INVARIANT CODE MOTION.
+//
+// GOVERNING THEOREM (CbC): `⟦f⟧ = ⟦licm(f)⟧`, MEASURED by `equiv`. QBE deliberately
+// skips loop passes; we admit ONE (LICM) because it has a clean commuting-square proof:
+//
+//   A PURE, TRAP-FREE instruction whose operands are all defined OUTSIDE the loop
+//   computes the SAME value on every iteration. Moving its single (SSA) definition to
+//   the loop's PREHEADER — a block that dominates the loop and lies on the only entry
+//   edge — evaluates it ONCE instead of n times. Because it is pure and trap-free, the
+//   preheader may compute it even when the loop body runs zero times (speculation is
+//   safe): the result is simply unused, and no observable state changes. Every use of
+//   the value is inside the loop, which the preheader dominates ⟹ def-before-use holds.
+//   Hence ⟦·⟧ is preserved.
+//
+// SAFETY FENCES (why the "trap-free / pure" hypothesis actually holds):
+//   • hoist only Bin(¬Div,¬Rem) / Un / Copy / Cast / Lea — pure and non-faulting
+//     (integer +−×, bitwise, shifts, casts, frame-address computation). Div/Rem are the
+//     only trapping arithmetic (÷0 is UB) and are NOT hoisted; Load is NOT hoisted (it may
+//     fault or alias a store in the loop) — so speculation never introduces a fault.
+//   • zcc's IR is only PARTIAL SSA — to_ssa promotes address-not-taken scalar locals, but
+//     straight-lowering temps and non-promotable values stay MULTI-DEF (reassignable). So
+//     single-assignment is NOT assumed; it is CHECKED: an instruction is hoisted only when
+//     its DST is single-def and every operand is a constant or a single-def temp defined
+//     outside the loop. Hoisting one def of a multi-def temp (e.g. a loop-condition temp
+//     reassigned each iteration) would FREEZE the value and change control flow — the class
+//     of bug the earlier version introduced (a terminating loop turned infinite). `equiv`
+//     is BLIND to it (interp of an infinite loop → Err → skipped as UB), so the guard is a
+//     construction-time obligation, re-checked by a direct-interp regression test.
+//   • `cfg_complete`-guarded (computed goto ⟹ the CFG is incomplete → dominance unsound).
+//   • a loop with no single out-of-loop entry (irreducible / entry-as-header) is skipped.
+// This attacks matmul's invariant address arithmetic (`a + i*rowsize`, the base of
+// `c[i][j]`), the biggest gap in the bench.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Back-edges (tail → header): a CFG edge whose head DOMINATES its tail (Aho §9.6.2).
+/// The head is a natural-loop header.
+fn back_edges(f: &IrFunc, dom: &[HashSet<BlockId>]) -> Vec<(BlockId, BlockId)> {
+    let succ = successors(f);
+    let mut out = Vec::new();
+    for u in 0..f.blocks.len() as BlockId {
+        for &v in &succ[u as usize] {
+            if dom[u as usize].contains(&v) {
+                out.push((u, v));
+            }
+        }
+    }
+    out
+}
+
+/// The natural loop of back-edge (tail→header): {header} ∪ {nodes that reach `tail`
+/// without passing through `header`} — backward reachability from tail (Aho Alg. 9.45).
+fn natural_loop(f: &IrFunc, tail: BlockId, header: BlockId) -> HashSet<BlockId> {
+    let preds = predecessors(f);
+    let mut body = HashSet::from([header]);
+    let mut stack = Vec::new();
+    if tail != header && body.insert(tail) {
+        stack.push(tail);
+    }
+    while let Some(n) = stack.pop() {
+        for &p in &preds[n as usize] {
+            if body.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    body
+}
+
+/// Ensure a dedicated PREHEADER for `header`: a block OUTSIDE `body`, on the sole
+/// out-of-loop entry edge, dominating the loop. Returns its BlockId, or None when the
+/// loop has no single out-of-loop entry (0 = the function entry is itself the header;
+/// >1 = multiple entries / irreducible → bail). Reuses an existing single-successor
+/// `Jmp(header)` entry block; otherwise inserts a fresh empty block on the entry edge
+/// (⟦·⟧-preserving, exactly like a critical-edge split) and moves the header's φ-arm
+/// for the entry predecessor onto the preheader.
+fn ensure_preheader(f: &mut IrFunc, header: BlockId, body: &HashSet<BlockId>) -> Option<BlockId> {
+    let preds = predecessors(f);
+    let entries: Vec<BlockId> =
+        preds[header as usize].iter().copied().filter(|p| !body.contains(p)).collect();
+    if entries.len() != 1 {
+        return None;
+    }
+    let p = entries[0];
+    let mut succ = Vec::new();
+    term_targets(&f.blocks[p as usize].term, &mut succ);
+    if succ.len() == 1 && matches!(f.blocks[p as usize].term, Term::Jmp(h) if h == header) {
+        return Some(p); // already a dedicated preheader (also gives idempotency across runs)
+    }
+    let ph = f.blocks.len() as BlockId;
+    f.blocks.push(Block { insts: Vec::new(), term: Term::Jmp(header) });
+    retarget(&mut f.blocks[p as usize].term, header, ph);
+    rename_phi_pred(&mut f.blocks[header as usize], p, ph);
+    Some(ph)
+}
+
+/// Hoistable ⟺ pure AND trap-free AND fault-free (see SAFETY FENCES). φ, Load, Store,
+/// Div/Rem, and every impure exotic are excluded.
+fn is_hoistable(i: &Inst) -> bool {
+    match i {
+        Inst::Bin(_, op, ..) => !matches!(op, Op::Div | Op::Rem),
+        Inst::Un(..) | Inst::Copy(..) | Inst::Cast(..) | Inst::Lea(..) => true,
+        _ => false,
+    }
+}
+
+/// Every operand is either a compile-time constant or a temp AVAILABLE in the preheader
+/// (a single-def source whose one definition lies outside the loop, incl. an already-hoisted one).
+fn operands_avail(i: &Inst, avail: &[bool]) -> bool {
+    let mut u = Vec::new();
+    inst_uses(i, &mut u);
+    u.iter().all(|&t| avail[t as usize])
+}
+
+pub fn licm(f: &mut IrFunc) -> u32 {
+    if !cfg_complete(f) {
+        return 0; // computed goto ⟹ incomplete CFG ⟹ dominance/back-edges unsound
+    }
+    // zcc's IR is only PARTIAL SSA: to_ssa promotes address-not-taken scalar locals into
+    // single-assignment temps, but straight-lowering temps and non-promotable values stay
+    // MULTI-DEF (reassignable 3-address temps). LICM's theorem needs single-assignment, so
+    // it is gated on it EXPLICITLY: def counts per temp + the (unique) defining block.
+    let nt = f.temps.len();
+    let mut defcnt = vec![0u32; nt];
+    let mut def_block = vec![u32::MAX; nt];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for i in &b.insts {
+            if let Some(d) = inst_def(i) {
+                defcnt[d as usize] += 1;
+                def_block[d as usize] = bi as BlockId;
+            }
+        }
+    }
+    let dom = dominators(f);
+    let backs = back_edges(f, &dom);
+    let mut hoisted = 0u32;
+    for (tail, header) in backs {
+        let body = natural_loop(f, tail, header); // against the CURRENT CFG (fresh preds)
+        // A temp is an AVAILABLE invariant source ⟺ it is SINGLE-DEF and its one definition
+        // lies OUTSIDE the loop body. A multi-def temp is never invariant (it may be
+        // reassigned — the loop-condition bug), and a temp defined inside the body is not
+        // yet available (until it is itself hoisted).
+        let mut avail = vec![false; nt];
+        for t in 0..nt {
+            if defcnt[t] == 1 && def_block[t] != u32::MAX && !body.contains(&def_block[t]) {
+                avail[t] = true;
+            }
+        }
+        // Candidate ⟺ hoistable shape ∧ its DST is SINGLE-DEF (moving a multi-def
+        // instruction would break the value that flows on another path) ∧ every operand
+        // is available. Only disturb the CFG if such a candidate exists (no empty preheaders).
+        let candidate = |inst: &Inst, avail: &[bool]| {
+            is_hoistable(inst)
+                && matches!(inst_def(inst), Some(d) if defcnt[d as usize] == 1)
+                && operands_avail(inst, avail)
+        };
+        let has_candidate =
+            body.iter().any(|&bid| f.blocks[bid as usize].insts.iter().any(|i| candidate(i, &avail)));
+        if !has_candidate {
+            continue;
+        }
+        let ph = match ensure_preheader(f, header, &body) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Fixpoint hoist: each round moves the first newly-available invariant instruction
+        // and marks its (single) def available, so a dependent invariant becomes hoistable
+        // next round — and lands AFTER its producer in the preheader (dependency order kept).
+        loop {
+            let mut found = None;
+            'scan: for &bid in body.iter() {
+                for (ix, inst) in f.blocks[bid as usize].insts.iter().enumerate() {
+                    if candidate(inst, &avail) {
+                        found = Some((bid, ix));
+                        break 'scan;
+                    }
+                }
+            }
+            let (bid, ix) = match found {
+                Some(x) => x,
+                None => break,
+            };
+            let inst = f.blocks[bid as usize].insts.remove(ix);
+            if let Some(d) = inst_def(&inst) {
+                avail[d as usize] = true; // now defined in the preheader (outside the body)
+            }
+            f.blocks[ph as usize].insts.push(inst);
+            hoisted += 1;
+        }
+    }
+    hoisted
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
 // point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
 // return to executable (φ-free) IR and do a final non-SSA cleanup.
 //
-//   optimize_ssa = to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce)* ▸ out_of_ssa ▸ optimize
+//   optimize_ssa = to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce ∘ cfg ∘ licm)* ▸ out_of_ssa ▸ optimize
 //
 // Each stage is an INDIVIDUALLY-PROVEN semantics-preserving rewrite (⟦·⟧-invariant,
 // gated by `equiv`); the COMPOSITE is therefore semantics-preserving, and this is
 // re-checked end-to-end by `optimize_ssa_preserves` — composition of commuting squares
 // is a commuting square, but we MEASURE it anyway (never trust by reasoning). This is
 // the artifact Stage 5 wires into the backend behind an optimization flag.
+//
+// INDUSTRIAL TOGGLEABLE PIPELINE (cf. gcc `-fno-<pass>` / LLVM PassBuilder): every stage
+// is a switch in `Passes`, so any element can be disabled independently. This matters
+// because a pass may be ⟦·⟧-CORRECT yet not a MEASURED win on a given backend — the
+// constitution ships only a proven-AND-measured win. `licm` is exactly that case: proven
+// (0 FAIL / 0 DIVERGE) but MEASURED to regress the memory-bound naive-slot backend
+// (hoisting trades a cheap address recompute for a per-iteration reload + more spill
+// pressure), so it defaults OFF and is one flag from ON for when a register-resident
+// backend makes hoisting pay. All other proven passes default ON.
 // ─────────────────────────────────────────────────────────────────────────────
-pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc) {
+
+/// Per-pass on/off switches for the SSA optimizer. `default()` is the shipped profile
+/// (every proven pass ON except the measured-negative `licm`); `all()` turns everything
+/// ON (the maximal pipeline the proofs cover). `from_env()` applies `ZCC_OPT_OFF` /
+/// `ZCC_OPT_ON` (comma-separated pass names) on top of the default profile.
+#[derive(Clone, Copy)]
+pub struct Passes {
+    pub sccp: bool,
+    pub const_fold: bool,
+    pub copy_prop: bool,
+    pub gvn: bool,
+    pub cse: bool,
+    pub dce: bool,
+    pub cfg_simplify: bool,
+    pub licm: bool,
+    pub coalesce: bool, // register coalescing (biased coloring, inside abi_alloc)
+}
+
+impl Default for Passes {
+    fn default() -> Self {
+        Passes {
+            sccp: true,
+            const_fold: true,
+            copy_prop: true,
+            gvn: true,
+            cse: true,
+            dce: true,
+            cfg_simplify: true,
+            licm: false, // proven-correct but measured-negative on the naive-slot backend
+            coalesce: true,
+        }
+    }
+}
+
+impl Passes {
+    /// The maximal pipeline the proofs cover (everything ON, incl. `licm`). Test-only:
+    /// at runtime the same effect is `ZCC_OPT_ON=licm` over the default profile.
+    #[cfg(test)]
+    pub fn all() -> Self {
+        Passes { licm: true, ..Passes::default() }
+    }
+    fn set(&mut self, name: &str, v: bool) {
+        match name {
+            "sccp" => self.sccp = v,
+            "const_fold" | "fold" => self.const_fold = v,
+            "copy_prop" | "copy" => self.copy_prop = v,
+            "gvn" => self.gvn = v,
+            "cse" => self.cse = v,
+            "dce" => self.dce = v,
+            "cfg_simplify" | "cfg" => self.cfg_simplify = v,
+            "licm" => self.licm = v,
+            "coalesce" => self.coalesce = v,
+            _ => {} // an unknown name is ignored (forward-compatible)
+        }
+    }
+    /// The default profile, then `ZCC_OPT_OFF=a,b` disables and `ZCC_OPT_ON=c,d` enables.
+    pub fn from_env() -> Self {
+        let mut p = Passes::default();
+        if let Ok(off) = std::env::var("ZCC_OPT_OFF") {
+            for n in off.split(',') {
+                p.set(n.trim(), false);
+            }
+        }
+        if let Ok(on) = std::env::var("ZCC_OPT_ON") {
+            for n in on.split(',') {
+                p.set(n.trim(), true);
+            }
+        }
+        p
+    }
+}
+
+pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
     to_ssa(tt, f);
     for _ in 0..32 {
         let mut n = 0;
-        n += sccp(tt, f); // conditional constants + dead-branch pruning (through φ)
-        n += const_fold(tt, f); // fold newly-constant operands
-        n += copy_prop(f); // collapse copies so GVN's operand value-numbers are canonical
-        n += gvn(f); // global redundant-expression elimination (dominator-based)
-        n += cse(f); // block-local load reuse (GVN skips memory)
-        n += dce(f); // reclaim the temps the above passes deadened (incl. φ)
-        n += cfg_simplify(f); // collapse the straight lines / dead blocks SCCP exposed
+        if p.sccp {
+            n += sccp(tt, f); // conditional constants + dead-branch pruning (through φ)
+        }
+        if p.const_fold {
+            n += const_fold(tt, f); // fold newly-constant operands
+        }
+        if p.copy_prop {
+            n += copy_prop(f); // collapse copies so GVN's operand value-numbers are canonical
+        }
+        if p.gvn {
+            n += gvn(f); // global redundant-expression elimination (dominator-based)
+        }
+        if p.cse {
+            n += cse(f); // block-local load reuse (GVN skips memory)
+        }
+        if p.dce {
+            n += dce(f); // reclaim the temps the above passes deadened (incl. φ)
+        }
+        if p.cfg_simplify {
+            n += cfg_simplify(f); // collapse the straight lines / dead blocks SCCP exposed
+        }
+        if p.licm {
+            n += licm(f); // hoist loop-invariant pure arithmetic to the preheader
+        }
         if n == 0 {
             break; // fixpoint
         }
@@ -2154,7 +2448,7 @@ mod tests {
         ] {
             let (ast, ir) = compile(nm, src);
             for f in &ir {
-                let home = abi_alloc(&ast.tt, f, &gp_budget(), &fp_budget());
+                let home = abi_alloc(&ast.tt, f, &gp_budget(), &fp_budget(), true);
                 verify_abi(&ast.tt, f, &home, &gp_budget(), &fp_budget())
                     .unwrap_or_else(|e| panic!("{nm}/{}: {e}", f.name));
             }
@@ -2180,7 +2474,7 @@ mod tests {
         out_of_ssa(&mut f); // emits the Copy insts coalescing bites on
         verify(&f).unwrap();
         let (gp, fp) = (gp_budget(), fp_budget());
-        let home = abi_alloc(&ast.tt, &f, &gp, &fp);
+        let home = abi_alloc(&ast.tt, &f, &gp, &fp, true);
         verify_abi(&ast.tt, &f, &home, &gp, &fp).expect("biased coloring must still be valid");
         let mut move_pairs = 0u32;
         let mut coalesced = 0u32;
@@ -2207,7 +2501,7 @@ mod tests {
         let fp = ClassBudget { k: 16, ncaller: 16 };
         let (ast, ir) = compile("x", "int h(int);int f(int a){int x=a*a;return h(a)+x;}");
         let f = ir.iter().find(|f| f.name == "f").unwrap();
-        let home = abi_alloc(&ast.tt, f, &gp, &fp);
+        let home = abi_alloc(&ast.tt, f, &gp, &fp, true);
         verify_abi(&ast.tt, f, &home, &gp, &fp).expect("no-callee budget must still verify (via spills)");
         assert!(
             home.iter().any(|h| h.is_none()),
@@ -2224,7 +2518,7 @@ mod tests {
             "int f(int a){int b=0; __asm__(\"lsl %w0, %w1, #1\" : \"=r\"(b) : \"r\"(a)); return b;}",
         );
         let f = ir.iter().find(|f| f.name == "f").unwrap();
-        let home = abi_alloc(&ast.tt, f, &gp_budget(), &fp_budget());
+        let home = abi_alloc(&ast.tt, f, &gp_budget(), &fp_budget(), true);
         assert!(
             home.iter().all(|h| h.is_none()),
             "a function containing inline asm must fall back to all-spill"
@@ -2646,7 +2940,7 @@ mod tests {
         );
         let mut ssa = ir.clone();
         for f in ssa.iter_mut() {
-            optimize_ssa(&ast.tt, f);
+            optimize_ssa(&ast.tt, f, &Passes::all());
         }
         for f in &ssa {
             verify(f).unwrap();
@@ -3186,6 +3480,190 @@ mod tests {
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    // LICM — Phase B loop-invariant code motion. THEOREM ⟦f⟧ = ⟦licm(f)⟧ (a pure,
+    // trap-free invariant computed once in the preheader = computed n times in the loop).
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // How many Mul instructions live in a function's loop-carrying (φ-headed) blocks?
+    fn muls_total(ir: &[IrFunc]) -> usize {
+        ir.iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Bin(_, Op::Mul, ..)))
+            .count()
+    }
+
+    #[test]
+    fn licm_semantics_preserved() {
+        // ∀ e ∈ 𝔼_struct: to_ssa ▸ licm commutes with ⟦·⟧ and stays well-formed. The loop
+        // family (E) supplies the back-edges; anti-vacuous below via `licm_hoists_invariant`.
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("licm", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+            }
+            let mut opt = ssa.clone();
+            for f in opt.iter_mut() {
+                licm(f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify licm {src}: {e}"));
+            }
+            equiv(&ast.tt, &ssa, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦licm(·)⟧ for {src}: {e}"));
+            proven += 1;
+        }
+        assert_eq!(proven, 312, "must prove licm over the whole generated space");
+        eprintln!("licm theorem: {proven} exprs proven ⟦to_ssa(f)⟧=⟦licm(·)⟧");
+    }
+
+    // NON-VACUOUS + the matmul motivation: a nested loop where the INNER body multiplies
+    // the OUTER induction variable by a constant (`i*7`). `i` is invariant in the inner
+    // loop (a promoted temp defined in the outer header), so `i*7` must be HOISTED to the
+    // inner preheader — the multiply leaves the inner loop. Value preserved.
+    #[test]
+    fn licm_hoists_invariant() {
+        let (ast, ir) = compile(
+            "licmh",
+            "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){int j;for(j=0;j<n;j=j+1){s=s+i*7;}}return s;}",
+        );
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        let muls_before = muls_total(&ssa);
+        let mut opt = ssa.clone();
+        let mut n = 0u32;
+        for f in opt.iter_mut() {
+            n += licm(f);
+        }
+        for f in &opt {
+            verify(f).unwrap();
+        }
+        assert!(n > 0, "licm must hoist the invariant i*7 out of the inner loop");
+        // The hoisted multiply is now in a preheader, not re-executed per inner iteration —
+        // but Mul count is unchanged (it MOVED, not deleted). Prove the MOVE instead: the
+        // instruction left every φ-headed loop body. Simpler robust check: equiv + value.
+        assert_eq!(muls_total(&opt), muls_before, "licm moves (does not delete) the multiply");
+        equiv(&ast.tt, &ssa, &opt, "f").expect("nested-loop LICM: ⟦to_ssa(f)⟧=⟦licm(·)⟧");
+        // f(3): Σ_{i=0}^{2} Σ_{j=0}^{2} i*7 = 3*(0+7+14) = 63.
+        assert_eq!(interp(&ast.tt, &opt, "f", &[3]).unwrap(), 63);
+        assert_eq!(interp(&ast.tt, &opt, "f", &[0]).unwrap(), 0);
+    }
+
+    // Prove the invariance test actually BITES: a loop-VARIANT expression must NOT be
+    // hoisted. `s*2` where `s` is loop-carried (a header φ) is variant — licm must leave
+    // it in the body. If licm wrongly hoisted a variant, equiv would diverge.
+    #[test]
+    fn licm_respects_variance() {
+        let (ast, ir) =
+            compile("licmv", "int f(int n){int s=1;int i;for(i=0;i<n;i=i+1){s=s*2;}return s;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        let mut opt = ssa.clone();
+        licm(&mut opt);
+        verify(&opt).unwrap();
+        let base = vec![ssa];
+        equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("variant must be preserved");
+        // f(3) = 1*2*2*2 = 8 (the variant multiply stayed in the loop).
+        assert_eq!(interp(&ast.tt, &vec![opt], "f", &[3]).unwrap(), 8);
+    }
+
+    // REGRESSION (partial-SSA soundness): a loop whose CONDITION temp is multi-def must
+    // NOT have one of its defs hoisted — that freezes the condition and turns a terminating
+    // loop INFINITE. `equiv` is blind here (interp of the broken loop hits the step budget →
+    // Err → skipped as UB), so this is checked by DIRECT interp: the pipeline output must
+    // still TERMINATE with the right value. GCC torture loop-9 shape (short-circuit || with
+    // a call, loop never taken). This is the exact bug the first LICM introduced.
+    #[test]
+    fn licm_multidef_condition_stays_finite() {
+        let (ast, ir) = compile(
+            "licmc",
+            "int fa(){return 0;} int f(){int count=0; while(fa()||count<-123) ++count; return count;}",
+        );
+        // Full pipeline (the real backend path).
+        let mut opt = ir.clone();
+        for f in opt.iter_mut() {
+            optimize_ssa(&ast.tt, f, &Passes::all());
+        }
+        for f in &opt {
+            verify(f).unwrap_or_else(|e| panic!("verify: {e}"));
+        }
+        // The loop is never taken ⟹ count stays 0. A frozen condition would loop forever
+        // (interp → step-budget Err); TERMINATION with 0 is the whole point.
+        assert_eq!(
+            interp(&ast.tt, &opt, "f", &[]).unwrap(),
+            0,
+            "a multi-def loop condition must NOT be hoisted (loop must stay finite)"
+        );
+    }
+
+    // The industrial toggle: the default profile ships licm OFF (measured-negative), all()
+    // turns it ON, and set() flips individual elements — so any pass can be disabled without
+    // touching the others. Correctness of every profile is covered by the equiv proofs;
+    // this only checks the switch wiring.
+    #[test]
+    fn passes_toggle_wiring() {
+        assert!(!Passes::default().licm, "default profile ships licm OFF (measured-negative)");
+        assert!(Passes::default().gvn && Passes::default().coalesce, "other proven passes default ON");
+        assert!(Passes::all().licm, "all() turns licm ON");
+        let mut p = Passes::default();
+        p.set("gvn", false);
+        p.set("licm", true);
+        assert!(!p.gvn && p.licm, "set() flips individual elements independently");
+        p.set("nonexistent", false); // unknown name ignored (forward-compatible)
+    }
+
+    // With coalescing toggled OFF, abi_alloc must still produce a VALID coloring (the bias
+    // only ever chose among free legal colors; removing it cannot break validity).
+    #[test]
+    fn coalesce_off_still_valid() {
+        let (ast, ir) = compile("nocoal", "int h(int);int f(int a){int x=a*a;int y=a+7;return h(a)+x-y;}");
+        let (gp, fp) = (gp_budget(), fp_budget());
+        for f in &ir {
+            let home = abi_alloc(&ast.tt, f, &gp, &fp, false);
+            verify_abi(&ast.tt, f, &home, &gp, &fp).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    // Self-proof (clean-input law): the gate has TEETH. Corrupt a hoisted instruction and
+    // equiv MUST catch it — the input battery exercises the preheader code.
+    #[test]
+    fn licm_gate_has_teeth() {
+        let (ast, ir) = compile(
+            "licmt",
+            "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){int j;for(j=0;j<n;j=j+1){s=s+i*7;}}return s;}",
+        );
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        let mut opt = ssa.clone();
+        assert!(licm(&mut opt) > 0, "licm must fire (precondition for the teeth)");
+        verify(&opt).unwrap();
+        let base = vec![ssa];
+        equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("identity: licm preserves ⟦·⟧");
+        // Mutate the hoisted i*7 → i+7; equiv must diverge (proving it is truly exercised).
+        let mut bad = opt.clone();
+        let mut mutated = false;
+        'o: for b in bad.blocks.iter_mut() {
+            for i in b.insts.iter_mut() {
+                if let Inst::Bin(_, op @ Op::Mul, ..) = i {
+                    *op = Op::Add;
+                    mutated = true;
+                    break 'o;
+                }
+            }
+        }
+        assert!(mutated, "there must be a hoisted Mul to mutate");
+        assert!(
+            equiv(&ast.tt, &base, &vec![bad], "f").is_err(),
+            "a Mul→Add mutation of the hoisted invariant MUST be caught (else the gate is blind)"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     // THE SSA PIPELINE — the composite QBE-level optimizer. THEOREM ⟦f⟧=⟦optimize_ssa(f)⟧.
     // ═════════════════════════════════════════════════════════════════════════
 
@@ -3200,7 +3678,7 @@ mod tests {
             let (ast, ir) = compile("pipe", src);
             let mut opt = ir.clone();
             for f in opt.iter_mut() {
-                optimize_ssa(&ast.tt, f);
+                optimize_ssa(&ast.tt, f, &Passes::all());
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify optimize_ssa {src}: {e}"));
@@ -3232,7 +3710,7 @@ mod tests {
             let before = count_insts(&ir);
             let mut opt = ir.clone();
             for f in opt.iter_mut() {
-                optimize_ssa(&ast.tt, f);
+                optimize_ssa(&ast.tt, f, &Passes::all());
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify {nm}: {e}"));

@@ -256,6 +256,38 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > theorem is unchanged — the same interference-invariant rename-bisimulation as Stage 5b
 > (`verify_abi`). No node-merge ⟹ k-colorability is never worsened ⟹ no spill risk.
 
+> **`licm` (Phase B, `opt::licm`, loop-invariant code motion) — TOGGLEABLE, default-OFF.**
+> Loop infra first: `back_edges` finds an edge `t→h` with `h dom t`; `natural_loop`
+> collects the body (nodes reaching `t` without passing `h`); `ensure_preheader` splits
+> a dominating single-entry block onto the header's sole external in-edge. LICM then
+> hoists a body instruction `d := op(a,b)` to the preheader **iff** it is (1) PURE and
+> TRAP-FREE — only `Bin(¬Div,¬Rem)/Un/Copy/Cast/Lea`, never `Load` (a store could alias);
+> (2) INVARIANT — every operand is a constant or defined outside the body; and (3)
+> **SINGLE-DEF** (`defcnt[d]==1`). Clause (3) is the load-bearing fence: zcc IR is only
+> *partial*-SSA (`to_ssa` promotes just address-not-taken scalars), so a multi-def
+> loop-condition temp still exists; hoisting one of its defs FREEZES it and turns a finite
+> loop infinite. That miscompile is invisible to `equiv` (an infinite loop → interp step
+> budget → `Err` → skipped as UB), so it is fenced by construction and pinned by a
+> DIRECT-interp regression test (`licm_multidef_condition_stays_finite`), not by `equiv`
+> alone. Speculation is safe (pure+trap-free) and def-before-use holds (the preheader
+> dominates the body), so **`⟦f⟧ = ⟦licm(f)⟧`** (`licm_semantics_preserved`,
+> `licm_hoists_invariant`, `licm_respects_variance`, `licm_gate_has_teeth`). MEASURED to
+> REGRESS the memory-bound naive-slot backend (every temp spills; hoisting trades a cheap
+> recompute for a reload — matmul 2.44→2.70×), so it ships OFF: only a MEASURED win is
+> default-on. Kept wired behind the `Passes` toggle (`ZCC_OPT_ON=licm`) for a future
+> register-resident backend where hoisting a loop-invariant into a callee-saved register
+> would pay.
+
+> **Pass pipeline as an industrial toggle (`opt::Passes`).** `optimize_ssa` no longer
+> hard-codes its pass set; it reads a `Passes { sccp, const_fold, copy_prop, gvn, cse,
+> dce, cfg_simplify, licm, coalesce }` record. `Passes::default()` = every ⟦·⟧-preserving
+> MEASURED-win pass ON, `licm` OFF. `Passes::from_env()` applies comma lists
+> `ZCC_OPT_OFF=`/`ZCC_OPT_ON=` (the gcc `-fno-<pass>` / LLVM `PassBuilder` idiom) so any
+> element is switched without a rebuild. Every toggle is `⟦·⟧`-neutral by construction —
+> each pass already carries its own commuting-square proof, so any subset composes to the
+> same denotation; the toggle changes only PERFORMANCE, never OBSERVABLE behavior
+> (`passes_toggle_wiring`, `coalesce_off_still_valid`).
+
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
 `Alloca`, `CallX`, `Sync`, `Asm`. The interpreter returns an error, meaning the

@@ -154,20 +154,28 @@ target file (Side II); everything else is Side I.
 | ABI-aware register allocation (consume Chaitin coloring in the backend) | interference-invariant rename-bisimulation ⊕ **call-clobber set-disjointness** — allocatable ∩ scratch = ∅ (no mid-instruction corruption) and, for a call-crossing temp, allocatable ∩ caller-saved = ∅ (survives every `bl`) — with `⟦·⟧` unchanged | **DONE (Stage 5b)** — `opt::abi_alloc`/`color_abi`; class-split Chaitin (GP callee x19–x28 ⊕ caller x14–x15, FP callee v8–v15 ⊕ caller v16–v31) with the crossing-temp select-range restricted to the callee-saved colors; homes wired into the backend `tmp_load`/`tmp_store` contract + a frame-bottom callee-saved save/restore slab; proven by `abi_alloc_valid` (per-class `verify_coloring`) + `abi_alloc_no_clobber` (no crossing temp lands in caller-saved) + `abi_alloc_spill`, gated by the fuzzer differential |
 | CFG simplification (Phase A — block merge + unreachable elimination) | straight-line splice (a block spliced into its sole predecessor) + dead-block deletion + renumber ⟹ the executed instruction SEQUENCE is unchanged ⟹ `⟦f⟧=⟦cfg_simplify(f)⟧` | **DONE (Phase A)** — `opt::cfg_simplify` (in the `optimize_ssa` fixpoint); `cfg_complete`-guarded; collapses the straight lines / dead blocks SCCP exposes (φ-arms renamed/pruned to the new numbering); proven by `cfg_simplify_semantics_preserved` (312 exprs × equiv, ≥36 shrink), `cfg_simplify_prunes_dead_branch` (SCCP→prune synergy), `cfg_simplify_gate_has_teeth` |
 | register COALESCING (Phase A — conservative biased coloring) | a non-interfering move pair (`Copy` dst/src) prefers the SAME color ⟹ the copy is a self-move (peephole-elidable); the bias picks only among already-free legal colors ⟹ the coloring stays valid ⟹ the SAME `verify_abi` interference invariant ⟹ `⟦·⟧` unchanged (no new proof obligation, no node-merge ⟹ k-colorability never worsened) | **DONE (Phase A)** — `opt::color_abi` `bias` arg fed by `abi_alloc`'s non-interfering `Copy` pairs; proven valid by `abi_alloc_valid` (now WITH bias) + non-vacuous by `coalesce_shares_register_for_moves` (a real edge-copy pair shares a register) |
+| LICM (Phase B — loop-invariant code motion) | a PURE, TRAP-FREE, SINGLE-DEF instruction whose operands are all defined outside the loop is hoisted to the loop PREHEADER (a dominating block on the sole entry edge): computed once, not n times; speculation is safe (pure+trap-free), def-before-use holds (preheader dominates the loop) ⟹ `⟦f⟧=⟦licm(f)⟧`. Fences: hoist only Bin(¬Div,¬Rem)/Un/Copy/Cast/Lea, NEVER Load; SINGLE-DEF-gated (zcc IR is only partial-SSA — freezing one def of a multi-def loop-condition temp would turn a finite loop infinite, a bug `equiv` is BLIND to since interp of an infinite loop → Err → skipped); `cfg_complete`-guarded | **DONE, TOGGLEABLE, default-OFF** — `opt::licm` + loop infra (`back_edges`/`natural_loop`/`ensure_preheader`). Proven ⟦·⟧-preserving (`licm_semantics_preserved` 312×equiv, `licm_hoists_invariant`, `licm_respects_variance`, `licm_multidef_condition_stays_finite` direct-interp regression, `licm_gate_has_teeth`) — but MEASURED to REGRESS the memory-bound naive-slot backend (matmul 2.44→2.70×): hoisting trades a cheap recompute for a reload. Kept wired behind `Passes.licm` (`ZCC_OPT_ON=licm`) for a future register-resident backend; ships OFF (only a MEASURED win is default-on) |
 
 **5 passes → theorem (all DECIDABLE; no loop restructuring → outside Rice):**
 const-fold = rewrite-soundness · DCE = liveness · copy-prop = dominance + Leibniz ·
 CSE = value-numbering · regalloc = rename-bisimulation.
 
 **The SSA pipeline `opt::optimize_ssa` (the QBE-level projection under CbC) `[ssa-qbe fork]`:**
-`to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce ∘ cfg_simplify)* ▸ out_of_ssa ▸ optimize`
-(register coalescing runs later, inside `abi_alloc`, as a coloring bias).
+`to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce ∘ cfg_simplify [∘ licm])* ▸ out_of_ssa ▸ optimize`
+(register coalescing runs later, inside `abi_alloc`, as a coloring bias; `licm` is
+default-OFF — see below). The active pass set is not hard-coded: `optimize_ssa` reads an
+`opt::Passes` record, so any element toggles via `ZCC_OPT_OFF=`/`ZCC_OPT_ON=` comma lists
+(the gcc `-fno-<pass>` / LLVM `PassBuilder` idiom). Each toggle is `⟦·⟧`-neutral by
+construction — every pass carries its own commuting-square proof, so any subset composes
+to the same denotation; the toggle changes only PERFORMANCE (`passes_toggle_wiring`).
 Each stage is an individually-proven ⟦·⟧-invariant rewrite ⟹ the composite is too;
 re-MEASURED end-to-end by `optimize_ssa_preserves` (312 exprs × equiv, φ-free result)
 + `optimize_ssa_preserves_corpus_and_reduces` (value-correct + shrinks). The artifact
-Stage 5 wires into the backend behind an optimization flag. Deliberately OMITTED (QBE
-"most of the win, a fraction of the complexity", and the harder-to-prove): LICM,
-cross-loop GVN, and other loop restructuring.
+Stage 5 wires into the backend behind an optimization flag. **LICM is IMPLEMENTED and
+PROVEN but ships OFF** (measured-negative on the naive-slot backend — see the LICM row);
+still OMITTED (QBE "most of the win, a fraction of the complexity", harder-to-prove, or
+measured no-pay on this backend): strength-reduction, cross-loop GVN, other loop
+restructuring.
 
 ### A8. Testing & proof methodology `[IN USE]`
 Differential testing · Metamorphic (commuting-square) · Property/boundary-value ·

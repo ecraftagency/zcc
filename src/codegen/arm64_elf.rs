@@ -79,6 +79,7 @@ struct Cg<'a> {
     // distinct CALLEE-saved physical registers used → saved into a frame-bottom slab
     // (the lowest bytes of the temp region, below the slots) and restored before each ret.
     regalloc: bool,
+    coalesce: bool, // register-coalescing toggle (biased coloring in abi_alloc)
     talloc: Vec<AbiHome>,
     csave_gp: Vec<u32>,
     csave_fp: Vec<u32>,
@@ -1523,7 +1524,7 @@ impl<'a> Cg<'a> {
         self.ir_temps = irf.temps.clone();
         // Stage 5b: assign each temp a home. regalloc off ⟹ all-spill = the memory model.
         self.talloc = if self.regalloc {
-            crate::opt::abi_alloc(&self.a.tt, irf, &GP_BUDGET, &FP_BUDGET)
+            crate::opt::abi_alloc(&self.a.tt, irf, &GP_BUDGET, &FP_BUDGET, self.coalesce)
         } else {
             vec![None; irf.temps.len()]
         };
@@ -1590,9 +1591,13 @@ pub fn emit_ir(ast: &Ast) -> String {
     //   (2) ZCC_O0 — the -O0 escape (debug + the bench baseline), the sole knob that turns
     //       the optimizer off. Default (unset) = full SSA optimization + regalloc.
     let opt_on = !ast.has_volatile && std::env::var("ZCC_O0").is_err();
+    // Industrial toggleable pipeline: which passes run is read once from the environment
+    // (ZCC_OPT_OFF / ZCC_OPT_ON over the default profile). `coalesce` is consumed later by
+    // abi_alloc, so it is stashed on Cg.
+    let passes = crate::opt::Passes::from_env();
     if opt_on {
         for f in funcs.iter_mut() {
-            crate::opt::optimize_ssa(&ast.tt, f);
+            crate::opt::optimize_ssa(&ast.tt, f, &passes);
             debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
         }
     }
@@ -1614,6 +1619,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         ir_temps: Vec::new(),
         ir_tspill: 0,
         regalloc,
+        coalesce: passes.coalesce,
         talloc: Vec::new(),
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
