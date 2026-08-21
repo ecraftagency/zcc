@@ -1,5 +1,5 @@
 // Parser: &[Tok] → AST arena (Vec<Node> + NodeId u32) + type arena (TyTab).
-// Grammar C89 (thiếu: initializer {..}, bitfield, struct by value — các vòng sau):
+// C89 grammar (missing: initializer {..}, bitfield, struct by value — later passes):
 //   decl       = decl_specs (declarator ("=" init)? ("," declarator ...)*)? ";"
 //              | decl_specs declarator [old-style decls] block   (funcdef)
 //   decl_specs = (storage | qualifier | void/char/short/int/long/signed/unsigned/
@@ -10,8 +10,9 @@
 //   cond → lor → land → bitor → bitxor → bitand → eq → rel → shift → add → mul
 //        → cast-expr = "(" typename ")" cast-expr | unary
 //   postfix    = primary ("[" e "]" | "." id | "->" id | "(" args ")" | "++" | "--")*
-// Chuyển đổi kiểu: parser chèn Node::Cast tại mọi điểm hội tụ (usual arithmetic
-// conversions, gán, arg theo prototype, return) — codegen chỉ nhìn type để chọn lệnh.
+// Type conversion: the parser inserts Node::Cast at every convergence point (usual
+// arithmetic conversions, assignment, argument by prototype, return) — codegen only
+// inspects the type to select instructions.
 use crate::ast::{
     AsmOp, Ast, BOOL, CHAR, DOUBLE, FLOAT, FnSig, Func, GInit, Global, INT, LDOUBLE, LONG, Node, NodeId,
     SHORT, StructDef, SyncOp, Ty, TyTab, TypeId, UCHAR, UINT, ULONG, USHORT, VOID,
@@ -31,17 +32,17 @@ enum Storage {
 enum Vloc {
     Stack(u32),
     Glob(u32),
-    Fn, // prototype trong block shadow biến ngoài — tra tiếp self.fns
+    Fn, // a prototype inside a block shadows an outer variable — look further in self.fns
 }
 
-// cây initializer: expr / danh sách {..} / string literal
+// initializer tree: expr / list {..} / string literal
 #[derive(Clone)]
 enum Init {
     E(NodeId),
     L(Vec<(Desig, Init)>),
-    S(Vec<u8>, u8), // element width byte (1 narrow, 2 char16, 4 wchar/char32)
+    S(Vec<u8>, u8), // element width in bytes (1 narrow, 2 char16, 4 wchar/char32)
 }
-// designator C99 ([i] = / .m =) — clang chấp nhận trong -std=c89
+// C99 designator ([i] = / .m =) — clang accepts it under -std=c89
 #[derive(Clone)]
 enum Desig {
     No,
@@ -49,7 +50,7 @@ enum Desig {
     Rng(u32, u32), // EXT(gcc): [lo ... hi] range designator
     Mem(String),
 }
-// leaf sau khi đổ phẳng initializer: expr hoặc chuỗi byte (string vào mảng char)
+// leaf after flattening an initializer: an expr or a byte string (string into a char array)
 enum FlatItem {
     E(NodeId),
     B(Vec<u8>),
@@ -62,81 +63,84 @@ struct P<'a> {
     nodes: Vec<Node>,
     types: Vec<TypeId>,
     tt: TyTab,
-    locals: Vec<(String, TypeId, Vloc)>, // scope = truncate khi đóng block
+    locals: Vec<(String, TypeId, Vloc)>, // scope = truncate when a block closes
     cur_off: u32,
     globals: Vec<Global>,
     strs: Vec<Vec<u8>>,
-    fns: HashMap<String, TypeId>, // tên hàm → TypeId (Ty::Func)
-    static_fns: std::collections::HashSet<String>, // đã khai static → definition giữ internal linkage
+    fns: HashMap<String, TypeId>, // function name → TypeId (Ty::Func)
+    static_fns: std::collections::HashSet<String>, // declared static → definition keeps internal linkage
     tags: HashMap<String, TypeId>,
     typedefs: HashMap<String, TypeId>,
     enums: HashMap<String, i64>,
-    enum_tags: HashMap<String, TypeId>, // tag → underlying (INT | UINT, khớp clang)
+    enum_tags: HashMap<String, TypeId>, // tag → underlying (INT | UINT, matching clang)
     switches: Vec<(Vec<(i64, i64, NodeId)>, Option<NodeId>)>,
-    fret: TypeId,              // kiểu trả về của hàm đang parse
-    va_off: u32,               // offset từ x29 đến vùng arg vô danh (16 + 8*named-stack-params)
-    in_fn: bool,               // đang trong body hàm (compound literal: local vs global ẩn)
-    attr_aligned: Option<u32>, // aligned(n) lơ lửng từ decl_specs (member: pr23467)
-    saw_inline: bool,          // EXT(gcc): decl_specs vừa gặp inline/__inline (gnu89)
-    saw_thread: bool,          // EXT(gcc): decl_specs vừa gặp __thread (capture NGAY sau
-    // decl_specs — init chứa cast sẽ gọi decl_specs lồng làm reset cờ)
-    // EXT(gcc): tên đã có file-scope declaration KHÔNG inline — C99 6.7.4p7:
-    // định nghĩa inline của tên đó vẫn là external definition (logreqres redis)
+    fret: TypeId,              // return type of the function currently being parsed
+    va_off: u32,               // offset from x29 to the anonymous-argument area (16 + 8*named-stack-params)
+    in_fn: bool,               // inside a function body (compound literal: local vs implicit global)
+    attr_aligned: Option<u32>, // aligned(n) pending from decl_specs (member: pr23467)
+    saw_inline: bool,          // EXT(gcc): decl_specs just saw inline/__inline (gnu89)
+    saw_thread: bool,          // EXT(gcc): decl_specs just saw __thread (captured IMMEDIATELY after
+    // decl_specs — an init containing a cast calls decl_specs recursively and would reset the flag)
+    // EXT(gcc): a name with a NON-inline file-scope declaration — C99 6.7.4p7:
+    // an inline definition of that name is still an external definition
     plain_decls: std::collections::HashSet<String>,
-    // C99: declarator vừa gặp mảng size không hằng (VLA) — expr của size;
-    // chỉ stmt() (local decl) tiêu thụ, hạ xuống con trỏ + Alloca
+    // C99: declarator just saw an array with a non-constant size (VLA) — the size expr;
+    // consumed only by stmt() (local decl), lowered to pointer + Alloca
     vla_size: Option<NodeId>,
-    // C99 6.7.6.2: VLA đa chiều `int M[d0][d1]` — vla_size giữ chiều NGOÀI (d0),
-    // vla_inner giữ các chiều TRONG (d1, ...) theo thứ tự ngoài→trong. Chỉ
-    // stmt() tiêu thụ (2D-only hiện tại; ≥3 chiều reject sạch).
+    // C99 6.7.6.2: multidimensional VLA `int M[d0][d1]` — vla_size holds the OUTER
+    // dimension (d0), vla_inner holds the INNER dimensions (d1, ...) in outer→inner
+    // order. Consumed only by stmt() (2D-only for now; ≥3 dimensions are rejected cleanly).
     vla_inner: Vec<NodeId>,
-    // C99 6.7.6.2/6.9.1: dimension array-param CÓ side-effect (`array[i++]`)
-    // eval-on-entry — param decay về con trỏ nhưng side-effect của size expr
-    // PHẢI chạy khi hàm được gọi. Lưu (start,end) token-range của từng dim vì
-    // param chưa trong scope lúc parse declarator; re-parse ở prologue sau
-    // setup_params (params đã là local). Drain lúc vào funcdef; clear ở non-def.
+    // C99 6.7.6.2/6.9.1: an array-parameter dimension WITH a side effect (`array[i++]`)
+    // is evaluated on entry — the parameter decays to a pointer, but the side effect of
+    // the size expr MUST run when the function is called. Store the (start,end) token range
+    // of each dimension, since the parameter is not yet in scope while parsing the declarator;
+    // re-parse in the prologue after setup_params (parameters are now locals). Drained on
+    // entering a funcdef; cleared for a non-definition.
     param_vla_dims: Vec<(usize, usize)>,
-    // đang parse param list (đếm vì lồng nhau): size mảng param không hằng
-    // (glibc regex.h `__pmatch[__nmatch]` — __nmatch là param TRƯỚC, không có
-    // trong scope) → bỏ qua expr, param decay về con trỏ nên size vô nghĩa
+    // currently parsing a parameter list (counted because of nesting): a non-constant
+    // parameter-array size (glibc regex.h `__pmatch[__nmatch]` — __nmatch is a PRIOR
+    // parameter, not in scope) → skip the expr; the parameter decays to a pointer, so the
+    // size is meaningless
     in_params: u32,
-    // EXT(gcc): local ghim reg `register long v __asm__("x8")` (musl syscall)
-    // — key = offset stack của local, value = số reg GP
+    // EXT(gcc): a local pinned to a register `register long v __asm__("x8")` (musl syscall)
+    // — key = the local's stack offset, value = GP register number
     reg_pins: HashMap<u32, u8>,
-    // C99: con trỏ tới VLA `char (*p)[w]` (musl lsearch/dynlink) — key =
-    // TypeId của Array(elem, 0) pointee (không intern nên unique mỗi decl),
-    // value = offset local ẩn giữ SIZE BYTE runtime; mkbin scale theo nó
+    // C99: pointer to a VLA `char (*p)[w]` (musl lsearch/dynlink) — key = the TypeId of
+    // the Array(elem, 0) pointee (not interned, so unique per decl), value = offset of the
+    // hidden local holding the runtime SIZE IN BYTES; mkbin scales by it
     vla_arrs: HashMap<TypeId, u32>,
-    // C99 6.5.3.4p2: sizeof(vla local) là giá trị RUNTIME — key = offset
-    // local VLA, value = offset local ẩn `.vlasz` giữ số byte (chốt một lần
-    // lúc khai báo). Offset tái dụng giữa các hàm → PHẢI clear mỗi hàm.
+    // C99 6.5.3.4p2: sizeof(local vla) is a RUNTIME value — key = offset of the VLA local,
+    // value = offset of the hidden local `.vlasz` holding the byte count (fixed once at
+    // declaration). Offsets are reused across functions → MUST be cleared per function.
     vla_szs: HashMap<u32, u32>,
-    // C99 6.7.7 + 6.5.3.4p2: typedef của variably-modified array (`typedef int
-    // c[i+2]`) — size chốt RUNTIME lúc khai báo, sizeof(c) đọc lại. Key = TypeId
-    // Array(elem,0) (unique mỗi decl), value = offset local ẩn giữ số byte. Clear
-    // mỗi hàm như vla_szs (offset frame-local).
+    // C99 6.7.7 + 6.5.3.4p2: typedef of a variably-modified array (`typedef int c[i+2]`)
+    // — the size is fixed at RUNTIME at the declaration, and sizeof(c) reads it back. Key =
+    // TypeId Array(elem,0) (unique per decl), value = offset of the hidden local holding the
+    // byte count. Cleared per function like vla_szs (frame-local offset).
     vm_typedef_sz: HashMap<TypeId, u32>,
-    // C99: _Complex t (musl src/complex) hạ về struct {re, im} — layout,
-    // union punning, HFA ABI (AAPCS64 coi complex như struct 2 phần tử) ăn
-    // nguyên máy móc struct sẵn có. Key = elem (FLOAT/DOUBLE), value = TypeId struct.
+    // C99: _Complex t (musl src/complex) is lowered to struct {re, im} — layout, union
+    // punning, and HFA ABI (AAPCS64 treats a complex as a 2-element struct) all reuse the
+    // existing struct machinery verbatim. Key = elem (FLOAT/DOUBLE), value = TypeId of the struct.
     cplx_tys: HashMap<TypeId, TypeId>,
-    fname: String, // tên hàm đang parse (label symbol cho &&label trong static init)
-    asm_label: Option<String>, // EXT(gcc): __asm("_sym") vừa nuốt trong skip_attrs
-    renames: HashMap<String, String>, // EXT(gcc): tên C → symbol __asm (SDK versioning)
+    fname: String, // name of the function being parsed (label symbol for &&label in static init)
+    asm_label: Option<String>, // EXT(gcc): __asm("_sym") just consumed in skip_attrs
+    renames: HashMap<String, String>, // EXT(gcc): C name → __asm symbol (SDK versioning)
     attr_weak: bool,            // EXT(gcc): __attribute__((weak)) (musl)
     attr_transp: bool,          // EXT(gcc): transparent_union (glibc sockaddr arg)
     attr_alias: Option<String>, // EXT(gcc): __attribute__((alias("sym"))) (musl weak_alias)
-    attr_mode: Option<(u32, bool)>, // EXT(gcc): mode(M) → (width-byte, is_float); remap type
-    raw_asm: Vec<String>,       // EXT(gcc): __asm__("...") cấp toàn cục (musl crt)
-    aliases: Vec<(String, String, bool)>, // (mới, cũ, weak)
-    // EXT(gcc): prototype mang weak (musl `extern weak hidden _DYNAMIC[]`) —
-    // TU tham chiếu phải phát .weak kẻo strong undef ref làm link đòi symbol
+    attr_mode: Option<(u32, bool)>, // EXT(gcc): mode(M) → (width-in-bytes, is_float); remap type
+    raw_asm: Vec<String>,       // EXT(gcc): global-level __asm__("...") (musl crt)
+    aliases: Vec<(String, String, bool)>, // (new, old, weak)
+    // EXT(gcc): a prototype carrying weak (musl `extern weak hidden _DYNAMIC[]`) —
+    // a referencing TU must emit .weak, otherwise a strong undefined reference makes the
+    // link demand the symbol
     weak_decls: Vec<String>,
 }
 
 type R = Result<NodeId, String>;
 
-// trải một GInit (offset gốc off) vào list phẳng (offset, size, item)
+// splice a GInit (base offset `off`) into a flat list (offset, size, item)
 fn splice_ginit(off: u32, sz: u32, init: GInit, list: &mut Vec<(u32, u32, GInit)>) {
     match init {
         GInit::List(items) => {
@@ -180,16 +184,16 @@ const TYPE_WORDS: [&str; 25] = [
     "volatile",
     "_Bool",
     "_Complex",     // C99
-    "__complex__",  // EXT(gcc): bí danh _Complex
-    "__complex",    // EXT(gcc): dạng không gạch đuôi (`__complex double`)
+    "__complex__",  // EXT(gcc): alias for _Complex
+    "__complex",    // EXT(gcc): form without trailing underscores (`__complex double`)
     "__const",
     "__volatile",
     "__signed",
     "__signed__",
     "__typeof__",
     "__typeof",
-    "typeof", // EXT(gcc): typeof trần — kernel/coreutils/gnulib xài (rủi ro nhỏ:
-              // chương trình C89 đặt biến tên `typeof` sẽ vỡ; không code thật nào làm)
+    "typeof", // EXT(gcc): bare typeof — used by kernel/coreutils/gnulib (minor risk:
+              // a C89 program that names a variable `typeof` would break; no real code does)
 ];
 
 impl P<'_> {
@@ -218,7 +222,7 @@ impl P<'_> {
         if self.eat(&want) {
             Ok(())
         } else {
-            Err(format!("cần {:?}, gặp {:?}", want, self.toks.get(self.pos)))
+            Err(format!("expected {:?}, found {:?}", want, self.toks.get(self.pos)))
         }
     }
     fn ident(&mut self) -> Result<String, String> {
@@ -226,28 +230,28 @@ impl P<'_> {
             self.pos += 1;
             Ok(n.clone())
         } else {
-            Err(format!("cần tên, gặp {:?}", self.toks.get(self.pos)))
+            Err(format!("expected identifier, found {:?}", self.toks.get(self.pos)))
         }
     }
     fn is_type_word(&self, n: &str) -> bool {
         TYPE_WORDS.contains(&n)
-            // typedef bị biến local CÙNG TÊN shadow (redis: quicklist *quicklist)
-            // — sau dòng khai báo đó, tên là biến chứ không còn là kiểu
-            // (chỉ soi shadow TRONG body — ngoài body locals là đồ thừa hàm trước)
+            // a typedef shadowed by a local variable of the SAME NAME (redis: quicklist *quicklist)
+            // — after that declaration line the name is a variable, no longer a type
+            // (only check shadowing INSIDE a body — outside a body, locals are leftovers from a prior function)
             || (self.typedefs.contains_key(n)
                 && !(self.in_fn && self.locals.iter().any(|(ln, ..)| ln == n)))
             || ["typedef", "static", "extern", "auto", "register"].contains(&n)
     }
-    // keyword cứng — typedef-name KHÔNG tính (vẫn được làm tên declarator/member)
+    // hard keyword — a typedef-name does NOT count (it may still be a declarator/member name)
     fn is_keyword(&self, n: &str) -> bool {
         TYPE_WORDS.contains(&n) || ["typedef", "static", "extern", "auto", "register"].contains(&n)
     }
 
-    // ---- hằng ----
-    // EXT(gcc): compat cấu trúc cho __builtin_types_compatible_p — TyTab không
-    // intern nên so đệ quy. Func so CHỮ KÝ (C99 6.7.5.3): return + số param +
-    // từng param + cờ variadic phải khớp (chibicc builtin.c phân biệt
-    // int(*)(float,double) ≠ int(*)(float), (...) ≠ (void)).
+    // ---- constants ----
+    // EXT(gcc): structural compatibility for __builtin_types_compatible_p — TyTab does
+    // not intern, so compare recursively. Functions compare by SIGNATURE (C99 6.7.5.3):
+    // return type + parameter count + each parameter + the variadic flag must match
+    // (chibicc builtin.c distinguishes int(*)(float,double) ≠ int(*)(float), (...) ≠ (void)).
     fn ty_compat(&self, a: TypeId, b: TypeId) -> bool {
         match (&self.tt.tys[a as usize], &self.tt.tys[b as usize]) {
             (Ty::Ptr(x), Ty::Ptr(y)) => self.ty_compat(*x, *y),
@@ -267,24 +271,24 @@ impl P<'_> {
         let e = self.cond_expr()?;
         self.fold(e)
     }
-    // EXT(c11): _Static_assert(const-expr[, "msg"]); — declaration ở cả
-    // file-scope lẫn block (postgres18 StaticAssertStmt/Decl đòi). Đánh giá
-    // NGAY lúc parse: fail = lỗi biên dịch, pass = không sinh node nào.
-    // Msg optional (C23 cho bỏ — nuốt luôn cho rẻ).
+    // EXT(c11): _Static_assert(const-expr[, "msg"]); — a declaration at both file scope
+    // and block scope (required by postgres18 StaticAssertStmt/Decl). Evaluated
+    // IMMEDIATELY at parse time: failure = a compile error, success = no node emitted.
+    // The message is optional (C23 allows omitting it — accepted here for simplicity).
     fn static_assert(&mut self) -> Result<(), String> {
         self.expect(Tok::Punct("("))?;
         let v = self.const_expr()?;
         let mut msg = String::new();
         if self.eat(&Tok::Punct(",")) {
             while let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
-                msg.push_str(&String::from_utf8_lossy(b)); // chuỗi liền kề tự nối
+                msg.push_str(&String::from_utf8_lossy(b)); // adjacent strings are concatenated
                 self.pos += 1;
             }
         }
         self.expect(Tok::Punct(")"))?;
         self.expect(Tok::Punct(";"))?;
         if v == 0 {
-            return Err(format!("_Static_assert fail: {msg}"));
+            return Err(format!("_Static_assert failed: {msg}"));
         }
         Ok(())
     }
@@ -292,7 +296,7 @@ impl P<'_> {
         match &self.nodes[id as usize] {
             Node::Num(v) => Ok(*v),
             Node::Neg(e) => Ok(self.fold(*e)?.wrapping_neg()),
-            // &((T *)K)->m / &((T *)K)->a[i]: offsetof cổ điển — hằng nguyên
+            // &((T *)K)->m / &((T *)K)->a[i]: classic offsetof — an integer constant
             Node::Addr(x) => {
                 let mut e = *x;
                 let mut off = 0i64;
@@ -304,16 +308,16 @@ impl P<'_> {
                             e = *b;
                         }
                         Node::Deref(p) => return Ok(self.fold(*p)? + off),
-                        _ => return Err("cần biểu thức hằng".into()),
+                        _ => return Err("constant expression required".into()),
                     }
                 }
             }
             Node::Cast(e) => {
-                // thu hẹp theo kiểu đích để (char)300 v.v. đúng
+                // narrow to the target type so that (char)300 etc. is correct
                 let v = self.fold(*e)?;
                 let t = self.ty(id);
-                // _Bool KHÔNG thu hẹp modular: C99 6.3.1.2 = (value != 0). size 1 +
-                // unsigned trùng nhánh `v as u8` → (_Bool)0x100 ra 0 (sai). Chặn trước.
+                // _Bool does NOT narrow modularly: C99 6.3.1.2 = (value != 0). size 1 +
+                // unsigned collides with the `v as u8` arm → (_Bool)0x100 would yield 0 (wrong). Handle first.
                 if matches!(self.tt.tys[t as usize], Ty::Bool) {
                     return Ok((v != 0) as i64);
                 }
@@ -334,7 +338,7 @@ impl P<'_> {
                     self.fold(*e)
                 }
             }
-            // cả 2 vế phải fold được — Comma có side effect không phải hằng
+            // both sides must fold — a Comma with a side effect is not a constant
             Node::Comma(l, r) => {
                 self.fold(*l)?;
                 self.fold(*r)
@@ -348,7 +352,7 @@ impl P<'_> {
                     "+" => l.wrapping_add(r),
                     "-" => l.wrapping_sub(r),
                     "*" => l.wrapping_mul(r),
-                    "/" | "%" if r == 0 => return Err("chia 0 trong hằng".into()),
+                    "/" | "%" if r == 0 => return Err("division by zero in constant expression".into()),
                     "/" if u => (l as u64 / r as u64) as i64,
                     "/" => l.wrapping_div(r),
                     "%" if u => (l as u64 % r as u64) as i64,
@@ -369,16 +373,16 @@ impl P<'_> {
                     ">" => (l > r) as i64,
                     ">=" if u => ((l as u64) >= r as u64) as i64,
                     ">=" => (l >= r) as i64,
-                    _ => return Err("op không dùng được trong hằng".into()),
+                    _ => return Err("operator not usable in constant expression".into()),
                 })
             }
-            _ => Err("cần biểu thức hằng".into()),
+            _ => Err("constant expression required".into()),
         }
     }
-    // hằng thực cho global init kiểu float
+    // floating constant for a float-typed global initializer
     fn fold_f(&self, id: NodeId) -> Result<f64, String> {
-        // cây con kiểu NGUYÊN (musl: (double)(1 << k) trong POWF_SCALE):
-        // fold nguyên trọn vẹn rồi đổi sang thực theo dấu
+        // an INTEGER-typed subtree (musl: (double)(1 << k) in POWF_SCALE):
+        // fold it fully as an integer, then convert to floating according to signedness
         if !self.tt.is_float(self.ty(id))
             && let Ok(v) = self.fold(id) {
                 return Ok(if self.tt.is_unsigned(self.ty(id)) {
@@ -389,7 +393,7 @@ impl P<'_> {
             }
         match &self.nodes[id as usize] {
             Node::FNum(v) => Ok(*v),
-            // unsigned 64-bit: 9223372036854775810ul phải thành 9.2e18 chứ không âm
+            // unsigned 64-bit: 9223372036854775810ul must become 9.2e18, not negative
             Node::Num(v) => Ok(if self.tt.is_unsigned(self.ty(id)) {
                 *v as u64 as f64
             } else {
@@ -404,17 +408,17 @@ impl P<'_> {
                     "-" => l - r,
                     "*" => l * r,
                     "/" => l / r,
-                    _ => return Err("op không dùng được trong hằng thực".into()),
+                    _ => return Err("operator not usable in floating constant expression".into()),
                 })
             }
-            _ => Err("cần hằng thực".into()),
+            _ => Err("floating constant required".into()),
         }
     }
 
-    // ---- kiểu ----
-    // None = token hiện tại không mở đầu một declaration
+    // ---- types ----
+    // None = the current token does not begin a declaration
     fn decl_specs(&mut self) -> Result<Option<(TypeId, Storage)>, String> {
-        self.attr_aligned = None; // của declaration trước, không lây
+        self.attr_aligned = None; // belongs to the previous declaration; do not carry over
         self.saw_inline = false;
         self.saw_thread = false;
         self.attr_weak = false;
@@ -434,25 +438,25 @@ impl P<'_> {
                 "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict"
                 | "__restrict__" | "__extension__" | "__volatile" | "__volatile__" | "__const"
                 | "__const__" | "_Noreturn" => {}
-                // EXT(gcc): __thread TLS thật (Mach-O @TLVP) — redis-tests
-                // unit io-threads>=2 là chủ nợ đòi. Plain __thread trên auto
-                // local (gcc cấm) rơi tự nhiên về stack — vốn đã per-thread.
+                // EXT(gcc): real __thread TLS (Mach-O @TLVP) — required by the redis-tests
+                // io-threads>=2 unit. A plain __thread on an auto local (which gcc forbids)
+                // naturally falls back to the stack — already per-thread.
                 "__thread" => self.saw_thread = true,
-                // EXT(gcc): inline — zcc không có inliner; definition inline sẽ hạ
-                // về static (mỗi TU một bản, như nhánh "static __inline" của cdefs.h)
-                // để "extern __inline" gnu89 của SDK không phát duplicate symbol
+                // EXT(gcc): inline — zcc has no inliner; an inline definition is lowered
+                // to static (one copy per TU, like the "static __inline" branch of cdefs.h)
+                // so that the SDK's gnu89 "extern __inline" does not emit a duplicate symbol
                 "inline" | "__inline" | "__inline__" => self.saw_inline = true,
-                // EXT(clang): nullability — no-op về ngữ nghĩa
+                // EXT(clang): nullability — semantically a no-op
                 "_Nullable" | "_Nonnull" | "_Null_unspecified" => {}
                 "__attribute__" | "__asm__" | "__asm" => {
                     let (pk, al) = self.skip_attrs()?;
                     if pk || al.is_some() {
-                        // "struct {...} __attribute__((packed / aligned))" hậu tố
+                        // "struct {...} __attribute__((packed / aligned))" suffix
                         if let Some(t) = direct {
                             self.repack(t, pk, al);
                         } else if let Some(a) = al {
-                            // "int __attribute__((aligned(8))) x" — treo lại cho
-                            // declarator/member dùng (pr23467)
+                            // "int __attribute__((aligned(8))) x" — hold it for the
+                            // declarator/member to use (pr23467)
                             self.attr_aligned = Some(self.attr_aligned.unwrap_or(1).max(a));
                         }
                     }
@@ -463,8 +467,8 @@ impl P<'_> {
                 "static" => storage = Storage::Static,
                 "extern" => storage = Storage::Extern,
                 "void" | "char" | "int" | "float" | "double" | "_Bool" => base = Some(n),
-                // C99: _Complex — musl src/complex; hạ về struct {re, im}.
-                // EXT(gcc): __complex__ / __complex là bí danh (torture complex-*)
+                // C99: _Complex — musl src/complex; lowered to struct {re, im}.
+                // EXT(gcc): __complex__ / __complex are aliases (torture complex-*)
                 "_Complex" | "__complex__" | "__complex" => cplx = true,
                 "short" => short = true,
                 "long" => longs += 1,
@@ -482,7 +486,7 @@ impl P<'_> {
                     any = true;
                     continue;
                 }
-                // EXT(gcc): __typeof__(expr | typename) đứng như type-specifier
+                // EXT(gcc): __typeof__(expr | typename) acts as a type-specifier
                 "__typeof__" | "__typeof" | "typeof" => {
                     self.pos += 1;
                     self.expect(Tok::Punct("("))?;
@@ -490,10 +494,10 @@ impl P<'_> {
                     {
                         self.typename()?
                     } else {
-                        let e = self.expr()?; // node thành rác arena, như sizeof
+                        let e = self.expr()?; // the node becomes arena garbage, like sizeof
                         let mut t = self.ty(e);
-                        // typeof(tên hàm) = KIỂU HÀM, không decay (musl weak_alias:
-                        // extern __typeof(f) g — g phải là hàm để alias đúng nhánh)
+                        // typeof(function name) = the FUNCTION TYPE, no decay (musl weak_alias:
+                        // extern __typeof(f) g — g must be a function so the alias hits the right branch)
                         if let Node::FunAddr(_) = self.nodes[e as usize]
                             && let Ty::Ptr(p) = self.tt.tys[t as usize]
                                 && matches!(self.tt.tys[p as usize], Ty::Func(_)) {
@@ -507,8 +511,8 @@ impl P<'_> {
                     continue;
                 }
                 _ => {
-                    // typedef-name: chỉ khi chưa có kiểu nào khác (và không bị
-                    // biến local cùng tên shadow — redis: quicklist *quicklist)
+                    // typedef-name: only when no other type is present yet (and not
+                    // shadowed by a local variable of the same name — redis: quicklist *quicklist)
                     if base.is_none() && direct.is_none() && !uns && !sgn && !short && longs == 0 {
                         let shadowed = self.in_fn && self.locals.iter().any(|(ln, ..)| ln == n);
                         if let Some(&t) = self.typedefs.get(n).filter(|_| !shadowed) {
@@ -524,7 +528,7 @@ impl P<'_> {
             self.pos += 1;
             any = true;
         }
-        let n = n_hack(base); // tránh borrow; xem dưới
+        let n = n_hack(base); // avoid a borrow; see below
         if !any {
             return Ok(None);
         }
@@ -534,8 +538,8 @@ impl P<'_> {
         let t = match n {
             "void" => VOID,
             "char" => {
-                // plain char: UNSIGNED trên Linux arm64 (AAPCS64);
-                // "signed char" tường minh vẫn là CHAR
+                // plain char: UNSIGNED on Linux arm64 (AAPCS64);
+                // an explicit "signed char" is still CHAR
                 if uns || !sgn {
                     UCHAR
                 } else {
@@ -543,8 +547,8 @@ impl P<'_> {
                 }
             }
             "float" => FLOAT,
-            // C99 long double: ELF = binary128 TẠI BIÊN ABI/memory (số học vẫn
-            // double, float.h khai LDBL_MANT_DIG 53)
+            // C99 long double: ELF = binary128 AT the ABI/memory boundary (the arithmetic
+            // is still double, float.h declares LDBL_MANT_DIG 53)
             "double" => {
                 if longs > 0 {
                     LDOUBLE
@@ -554,7 +558,7 @@ impl P<'_> {
             }
             "_Bool" => BOOL,
             _ => {
-                // họ int (kể cả không có "int" tường minh)
+                // the int family (even without an explicit "int")
                 if short {
                     if uns { USHORT } else { SHORT }
                 } else if longs > 0 {
@@ -564,30 +568,30 @@ impl P<'_> {
                 }
             }
         };
-        let t = self.apply_mode(t)?; // EXT(gcc): mode(M) ở specifier-position
+        let t = self.apply_mode(t)?; // EXT(gcc): mode(M) at specifier position
         if cplx {
-            // C99 6.2.5: complex CHỈ float/double/long double. `_Complex int/long/
-            // char/unsigned…` = complex SỐ NGUYÊN (GNU ext, ngoài C99) → reject SẠCH
-            // thay vì âm thầm ép về double complex (mis-size: complex int 8B vs
-            // complex double 16B → miscompile, pr56837). Bare `_Complex` (không
-            // keyword base) = double complex (gcc default). long double = double (sổ).
+            // C99 6.2.5: complex is ONLY float/double/long double. `_Complex int/long/
+            // char/unsigned…` = INTEGER complex (GNU ext, outside C99) → reject CLEANLY
+            // instead of silently coercing to double complex (mis-size: complex int 8B vs
+            // complex double 16B → miscompile, pr56837). Bare `_Complex` (no base
+            // keyword) = double complex (gcc default). long double = double (documented).
             let elem = if t == FLOAT {
                 FLOAT
             } else if t == DOUBLE || t == LDOUBLE {
                 DOUBLE
             } else if base.is_some() || short || longs > 0 || uns || sgn {
                 return Err(
-                    "_Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ".into(),
+                    "integer _Complex (GNU extension outside C99 6.2.5): not supported".into(),
                 );
             } else {
-                DOUBLE // _Complex trần = double _Complex
+                DOUBLE // bare _Complex = double _Complex
             };
             return Ok(Some((self.cplx_of(elem), storage)));
         }
         Ok(Some((t, storage)))
     }
-    // C99: intern struct {re, im} đại diện _Complex elem — AAPCS64 truyền
-    // complex "as if" struct 2 phần tử nên HFA machinery sẵn có cho ABI đúng
+    // C99: intern a struct {re, im} representing _Complex elem — AAPCS64 passes a
+    // complex "as if" it were a 2-element struct, so the existing HFA machinery gives the correct ABI
     fn cplx_of(&mut self, elem: TypeId) -> TypeId {
         if let Some(&t) = self.cplx_tys.get(&elem) {
             return t;
@@ -603,7 +607,7 @@ impl P<'_> {
         self.cplx_tys.insert(elem, t);
         t
     }
-    // tra ngược: t có phải kiểu complex không → elem
+    // reverse lookup: is t a complex type → elem
     fn cplx_elem(&self, t: TypeId) -> Option<TypeId> {
         self.cplx_tys
             .iter()
@@ -620,8 +624,8 @@ impl P<'_> {
             None
         };
         if !self.eat(&Tok::Punct("{")) {
-            let tag = tag.ok_or("struct/union cần tag hoặc thân")?;
-            // forward reference: tạo placeholder incomplete, định nghĩa sau ghi đè
+            let tag = tag.ok_or("struct/union requires a tag or a body")?;
+            // forward reference: create an incomplete placeholder; a later definition overwrites it
             if let Some(&t) = self.tags.get(&tag) {
                 return Ok(t);
             }
@@ -635,8 +639,9 @@ impl P<'_> {
             self.tags.insert(tag, t);
             return Ok(t);
         }
-        // có thân: tag đã có placeholder INCOMPLETE thì định nghĩa vào đúng slot
-        // (tự tham chiếu được); tag đã complete → định nghĩa MỚI shadow (scope con)
+        // with a body: if the tag already has an INCOMPLETE placeholder, define into that
+        // same slot (allowing self-reference); if the tag is already complete → a NEW definition
+        // shadows it (inner scope)
         let incomplete =
             tag.as_ref()
                 .and_then(|g| self.tags.get(g))
@@ -665,21 +670,22 @@ impl P<'_> {
             unreachable!()
         };
         let mut members = Vec::new();
-        // layout theo ABI Itanium (khoá clang Darwin — bitfield là impl-def C89
-        // nhưng interop SDK bắt buộc khớp platform): cursor cấp phát theo BIT;
-        // bitfield nhét vào bit trống kế trừ khi vắt qua biên container kiểu
-        // khai báo; member thường đặt ở byte trống kế aligned. Bug unit-per-run
-        // cũ (sizeof 12 vs 4 khi bitfield xen member thường) bắt bởi shape.sh.
+        // layout per the Itanium ABI (locked to clang on Darwin — bitfields are impl-defined
+        // in C89, but SDK interop requires matching the platform): the cursor allocates in
+        // BITS; a bitfield is packed into the next free bit unless it would straddle the
+        // container boundary of the declared type; an ordinary member is placed at the next
+        // free aligned byte. An old bug (sizeof 12 vs 4 when a bitfield is interleaved with an
+        // ordinary member) is caught by shape.sh.
         let (mut bits, mut mx) = (0u32, 1u32);
         while !self.eat(&Tok::Punct("}")) {
-            let (bt, _) = self.decl_specs()?.ok_or("cần kiểu member")?;
+            let (bt, _) = self.decl_specs()?.ok_or("member type required")?;
             let attr_al = self.attr_aligned.take().unwrap_or(1);
-            // không có declarator: anonymous struct/union (C11, clang cho) → trải
-            // member con lên tầng này; kiểu khác (định nghĩa tag) → bỏ qua
+            // no declarator: an anonymous struct/union (C11, allowed by clang) → hoist its
+            // members into this level; any other type (a tag definition) → ignore
             if self.peek(";") {
                 if let Ty::Struct(_) = self.tt.tys[bt as usize] {
-                    // member ĐƠN tên rỗng (giữ cursor init đúng); truy cập
-                    // xuyên qua bằng find_member đệ quy
+                    // a SINGLE empty-named member (keeps the init cursor correct); accessed
+                    // through it via recursive find_member
                     let (sz, al) = (self.tt.size(bt), self.tt.align(bt));
                     let o = if is_union {
                         0
@@ -698,30 +704,30 @@ impl P<'_> {
                 continue;
             }
             loop {
-                // bitfield không tên: "int : 3;" — không có declarator
+                // unnamed bitfield: "int : 3;" — no declarator
                 let (mn, mt) = if self.peek(":") {
                     (String::new(), bt)
                 } else {
                     self.declarator(bt, true)?
                 };
-                // C99 6.7.2.1: member mảng phải kích thước hằng — VLA-trong-struct
-                // là GNU-ext (clang -pedantic-errors: "will never be supported").
-                // Reject sạch, dọn state VLA để không rò sang biến bao ngoài.
+                // C99 6.7.2.1: an array member must have a constant size — a VLA-in-struct
+                // is a GNU extension (clang -pedantic-errors: "will never be supported").
+                // Reject cleanly, and clear VLA state so it does not leak into the enclosing variable.
                 if self.vla_size.take().is_some() {
                     self.vla_inner.clear();
-                    return Err("VLA trong struct/union (GNU) chưa hỗ trợ".into());
+                    return Err("VLA in struct/union (GNU) not supported".into());
                 }
                 if self.eat(&Tok::Punct(":")) {
                     let w = self.const_expr()? as u32;
                     let (s, al) = (self.tt.size(mt), self.tt.align(mt));
-                    let cb = s * 8; // container theo kiểu khai báo
+                    let cb = s * 8; // container per the declared type
                     if w == 0 {
-                        // :0 — đẩy cursor tới biên container kế (3.5.2.1)
+                        // :0 — push the cursor to the next container boundary (3.5.2.1)
                         if !is_union {
                             bits = bits.div_ceil(cb) * cb;
                         }
                     } else {
-                        // vắt qua biên container thì dời lên biên kế
+                        // if it straddles a container boundary, move up to the next boundary
                         let b = if is_union {
                             0
                         } else if bits % cb + w <= cb {
@@ -732,20 +738,20 @@ impl P<'_> {
                         if !mn.is_empty() {
                             let ft = self.tt.add(Ty::Bitfield(mt, b % cb, w));
                             members.push((mn, ft, b / cb * s));
-                            mx = mx.max(al); // unnamed KHÔNG ảnh hưởng align (Itanium)
+                            mx = mx.max(al); // unnamed does NOT affect alignment (Itanium)
                         }
                         bits = if is_union { bits.max(cb) } else { b + w };
                     }
                 } else {
-                    // layout miền u32 (object ≤4GB — deviation-có-sổ ast.rs:116);
-                    // wrapping cho khớp size() đã wrapping — huge array (2^62 short,
-                    // 991014-1) wrap thay vì panic debug, KHÔNG crash trên input hợp lệ
+                    // layout in the u32 domain (object ≤4GB — documented deviation, ast.rs:116);
+                    // wrapping to match size(), which already wraps — a huge array (2^62 short,
+                    // 991014-1) wraps instead of a debug panic, and does NOT crash on valid input
                     let sz = self.tt.size(mt);
-                    // object >4GB ngoài giới hạn zcc (layout size u32 — deviation-có-sổ
-                    // ast.rs:116). Nuốt = wrap → sizeof/offset SAI (991014-1). Reject SẠCH.
+                    // an object >4GB is outside zcc's limit (layout size u32 — documented
+                    // deviation, ast.rs:116). Accepting it wraps → sizeof/offset WRONG (991014-1). Reject CLEANLY.
                     if self.tt.size64(mt) > u32::MAX as u64 {
                         return Err(format!(
-                            "member '{mn}' >4GB: object vượt giới hạn size u32 của zcc"
+                            "member '{mn}' >4GB: object exceeds zcc's u32 size limit"
                         ));
                     }
                     let al = if packed {
@@ -792,7 +798,7 @@ impl P<'_> {
                 tag = n.clone();
                 self.pos += 1;
             }
-        // EXT(clang): enum tag : underlying-type (SDK malloc.h) — honor kiểu nền
+        // EXT(clang): enum tag : underlying-type (SDK malloc.h) — honor the underlying type
         let under = if self.eat(&Tok::Punct(":")) {
             Some(self.typename()?)
         } else {
@@ -814,8 +820,8 @@ impl P<'_> {
                     break;
                 }
             }
-            // khớp clang: mọi enumerator không âm → underlying unsigned int
-            // (quan trọng cho bitfield kiểu enum: phải zero-extend)
+            // match clang: if every enumerator is non-negative → underlying unsigned int
+            // (important for an enum-typed bitfield: it must zero-extend)
             let t = under.unwrap_or(if any_neg { INT } else { UINT });
             if !tag.is_empty() {
                 self.enum_tags.insert(tag, t);
@@ -826,8 +832,8 @@ impl P<'_> {
             .or_else(|| self.enum_tags.get(&tag).copied())
             .unwrap_or(INT))
     }
-    // declarator đầy đủ C: con trỏ, nested "(...)", suffix mảng/hàm.
-    // need_name=false cho abstract declarator (cast, sizeof, param không tên).
+    // full C declarator: pointer, nested "(...)", array/function suffixes.
+    // need_name=false for an abstract declarator (cast, sizeof, unnamed parameter).
     fn declarator(&mut self, mut t: TypeId, need_name: bool) -> Result<(String, TypeId), String> {
         self.skip_attrs()?;
         while self.eat(&Tok::Punct("*")) {
@@ -837,7 +843,7 @@ impl P<'_> {
                 || self.eat_kw("restrict")
                 || self.eat_kw("__restrict")
                 || self.eat_kw("__restrict__")
-                // EXT(clang): nullability qualifier — SDK dùng trần trong FILE...
+                // EXT(clang): nullability qualifier — the SDK uses it bare in FILE...
                 || self.eat_kw("_Nullable")
                 || self.eat_kw("_Nonnull")
                 || self.eat_kw("_Null_unspecified")
@@ -847,14 +853,14 @@ impl P<'_> {
         if self.nested_ahead() {
             self.pos += 1; // '('
             let save = self.pos;
-            self.declarator(VOID, false)?; // parse nháp tìm ')' — type tạo ra là rác arena
+            self.declarator(VOID, false)?; // trial parse to find ')' — the type produced is arena garbage
             self.expect(Tok::Punct(")"))?;
-            let outer = self.suffixes(t)?; // suffix NGOÀI áp trước (luật inside-out)
+            let outer = self.suffixes(t)?; // the OUTER suffix applies first (inside-out rule)
             let end = self.pos;
             self.pos = save;
             let res = self.declarator(outer, need_name)?;
             self.pos = end;
-            // đuôi sau suffix ngoài: attribute/asm-label (mach_init.h:
+            // tail after the outer suffix: attribute/asm-label (mach_init.h:
             // "extern int (*f)(...) __printflike(1,0);")
             self.asm_label = None;
             self.skip_attrs()?;
@@ -865,11 +871,11 @@ impl P<'_> {
             return Ok(res);
         }
         let name = match self.toks.get(self.pos) {
-            // tên được phép TRÙNG typedef-name (shadow); chỉ cấm keyword cứng.
-            // Không cần need_name: specifier đã bị decl_specs ăn hết trước đó,
-            // abstract declarator không bao giờ chứa ident trần → ident ở đây
-            // LUÔN là tên (git: param `reftable_fsck_report_fn report_fn`
-            // với report_fn đồng thời là typedef toàn cục ở usage.h)
+            // the name MAY coincide with a typedef-name (shadow); only hard keywords are forbidden.
+            // No need for need_name: the specifiers were already consumed by decl_specs, and an
+            // abstract declarator never contains a bare ident → an ident here is ALWAYS a name
+            // (git: parameter `reftable_fsck_report_fn report_fn`, where report_fn is also a
+            // global typedef in usage.h)
             Some(Tok::Ident(n)) if !self.is_keyword(n) => {
                 let n = n.clone();
                 self.pos += 1;
@@ -882,7 +888,7 @@ impl P<'_> {
             }
             _ if need_name => {
                 return Err(format!(
-                    "cần tên trong declarator, gặp {:?}",
+                    "identifier required in declarator, found {:?}",
                     self.toks.get(self.pos)
                 ));
             }
@@ -890,9 +896,9 @@ impl P<'_> {
         };
         let mut t = self.suffixes(t)?;
         self.asm_label = None;
-        // EXT(gcc): aligned(n) SAU declarator (torture 20050215-1: `typedef
-        // struct {...} V __attribute__((aligned(8)))`) — type over-aligned
-        // RIÊNG (clone def, không mutate: tag gốc dùng chỗ khác giữ nguyên)
+        // EXT(gcc): aligned(n) AFTER the declarator (torture 20050215-1: `typedef
+        // struct {...} V __attribute__((aligned(8)))`) — a SEPARATE over-aligned type
+        // (clone the def, do not mutate: the original tag used elsewhere stays unchanged)
         let (_, al) = self.skip_attrs()?;
         if let (Some(a), Ty::Struct(si)) = (al, &self.tt.tys[t as usize]) {
             let mut d = self.tt.structs[*si as usize].clone();
@@ -903,12 +909,12 @@ impl P<'_> {
                 t = self.tt.add(Ty::Struct(self.tt.structs.len() as u32 - 1));
             }
         }
-        t = self.apply_mode(t)?; // EXT(gcc): mode(M) trailing (glibc register_t)
-        // EXT(gcc): transparent_union — call truyền arg theo ABI của member ĐẦU
-        // (gcc doc). Trong scope chỉ gặp ở PROTOTYPE glibc (bind/connect… dưới
-        // _GNU_SOURCE), không ai định nghĩa hàm nhận nó → thay thẳng type =
-        // member đầu là trọn ngữ nghĩa; giữ union thật sẽ đi lộn protocol
-        // composite (bug redis/nginx bind EFAULT 2026-08-18).
+        t = self.apply_mode(t)?; // EXT(gcc): trailing mode(M) (glibc register_t)
+        // EXT(gcc): transparent_union — a call passes the argument per the ABI of the FIRST
+        // member (gcc docs). Within scope this appears only in glibc PROTOTYPES (bind/connect…
+        // under _GNU_SOURCE); nobody defines a function taking it → replacing the type directly
+        // with the first member is fully faithful; keeping the real union would route through the
+        // wrong composite protocol (redis/nginx bind EFAULT bug).
         if self.attr_transp {
             self.attr_transp = false;
             if let Ty::Struct(si) = &self.tt.tys[t as usize] {
@@ -918,14 +924,14 @@ impl P<'_> {
                 }
             }
         }
-        // EXT(gcc): asm-label sau declarator → symbol thật khi emit (Call/FunAddr)
+        // EXT(gcc): asm-label after the declarator → the real symbol when emitting (Call/FunAddr)
         if let Some(l) = self.asm_label.take()
             && !name.is_empty() {
                 self.renames.insert(name.clone(), l);
             }
         Ok((name, t))
     }
-    // EXT(gcc): tên C → symbol emit; prefix \x01 = đã đủ tên, codegen không thêm '_'
+    // EXT(gcc): C name → emitted symbol; prefix \x01 = the name is complete, codegen adds no '_'
     fn funref(&self, n: String) -> String {
         match self.renames.get(&n) {
             Some(l) => format!("\x01{}", l),
@@ -942,11 +948,11 @@ impl P<'_> {
             _ => false,
         }
     }
-    // nuốt __attribute__((...)) / __asm__("..") — extension, không ảnh hưởng ngữ nghĩa
-    // nuốt __attribute__/__asm__; hiểu packed + aligned(n)
-    // EXT(gcc): áp mode(M) đã ghi ở attr_mode — remap t sang kiểu vô hạng width M,
-    // giữ signedness/floatness (int mode(word)→long; unsigned int mode(QI)→uchar).
-    // Bảng width Vế-II (gcc machmode.def). No-op nếu không có mode.
+    // consume __attribute__((...)) / __asm__("..") — an extension, no semantic effect
+    // consume __attribute__/__asm__; understand packed + aligned(n)
+    // EXT(gcc): apply the mode(M) recorded in attr_mode — remap t to the type of width M,
+    // preserving signedness/floatness (int mode(word)→long; unsigned int mode(QI)→uchar).
+    // Width table from Part II (gcc machmode.def). No-op if there is no mode.
     fn apply_mode(&mut self, t: TypeId) -> Result<TypeId, String> {
         let (w, is_f) = match self.attr_mode.take() {
             Some(m) => m,
@@ -957,7 +963,7 @@ impl P<'_> {
                 4 => FLOAT,
                 8 => DOUBLE,
                 16 => LDOUBLE,
-                _ => return Err(format!("mode float width {w} chưa hỗ trợ")),
+                _ => return Err(format!("mode float width {w} not supported")),
             }
         } else {
             let uns = self.tt.is_unsigned(t);
@@ -966,7 +972,7 @@ impl P<'_> {
                 2 => if uns { USHORT } else { SHORT },
                 4 => if uns { UINT } else { INT },
                 8 => if uns { ULONG } else { LONG },
-                _ => return Err(format!("mode int width {w} chưa hỗ trợ")),
+                _ => return Err(format!("mode int width {w} not supported")),
             }
         })
     }
@@ -983,28 +989,29 @@ impl P<'_> {
                     let n = self.ident()?;
                     match n.as_str() {
                         "packed" | "__packed__" => packed = true,
-                        // EXT(gcc): vector_size = kiểu SIMD (GNU vector). zcc KHÔNG
-                        // cài — nuốt im attr sẽ biến typedef vector→scalar rồi
-                        // miscompile số học/khởi tạo. Luật 2-fact: reject SẠCH.
+                        // EXT(gcc): vector_size = a SIMD type (GNU vector). zcc does NOT
+                        // implement it — silently swallowing the attribute would turn a vector
+                        // typedef into a scalar and then miscompile arithmetic/initialization.
+                        // 2-fact rule: reject CLEANLY.
                         "vector_size" | "__vector_size__" => {
                             return Err(
-                                "__attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ"
+                                "__attribute__((vector_size)): SIMD vector type (GNU) not supported"
                                     .into(),
                             );
                         }
-                        // EXT(gcc): scalar_storage_order đảo byte-order từng scalar
-                        // trong struct. zcc không cài — nuốt im = layout sai byte →
-                        // miscompile. Luật 2-fact: reject SẠCH.
+                        // EXT(gcc): scalar_storage_order reverses the byte order of each scalar
+                        // in a struct. zcc does not implement it — silently swallowing it would give
+                        // the wrong byte layout → miscompile. 2-fact rule: reject CLEANLY.
                         "scalar_storage_order" | "__scalar_storage_order__" => {
                             return Err(
-                                "__attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ"
+                                "__attribute__((scalar_storage_order)): byte-order reversal (GNU) not supported"
                                     .into(),
                             );
                         }
-                        // EXT(gcc): mode(M) ép width kiểu theo machine-mode (gcc
-                        // machmode.def). glibc `register_t __mode__(word)` + int8_t họ.
-                        // Nuốt im = giữ width khai báo → sizeof sai (đo: mode(QI) 1→4).
-                        // Bảng width Vế-II; remap giữ signedness ở decl_specs.
+                        // EXT(gcc): mode(M) forces the type width per a machine-mode (gcc
+                        // machmode.def). glibc `register_t __mode__(word)` + the int8_t family.
+                        // Silently swallowing it keeps the declared width → wrong sizeof (measured: mode(QI) 1→4).
+                        // Width table from Part II; the remap preserves signedness in decl_specs.
                         "mode" | "__mode__" => {
                             self.expect(Tok::Punct("("))?;
                             let m = self.ident()?;
@@ -1017,16 +1024,16 @@ impl P<'_> {
                                 "SF" => (4, true),
                                 "DF" => (8, true),
                                 "TF" => (16, true),
-                                // TI(int128)/XF(x87-80b)/vector: không kiểu zcc → reject SẠCH
+                                // TI(int128)/XF(x87-80b)/vector: no zcc type → reject CLEANLY
                                 _ => return Err(format!(
-                                    "__attribute__((mode({m}))): machine-mode chưa hỗ trợ"
+                                    "__attribute__((mode({m}))): machine-mode not supported"
                                 )),
                             });
                         }
-                        // EXT(gcc): weak/alias — bộ xương weak_alias() của musl
+                        // EXT(gcc): weak/alias — the skeleton of musl's weak_alias()
                         "weak" | "__weak__" => self.attr_weak = true,
-                        // EXT(gcc): glibc bật union này dưới _GNU_SOURCE
-                        // (__CONST_SOCKADDR_ARG của bind/connect/sendto…)
+                        // EXT(gcc): glibc enables this union under _GNU_SOURCE
+                        // (__CONST_SOCKADDR_ARG of bind/connect/sendto…)
                         "transparent_union" | "__transparent_union__" => self.attr_transp = true,
                         "alias" | "__alias__" => {
                             self.expect(Tok::Punct("("))?;
@@ -1042,18 +1049,18 @@ impl P<'_> {
                                 self.expect(Tok::Punct(")"))?;
                                 aligned = Some(aligned.unwrap_or(0).max(v));
                             } else {
-                                aligned = Some(16); // GCC: aligned trần = 16
+                                aligned = Some(16); // GCC: bare aligned = 16
                             }
                         }
                         _ => {
-                            // attr lạ (có thể kèm (args)): nuốt balanced
+                            // unknown attribute (may carry (args)): consume balanced
                             if self.eat(&Tok::Punct("(")) {
                                 let mut depth = 1u32;
                                 while depth > 0 {
                                     match self.toks.get(self.pos) {
                                         Some(Tok::Punct("(")) => depth += 1,
                                         Some(Tok::Punct(")")) => depth -= 1,
-                                        None => return Err("__attribute__ không đóng".into()),
+                                        None => return Err("unterminated __attribute__".into()),
                                         _ => {}
                                     }
                                     self.pos += 1;
@@ -1065,11 +1072,11 @@ impl P<'_> {
                 self.expect(Tok::Punct(")"))?;
             } else if self.eat_kw("__asm__") || self.eat_kw("__asm") {
                 self.expect(Tok::Punct("("))?;
-                // EXT(gcc): asm-label — "(chuỗi)" thuần là symbol thay thế cho
-                // declarator (SDK versioning: __asm("_open")); còn lại nuốt bỏ
+                // EXT(gcc): asm-label — a plain "(string)" is a replacement symbol for the
+                // declarator (SDK versioning: __asm("_open")); anything else is discarded
                 let mut label = String::new();
                 while let Some(Tok::Str(b, _)) = self.toks.get(self.pos) {
-                    label.push_str(&String::from_utf8_lossy(b)); // "_" "open" ghép
+                    label.push_str(&String::from_utf8_lossy(b)); // "_" "open" concatenated
                     self.pos += 1;
                 }
                 if !label.is_empty() && self.eat(&Tok::Punct(")")) {
@@ -1081,7 +1088,7 @@ impl P<'_> {
                     match self.toks.get(self.pos) {
                         Some(Tok::Punct("(")) => depth += 1,
                         Some(Tok::Punct(")")) => depth -= 1,
-                        None => return Err("__asm__ không đóng".into()),
+                        None => return Err("unterminated __asm__".into()),
                         _ => {}
                     }
                     self.pos += 1;
@@ -1093,8 +1100,8 @@ impl P<'_> {
     }
     fn suffixes(&mut self, t: TypeId) -> Result<TypeId, String> {
         if self.eat(&Tok::Punct("[")) {
-            // C99: 6.7.5.3p21 — qualifier/static trong [] của array param
-            // (SDK _regex.h: `__pmatch[ restrict n ]` khi xưng C99); no-op ở -O0
+            // C99 6.7.5.3p21 — qualifier/static inside the [] of an array parameter
+            // (SDK _regex.h: `__pmatch[ restrict n ]` when declared C99); no-op at -O0
             while self.eat_kw("restrict")
                 || self.eat_kw("__restrict")
                 || self.eat_kw("__restrict__")
@@ -1108,8 +1115,8 @@ impl P<'_> {
                 let save = self.pos;
                 match self.const_expr() {
                     Ok(v) => v as u64,
-                    // C99: trong param list size có thể trỏ về param trước
-                    // (chưa có scope) — skip balanced đến ']', decay lo phần còn lại
+                    // C99: inside a parameter list the size may refer to a prior parameter
+                    // (not yet in scope) — skip balanced to ']', and let decay handle the rest
                     Err(_) if self.in_params > 0 => {
                         self.pos = save;
                         let mut depth = 0u32;
@@ -1119,16 +1126,16 @@ impl P<'_> {
                                 Some(Tok::Punct("[")) => depth += 1,
                                 Some(Tok::Punct("]")) if depth == 0 => break,
                                 Some(Tok::Punct("]")) => depth -= 1,
-                                None => return Err("mảng param thiếu ']'".into()),
-                                // C99 6.9.1: size expr array-param CÓ side-effect (`b[a++]`)
-                                // đúng ra eval KHI HÀM ĐƯỢC GỌI (prologue). zcc decay param
-                                // về con trỏ, drop size — nếu size chỉ đọc (`__pmatch[n]`)
-                                // thì drop VÔ HẠI (đằng nào cũng là con trỏ). Nhưng dimension
-                                // CÓ ++/-- thì drop = MẤT side-effect → miscompile khi gọi
-                                // (970217-1/pr77767): ở ĐỊNH NGHĨA hàm (top-level, !in_fn)
-                                // lưu token-range, re-eval ở prologue (C99 6.9.1). Trong
-                                // prototype nội hàm (in_fn) dim KHÔNG được eval (6.7.6.2p5)
-                                // → drop đúng chuẩn. Param vẫn decay con trỏ như thường.
+                                None => return Err("array parameter missing ']'".into()),
+                                // C99 6.9.1: an array-parameter size expr WITH a side effect (`b[a++]`)
+                                // should really be evaluated WHEN THE FUNCTION IS CALLED (prologue). zcc
+                                // decays the parameter to a pointer and drops the size — if the size only
+                                // reads (`__pmatch[n]`) the drop is HARMLESS (it is a pointer either way).
+                                // But a dimension WITH ++/-- makes the drop LOSE a side effect → miscompile
+                                // on call (970217-1/pr77767): at a function DEFINITION (top-level, !in_fn)
+                                // store the token range and re-evaluate it in the prologue (C99 6.9.1). Inside
+                                // a nested prototype (in_fn) the dimension is NOT evaluated (6.7.6.2p5)
+                                // → dropping is correct. The parameter still decays to a pointer as usual.
                                 Some(Tok::Punct("++")) | Some(Tok::Punct("--")) => {
                                     side_effect = true
                                 }
@@ -1141,9 +1148,9 @@ impl P<'_> {
                         }
                         0
                     }
-                    // C99: size không hằng = VLA — giữ expr cho stmt() hạ xuống
-                    // alloca. Chiều NGOÀI (gặp trước) vào vla_size, chiều TRONG
-                    // (đệ quy suffixes) dồn vào vla_inner theo thứ tự ngoài→trong.
+                    // C99: a non-constant size = a VLA — keep the expr for stmt() to lower to
+                    // alloca. The OUTER dimension (seen first) goes into vla_size, the INNER
+                    // dimensions (recursive suffixes) accumulate into vla_inner in outer→inner order.
                     Err(_) => {
                         self.pos = save;
                         let e = self.expr()?;
@@ -1157,7 +1164,7 @@ impl P<'_> {
                 }
             };
             self.expect(Tok::Punct("]"))?;
-            let inner = self.suffixes(t)?; // đa chiều: int a[2][3] = array 2 của array 3
+            let inner = self.suffixes(t)?; // multidimensional: int a[2][3] = array 2 of array 3
             return Ok(self.tt.add(Ty::Array(inner, n)));
         }
         if self.eat(&Tok::Punct("(")) {
@@ -1179,7 +1186,7 @@ impl P<'_> {
             return Ok(FnSig {
                 oldstyle: true,
                 ..empty
-            }); // () — không thông tin
+            }); // () — no information
         }
         if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "void")
             && self.toks.get(self.pos + 1) == Some(&Tok::Punct(")"))
@@ -1187,8 +1194,8 @@ impl P<'_> {
             self.pos += 2;
             return Ok(empty); // (void)
         }
-        // old-style ident list: f(a, b) — nhưng __attribute__/nullability mở đầu
-        // param hiện đại (SDK mig_errors.h: f(__unused T *x)), không phải tên
+        // old-style identifier list: f(a, b) — but __attribute__/nullability begins a
+        // modern parameter (SDK mig_errors.h: f(__unused T *x)), not a name
         if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if !self.is_type_word(n)
             && !matches!(n.as_str(), "__attribute__" | "__attribute"
                 | "_Nullable" | "_Nonnull" | "_Null_unspecified"))
@@ -1214,11 +1221,11 @@ impl P<'_> {
                 variadic = true;
                 break;
             }
-            let (bt, _) = self.decl_specs()?.ok_or("cần kiểu tham số")?;
+            let (bt, _) = self.decl_specs()?.ok_or("parameter type required")?;
             let (nm, pt) = self.declarator(bt, false)?;
-            self.vla_size = None; // C99: param VLA decay về con trỏ — bỏ size
-            self.vla_inner.clear(); // 2D-param không hỗ trợ: drop (decay con trỏ)
-            // điều chỉnh kiểu param: mảng → con trỏ, hàm → con trỏ hàm
+            self.vla_size = None; // C99: a VLA parameter decays to a pointer — drop the size
+            self.vla_inner.clear(); // 2D parameter unsupported: drop (decays to a pointer)
+            // adjust the parameter type: array → pointer, function → function pointer
             let pt = match self.tt.tys[pt as usize] {
                 Ty::Array(e, _) => self.tt.ptr_to(e),
                 Ty::Func(_) => self.tt.ptr_to(pt),
@@ -1241,19 +1248,19 @@ impl P<'_> {
         })
     }
     fn typename(&mut self) -> Result<TypeId, String> {
-        let (bt, _) = self.decl_specs()?.ok_or("cần tên kiểu")?;
+        let (bt, _) = self.decl_specs()?.ok_or("type name required")?;
         let (_, t) = self.declarator(bt, false)?;
         Ok(t)
     }
 
-    // ---- chuyển đổi kiểu ----
+    // ---- type conversion ----
     fn cast(&mut self, e: NodeId, to: TypeId) -> NodeId {
         if self.ty(e) == to {
             return e;
         }
-        // C99: chuyển đổi complex (6.3.1.6/6.3.1.7) — desugar member-wise.
-        // complex → real: lấy phần thực (creal của musl CHÍNH LÀ cast này);
-        // real/complex → complex: temp + gán từng phần, phần ảo = 0.
+        // C99: complex conversion (6.3.1.6/6.3.1.7) — desugar member-wise.
+        // complex → real: take the real part (musl's creal IS exactly this cast);
+        // real/complex → complex: temp + assign each part, imaginary part = 0.
         let (se, de) = (self.cplx_elem(self.ty(e)), self.cplx_elem(to));
         if let (Some(sel), None) = (se, de)
             && (self.tt.is_integer(to) || self.tt.is_float(to)) {
@@ -1270,7 +1277,7 @@ impl P<'_> {
             let mut pre = None;
             let (rs, is_) = match se {
                 Some(sel) => {
-                    // nguồn cũng complex: chốt vào temp để không eval 2 lần
+                    // the source is also complex: bind it to a temp to avoid evaluating it twice
                     let st = self.ty(e);
                     let soff = self.alloc_local(format!(".cplxs{}", self.nodes.len()), st);
                     let sv = self.push(Node::Var(soff), st);
@@ -1306,10 +1313,10 @@ impl P<'_> {
     fn promote(&self, t: TypeId) -> TypeId {
         match self.tt.tys[t as usize] {
             Ty::Char | Ty::Short => INT,
-            Ty::UChar | Ty::UShort | Ty::Bool => INT, // cả ba lọt trong int (LP64)
+            Ty::UChar | Ty::UShort | Ty::Bool => INT, // all three fit in int (LP64)
             Ty::Float => DOUBLE,
-            // Bitfield: lên int nếu range lọt int, unsigned int nếu lọt uint,
-            // rộng hơn 32 bit thì theo base (ANSI không định nghĩa, theo gcc)
+            // Bitfield: promote to int if the range fits int, unsigned int if it fits uint,
+            // wider than 32 bits follows the base (ANSI leaves this undefined; follow gcc)
             Ty::Bitfield(b, _, w) => {
                 if w < 32 || (w == 32 && !self.tt.is_unsigned(b)) {
                     INT
@@ -1324,16 +1331,16 @@ impl P<'_> {
     }
     fn common_ty(&self, lt: TypeId, rt: TypeId) -> TypeId {
         if self.tt.is_float(lt) || self.tt.is_float(rt) {
-            // C99 UAC: long double đứng đỉnh semilattice thực (giá trị vẫn f64
-            // trong reg — cast double↔ldbl là no-op, chỉ nhãn kiểu đổi cho ABI)
+            // C99 UAC: long double sits at the top of the real semilattice (the value is still
+            // f64 in a register — a double↔ldbl cast is a no-op, only the type label changes for the ABI)
             if matches!(self.tt.tys[lt as usize], Ty::LDouble)
                 || matches!(self.tt.tys[rt as usize], Ty::LDouble)
             {
                 return LDOUBLE;
             }
-            // float+float / float+int → FLOAT (operand phải TRÒN về f32 —
-            // 16777217L != (float)16777217e0 phân biệt được); còn lại double.
-            // Số học chạy trong double (C89 cho phép dư precision).
+            // float+float / float+int → FLOAT (the operand must be ROUNDED to f32 —
+            // 16777217L != (float)16777217e0 is distinguishable); otherwise double.
+            // Arithmetic runs in double (C89 permits excess precision).
             let fl = |t: TypeId| {
                 matches!(self.tt.tys[t as usize], Ty::Double)
                     || !self.tt.is_integer(t) && !matches!(self.tt.tys[t as usize], Ty::Float)
@@ -1341,7 +1348,7 @@ impl P<'_> {
             return if fl(lt) || fl(rt) { DOUBLE } else { FLOAT };
         }
         if !self.tt.is_integer(lt) || !self.tt.is_integer(rt) {
-            return ULONG; // con trỏ v.v.: so sánh/số học 64-bit không dấu
+            return ULONG; // pointers etc.: 64-bit unsigned comparison/arithmetic
         }
         let (l, r) = (self.promote(lt), self.promote(rt));
         if l == r {
@@ -1366,13 +1373,13 @@ impl P<'_> {
     fn scalar(&self, t: TypeId) -> bool {
         !matches!(self.tt.tys[t as usize], Ty::Struct(_) | Ty::Array(..))
     }
-    // L op= R (và ++L/--L): L xuất hiện 2 lần trong cây (load + store) — nếu
-    // địa chỉ có side effect (a[*s++] |= 1) phải giữ vào temp, eval đúng 1 lần:
+    // L op= R (and ++L/--L): L appears twice in the tree (load + store) — if the
+    // address has a side effect (a[*s++] |= 1) it must be held in a temp and evaluated once:
     // (tmp = &L, *tmp = *tmp op R)
     fn opassign(&mut self, l: NodeId, bop: &'static str, r: NodeId) -> R {
         match self.nodes[l as usize] {
             Node::Var(_) | Node::GVar(_) => {
-                // địa chỉ tĩnh, khỏi temp
+                // static address, no temp needed
                 let r = self.mkbin(bop, l, r)?;
                 self.mkassign(l, r)
             }
@@ -1395,10 +1402,10 @@ impl P<'_> {
     fn mkassign(&mut self, l: NodeId, r: NodeId) -> R {
         self.check_lval(l)?;
         let lt = self.ty(l);
-        // complex là Ty::Struct → scalar()=false, nhưng gán `c = x` (scalar→complex)
-        // BẮT BUỘC qua cast() để dựng temp {re=x, im=0}; nếu không → Assign coi RHS
-        // int là ĐỊA CHỈ rồi struct-copy 16B từ đó → segfault (960512-1). cast()
-        // identity-return khi cùng type nên complex↔complex same-type vẫn struct-copy.
+        // complex is Ty::Struct → scalar()=false, but an assignment `c = x` (scalar→complex)
+        // MUST go through cast() to build a temp {re=x, im=0}; otherwise Assign treats an int
+        // RHS as an ADDRESS and struct-copies 16B from there → segfault (960512-1). cast()
+        // returns identity when the types match, so a same-type complex↔complex is still a struct-copy.
         let r = if self.scalar(lt) || self.cplx_elem(lt).is_some() {
             self.cast(r, lt)
         } else {
@@ -1406,11 +1413,11 @@ impl P<'_> {
         };
         Ok(self.push(Node::Assign(l, r), lt))
     }
-    // điều kiện: float phải so != 0.0 (cbz nhìn bit pattern sẽ sai với -0.0)
+    // condition: a float must be compared != 0.0 (cbz on the bit pattern would be wrong for -0.0)
     fn truthy(&mut self, e: NodeId) -> R {
-        // C99 6.3.1.2: complex nonzero ⟺ re≠0 || im≠0. e là Ty::Struct nên cbz sẽ
-        // nhìn địa chỉ struct (luôn ≠0) → SAI (960512-1). Chốt temp (e có thể có
-        // side-effect: `if(c=f())`) rồi OR hai phần != 0.
+        // C99 6.3.1.2: complex nonzero ⟺ re≠0 || im≠0. e is Ty::Struct, so cbz would look
+        // at the struct address (always ≠0) → WRONG (960512-1). Bind a temp (e may have a
+        // side effect: `if(c=f())`) then OR the two parts != 0.
         if let Some(el) = self.cplx_elem(self.ty(e)) {
             let ct = self.ty(e);
             let off = self.alloc_local(String::new(), ct);
@@ -1424,7 +1431,7 @@ impl P<'_> {
             let im = self.cplx_proj(t2, true)?;
             let z2 = self.push(Node::FNum(0.0), el);
             let ine = self.mkbin("!=", im, z2)?;
-            let or = self.mkbin("|", rne, ine)?; // rne,ine ∈ {0,1} → bitwise = logic
+            let or = self.mkbin("|", rne, ine)?; // rne,ine ∈ {0,1} → bitwise = logical
             let ot = self.ty(or);
             return Ok(self.push(Node::Comma(save, or), ot));
         }
@@ -1435,23 +1442,23 @@ impl P<'_> {
             Ok(e)
         }
     }
-    // scale bước con trỏ: pointee VLA → nạp size byte từ local ẩn, còn lại hằng
+    // pointer-step scale: a VLA pointee → load the byte size from a hidden local, otherwise a constant
     fn vla_scale(&mut self, e: TypeId) -> NodeId {
         match self.vla_arrs.get(&e) {
             Some(&off) => self.push(Node::Var(off), LONG),
             None => self.push(Node::Num(self.tt.size(e) as i64), LONG),
         }
     }
-    // Dựng node binary op kèm chèn conversion + scale con trỏ
+    // Build a binary-op node, inserting conversions + pointer scaling
     fn mkbin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
-        // C99: complex là struct — PHẢI chặn trước nhánh scalar, nếu không
-        // codegen coi địa chỉ struct như giá trị 8 byte đầu → sai im lặng
+        // C99: complex is a struct — MUST be handled before the scalar branch, otherwise
+        // codegen treats the struct address as its first 8-byte value → silent error
         if self.cplx_elem(self.ty(l)).is_some() || self.cplx_elem(self.ty(r)).is_some() {
             return self.cplx_bin(op, l, r);
         }
         let (lp, rp) = (self.tt.pointee(self.ty(l)), self.tt.pointee(self.ty(r)));
         match (op, lp, rp) {
-            ("+", None, Some(_)) => self.mkbin("+", r, l), // int + ptr: giao hoán
+            ("+", None, Some(_)) => self.mkbin("+", r, l), // int + ptr: commutative
             ("+" | "-", Some(e), None) => {
                 let r = self.cast(r, LONG);
                 let sz = self.vla_scale(e);
@@ -1473,7 +1480,7 @@ impl P<'_> {
                 "<<" | ">>" => {
                     let lt = self.promote(self.ty(l));
                     if self.tt.is_float(lt) {
-                        return Err("shift trên số thực".into());
+                        return Err("shift on floating-point operand".into());
                     }
                     let l = self.cast(l, lt);
                     Ok(self.push(Node::Bin(op, l, r), lt))
@@ -1481,7 +1488,7 @@ impl P<'_> {
                 _ => {
                     let ct = self.common_ty(self.ty(l), self.ty(r));
                     if self.tt.is_float(ct) && matches!(op, "%" | "&" | "|" | "^") {
-                        return Err(format!("op '{}' trên số thực", op));
+                        return Err(format!("operator '{}' on floating-point operand", op));
                     }
                     let (l, r) = (self.cast(l, ct), self.cast(r, ct));
                     Ok(self.push(Node::Bin(op, l, r), ct))
@@ -1489,19 +1496,19 @@ impl P<'_> {
             },
         }
     }
-    // C99: đại số complex hạ member-wise qua temp (6.3.1.8 UAC + phép toán
-    // trên trường số phức). Nhân/chia dùng công thức đại số thẳng — KHÔNG Annex G
-    // NaN-fixup/scaling (tương đương gcc -fcx-limited-range; deviation tuyên bố,
-    // musl src/complex tự decompose creal/cimag ở các đường biên nên ít đụng).
-    // đọc hằng phức từ node const: Bin("__ci",re,im) | scalar thực → (re,im)
+    // C99: complex algebra lowered member-wise through temps (6.3.1.8 UAC + operations
+    // on the field of complex numbers). Multiplication/division use the direct algebraic
+    // formulas — NO Annex G NaN-fixup/scaling (equivalent to gcc -fcx-limited-range; a
+    // declared deviation, and musl src/complex decomposes creal/cimag at the boundaries, so it is rarely hit).
+    // read a complex constant from a const node: Bin("__ci",re,im) | real scalar → (re,im)
     fn ccval(&self, id: NodeId) -> Option<(f64, f64)> {
         match &self.nodes[id as usize] {
             Node::Bin("__ci", a, b) => Some((self.fold_f(*a).ok()?, self.fold_f(*b).ok()?)),
             _ => self.fold_f(id).ok().map(|v| (v, 0.0)),
         }
     }
-    // hằng ảo → temp complex {re=0, im=v} (phép nhúng ℝ→ℂ).
-    // !in_fn (static init): dựng sentinel Bin("__ci",0,v) để ginit fold ra bytes.
+    // an imaginary constant → a complex temp {re=0, im=v} (the embedding ℝ→ℂ).
+    // !in_fn (static init): build the sentinel Bin("__ci",0,v) so ginit folds it to bytes.
     fn cplx_imag(&mut self, im: f64, elem: TypeId) -> NodeId {
         let ct = self.cplx_of(elem);
         if !self.in_fn {
@@ -1522,13 +1529,13 @@ impl P<'_> {
         let seq = self.push(Node::Comma(aim, val), ct);
         self.push(Node::Comma(are, seq), ct)
     }
-    // π₁/π₂: __real__ z / __imag__ z — phép chiếu ℂ→ℝ (Member re@0 / im@esz)
+    // π₁/π₂: __real__ z / __imag__ z — the projection ℂ→ℝ (Member re@0 / im@esz)
     fn cplx_proj(&mut self, e: NodeId, imag: bool) -> R {
         if let Some(el) = self.cplx_elem(self.ty(e)) {
             let off = if imag { self.tt.size(el) } else { 0 };
             return Ok(self.push(Node::Member(e, off), el));
         }
-        // scalar thực: __real__ x = x; __imag__ x = 0 (cùng kiểu)
+        // real scalar: __real__ x = x; __imag__ x = 0 (same type)
         if imag {
             let t = self.ty(e);
             return Ok(if self.tt.is_float(t) {
@@ -1545,11 +1552,11 @@ impl P<'_> {
         let elem = if lf && rf { FLOAT } else { DOUBLE };
         let ct = self.cplx_of(elem);
         let esz = self.tt.size(elem);
-        // static init: fold hằng ℂ → sentinel Bin("__ci",re,im) (không temp runtime)
+        // static init: fold the ℂ constant → sentinel Bin("__ci",re,im) (no runtime temp)
         if !self.in_fn {
             let ((a, b), (c, d)) = (
-                self.ccval(l).ok_or("toán tử complex trên hạng không hằng")?,
-                self.ccval(r).ok_or("toán tử complex trên hạng không hằng")?,
+                self.ccval(l).ok_or("complex operator on non-constant operand")?,
+                self.ccval(r).ok_or("complex operator on non-constant operand")?,
             );
             let (re, im) = match op {
                 "+" => (a + c, b + d),
@@ -1559,7 +1566,7 @@ impl P<'_> {
                     let den = c * c + d * d;
                     ((a * c + b * d) / den, (b * c - a * d) / den)
                 }
-                _ => return Err(format!("op '{op}' trên hằng complex")),
+                _ => return Err(format!("operator '{op}' on complex constant")),
             };
             let (rn, in_) = (self.push(Node::FNum(re), elem), self.push(Node::FNum(im), elem));
             return Ok(self.push(Node::Bin("__ci", rn, in_), ct));
@@ -1571,7 +1578,7 @@ impl P<'_> {
         let bo = self.alloc_local(format!(".cb{}", self.nodes.len()), ct);
         let bv = self.push(Node::Var(bo), ct);
         let p2 = self.push(Node::Assign(bv, rv), ct);
-        // đọc member tươi mỗi lần dùng (temp nên không có side effect)
+        // read the member fresh each use (a temp, so no side effect)
         let m = |s: &mut Self, o: u32, k: u32| {
             let v = s.push(Node::Var(o), ct);
             s.push(Node::Member(v, k), elem)
@@ -1633,7 +1640,7 @@ impl P<'_> {
                 let di = self.push(Node::Var(dof), elem);
                 (re, self.mkbin("/", nim, di)?)
             }
-            _ => return Err(format!("op '{}' trên complex", op)),
+            _ => return Err(format!("operator '{}' on complex operand", op)),
         };
         let mut seq = self.cplx_pack(rre, rim, elem);
         if let Some(p) = p3 {
@@ -1642,7 +1649,7 @@ impl P<'_> {
         seq = self.push(Node::Comma(p2, seq), ct);
         Ok(self.push(Node::Comma(p1, seq), ct))
     }
-    // gói (re,im) → temp complex, trả về Var(temp) (cần in_fn)
+    // pack (re,im) → a complex temp, returning Var(temp) (requires in_fn)
     fn cplx_pack(&mut self, rre: NodeId, rim: NodeId, elem: TypeId) -> NodeId {
         let ct = self.cplx_of(elem);
         let esz = self.tt.size(elem);
@@ -1657,10 +1664,10 @@ impl P<'_> {
         let seq = self.push(Node::Comma(ai, val), ct);
         self.push(Node::Comma(ar, seq), ct)
     }
-    // EXT(gcc): ~z trên complex = liên hợp (re, −im). Dùng Neg (FNEG lật sign
-    // bit) chứ KHÔNG 0−im: liên hợp của +0 là −0 (signed zero, khớp cc bit-đối-bit).
+    // EXT(gcc): ~z on a complex = the conjugate (re, −im). Use Neg (FNEG flips the sign
+    // bit), NOT 0−im: the conjugate of +0 is −0 (signed zero, matching cc bit-for-bit).
     fn cplx_conj(&mut self, e: NodeId) -> R {
-        let el = self.cplx_elem(self.ty(e)).ok_or("~ trên không phải complex")?;
+        let el = self.cplx_elem(self.ty(e)).ok_or("~ on non-complex operand")?;
         let esz = self.tt.size(el);
         let re = self.push(Node::Member(e, 0), el);
         let im0 = self.push(Node::Member(e, esz), el);
@@ -1675,10 +1682,10 @@ impl P<'_> {
         self.locals.push((name, t, Vloc::Stack(self.cur_off)));
         self.cur_off
     }
-    // cấp slot param + mirror thuật toán spill codegen (PHẢI khớp từng byte):
-    // stack args pack — scalar natural align, composite align max(8,align) size
-    // tròn 8, tràn khóa gp=8 (C.11). Vùng arg vô danh variadic bắt đầu sau named
-    // tròn 8. Trả (params, sret slot). Dùng chung top-level & nested funcdef.
+    // allocate parameter slots + mirror the codegen spill algorithm (MUST match byte for byte):
+    // stack args pack — scalar at natural alignment, composite at max(8,align) with size
+    // rounded to 8, overflow locks gp=8 (C.11). The variadic anonymous-argument area starts
+    // after the named args, rounded to 8. Returns (params, sret slot). Shared by top-level & nested funcdef.
     fn setup_params(
         &mut self,
         sig: &crate::ast::FnSig,
@@ -1701,7 +1708,7 @@ impl P<'_> {
                 if fp + n <= 8 {
                     fp += n;
                 } else {
-                    fp = 8; // AAPCS: HFA tràn thì khóa luôn v-reg còn lại
+                    fp = 8; // AAPCS: when an HFA overflows, lock the remaining v-registers
                     let o = alup(boff, self.tt.align(pt).max(8));
                     boff = o + self.tt.size(pt).div_ceil(8) * 8;
                 }
@@ -1747,10 +1754,10 @@ impl P<'_> {
     }
 
 
-    // nhánh bị DCE có chứa label không (goto từ ngoài vào thì không được bỏ)
+    // does a DCE-eliminated branch contain a label (a goto from outside must not drop it)
     fn has_label(&self, id: NodeId) -> bool {
         match &self.nodes[id as usize] {
-            // Case cũng là jump target (bảng switch tham chiếu LC{id})
+            // a Case is also a jump target (the switch table references LC{id})
             Node::Label(..) | Node::Case(..) => true,
             Node::If(a, b, c) => {
                 self.has_label(*a) || self.has_label(*b) || c.is_some_and(|x| self.has_label(x))
@@ -1800,29 +1807,29 @@ impl P<'_> {
         ) {
             Ok(())
         } else {
-            Err("cần lvalue".into())
+            Err("lvalue required".into())
         }
     }
 
     // ---- statement ----
     fn stmt(&mut self) -> R {
-        // EXT(gcc): __extension__ đầu stmt là no-op nhưng nằm trong type-word
-        // → phải bóc TRƯỚC khi phân loại decl/expr, kẻo `__extension__ ({...});`
-        // (obstack_blank của git) bị ăn nhầm thành declaration
+        // EXT(gcc): __extension__ at the start of a statement is a no-op but is a type-word
+        // → it must be stripped BEFORE classifying decl/expr, otherwise `__extension__ ({...});`
+        // (git's obstack_blank) is mistaken for a declaration
         if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "__extension__")
             && matches!(self.toks.get(self.pos + 1), Some(Tok::Punct("(")))
         {
             self.pos += 1;
         }
         if self.eat_kw("_Static_assert") {
-            // EXT(c11): declaration rỗng về mặt codegen — trả block trống
+            // EXT(c11): a declaration that is empty for codegen — return an empty block
             self.static_assert()?;
             return Ok(self.push(Node::Block(Vec::new()), INT));
         }
         if let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
             (self.toks.get(self.pos), self.toks.get(self.pos + 1))
         {
-            // typedef-name + ":" vẫn là label (declaration không thể bắt đầu bằng ":")
+            // typedef-name + ":" is still a label (a declaration cannot begin with ":")
             if !["case", "default"].contains(&n.as_str()) {
                 let n = n.clone();
                 self.pos += 2;
@@ -1831,11 +1838,11 @@ impl P<'_> {
             }
         }
         if self.eat_kw("asm") || self.eat_kw("__asm__") || self.eat_kw("__asm") {
-            // EXT(gcc): inline asm SUBSET (xxhash M14; musl M17 nới): template
-            // phát verbatim; constraint xem AsmOp bên ast.rs. Clobber bỏ qua —
-            // vô hại ở -O0 vì mọi statement reload từ memory, chỉ sp/x29/x30
-            // là bất khả xâm phạm. KHÔNG [tên], không asm goto — lỗi rõ ràng
-            // để không im lặng sinh code sai.
+            // EXT(gcc): inline asm SUBSET (xxhash M14; extended for musl at M17): the template
+            // is emitted verbatim; for constraints see AsmOp in ast.rs. Clobbers are ignored —
+            // harmless at -O0 because every statement reloads from memory; only sp/x29/x30
+            // are inviolable. NO [name], no asm goto — a clear error so incorrect code is
+            // never silently produced.
             while self.eat_kw("volatile")
                 || self.eat_kw("__volatile__")
                 || self.eat_kw("__volatile")
@@ -1867,7 +1874,7 @@ impl P<'_> {
                             tied: None,
                             pin: None,
                         };
-                        // "&" (early-clobber) vô hại: pool mỗi operand một reg riêng
+                        // "&" (early-clobber) is harmless: the pool gives each operand its own register
                         match c.trim_start_matches(['=', '+', '&']) {
                             "r" => {}
                             "w" => op.fp = true,
@@ -1875,7 +1882,7 @@ impl P<'_> {
                             d if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => {
                                 op.tied = Some(d.parse().map_err(|e| format!("{e}"))?)
                             }
-                            _ => return Err(format!("asm: constraint \"{c}\" chưa hỗ trợ")),
+                            _ => return Err(format!("asm: constraint \"{c}\" not supported")),
                         }
                         if let Node::Var(off) = self.nodes[e as usize] {
                             op.pin = self.reg_pins.get(&off).copied();
@@ -1890,22 +1897,22 @@ impl P<'_> {
                     }
                 }
             }
-            // pool tách GP/FP; pin và tied không tốn pool
+            // the pool is split GP/FP; pinned and tied operands do not consume the pool
             let pool = |fp: bool| {
                 ops.iter()
                     .filter(|o| o.fp == fp && o.pin.is_none() && o.tied.is_none())
                     .count()
             };
             if pool(false) > 7 || pool(true) > 7 {
-                return Err("asm: tối đa 7 operand mỗi pool (x9-x15 / v16-v22)".into());
+                return Err("asm: at most 7 operands per pool (x9-x15 / v16-v22)".into());
             }
             self.expect(Tok::Punct(")"))?;
             self.expect(Tok::Punct(";"))?;
             return Ok(self.push(Node::Asm(tpl, ops), INT));
         }
         if self.eat_kw("__label__") {
-            // EXT(gcc): __label__ local label — no-op: label cùng hàm resolve qua Goto
-            // thường; non-local goto (nested func) đã bỏ nên không track gì thêm.
+            // EXT(gcc): __label__ local label — no-op: a same-function label resolves through the
+            // ordinary Goto; non-local goto (nested func) has been dropped, so nothing extra is tracked.
             loop {
                 self.pos += 1;
                 if self.eat(&Tok::Punct(";")) {
@@ -1937,8 +1944,8 @@ impl P<'_> {
             } else {
                 None
             };
-            // điều kiện hằng → giữ đúng nhánh (DCE tối thiểu — clang -O0 cũng
-            // làm, torture link_error dựa vào); nhánh bỏ chứa label thì thôi
+            // constant condition → keep the correct branch (minimal DCE — clang -O0 does this
+            // too, and torture link_error relies on it); skip if the dropped branch contains a label
             if let Ok(v) = self.fold(c) {
                 let (keep, drop) = if v != 0 { (Some(t), e) } else { (e, Some(t)) };
                 if !drop.is_some_and(|d| self.has_label(d)) {
@@ -1955,14 +1962,14 @@ impl P<'_> {
             Ok(self.push(Node::While(c, b), INT))
         } else if self.eat_kw("for") {
             self.expect(Tok::Punct("("))?;
-            // C99 6.8.5.3: for-init declaration được scope TỚI HẾT for (init+cond+
-            // incr+body), phải đóng sau body kẻo leak shadow ra ngoài. Chỉ cho auto/
-            // register object nên chỉ cần locals (không tag/typedef).
+            // C99 6.8.5.3: a for-init declaration is scoped to the WHOLE for (init+cond+
+            // incr+body) and must be closed after the body, otherwise the shadow leaks out. Only
+            // auto/register objects are allowed, so only locals are needed (no tag/typedef).
             let scope = self.locals.len();
-            // C99 (clang -std=c89 cho): "for (int i = 0; ...)" — init là declaration
+            // C99 (allowed by clang -std=c89): "for (int i = 0; ...)" — the init is a declaration
             let i = if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if self.is_type_word(n))
             {
-                Some(self.stmt()?) // decl-stmt tự nuốt ";"
+                Some(self.stmt()?) // a decl-stmt consumes its own ";"
             } else {
                 self.opt_expr(";")?
             };
@@ -1977,7 +1984,7 @@ impl P<'_> {
         } else if self.eat_kw("do") {
             let b = self.stmt()?;
             if !self.eat_kw("while") {
-                return Err("do cần while".into());
+                return Err("do requires while".into());
             }
             self.expect(Tok::Punct("("))?;
             let c = self.expr()?;
@@ -1992,7 +1999,7 @@ impl P<'_> {
             self.switches.push((Vec::new(), None));
             let b = self.stmt()?;
             let (mut cases, def) = self.switches.pop().unwrap();
-            // C89 6.6.4.2: case constant convert về type (promoted) của control expr
+            // C89 6.6.4.2: a case constant is converted to the (promoted) type of the control expr
             let ct = self.promote(self.ty(c));
             if self.tt.size(ct) == 4 {
                 let uns = self.tt.is_unsigned(ct);
@@ -2005,7 +2012,7 @@ impl P<'_> {
             Ok(self.push(Node::Switch(c, b, cases, def), INT))
         } else if self.eat_kw("case") {
             let lo = self.const_expr()?;
-            // EXT(gcc): case lo ... hi — nhãn cho MỌI giá trị trong [lo,hi]
+            // EXT(gcc): case lo ... hi — a label for EVERY value in [lo,hi]
             let hi = if self.eat(&Tok::Punct("...")) {
                 self.const_expr()?
             } else {
@@ -2016,7 +2023,7 @@ impl P<'_> {
             let id = self.push(Node::Case(st), INT);
             self.switches
                 .last_mut()
-                .ok_or("case ngoài switch")?
+                .ok_or("case outside switch")?
                 .0
                 .push((lo, hi, id));
             Ok(id)
@@ -2024,7 +2031,7 @@ impl P<'_> {
             self.expect(Tok::Punct(":"))?;
             let st = self.stmt()?;
             let id = self.push(Node::Case(st), INT);
-            self.switches.last_mut().ok_or("default ngoài switch")?.1 = Some(id);
+            self.switches.last_mut().ok_or("default outside switch")?.1 = Some(id);
             Ok(id)
         } else if self.eat_kw("break") {
             self.expect(Tok::Punct(";"))?;
@@ -2046,7 +2053,7 @@ impl P<'_> {
             Ok(self.push(Node::Block(Vec::new()), INT))
         } else if self.eat(&Tok::Punct("{")) {
             let scope = self.locals.len();
-            // tag/typedef/enum cũng scope theo block (shadow rồi khôi phục)
+            // tag/typedef/enum are also block-scoped (shadow, then restore)
             let (ts, ds, es, ets) = (
                 self.tags.clone(),
                 self.typedefs.clone(),
@@ -2064,42 +2071,42 @@ impl P<'_> {
             self.enum_tags = ets;
             Ok(self.push(Node::Block(v), INT))
         } else if let Some((bt, storage)) = self.decl_specs()? {
-            // khai báo local (nhiều declarator, có init); typedef/static/extern xử lý riêng
+            // local declaration (multiple declarators, with init); typedef/static/extern handled separately
             let tls = self.saw_thread;
             let mut stmts = Vec::new();
             if !self.eat(&Tok::Punct(";")) {
                 loop {
                     let (name, mut t) = self.declarator(bt, true)?;
                     let vla = self.vla_size.take(); // C99
-                    let vla_in = std::mem::take(&mut self.vla_inner); // chiều trong (2D)
-                    // EXT(gcc): asm-label trên LOCAL = ghim reg (musl syscall
-                    // `register long x8 __asm__("x8")`); gỡ khỏi renames vì
-                    // local không có symbol để rename
+                    let vla_in = std::mem::take(&mut self.vla_inner); // inner dimensions (2D)
+                    // EXT(gcc): an asm-label on a LOCAL = pin to a register (musl syscall
+                    // `register long x8 __asm__("x8")`); remove it from renames because
+                    // a local has no symbol to rename
                     let pin = self.renames.remove(&name).and_then(|l| {
                         l.strip_prefix('x')
                             .or_else(|| l.strip_prefix('w'))
                             .and_then(|d| d.parse::<u8>().ok())
                             .filter(|&r| r < 29)
                     });
-                    // nested function (GNU) = vendor lock-in đã BỎ (clang/MSVC không
-                    // có, không app nào trong rổ đòi, đòi exec-stack): reject sạch.
+                    // nested function (GNU) = vendor lock-in, DROPPED (clang/MSVC lack it,
+                    // no app in the corpus needs it, and it requires an executable stack): reject cleanly.
                     if let Ty::Func(_) = self.tt.tys[t as usize]
                         && self.peek("{") {
-                            return Err("nested function (GNU) không hỗ trợ".into());
+                            return Err("nested function (GNU) not supported".into());
                         }
                     match storage {
                         Storage::Typedef => {
-                            // C99 6.7.7 + 6.5.3.4p2: typedef của variably-modified
-                            // array (`typedef int c[i+2]`) — size expr eval MỘT LẦN
-                            // tại điểm khai báo, chốt số byte vào local ẩn; sizeof(c)
-                            // đọc lại (không trả 0 = miscompile 20040411-1).
+                            // C99 6.7.7 + 6.5.3.4p2: typedef of a variably-modified array
+                            // (`typedef int c[i+2]`) — the size expr is evaluated ONCE at the
+                            // declaration, fixing the byte count into a hidden local; sizeof(c)
+                            // reads it back (not returning 0, which would be miscompile 20040411-1).
                             if let Some(w) = vla {
                                 let Ty::Array(elem, 0) = self.tt.tys[t as usize] else {
-                                    return Err("variably-modified typedef ngoài mảng: chưa hỗ trợ".into());
+                                    return Err("variably-modified typedef outside array: not supported".into());
                                 };
                                 let esz = self.tt.size(elem);
                                 if esz == 0 {
-                                    return Err("variably-modified typedef nhiều chiều: chưa hỗ trợ".into());
+                                    return Err("multidimensional variably-modified typedef: not supported".into());
                                 }
                                 let n = self.cast(w, ULONG);
                                 let szn = self.push(Node::Num(esz as i64), ULONG);
@@ -2112,8 +2119,8 @@ impl P<'_> {
                             self.typedefs.insert(name, t);
                         }
                         _ if matches!(self.tt.tys[t as usize], Ty::Func(_)) => {
-                            self.fns.insert(name.clone(), t); // prototype trong hàm
-                            self.locals.push((name, t, Vloc::Fn)); // shadow biến cùng tên
+                            self.fns.insert(name.clone(), t); // prototype inside a function
+                            self.locals.push((name, t, Vloc::Fn)); // shadow a variable of the same name
                         }
                         Storage::Static => {
                             let g = format!("{}.{}", name, self.globals.len());
@@ -2131,11 +2138,11 @@ impl P<'_> {
                                 .push((name, t, Vloc::Glob(self.globals.len() as u32 - 1)));
                         }
                         Storage::Extern => {
-                            // C99 6.2.2p4: block-scope extern có prior declaration
-                            // cùng tên (file-scope) → GIỮ nguyên linkage cũ, trỏ về
-                            // ĐÚNG global đó. Chỉ push extern mới khi tên chưa từng
-                            // khai báo trong TU (nếu không: extern int b của
-                            // `static int b=20` alias nhầm sang global khác).
+                            // C99 6.2.2p4: a block-scope extern with a prior declaration of the
+                            // same name (file-scope) → KEEP the existing linkage and point to
+                            // THAT exact global. Only push a new extern when the name was never
+                            // declared in the TU (otherwise: the `extern int b` of
+                            // `static int b=20` would alias to the wrong global).
                             let gi = self
                                 .globals
                                 .iter()
@@ -2154,33 +2161,32 @@ impl P<'_> {
                                 });
                             self.locals.push((name, t, Vloc::Glob(gi as u32)));
                         }
-                        // C99: VLA local → con trỏ + alloca(n*sizeof(elem)).
-                        // Hệ quả biết trước: sizeof(vla) = 8 (size con trỏ), sai
-                        // spec nhưng redis không đụng; epilogue mov sp,x29 thu hồi.
-                        // C99 6.7.6.2: VLA 2 chiều `int M[d0][d1]` → con trỏ tới
-                        // HÀNG VLA `int[d1]` + alloca(d0*d1*elem). Tái dùng nguyên
-                        // cơ chế (*p)[w]: đăng ký row-type vào vla_arrs để mkbin
-                        // scale bước-hàng runtime (d1*elem); indexing M[i][j] tự
-                        // đúng qua decay Deref-Array (867-875 arm64_elf). ≥3 chiều
-                        // hoặc chiều-trong-lồng-VLA → reject sạch (chưa hỗ trợ).
+                        // C99: a local VLA → pointer + alloca(n*sizeof(elem)).
+                        // Known consequence: sizeof(vla) = 8 (pointer size), which is off-spec
+                        // but redis does not hit it; the epilogue mov sp,x29 reclaims it.
+                        // C99 6.7.6.2: a 2D VLA `int M[d0][d1]` → pointer to a VLA ROW `int[d1]`
+                        // + alloca(d0*d1*elem). Reuse the (*p)[w] mechanism verbatim: register
+                        // the row-type in vla_arrs so mkbin scales the runtime row step (d1*elem);
+                        // indexing M[i][j] then works via the Deref-Array decay (867-875 arm64_elf).
+                        // ≥3 dimensions or an inner VLA-nested dimension → reject cleanly (unsupported).
                         _ if vla.is_some() && !vla_in.is_empty() => {
                             if vla_in.len() != 1 {
-                                return Err("VLA >2 chiều: chưa hỗ trợ".into());
+                                return Err("VLA with more than 2 dimensions: not supported".into());
                             }
                             let Ty::Array(row, 0) = self.tt.tys[t as usize] else {
-                                return Err("VLA đa chiều ngoài mảng".into());
+                                return Err("multidimensional VLA outside array".into());
                             };
                             let Ty::Array(elem, 0) = self.tt.tys[row as usize] else {
-                                return Err("VLA đa chiều: chiều trong không phải mảng".into());
+                                return Err("multidimensional VLA: inner dimension is not an array".into());
                             };
                             let esz = self.tt.size(elem);
                             if esz == 0 {
-                                return Err("VLA >2 chiều: chưa hỗ trợ".into());
+                                return Err("VLA with more than 2 dimensions: not supported".into());
                             }
                             if self.peek("=") {
-                                return Err("VLA có initializer".into());
+                                return Err("VLA with initializer".into());
                             }
-                            // bước-hàng = d1 * sizeof(elem) (runtime) → local ẩn
+                            // row step = d1 * sizeof(elem) (runtime) → hidden local
                             let d1 = self.cast(vla_in[0], ULONG);
                             let eszn = self.push(Node::Num(esz as i64), ULONG);
                             let rbytes = self.push(Node::Bin("*", d1, eszn), ULONG);
@@ -2188,7 +2194,7 @@ impl P<'_> {
                             let hrv = self.push(Node::Var(hrow), ULONG);
                             stmts.push(self.mkassign(hrv, rbytes)?);
                             self.vla_arrs.insert(row, hrow);
-                            // tổng byte = d0 * bước-hàng → local ẩn (sizeof + alloca)
+                            // total bytes = d0 * row step → hidden local (sizeof + alloca)
                             let d0 = self.cast(vla.unwrap(), ULONG);
                             let hrv2 = self.push(Node::Var(hrow), ULONG);
                             let total = self.push(Node::Bin("*", d0, hrv2), ULONG);
@@ -2204,13 +2210,13 @@ impl P<'_> {
                             stmts.push(self.mkassign(v, al)?);
                         }
                         _ if vla.is_some() => {
-                            // con trỏ tới VLA `char (*p)[w]` (musl): KHÔNG cấp
-                            // phát — chỉ ghi size byte pointee vào local ẩn để
-                            // mkbin scale runtime; init scalar bình thường
+                            // pointer to a VLA `char (*p)[w]` (musl): NO allocation —
+                            // only record the pointee byte size in a hidden local so
+                            // mkbin can scale at runtime; scalar init as usual
                             if let Ty::Ptr(inner) = self.tt.tys[t as usize] {
                                 let Ty::Array(elem, 0) = self.tt.tys[inner as usize] else {
                                     return Err(
-                                        "size không hằng sau con trỏ: chỉ hỗ trợ (*p)[w]".into()
+                                        "non-constant size after pointer: only (*p)[w] supported".into()
                                     );
                                 };
                                 let w = self.cast(vla.unwrap(), ULONG);
@@ -2231,11 +2237,11 @@ impl P<'_> {
                                 }
                             } else {
                                 if self.peek("=") {
-                                    return Err("VLA có initializer".into());
+                                    return Err("VLA with initializer".into());
                                 }
                                 let elem = match self.tt.tys[t as usize] {
                                     Ty::Array(e, _) => e,
-                                    _ => return Err("size không hằng ngoài mảng".into()),
+                                    _ => return Err("non-constant size outside array".into()),
                                 };
                                 let pt = self.tt.ptr_to(elem);
                                 let off = self.alloc_local(name.clone(), pt);
@@ -2243,9 +2249,9 @@ impl P<'_> {
                                 let esz = self.tt.size(elem);
                                 let sz = self.push(Node::Num(esz as i64), ULONG);
                                 let bytes = self.push(Node::Bin("*", n, sz), ULONG);
-                                // C99 6.5.3.4p2: sizeof(vla) = runtime — chốt
-                                // số byte vào local ẩn (size expr eval đúng 1
-                                // lần), sizeof + alloca cùng đọc lại từ đó
+                                // C99 6.5.3.4p2: sizeof(vla) = runtime — fix the byte count
+                                // into a hidden local (the size expr is evaluated exactly once),
+                                // and both sizeof and alloca read it back from there
                                 let hid = self.alloc_local(format!("{name}.vlasz"), ULONG);
                                 let hv = self.push(Node::Var(hid), ULONG);
                                 stmts.push(self.mkassign(hv, bytes)?);
@@ -2258,9 +2264,9 @@ impl P<'_> {
                         }
                         _ => {
                             if self.eat(&Tok::Punct("=")) {
-                                // scope của tên bắt đầu SAU declarator — init được
-                                // tham chiếu chính nó (sizeof *p). Chỉ mảng [] chưa
-                                // chốt size mới phải đổ phẳng trước khi cấp slot.
+                                // the name's scope begins AFTER the declarator — the init may
+                                // reference itself (sizeof *p). Only an array [] whose size is
+                                // not yet fixed must be flattened before allocating the slot.
                                 let no_size = matches!(self.tt.tys[t as usize], Ty::Array(_, 0));
                                 let mut off = 0;
                                 if !no_size {
@@ -2274,7 +2280,7 @@ impl P<'_> {
                                     self.reg_pins.insert(off, r);
                                 }
                                 let v = self.push(Node::Var(off), t);
-                                // aggregate {..}/"..": zero-fill trước (partial init)
+                                // aggregate {..}/"..": zero-fill first (partial init)
                                 if agg
                                     && matches!(
                                         self.tt.tys[t as usize],
@@ -2330,15 +2336,15 @@ impl P<'_> {
         Ok(Some(e))
     }
     // ---- initializer ----
-    // Cây init parse trước, chốt size mảng [], rồi mới hạ xuống assign (local)
-    // hoặc phẳng hóa thành (offset, size, item) (global/static).
+    // The init tree is parsed first, the [] array size is fixed, and only then is it lowered
+    // to assignments (local) or flattened to (offset, size, item) (global/static).
     fn parse_init(&mut self) -> Result<Init, String> {
         if self.eat(&Tok::Punct("{")) {
             let mut v = Vec::new();
             if !self.eat(&Tok::Punct("}")) {
                 loop {
-                    // chuỗi designator: .a.j / [2].x / .m[1] — desugar phần đuôi
-                    // thành init lồng: ".a.j = v" ≡ ".a = { .j = v }"
+                    // designator chain: .a.j / [2].x / .m[1] — desugar the tail into
+                    // a nested init: ".a.j = v" ≡ ".a = { .j = v }"
                     let mut steps = Vec::new();
                     loop {
                         if self.eat(&Tok::Punct("[")) {
@@ -2357,7 +2363,7 @@ impl P<'_> {
                             break;
                         }
                     }
-                    // EXT(gcc) cổ: "a : 'A'" ≡ ".a = 'A'" (đầu phần tử, không nhầm ?:)
+                    // old EXT(gcc): "a : 'A'" ≡ ".a = 'A'" (element head, not confused with ?:)
                     if steps.is_empty()
                         && let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
                             (self.toks.get(self.pos), self.toks.get(self.pos + 1))
@@ -2402,10 +2408,10 @@ impl P<'_> {
             self.pos += 1;
             while let Some(Tok::Str(m, w2)) = self.toks.get(self.pos) {
                 b.extend_from_slice(m);
-                w = w.max(w2.0); // nối chuỗi: prefix rộng nhất thắng (C11 6.4.5p5)
+                w = w.max(w2.0); // string concatenation: the widest prefix wins (C11 6.4.5p5)
                 self.pos += 1;
             }
-            // string trần mới là Init::S; "abc" + 10 là biểu thức
+            // only a bare string is Init::S; "abc" + 10 is an expression
             if matches!(
                 self.toks.get(self.pos),
                 None | Some(Tok::Punct("," | ";" | "}"))
@@ -2416,8 +2422,8 @@ impl P<'_> {
         }
         Ok(Init::E(self.assign()?))
     }
-    // ---- đổ initializer (mô hình cursor — brace elision chuẩn C89) ----
-    // fill_obj: một initializer TRỌN VẸN (braced/string/expr) vào object (t, base).
+    // ---- initializer emission (cursor model — C89-standard brace elision) ----
+    // fill_obj: one COMPLETE initializer (braced/string/expr) into an object (t, base).
     fn fill_obj(
         &mut self,
         t: TypeId,
@@ -2431,8 +2437,8 @@ impl P<'_> {
                 if let Ty::Array(e, n) = self.tt.tys[t as usize] {
                     let es = self.tt.size(e);
                     if w > 1 && es == w as u32 {
-                        // wchar_t/char16_t ws[] = L".."/u"..": mỗi codepoint → es
-                        // byte LE + NUL es byte (khớp width phần tử mảng)
+                        // wchar_t/char16_t ws[] = L".."/u"..": each codepoint → es
+                        // bytes LE + an es-byte NUL (matching the array element width)
                         let cps = wchars(&b);
                         let ew = es as usize;
                         let mut wb = Vec::with_capacity((cps.len() + 1) * ew);
@@ -2449,7 +2455,7 @@ impl P<'_> {
                     if es == 1 && w == 1 {
                         b.push(0);
                         if n > 0 && b.len() as u64 > n {
-                            b.truncate(n as usize); // char s[3] = "abc" hợp lệ C89
+                            b.truncate(n as usize); // char s[3] = "abc" is valid C89
                         }
                         out.push((base, t, FlatItem::B(b)));
                         return Ok(());
@@ -2463,7 +2469,7 @@ impl P<'_> {
                     for c in cps {
                         wb.extend_from_slice(&c.to_le_bytes()[..ew]);
                     }
-                    wb.extend(std::iter::repeat_n(0, ew - 1)); // .asciz bù NUL cuối
+                    wb.extend(std::iter::repeat_n(0, ew - 1)); // .asciz supplies the trailing NUL
                     b = wb;
                     (n + 1, if w == 2 { USHORT } else { INT })
                 } else {
@@ -2482,14 +2488,14 @@ impl P<'_> {
                 Ok(())
             }
             Init::E(e) => {
-                // complex FLOATING (init HẰNG tĩnh, !in_fn) là scalar leaf: gitem fold
-                // (re,im) ra bytes. Local runtime (in_fn) PHẢI giữ đường cũ — assign
-                // scalar vào struct{re,im} 16-byte sẽ sai/crash; descend vào .re.
+                // FLOATING complex (a static CONSTANT init, !in_fn) is a scalar leaf: gitem folds
+                // (re,im) to bytes. A runtime local (in_fn) MUST keep the old path — assigning a
+                // scalar into a 16-byte struct{re,im} would be wrong/crash; descend into .re.
                 if !self.in_fn && self.cplx_elem(t).is_some_and(|el| self.tt.is_float(el)) {
                     out.push((base, t, FlatItem::E(e)));
                     return Ok(());
                 }
-                // scalar "chảy" vào leaf đầu khi t aggregate mà expr khác kiểu
+                // a scalar "flows" into the first leaf when t is an aggregate and the expr has a different type
                 let (mut t, mut base) = (t, base);
                 while !self.scalar(t) && self.ty(e) != t {
                     match self.tt.tys[t as usize] {
@@ -2498,7 +2504,7 @@ impl P<'_> {
                             let m = self.tt.structs[si as usize]
                                 .members
                                 .first()
-                                .ok_or("init struct rỗng")?;
+                                .ok_or("empty struct initializer")?;
                             base += m.2;
                             t = m.1;
                         }
@@ -2510,8 +2516,8 @@ impl P<'_> {
             }
         }
     }
-    // fill_list: đổ dần iterator (CHIA SẺ giữa các tầng = elision) vào aggregate t.
-    // Trả số phần tử array đã chạm (suy size cho T x[]).
+    // fill_list: drain the iterator (SHARED across levels = elision) into aggregate t.
+    // Returns the number of array elements touched (to infer the size of T x[]).
     fn fill_list(
         &mut self,
         t: TypeId,
@@ -2525,9 +2531,9 @@ impl P<'_> {
                 let (mut i, mut cnt) = (0u32, 0u32);
                 while let Some((d, _)) = it.peek_mut() {
                     match d {
-                        // quay lui index TRƯỚC khi xét đầy; desig của tầng NÀY dùng
-                        // xong phải XÓA — elision descend giữ chung iterator, tầng
-                        // trong thấy lại sẽ apply nhầm (hoặc lặp vô hạn với Mem)
+                        // reposition the index BEFORE checking fullness; a designator at THIS level
+                        // must be CLEARED after use — elision descent shares the iterator, and an
+                        // inner level seeing it again would apply it wrongly (or loop forever with Mem)
                         Desig::Idx(k) => {
                             i = *k;
                             *d = Desig::No;
@@ -2562,12 +2568,12 @@ impl P<'_> {
                 let mut i = 0usize;
                 while it.peek().is_some() {
                     if let Some((Desig::Mem(nm), _)) = it.peek() {
-                        // designator quay lui cursor TRƯỚC khi xét đầy; không thấy
-                        // trực tiếp thì trỏ vào anon member chứa nó (descend tự tìm lại)
+                        // a designator repositions the cursor BEFORE checking fullness; if not found
+                        // directly, point at the anonymous member containing it (descent finds it again)
                         let nm = nm.clone();
                         i = match members.iter().position(|(mn, ..)| *mn == nm) {
                             Some(k) => {
-                                // desig tầng NÀY đã dùng: xóa kẻo tầng trong lặp vô hạn
+                                // the designator at THIS level is used: clear it, otherwise an inner level loops forever
                                 it.peek_mut().unwrap().0 = Desig::No;
                                 k
                             }
@@ -2577,7 +2583,7 @@ impl P<'_> {
                                         if self.find_member(s2, &nm).is_some())
                             }) {
                                 Some(k) => k,
-                                None => break, // member của tầng NGOÀI → trả cursor về caller
+                                None => break, // a member of an OUTER level → return the cursor to the caller
                             },
                         };
                     }
@@ -2594,14 +2600,14 @@ impl P<'_> {
                 Ok(0)
             }
             _ => {
-                let init = it.next().ok_or("initializer rỗng")?.1;
+                let init = it.next().ok_or("empty initializer")?.1;
                 self.fill_obj(t, base, init, out)?;
                 Ok(1)
             }
         }
     }
-    // Một sub-object: phần tử kế là braced/string → tiêu thụ nguyên; scalar expr
-    // trên sub-object aggregate → elision: descend với CÙNG iterator.
+    // One sub-object: if the next element is braced/string → consume it whole; a scalar expr
+    // over an aggregate sub-object → elision: descend with the SAME iterator.
     fn fill_one(
         &mut self,
         t: TypeId,
@@ -2609,13 +2615,13 @@ impl P<'_> {
         it: &mut ItInit,
         out: &mut Vec<(u32, TypeId, FlatItem)>,
     ) -> Result<(), String> {
-        // string là "nguyên khối" với array/char*; với struct thì elision descend
+        // a string is "atomic" for array/char*; for a struct, elision descends
         let braced = match it.peek() {
             Some((_, Init::L(_))) => true,
             Some((_, Init::S(..))) => !matches!(self.tt.tys[t as usize], Ty::Struct(_)),
             _ => false,
         };
-        // expr kiểu struct KHỚP member → init nguyên khối, không elision descend
+        // a struct-typed expr that MATCHES the member → whole init, no elision descent
         let whole = matches!(
             it.peek(),
             Some((_, Init::E(e))) if {
@@ -2633,9 +2639,9 @@ impl P<'_> {
             self.fill_list(t, base, it, out).map(|_| ())
         }
     }
-    // parse init + đổ phẳng + chốt size mảng []. Trả (flat, init có phải {..}/"..").
-    // C89 3.5.7: string literal init mảng char/wchar được bọc {} tùy chọn
-    // (luac.c: static char Output[]={ "luac.out" }) — bóc ngoặc ra Init::S
+    // parse init + flatten + fix the [] array size. Returns (flat, whether the init is {..}/"..").
+    // C89 3.5.7: a string-literal init of a char/wchar array may be optionally wrapped in {}
+    // (luac.c: static char Output[]={ "luac.out" }) — unwrap the braces to Init::S
     fn unbrace_str(&self, t: TypeId, init: Init) -> Init {
         if let Ty::Array(e, _) = self.tt.tys[t as usize] {
             let esz = self.tt.size(e);
@@ -2663,8 +2669,8 @@ impl P<'_> {
                 *t = self.tt.add(Ty::Array(e, n.max(1) as u64));
             }
             (Ty::Array(e, 0), Init::S(b, w)) => {
-                // wide L"..": độ dài = số CODEPOINT decode (6.4.5), không phải
-                // byte thô — "Ä" = 1 wchar (U+00C4) chứ không 2 (bug wchar_t-1)
+                // wide L"..": the length = the number of decoded CODEPOINTS (6.4.5), not
+                // raw bytes — "Ä" = 1 wchar (U+00C4), not 2 (bug wchar_t-1)
                 let len = if w > 1 && self.tt.size(e) == w as u32 {
                     wchars(&b).len() as u64
                 } else {
@@ -2677,8 +2683,8 @@ impl P<'_> {
         }
         Ok((flat, agg))
     }
-    // một item hằng: số / bits float / địa chỉ symbol / string
-    // nhận diện (&&a - &&b) — kể cả dạng ((a-b)/1) do ptr-diff — trả cặp symbol
+    // a constant item: number / float bits / symbol address / string
+    // recognize (&&a - &&b) — including the ((a-b)/1) form from ptr-diff — return the symbol pair
     fn label_diff(&self, mut e: NodeId) -> Option<(String, String)> {
         loop {
             match &self.nodes[e as usize] {
@@ -2707,26 +2713,26 @@ impl P<'_> {
         }
         None
     }
-    // giá trị con trỏ hằng: symbol + offset byte (mkbin đã scale ptr arith ra byte)
+    // a constant pointer value: symbol + byte offset (mkbin already scaled the ptr arithmetic to bytes)
     fn gaddr(&self, mut e: NodeId) -> Option<(String, i64)> {
         loop {
             match &self.nodes[e as usize] {
                 Node::Cast(i) => e = *i,
                 Node::FunAddr(n) => return Some((n.clone(), 0)),
                 Node::Addr(x) => return self.glval(*x),
-                // chỉ array/function decay mới là giá trị con trỏ; scalar phải qua &
+                // only array/function decay is a pointer value; a scalar must go through &
                 Node::GVar(gi) => {
                     let g = &self.globals[*gi as usize];
                     return matches!(self.tt.tys[g.ty as usize], Ty::Array(..) | Ty::Func(_))
                         .then(|| (g.name.clone(), 0));
                 }
-                // decay MEMBER kiểu mảng: int *p = g.a.arr (C89 3.4 address
-                // constant qua path . -> [] — chibicc initializer.c đòi)
+                // decay an array-typed MEMBER: int *p = g.a.arr (C89 3.4 address
+                // constant through a . -> [] path — required by chibicc initializer.c)
                 Node::Member(..) if matches!(self.tt.tys[self.ty(e) as usize], Ty::Array(..)) => {
                     return self.glval(e);
                 }
-                // C99 6.6p9: mảng đa chiều — `*(a+i)` kiểu mảng (int[9]) tự decay
-                // về địa chỉ = giá trị con trỏ `a+i`; &a[i][j] lồng Deref như vậy.
+                // C99 6.6p9: a multidimensional array — `*(a+i)` of array type (int[9]) decays
+                // to an address = the pointer value `a+i`; &a[i][j] nests Deref this way.
                 Node::Deref(p) if matches!(self.tt.tys[self.ty(e) as usize], Ty::Array(..)) => {
                     e = *p
                 }
@@ -2739,7 +2745,7 @@ impl P<'_> {
             }
         }
     }
-    // lvalue path hằng → symbol + offset byte
+    // a constant lvalue path → symbol + byte offset
     fn glval(&self, mut e: NodeId) -> Option<(String, i64)> {
         loop {
             match &self.nodes[e as usize] {
@@ -2755,13 +2761,13 @@ impl P<'_> {
         }
     }
     fn gitem(&mut self, e0: NodeId, t: TypeId) -> Result<GInit, String> {
-        // lột cast CHỈ để nhận diện pattern địa chỉ (str/&g/decay); fold số
-        // phải dùng node gốc kẻo mất truncation của (unsigned int)-4 (pr39240)
+        // strip casts ONLY to recognize the address pattern (str/&g/decay); folding a number
+        // must use the original node, otherwise the truncation of (unsigned int)-4 is lost (pr39240)
         let mut e = e0;
         while let Node::Cast(inner) = self.nodes[e as usize] {
             e = inner;
         }
-        // "abc" + k / &"abc"[k] → địa chỉ giữa string
+        // "abc" + k / &"abc"[k] → an address into the middle of a string
         let stroff = |p: &Self, mut x: NodeId| -> Option<(u32, i64)> {
             while let Node::Cast(i) = p.nodes[x as usize] {
                 x = i;
@@ -2794,11 +2800,11 @@ impl P<'_> {
                     }
             }
             Node::LabelAddr(n) => {
-                // symbol khớp quy ước label của codegen (không gạch dưới đầu)
+                // a symbol matching codegen's label convention (no leading underscore)
                 return Ok(GInit::Addr(format!("\x01lg_{}.{}", self.fname, n), 0));
             }
-            // EXT(gcc): &&a - &&b hiệu 2 label (jump table tĩnh); ptr-diff void*
-            // bị mkbin bọc "/1" nên phải bóc
+            // EXT(gcc): &&a - &&b, the difference of two labels (static jump table); a void*
+            // ptr-diff is wrapped in "/1" by mkbin, so it must be stripped
             Node::Bin("/" | "-", ..) => {
                 if let Some((a, b)) = self.label_diff(e) {
                     return Ok(GInit::Diff(a, b));
@@ -2806,13 +2812,13 @@ impl P<'_> {
             }
             _ => {}
         }
-        // address constant tổng quát: &g.m, &a[i], (arr+1)->m... → symbol + offset
+        // a general address constant: &g.m, &a[i], (arr+1)->m... → symbol + offset
         if let Some((s, k)) = self.gaddr(e) {
             return Ok(GInit::Addr(s, k));
         }
-        // static init complex FLOATING: (re,im) → hai ô float liền kề {re,im}
+        // static init of a FLOATING complex: (re,im) → two adjacent float cells {re,im}
         if let Some(el) = self.cplx_elem(t).filter(|&el| self.tt.is_float(el)) {
-            let (re, im) = self.ccval(e).ok_or("init complex không hằng")?;
+            let (re, im) = self.ccval(e).ok_or("non-constant complex initializer")?;
             let esz = self.tt.size(el);
             let bits =
                 |v: f64| if esz == 4 { (v as f32).to_bits() as i64 } else { v.to_bits() as i64 };
@@ -2824,7 +2830,7 @@ impl P<'_> {
         if self.tt.is_float(t) {
             let v = self.fold_f(e0)?;
             if matches!(self.tt.tys[t as usize], Ty::LDouble) {
-                // memory long double ELF = binary128: nới f64 → f128 (exact)
+                // in-memory long double on ELF = binary128: widen f64 → f128 (exact)
                 return Ok(GInit::Bytes(f128_bytes(v).to_vec()));
             }
             let bits = if self.tt.size(t) == 4 {
@@ -2834,10 +2840,10 @@ impl P<'_> {
             };
             return Ok(GInit::Num(bits));
         }
-        // hằng nguyên từ biểu thức thực: (int)1.9 v.v. — fold_f rồi truncate
+        // an integer constant from a floating expression: (int)1.9 etc. — fold_f then truncate
         if (self.tt.is_float(self.ty(e0)) || self.tt.is_float(self.ty(e)))
             && let Ok(v) = self.fold_f(e) {
-                // cast Rust saturate: unsigned phải đi đường u64 kẻo 1.8e19 → i64::MAX
+                // Rust cast saturates: unsigned must go through u64, otherwise 1.8e19 → i64::MAX
                 let n = if self.tt.is_unsigned(t) {
                     v as u64 as i64
                 } else {
@@ -2847,7 +2853,7 @@ impl P<'_> {
             }
         Ok(GInit::Num(self.fold(e0)?))
     }
-    // init global/static: trả về GInit + chốt size mảng []
+    // global/static init: return the GInit + fix the [] array size
     fn ginit(&mut self, t: &mut TypeId) -> Result<GInit, String> {
         if !self.eat(&Tok::Punct("=")) {
             return Ok(GInit::None);
@@ -2857,14 +2863,14 @@ impl P<'_> {
     }
     fn flat_to_ginit(&mut self, flat: Vec<(u32, TypeId, FlatItem)>) -> Result<GInit, String> {
         let mut list: Vec<(u32, u32, GInit)> = Vec::new();
-        let mut bfs: Vec<(u32, u32, u128)> = Vec::new(); // bitfield: (byte đầu, byte sau cuối, ảnh bit)
+        let mut bfs: Vec<(u32, u32, u128)> = Vec::new(); // bitfield: (first byte, one-past-last byte, bit image)
         for (off, mt, item) in flat {
             match item {
                 FlatItem::E(e) => {
                     if self.tt.size(mt) == 0 {
-                        continue; // EXT(gcc): empty struct — không có data
+                        continue; // EXT(gcc): empty struct — no data
                     }
-                    // aggregate = compound literal ẩn (GVar static) → trải init nó vào đây
+                    // an aggregate = an implicit compound literal (static GVar) → splice its init in here
                     if matches!(self.tt.tys[mt as usize], Ty::Struct(_) | Ty::Array(..)) {
                         let mut e2 = e;
                         while let Node::Cast(i2) = self.nodes[e2 as usize] {
@@ -2877,11 +2883,11 @@ impl P<'_> {
                             continue;
                         }
                     }
-                    // bitfield: chỉ phát ĐÚNG dải byte field chiếm — Itanium cho
-                    // member thường chen vào byte trống của container, phát trọn
-                    // container sẽ đè/trôi hàng xóm (gdata List không quay lui)
+                    // bitfield: emit ONLY the exact byte range the field occupies — Itanium lets
+                    // an ordinary member slot into the container's free bytes, so emitting the whole
+                    // container would overwrite/shift the neighbor (the gdata List does not backtrack)
                     if let Ty::Bitfield(_, boff, w) = self.tt.tys[mt as usize] {
-                        let mask = !0u64 >> (64 - w); // w ≥ 1 (w=0 không có tên field)
+                        let mask = !0u64 >> (64 - w); // w ≥ 1 (w=0 has no named field)
                         let v = (self.fold(e)? as u64) & mask;
                         let (s0, s1) = (off + boff / 8, off + (boff + w).div_ceil(8));
                         bfs.push((s0, s1, (v as u128) << (boff % 8)));
@@ -2896,7 +2902,7 @@ impl P<'_> {
                 }
             }
         }
-        // các field giao byte nhau (chung container) OR thành một dải Bytes
+        // fields that overlap bytes (share a container) are OR-ed into one Bytes run
         bfs.sort_by_key(|x| x.0);
         let mut runs: Vec<(u32, u32, u128)> = Vec::new();
         for (s0, s1, img) in bfs {
@@ -2912,7 +2918,7 @@ impl P<'_> {
             let bytes: Vec<u8> = (0..s1 - s0).map(|k| (img >> (8 * k)) as u8).collect();
             list.push((s0, s1 - s0, GInit::Bytes(bytes)));
         }
-        // designator có thể ra ngoài thứ tự / ghi đè: sort ổn định + giữ bản CUỐI
+        // a designator may be out of order / overwrite: stable sort + keep the LAST version
         list.sort_by_key(|x| x.0);
         let mut ded: Vec<(u32, u32, GInit)> = Vec::new();
         for it in list {
@@ -2930,7 +2936,7 @@ impl P<'_> {
         let mut l = self.assign()?;
         while self.eat(&Tok::Punct(",")) {
             let r = self.assign()?;
-            // C99 6.5.17: vế phải qua lvalue conversion → array decay
+            // C99 6.5.17: the right operand undergoes lvalue conversion → array decay
             let t = self.arr_decay(self.ty(r));
             l = self.push(Node::Comma(l, r), t);
         }
@@ -2956,8 +2962,8 @@ impl P<'_> {
             return Ok(c);
         }
         let c = self.truthy(c)?;
-        // EXT(gcc): elvis "a ?: b" — vế giữa = chính cond, KHÔNG eval lại (codegen nhận
-        // diện tb==cond để giữ x0)
+        // EXT(gcc): elvis "a ?: b" — the middle operand = the cond itself, NOT re-evaluated
+        // (codegen recognizes tb==cond to preserve x0)
         if self.eat(&Tok::Punct(":")) {
             let e = self.cond_expr()?;
             let t = self.arr_decay(self.ty(c));
@@ -2966,22 +2972,22 @@ impl P<'_> {
         let t = self.expr()?;
         self.expect(Tok::Punct(":"))?;
         let e = self.cond_expr()?;
-        // hai vế hội tụ về kiểu chung (scalar); struct/ptr giữ vế trái
+        // the two operands converge to a common type (scalar); struct/ptr keeps the left operand
         let (tt_, te) = (self.ty(t), self.ty(e));
         if self.scalar(tt_) && self.scalar(te) && self.tt.is_integer(tt_) | self.tt.is_float(tt_) {
             let ct = self.common_ty(tt_, te);
             let (t, e) = (self.cast(t, ct), self.cast(e, ct));
             Ok(self.push(Node::Cond(c, t, e), ct))
         } else {
-            // C99 6.5.15: operand mảng decay về con trỏ — giữ type mảng thì arg
-            // variadic tràn stack bị store_narrow cắt theo size mảng (git diff.c
-            // `? " " : ""` → strh 2 byte → con trỏ rác, segv theo layout)
+            // C99 6.5.15: an array operand decays to a pointer — keeping the array type would
+            // make a variadic argument spilled to the stack be store_narrow-ed to the array size
+            // (git diff.c `? " " : ""` → strh 2 bytes → a garbage pointer, segv per layout)
             let rt = self.arr_decay(tt_);
             Ok(self.push(Node::Cond(c, t, e), rt))
         }
     }
-    // lvalue conversion C99 6.3.2.1p3: array → con trỏ phần tử (value = địa chỉ,
-    // codegen array-expr vốn đã trả địa chỉ nên chỉ cần đổi type)
+    // lvalue conversion C99 6.3.2.1p3: array → pointer-to-element (value = address;
+    // codegen for an array expr already returns the address, so only the type changes)
     fn arr_decay(&mut self, t: TypeId) -> TypeId {
         if let Ty::Array(e, _) = self.tt.tys[t as usize] {
             self.tt.ptr_to(e)
@@ -3059,7 +3065,7 @@ impl P<'_> {
         self.opassign(e, op, one)
     }
     fn unary(&mut self) -> R {
-        // EXT(gcc): __real__/__imag__ z — phép chiếu ℂ→ℝ (C99 dùng creal/cimag)
+        // EXT(gcc): __real__/__imag__ z — the projection ℂ→ℝ (C99 uses creal/cimag)
         if self.eat_kw("__real__") || self.eat_kw("__real") {
             let e = self.unary()?;
             return self.cplx_proj(e, false);
@@ -3075,11 +3081,11 @@ impl P<'_> {
                     self.pos += 1;
                     let ty = self.typename()?;
                     self.expect(Tok::Punct(")"))?;
-                    // compound literal (C99, clang chấp nhận ở -std=c89): "(T){...}"
+                    // compound literal (C99, accepted by clang under -std=c89): "(T){...}"
                     if self.peek("{") {
                         let mut t = ty;
                         if !self.in_fn {
-                            // global scope: vật thể ẩn dạng static + init hằng
+                            // global scope: an implicit static object + constant init
                             let (flat, _) = self.flat_init(&mut t)?;
                             let init = self.flat_to_ginit(flat)?;
                             let name = format!("__cl{}", self.globals.len());
@@ -3128,7 +3134,7 @@ impl P<'_> {
                                 }
                             }
                         }
-                        // lvalue hóa: Deref(Comma(inits, &temp)) — gán/& được như C99
+                        // make it an lvalue: Deref(Comma(inits, &temp)) — assignable/&-able as in C99
                         let res = self.push(Node::Var(off), t);
                         let pt = self.tt.ptr_to(t);
                         let ad = self.push(Node::Addr(res), pt);
@@ -3144,7 +3150,7 @@ impl P<'_> {
                 }
         if self.eat(&Tok::Punct("-")) {
             let e = self.unary()?;
-            // C99: -z trên complex → 0 - z (0.0 giữ elem để không lên double)
+            // C99: -z on a complex → 0 - z (0.0 keeps elem so it does not promote to double)
             if let Some(el) = self.cplx_elem(self.ty(e)) {
                 let z = self.push(Node::FNum(0.0), el);
                 return self.mkbin("-", z, e);
@@ -3175,7 +3181,7 @@ impl P<'_> {
         } else if self.eat(&Tok::Punct("~")) {
             let e = self.unary()?;
             if self.cplx_elem(self.ty(e)).is_some() {
-                return self.cplx_conj(e); // ~z = liên hợp
+                return self.cplx_conj(e); // ~z = conjugate
             }
             let m = self.push(Node::Num(-1), INT);
             self.mkbin("^", e, m)
@@ -3187,19 +3193,19 @@ impl P<'_> {
             let e = self.unary()?;
             let t = match self.tt.tys[self.ty(e) as usize] {
                 Ty::Ptr(p) | Ty::Array(p, _) => p,
-                Ty::Func(_) => self.ty(e), // *f trên hàm = chính nó
-                _ => return Err("deref thứ không phải con trỏ".into()),
+                Ty::Func(_) => self.ty(e), // *f on a function = itself
+                _ => return Err("dereference of non-pointer".into()),
             };
             Ok(self.push(Node::Deref(e), t))
         } else if self.eat(&Tok::Punct("&&")) {
-            // EXT(gcc): "&&label" — && ở vị trí prefix không thể là logical-and
+            // EXT(gcc): "&&label" — && in prefix position cannot be a logical-and
             let n = self.ident()?;
             let t = self.tt.ptr_to(VOID);
             Ok(self.push(Node::LabelAddr(n), t))
         } else if self.eat(&Tok::Punct("&")) {
             let e = self.unary()?;
             if matches!(self.nodes[e as usize], Node::FunAddr(_)) {
-                return Ok(e); // &f = f với hàm
+                return Ok(e); // &f = f for a function
             }
             let t = self.tt.ptr_to(self.ty(e));
             Ok(self.push(Node::Addr(e), t))
@@ -3215,16 +3221,16 @@ impl P<'_> {
             } else {
                 let save = self.nodes.len();
                 let e = self.unary()?;
-                // EXT(gcc): __alignof__(func) = alignment do __attribute__((aligned))
-                // đặt lên HÀM (align-3 đòi 256). C99 function không có alignment; zcc
-                // không track → func decay ptr, align()=8 ≠ 256 → miscompile. Reject SẠCH.
+                // EXT(gcc): __alignof__(func) = the alignment set by __attribute__((aligned))
+                // on a FUNCTION (align-3 requires 256). A C99 function has no alignment; zcc
+                // does not track it → the func decays to a pointer, align()=8 ≠ 256 → miscompile. Reject CLEANLY.
                 let is_fn = matches!(self.nodes[e as usize], Node::FunAddr(_));
                 let t = self.ty(e);
                 self.nodes.truncate(save);
                 self.types.truncate(save);
                 if is_fn {
                     return Err(
-                        "__alignof__ của function (GNU function-alignment) chưa hỗ trợ".into(),
+                        "__alignof__ of function (GNU function-alignment) not supported".into(),
                     );
                 }
                 self.tt.align(t)
@@ -3238,25 +3244,25 @@ impl P<'_> {
                 self.pos += 1;
                 let t = self.typename()?;
                 self.expect(Tok::Punct(")"))?;
-                // C99 6.5.3.4p2: sizeof(int[n]) với n không hằng → runtime
+                // C99 6.5.3.4p2: sizeof(int[n]) with a non-constant n → runtime
                 if let Some(w) = self.vla_size.take() {
                     let Ty::Array(elem, 0) = self.tt.tys[t as usize] else {
-                        return Err("size không hằng ngoài mảng".into());
+                        return Err("non-constant size outside array".into());
                     };
                     let n = self.cast(w, ULONG);
                     let esz = self.push(Node::Num(self.tt.size(elem) as i64), ULONG);
                     return Ok(self.push(Node::Bin("*", n, esz), ULONG));
                 }
-                // C99 6.7.7: sizeof(tên-typedef VM array) → đọc local ẩn đã chốt
+                // C99 6.7.7: sizeof(a VM-array typedef name) → read the fixed hidden local
                 if let Some(&hid) = self.vm_typedef_sz.get(&t) {
                     return Ok(self.push(Node::Var(hid), ULONG));
                 }
                 self.tt.size64(t)
             } else {
-                let e = self.unary()?; // node toán hạng thành rác arena, chấp nhận
-                // C99 6.5.3.4p2: toán hạng VLA → sizeof runtime, đọc local ẩn
-                // .vlasz: `sizeof a` (local VLA, đã decay con trỏ trong rep)
-                // qua vla_szs; `sizeof *p` (p = con trỏ tới VLA) qua vla_arrs
+                let e = self.unary()?; // the operand node becomes arena garbage, accepted
+                // C99 6.5.3.4p2: a VLA operand → runtime sizeof, read the hidden local
+                // .vlasz: `sizeof a` (a local VLA, already decayed to a pointer in the rep)
+                // via vla_szs; `sizeof *p` (p = pointer to a VLA) via vla_arrs
                 if let Node::Var(off) = self.nodes[e as usize]
                     && let Some(&hid) = self.vla_szs.get(&off) {
                         return Ok(self.push(Node::Var(hid), ULONG));
@@ -3276,7 +3282,7 @@ impl P<'_> {
         self.check_lval(e)?;
         let t = self.ty(e);
         if self.tt.is_float(t) {
-            // hiếm: desugar (x op= 1) op⁻¹ 1 — chấp nhận lệch rounding lý thuyết
+            // rare: desugar (x op= 1) op⁻¹ 1 — accept the theoretical rounding discrepancy
             let one = self.push(Node::FNum(1.0), DOUBLE);
             let v = self.mkbin(op, e, one)?;
             let a = self.mkassign(e, v)?;
@@ -3286,22 +3292,22 @@ impl P<'_> {
         let delta = self.tt.pointee(t).map_or(1, |p| self.tt.size(p) as i64);
         Ok(self.push(Node::Post(op, e, delta), t))
     }
-    // hoàn thiện một lời gọi: chèn cast theo prototype + default promotion
+    // finish a call: insert casts per the prototype + default promotions
     fn finish_call(&mut self, callee: NodeId, mut args: Vec<NodeId>) -> R {
         let sig = self
             .tt
             .fnsig(self.ty(callee))
             .map(|s| (s.ret, s.params.clone(), s.variadic, s.oldstyle));
-        let (ret, params, variadic, oldstyle) = sig.ok_or("gọi thứ không phải hàm/con trỏ hàm")?;
+        let (ret, params, variadic, oldstyle) = sig.ok_or("call of non-function/function-pointer")?;
         for (i, a) in args.iter_mut().enumerate() {
             if i < params.len() && !oldstyle {
                 *a = self.cast(*a, params[i]);
             } else {
-                // default argument promotions (+ decay mảng C99 6.5.2.2p6 —
-                // thiếu thì slot stack cắt theo size mảng, xem arr_decay)
+                // default argument promotions (+ array decay C99 6.5.2.2p6 —
+                // without it the stack slot is cut to the array size, see arr_decay)
                 let t = self.ty(*a);
                 let pt = if matches!(self.tt.tys[t as usize], Ty::LDouble) {
-                    t // C99 6.5.2.2p6: promotion chỉ nâng float→double, long double GIỮ NGUYÊN
+                    t // C99 6.5.2.2p6: promotion only raises float→double, long double is UNCHANGED
                 } else if self.tt.is_float(t) {
                     DOUBLE
                 } else if matches!(self.tt.tys[t as usize], Ty::Array(..)) {
@@ -3317,8 +3323,8 @@ impl P<'_> {
         } else {
             args.len() as u32
         };
-        // struct >16B by value: ABI truyền GIÁN TIẾP — copy vào temp, đưa con trỏ.
-        // Ngoại lệ: HFA đi by value (AAPCS B.4) — ELF kể cả anonymous (gcc pr92904
+        // struct >16B by value: the ABI passes it INDIRECTLY — copy into a temp, pass a pointer.
+        // Exception: an HFA is passed by value (AAPCS B.4) — on ELF even anonymous (gcc pr92904
         // f7: d0-d3)
         for a in args.iter_mut() {
             let t = self.ty(*a);
@@ -3341,10 +3347,10 @@ impl P<'_> {
         } else {
             self.push(Node::CallPtr(callee, args, nreg), ret)
         };
-        // trả struct: ≤16B hạ x0/x1 xuống temp; >16B callee ghi thẳng temp qua x8
+        // returning a struct: ≤16B lowers x0/x1 into a temp; >16B the callee writes the temp directly via x8
         if matches!(self.tt.tys[ret as usize], Ty::Struct(_)) {
             let sz = self.tt.size(ret);
-            // ≤16B: đệm 16 byte để codegen str nguyên 8-byte không đè slot khác
+            // ≤16B: pad to 16 bytes so a codegen 8-byte str does not overwrite another slot
             let pad = self.tt.add(Ty::Array(CHAR, sz.max(16) as u64));
             let off = self.alloc_local(String::new(), pad);
             return Ok(self.push(Node::SRet(call, off, sz), ret));
@@ -3355,7 +3361,7 @@ impl P<'_> {
         let e = self.primary()?;
         self.postfix_ops(e)
     }
-    // vòng hậu tố tách riêng để compound literal cũng nối được: (int[]){..}[i]
+    // the postfix loop is separate so a compound literal can also chain: (int[]){..}[i]
     fn postfix_ops(&mut self, mut e: NodeId) -> R {
         loop {
             if self.eat(&Tok::Punct("[")) {
@@ -3365,7 +3371,7 @@ impl P<'_> {
                 let t = self
                     .tt
                     .pointee(self.ty(sum))
-                    .ok_or("index thứ không phải mảng/con trỏ")?;
+                    .ok_or("subscript of non-array/pointer")?;
                 e = self.push(Node::Deref(sum), t);
             } else if self.eat(&Tok::Punct("(")) {
                 let mut args = Vec::new();
@@ -3385,7 +3391,7 @@ impl P<'_> {
                 let t = self
                     .tt
                     .pointee(self.ty(e))
-                    .ok_or("-> trên thứ không phải con trỏ")?;
+                    .ok_or("-> on non-pointer")?;
                 let d = self.push(Node::Deref(e), t);
                 e = self.member(d)?;
             } else if self.eat(&Tok::Punct("++")) {
@@ -3400,14 +3406,14 @@ impl P<'_> {
     fn member(&mut self, base: NodeId) -> R {
         let name = self.ident()?;
         let Ty::Struct(sd) = self.tt.tys[self.ty(base) as usize] else {
-            return Err("truy cập member trên thứ không phải struct/union".into());
+            return Err("member access on non-struct/union".into());
         };
         let (mt, off) = self
             .find_member(sd, &name)
-            .ok_or(format!("không có member: {}", name))?;
+            .ok_or(format!("no such member: {}", name))?;
         Ok(self.push(Node::Member(base, off), mt))
     }
-    // attr packed/aligned đứng SAU thân: tính lại layout tại chỗ
+    // packed/aligned attribute AFTER the body: recompute the layout in place
     fn repack(&mut self, t: TypeId, packed: bool, aligned: Option<u32>) {
         let Ty::Struct(si) = self.tt.tys[t as usize] else {
             return;
@@ -3422,8 +3428,8 @@ impl P<'_> {
             return;
         }
         let mut members = sd.members.clone();
-        // packed: align hạ về 1 NHƯNG giữ phần aligned tường minh trước đó
-        // (sd.align vượt align tự nhiên của member ⟺ có aligned(n) đứng trước)
+        // packed: alignment drops to 1 BUT keeps any prior explicit aligned
+        // (sd.align exceeds the members' natural alignment ⟺ there was a preceding aligned(n))
         let natural = sd
             .members
             .iter()
@@ -3454,7 +3460,7 @@ impl P<'_> {
             is_union: false,
         };
     }
-    // tìm member theo tên, xuyên qua anonymous struct/union (tên rỗng)
+    // find a member by name, through anonymous struct/union (empty name)
     fn find_member(&self, sd: u32, name: &str) -> Option<(TypeId, u32)> {
         for (n, t, o) in &self.tt.structs[sd as usize].members {
             if n == name {
@@ -3469,11 +3475,11 @@ impl P<'_> {
         None
     }
     fn primary(&mut self) -> R {
-        // EXT(gcc): __extension__ trước expr = no-op tắt cảnh báo pedantic
-        // (obstack.h của git: __extension__ ({ ... }))
+        // EXT(gcc): __extension__ before an expr = a no-op that suppresses pedantic warnings
+        // (git's obstack.h: __extension__ ({ ... }))
         while self.eat_kw("__extension__") {}
         if self.eat(&Tok::Punct("(")) {
-            // EXT(gcc): statement expression ({ ...; expr; }) — giá trị = stmt cuối
+            // EXT(gcc): statement expression ({ ...; expr; }) — value = the last statement
             if self.peek("{") {
                 self.pos += 1;
                 let scope = self.locals.len();
@@ -3513,12 +3519,12 @@ impl P<'_> {
             let v = if k != 0 { v } else { v as f32 as f64 };
             let t = match k {
                 0 => FLOAT,
-                2 => LDOUBLE, // suffix L (ELF: binary128 tại biên ABI)
+                2 => LDOUBLE, // suffix L (ELF: binary128 at the ABI boundary)
                 _ => DOUBLE,
             };
             Ok(self.push(Node::FNum(v), t))
         } else if let Some(&Tok::INum(v, k)) = self.toks.get(self.pos) {
-            // C99 6.4.4.2: hằng ảo `v i` = 0 + v·i (phép nhúng ℝ→ℂ)
+            // C99 6.4.4.2: imaginary constant `v i` = 0 + v·i (the embedding ℝ→ℂ)
             self.pos += 1;
             let elem = if k == 0 { FLOAT } else { DOUBLE };
             let v = if k == 0 { v as f32 as f64 } else { v };
@@ -3527,15 +3533,15 @@ impl P<'_> {
             let (mut bytes, mut wid, mut cps) = (bytes.clone(), w.0, w.1.clone());
             self.pos += 1;
             while let Some(Tok::Str(more, w2)) = self.toks.get(self.pos) {
-                bytes.extend_from_slice(more); // phase 6: nối string liền kề
-                wid = wid.max(w2.0); // prefix rộng nhất thắng (C11 6.4.5p5)
+                bytes.extend_from_slice(more); // phase 6: concatenate adjacent strings
+                wid = wid.max(w2.0); // the widest prefix wins (C11 6.4.5p5)
                 cps.extend_from_slice(&w2.1);
                 self.pos += 1;
             }
             if wid > 1 {
-                // wide/char16: mỗi codepoint → wid byte little-endian; .asciz thêm
-                // 1 NUL nên tự pad wid-1 — đủ terminator wid byte. u""→USHORT(2),
-                // L""/U""→INT(4). Dùng cps (ký tự nguồn đã tách khỏi escape).
+                // wide/char16: each codepoint → wid bytes little-endian; .asciz adds
+                // 1 NUL, so pad wid-1 more — for a full wid-byte terminator. u""→USHORT(2),
+                // L""/U""→INT(4). Use cps (source characters already separated from escapes).
                 let (n, ew) = (cps.len() as u32, wid as usize);
                 let mut wb = Vec::with_capacity((cps.len() + 1) * ew - 1);
                 for c in &cps {
@@ -3556,28 +3562,28 @@ impl P<'_> {
             Ok(self.push(Node::Str(i), t))
         } else if let Some(Tok::Ident(_)) = self.toks.get(self.pos) {
             let n = self.ident()?;
-            // ngoài body hàm locals là đồ thừa hàm TRƯỚC (không dọn để rẻ) —
-            // cấm tra, kẻo ginit toàn cục &x ăn nhầm param cùng tên (git rm.c:
-            // param index_only của check_local_mod vs global index_only)
+            // outside a function body, locals are leftovers from a PRIOR function (not cleared,
+            // for cheapness) — do not look them up, otherwise a global ginit &x mistakes a
+            // parameter of the same name (git rm.c: the index_only parameter of check_local_mod vs the global index_only)
             if let Some(idx) = self.locals.iter().rposition(|(l, ..)| self.in_fn && *l == n) {
                 let (t, loc) = (self.locals[idx].1, self.locals[idx].2);
                 match loc {
                     Vloc::Stack(off) => return Ok(self.push(Node::Var(off), t)),
                     Vloc::Glob(gi) => return Ok(self.push(Node::GVar(gi), t)),
-                    Vloc::Fn => {} // rơi xuống nhánh tra self.fns phía dưới
+                    Vloc::Fn => {} // fall through to the self.fns lookup below
                 }
             }
             if n == "__va_area__" {
                 let t = self.tt.ptr_to(CHAR);
                 return Ok(self.push(Node::VaArea(self.va_off), t));
             }
-            // ELF: stdarg.h nhánh AAPCS đổ về 2 builtin thật (Darwin: macro che tên)
+            // ELF: the AAPCS branch of stdarg.h lowers to 2 real builtins (Darwin: a macro hides the name)
             if n == "__builtin_va_start" {
                 self.expect(Tok::Punct("("))?;
                 let ap = self.assign()?;
                 self.expect(Tok::Punct(","))?;
                 let mark = self.nodes.len();
-                let _ = self.assign()?; // last: chỉ cần tên, không eval
+                let _ = self.assign()?; // last: only the name is needed, not evaluated
                 self.nodes.truncate(mark);
                 self.types.truncate(mark);
                 self.expect(Tok::Punct(")"))?;
@@ -3589,7 +3595,7 @@ impl P<'_> {
                 self.expect(Tok::Punct(","))?;
                 let ty = self.typename()?;
                 self.expect(Tok::Punct(")"))?;
-                // struct: cấp scratch — backend cần vùng liên tục khi gather HFA
+                // struct: allocate scratch — the backend needs a contiguous area when gathering an HFA
                 let tmp = if matches!(self.tt.tys[ty as usize], Ty::Struct(_)) {
                     self.alloc_local(format!(".vaarg{}", self.nodes.len()), ty)
                 } else {
@@ -3597,7 +3603,7 @@ impl P<'_> {
                 };
                 return Ok(self.push(Node::VaArg(ap, ty, tmp), ty));
             }
-            // __func__ = C99 6.4.2.2; EXT(gcc): __FUNCTION__/__PRETTY_FUNCTION__ bí danh
+            // __func__ = C99 6.4.2.2; EXT(gcc): __FUNCTION__/__PRETTY_FUNCTION__ aliases
             if n == "__func__" || n == "__FUNCTION__" || n == "__PRETTY_FUNCTION__" {
                 let bytes = self.fname.clone().into_bytes();
                 let ln = bytes.len() as u32;
@@ -3607,9 +3613,9 @@ impl P<'_> {
                 return Ok(self.push(Node::Str(i), t));
             }
             if n == "__builtin_types_compatible_p" {
-                // EXT(gcc): fold hằng 0/1 so kiểu cấu trúc — git ARRAY_SIZE
-                // (BUILD_ASSERT_OR_ZERO: sizeof(char[1-2*!(cond)])) cần nó
-                // trong constant expression; array ≠ pointer là điểm ăn tiền
+                // EXT(gcc): fold to a 0/1 constant comparing types structurally — git ARRAY_SIZE
+                // (BUILD_ASSERT_OR_ZERO: sizeof(char[1-2*!(cond)])) needs it
+                // in a constant expression; array ≠ pointer is the decisive case
                 self.expect(Tok::Punct("("))?;
                 let a = self.typename()?;
                 self.expect(Tok::Punct(","))?;
@@ -3619,8 +3625,8 @@ impl P<'_> {
                 return Ok(self.push(Node::Num(v), INT));
             }
             if n == "__builtin_classify_type" {
-                // EXT(gcc): hằng class của kiểu arg (không eval), mã theo gcc/typeclass.h:
-                // void=0 int=1 ptr=5 real=8 struct=12 union=13 — đủ cho torture
+                // EXT(gcc): the constant class of the argument's type (not evaluated), coded per
+                // gcc/typeclass.h: void=0 int=1 ptr=5 real=8 struct=12 union=13 — enough for torture
                 self.expect(Tok::Punct("("))?;
                 let mark = self.nodes.len();
                 let e = self.expr()?;
@@ -3647,23 +3653,23 @@ impl P<'_> {
                 self.expect(Tok::Punct("("))?;
                 let ty = self.typename()?;
                 self.expect(Tok::Punct(","))?;
-                // member-designator: ident ("." ident | "[" hằng "]")*
+                // member-designator: ident ("." ident | "[" constant "]")*
                 let (mut t, mut off) = (ty, 0i64);
                 loop {
                     let name = self.ident()?;
                     let Ty::Struct(si) = self.tt.tys[t as usize] else {
-                        return Err("offsetof trên thứ không phải struct".into());
+                        return Err("offsetof on non-struct".into());
                     };
                     let (mt, mo) = self
                         .find_member(si, &name)
-                        .ok_or_else(|| format!("offsetof: không có member {name}"))?;
+                        .ok_or_else(|| format!("offsetof: no such member {name}"))?;
                     t = mt;
                     off += mo as i64;
                     loop {
                         if self.eat(&Tok::Punct("[")) {
                             let i = self.const_expr()?;
                             self.expect(Tok::Punct("]"))?;
-                            let e = self.tt.pointee(t).ok_or("offsetof: index trên non-array")?;
+                            let e = self.tt.pointee(t).ok_or("offsetof: subscript on non-array")?;
                             off += i * self.tt.size(e) as i64;
                             t = e;
                         } else {
@@ -3677,9 +3683,9 @@ impl P<'_> {
                 self.expect(Tok::Punct(")"))?;
                 return Ok(self.push(Node::Num(off), ULONG));
             }
-            // EXT(gcc): __builtin_{add,sub,mul}_overflow(a, b, &res) — hạ xuống
-            // Node::Overflow; codegen phát chuỗi 128-bit (xem ext::overflow_emit).
-            // KHÔNG cast toán hạng: giữ kiểu gốc (dấu/width) đúng ngữ nghĩa GCC.
+            // EXT(gcc): __builtin_{add,sub,mul}_overflow(a, b, &res) — lowered to
+            // Node::Overflow; codegen emits a 128-bit sequence (see ext::overflow_emit).
+            // Do NOT cast the operands: keep the original type (signedness/width) per GCC semantics.
             if let Some(oop) = match n.as_str() {
                 "__builtin_add_overflow" => Some(0u8),
                 "__builtin_sub_overflow" => Some(1u8),
@@ -3695,8 +3701,8 @@ impl P<'_> {
                 self.expect(Tok::Punct(")"))?;
                 return Ok(self.push(Node::Overflow(oop, a, b, rp), INT));
             }
-            // EXT(gcc): atomics __sync_* (M12) — không phải symbol libc, hạ thẳng
-            // xuống Node::Sync cho codegen phát ldaxr/stlxr; bảng tên ở ext.rs
+            // EXT(gcc): atomics __sync_* (M12) — not a libc symbol, lowered directly to
+            // Node::Sync so codegen emits ldaxr/stlxr; the name table is in ext.rs
             if let Some((op, arity)) = crate::ext::sync_op(&n)
                 && self.peek("(") {
                     self.pos += 1;
@@ -3708,26 +3714,26 @@ impl P<'_> {
                         args.push(self.assign()?);
                     }
                     self.expect(Tok::Punct(")"))?;
-                    // Barrier không có ptr; còn lại kiểu + size = pointee của arg đầu
+                    // Barrier has no ptr; otherwise the type + size = the pointee of the first argument
                     let (et, sz) = if arity == 0 {
                         (VOID, 0)
                     } else {
                         let et = self
                             .tt
                             .pointee(self.ty(args[0]))
-                            .ok_or_else(|| format!("{n}: arg đầu phải là con trỏ"))?;
+                            .ok_or_else(|| format!("{n}: first argument must be a pointer"))?;
                         let ok = self.tt.is_integer(et)
                             || matches!(self.tt.tys[et as usize], Ty::Ptr(_));
                         let sz = self.tt.size(et);
                         if !ok || (sz != 4 && sz != 8) {
                             return Err(format!(
-                                "{n}: mới hỗ trợ operand integer/pointer 4|8 byte"
+                                "{n}: only 4/8-byte integer/pointer operands supported"
                             ));
                         }
                         (et, sz)
                     };
                     for k in 1..args.len() {
-                        args[k] = self.cast(args[k], et); // value arg về đúng độ rộng operand
+                        args[k] = self.cast(args[k], et); // value argument to the operand width
                     }
                     let ret = match op {
                         SyncOp::BoolCas => INT,
@@ -3749,22 +3755,22 @@ impl P<'_> {
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
             if self.peek("(") {
-                // __builtin_abort… → abort: GCC đổ builtin về symbol libc. Nhưng
-                // CHỈ khi <f> thực sự là hàm thư viện (whitelist ext::builtin_is_libc).
-                // Builtin intrinsic thuần (clrsb/parity/frame_address/apply/
-                // va_arg_pack/mul_overflow_p…) KHÔNG có symbol → strip = phun call
-                // rác → as/ld nghẹn. Luật 2-fact: reject SẠCH thay vì nuốt-rồi-phun.
+                // __builtin_abort… → abort: GCC lowers a builtin to a libc symbol. But
+                // ONLY when <f> really is a library function (whitelist ext::builtin_is_libc).
+                // A pure builtin intrinsic (clrsb/parity/frame_address/apply/
+                // va_arg_pack/mul_overflow_p…) has NO symbol → stripping would emit a garbage
+                // call → as/ld chokes. 2-fact rule: reject CLEANLY instead of swallow-then-emit.
                 let n = if let Some(f) = n.strip_prefix("__builtin_") {
                     if f == "alloca" || crate::ext::builtin_is_libc(f) {
                         f.to_string()
                     } else {
-                        return Err(format!("__builtin_{f}: builtin chưa hỗ trợ"));
+                        return Err(format!("__builtin_{f}: builtin not supported"));
                     }
                 } else {
                     n
                 };
                 if n == "alloca" {
-                    // không có symbol libc; sub sp trực tiếp (epilogue mov sp,x29 thu hồi)
+                    // no libc symbol; sub sp directly (the epilogue mov sp,x29 reclaims it)
                     self.expect(Tok::Punct("("))?;
                     let e = self.expr()?;
                     self.expect(Tok::Punct(")"))?;
@@ -3776,7 +3782,7 @@ impl P<'_> {
                     let n = self.funref(n); // EXT(gcc): asm-label rename
                     return Ok(self.push(Node::FunAddr(n), pt));
                 }
-                // gọi hàm chưa khai báo: implicit int, old-style
+                // call to an undeclared function: implicit int, old-style
                 let sig = FnSig {
                     ret: INT,
                     params: Vec::new(),
@@ -3790,18 +3796,18 @@ impl P<'_> {
                 let pt = self.tt.ptr_to(ft);
                 return Ok(self.push(Node::FunAddr(n), pt));
             }
-            Err(format!("biến chưa khai báo: {}", n))
+            Err(format!("undeclared identifier: {}", n))
         } else {
-            Err(format!("cần expr, gặp {:?}", self.toks.get(self.pos)))
+            Err(format!("expected expression, found {:?}", self.toks.get(self.pos)))
         }
     }
     fn program(&mut self) -> Result<Vec<Func>, String> {
         let mut funcs = Vec::new();
-        let mut ranges: Vec<(u32, u32)> = Vec::new(); // body [n0,n1) từng func
+        let mut ranges: Vec<(u32, u32)> = Vec::new(); // body [n0,n1) per func
         while self.pos < self.toks.len() {
-            // EXT(gcc): __asm__("...") cấp toàn cục → phát verbatim (musl
-            // crt_arch.h định nghĩa _start; PHẢI bắt trước decl_specs vì
-            // skip_attrs sẽ nuốt nhầm thành asm-label)
+            // EXT(gcc): global-level __asm__("...") → emitted verbatim (musl
+            // crt_arch.h defines _start; MUST be caught before decl_specs because
+            // skip_attrs would mistakenly consume it as an asm-label)
             if matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if n == "__asm__" || n == "__asm" || n == "asm")
                 && self.toks.get(self.pos + 1) == Some(&Tok::Punct("("))
             {
@@ -3824,23 +3830,23 @@ impl P<'_> {
                 Some(x) => x,
                 None => (INT, Storage::None), // implicit int: main() {...}
             };
-            // chốt NGAY: declarator/param/body sẽ gọi decl_specs và reset flag
+            // capture NOW: declarator/param/body will call decl_specs and reset the flags
             let inline_fn = self.saw_inline;
             let tls = self.saw_thread;
-            let weak_fn = self.attr_weak; // EXT(gcc): weak đứng trước declarator
+            let weak_fn = self.attr_weak; // EXT(gcc): weak before the declarator
             if self.eat(&Tok::Punct(";")) {
-                continue; // định nghĩa struct/union/enum thuần
+                continue; // a bare struct/union/enum definition
             }
             let (name, t) = self.declarator(bt, true)?;
             if self.vla_size.take().is_some() {
                 self.vla_inner.clear();
-                return Err("VLA chỉ được là biến local".into()); // C99
+                return Err("a VLA may only be a local variable".into()); // C99
             }
             self.vla_inner.clear();
-            // C99 6.9.1: side-effect dim của param VLA eval-on-entry; drain range
-            // đã capture (chỉ có nghĩa khi là funcdef — prototype thì bỏ).
+            // C99 6.9.1: a side-effecting param-VLA dimension is evaluated on entry; drain the
+            // captured ranges (meaningful only for a funcdef — dropped for a prototype).
             let pdims = std::mem::take(&mut self.param_vla_dims);
-            // funcdef: declarator ra kiểu Func và theo sau là "{" hoặc old-style decl list
+            // funcdef: the declarator yields a Func type and is followed by "{" or an old-style decl list
             if let Ty::Func(fidx) = self.tt.tys[t as usize] {
                 let is_def = self.peek("{")
                     || matches!(self.toks.get(self.pos), Some(Tok::Ident(n)) if self.is_type_word(n) && n != "typedef");
@@ -3848,17 +3854,17 @@ impl P<'_> {
                     self.fns.insert(name.clone(), t);
                     let sig = self.tt.fns[fidx as usize].clone();
                     self.locals.clear();
-                    self.reg_pins.clear(); // key = offset stack — hàm mới trùng offset là dính pin ma
-                    self.vla_szs.clear(); // cùng lý do: key offset stack
-                    self.vm_typedef_sz.clear(); // key TypeId nhưng value = offset stack
+                    self.reg_pins.clear(); // key = stack offset — a new function reusing an offset would inherit a phantom pin
+                    self.vla_szs.clear(); // same reason: key is a stack offset
+                    self.vm_typedef_sz.clear(); // key is a TypeId but the value = a stack offset
                     self.cur_off = 0;
                     self.fret = sig.ret;
                     self.fname = name.clone();
-                    // old-style: parse decl list gán kiểu cho từng tên param
+                    // old-style: parse the decl list assigning a type to each parameter name
                     let mut ptypes: HashMap<String, TypeId> = HashMap::new();
                     if sig.oldstyle {
                         while !self.peek("{") {
-                            let (dbt, _) = self.decl_specs()?.ok_or("cần kiểu param old-style")?;
+                            let (dbt, _) = self.decl_specs()?.ok_or("old-style parameter type required")?;
                             loop {
                                 let (dn, dt) = self.declarator(dbt, true)?;
                                 let dt = match self.tt.tys[dt as usize] {
@@ -3877,9 +3883,9 @@ impl P<'_> {
                     }
                     let (params, sret) = self.setup_params(&sig, &ptypes);
                     self.in_fn = true;
-                    let n0 = self.nodes.len() as u32; // range node của body (cho DCE weak)
-                    // C99 6.9.1: eval side-effect dim của param VLA ở prologue (params
-                    // giờ đã trong scope). Re-parse token-range, gói làm stmt đầu body.
+                    let n0 = self.nodes.len() as u32; // node range of the body (for weak DCE)
+                    // C99 6.9.1: evaluate the side-effecting param-VLA dimensions in the prologue
+                    // (parameters are now in scope). Re-parse the token range, wrapped as the first body statement.
                     let mut prologue = Vec::new();
                     if !pdims.is_empty() {
                         let bodypos = self.pos;
@@ -3900,9 +3906,9 @@ impl P<'_> {
                     let n1 = self.nodes.len() as u32;
                     self.in_fn = false;
                     let is_static = storage == Storage::Static || self.static_fns.contains(&name);
-                    // EXT(gcc): inline (kể cả static inline) không có declaration
-                    // trần (C99 6.7.4p7) → ứng viên DCE; codegen phát weak nếu
-                    // non-static để các TU cùng phát coalesce được
+                    // EXT(gcc): inline (including static inline) with no bare declaration
+                    // (C99 6.7.4p7) → a DCE candidate; codegen emits weak if non-static so that
+                    // copies from multiple TUs can coalesce
                     let is_inline = inline_fn && !self.plain_decls.contains(&name);
                     funcs.push(Func {
                         name,
@@ -3921,13 +3927,13 @@ impl P<'_> {
                     continue;
                 }
             }
-            // không phải funcdef: chuỗi declarator "a, *b, c[2];" — cái đầu đã parse
+            // not a funcdef: a declarator chain "a, *b, c[2];" — the first is already parsed
             let mut cur = (name, t);
             loop {
                 let (name, mut t) = cur;
                 if storage == Storage::Typedef {
                     self.typedefs.insert(name, t);
-                    self.eat(&Tok::Punct("=")); // typedef không init; phòng hờ
+                    self.eat(&Tok::Punct("=")); // a typedef has no init; defensive
                 } else if matches!(self.tt.tys[t as usize], Ty::Func(_)) {
                     if storage == Storage::Static {
                         self.static_fns.insert(name.clone());
@@ -3935,22 +3941,21 @@ impl P<'_> {
                     if !inline_fn {
                         self.plain_decls.insert(name.clone()); // C99 6.7.4p7
                     }
-                    // EXT(gcc): weak_alias musl — declaration hàm mang alias("old")
+                    // EXT(gcc): musl weak_alias — a function declaration carrying alias("old")
                     if let Some(old) = self.attr_alias.take() {
                         self.aliases
                             .push((name.clone(), old, weak_fn || self.attr_weak));
                     } else if weak_fn || self.attr_weak {
-                        self.weak_decls.push(name.clone()); // weak proto trần
+                        self.weak_decls.push(name.clone()); // bare weak prototype
                     }
                     self.fns.insert(name, t); // prototype
                 } else {
-                    // C89 6.1.2.1: tên vào scope từ CUỐI declarator, trước init
-                    // → push trước để initializer tự tham chiếu được
+                    // C89 6.1.2.1: the name enters scope from the END of the declarator, before the init
+                    // → push it first so the initializer can reference itself
                     // (git LIST_HEAD: static struct x = { &x, &x })
-                    // tentative definition: int x; int x = 3; int x; → MỘT symbol
-                    // EXT(gcc): alias trên object (musl weak_alias data) — chỉ
-                    // phát .set, không phát storage; vẫn đăng ký extern để TU
-                    // này tham chiếu tên mới được
+                    // tentative definition: int x; int x = 3; int x; → ONE symbol
+                    // EXT(gcc): alias on an object (musl weak_alias data) — emit only .set,
+                    // no storage; still register the extern so this TU can reference the new name
                     let obj_alias = self.attr_alias.take();
                     if let Some(old) = &obj_alias {
                         self.aliases
@@ -3964,7 +3969,7 @@ impl P<'_> {
                             ty: t,
                             init: GInit::None,
                             is_static: storage == Storage::Static,
-                            is_extern: true, // tạm; chốt sau khi biết có init
+                            is_extern: true, // provisional; finalized once init presence is known
                             is_tls: tls,
                             is_weak: false,
                         });
@@ -3976,7 +3981,7 @@ impl P<'_> {
                     let bigger = self.tt.size(t) > self.tt.size(self.globals[gi].ty);
                     let g = &mut self.globals[gi];
                     if bigger {
-                        g.ty = t; // int a[]; → int a[3]; hoàn thiện kiểu
+                        g.ty = t; // int a[]; → int a[3]; completes the type
                     }
                     if !matches!(init, GInit::None) {
                         g.init = init;
@@ -3992,11 +3997,11 @@ impl P<'_> {
             }
             self.expect(Tok::Punct(";"))?;
         }
-        // EXT(gcc): DCE hàm weak (inline) không ai với tới — như clang không
-        // phát inline chưa dùng. Bắt buộc: body inline trong header (server.h
-        // redis) tham chiếu symbol mà TU khác (redis-cli) không link.
-        // Root = mọi tham chiếu NGOÀI body các hàm weak (hàm thường, global
-        // init); lan truyền qua đồ thị gọi giữa các hàm weak.
+        // EXT(gcc): DCE for weak (inline) functions nobody reaches — like clang not
+        // emitting an unused inline. Required: an inline body in a header (redis server.h)
+        // references a symbol that another TU (redis-cli) does not link.
+        // Roots = all references OUTSIDE the bodies of weak functions (ordinary functions,
+        // global inits); propagate through the call graph among the weak functions.
         let weak_idx: HashMap<&str, usize> = funcs
             .iter()
             .enumerate()
@@ -4047,7 +4052,7 @@ impl P<'_> {
     }
 }
 
-// workaround borrow: decl_specs giữ &str từ token — copy ra ngoài vòng đời
+// borrow workaround: decl_specs holds a &str from a token — copy it out of the lifetime
 fn n_hack(base: Option<&str>) -> &str {
     base.unwrap_or("")
 }
@@ -4101,8 +4106,8 @@ pub fn parse(
         aliases: Vec::new(),
         weak_decls: Vec::new(),
     };
-    // EXT(gcc): __uint128_t/__int128_t — CHỈ storage 16 byte align 16 (SDK mach
-    // NEON state trong mcontext cần layout đúng); arithmetic không hỗ trợ.
+    // EXT(gcc): __uint128_t/__int128_t — ONLY 16-byte storage, align 16 (SDK mach
+    // NEON state in mcontext needs the correct layout); arithmetic is not supported.
     {
         p.tt.structs.push(crate::ast::StructDef {
             members: vec![("__lo".into(), ULONG, 0), ("__hi".into(), ULONG, 8)],
@@ -4114,10 +4119,10 @@ pub fn parse(
         p.typedefs.insert("__uint128_t".into(), t);
         p.typedefs.insert("__int128_t".into(), t);
     }
-    // ELF: seed struct __zcc_va_list COMPLETE — header ngoài (musl stdarg.h)
-    // chỉ thấy `__builtin_va_list` = tên tag này, không có thân; thiếu seed thì
-    // va_list local size 0 → va_start ghi 32 byte đè slot hàng xóm (vfprintf
-    // musl nát con trỏ fmt). stdarg.h nhúng định nghĩa lại chỉ shadow, vô hại.
+    // ELF: seed struct __zcc_va_list as COMPLETE — the external header (musl stdarg.h)
+    // only sees `__builtin_va_list` = this tag name, with no body; without the seed a
+    // va_list local has size 0 → va_start writes 32 bytes over the neighboring slot (musl
+    // vfprintf corrupts the fmt pointer). A redefinition embedded in stdarg.h merely shadows, harmlessly.
     {
         let pv = p.tt.ptr_to(VOID);
         p.tt.structs.push(crate::ast::StructDef {
@@ -4135,8 +4140,8 @@ pub fn parse(
         let t = p.tt.add(Ty::Struct(p.tt.structs.len() as u32 - 1));
         p.tags.insert("__zcc_va_list".into(), t);
     }
-    // libc trả con trỏ: gọi không prototype (torture hay thế) mà để implicit
-    // int thì sxtw cắt nửa cao địa chỉ heap → seed sẵn kiểu trả về đúng.
+    // libc functions returning a pointer: calling them without a prototype (common in torture)
+    // and leaving them implicit int makes sxtw cut off the high half of a heap address → seed the correct return type.
     {
         let pc = p.tt.ptr_to(CHAR);
         for f in [
@@ -4154,7 +4159,7 @@ pub fn parse(
             let ft = p.tt.add(Ty::Func(p.tt.fns.len() as u32 - 1));
             p.fns.insert(f.into(), ft);
         }
-        // libm trả double (implicit int sẽ đọc x0 thay vì d0)
+        // libm functions returning double (implicit int would read x0 instead of d0)
         for f in [
             "copysign", "fabs", "sqrt", "floor", "ceil", "fmod", "pow", "atan2",
         ] {
@@ -4169,8 +4174,8 @@ pub fn parse(
             let ft = p.tt.add(Ty::Func(p.tt.fns.len() as u32 - 1));
             p.fns.insert(f.into(), ft);
         }
-        // printf family variadic: arg vô danh phải LÊN STACK (Apple) — oldstyle
-        // (toàn "đặt tên") sẽ bỏ vào register và libc đọc rác
+        // the variadic printf family: anonymous arguments must go ON THE STACK (Apple) — oldstyle
+        // (all "named") would place them in registers and libc would read garbage
         for (f, nfix) in [
             ("printf", 1),
             ("sprintf", 2),
@@ -4193,7 +4198,7 @@ pub fn parse(
         }
     }
     let funcs = p.program().map_err(|e| {
-        // vị trí lỗi = token hiện tại của parser → file:line từ preprocess
+        // error position = the parser's current token → file:line from preprocessing
         match locs.get(p.pos.min(locs.len().saturating_sub(1))) {
             Some(&(f, l)) => format!("{}:{}: {}", files.get(f as usize).map_or("?", |s| s), l, e),
             None => e,
@@ -4210,16 +4215,16 @@ pub fn parse(
         aliases: p.aliases,
         pic: false,
         weak_decls: p.weak_decls,
-        // C99 6.7.3: quét 1 lần — bất kỳ token volatile nào ⟹ khoá opt (sound-by-
-        // construction: IR không mang volatile nên chỉ opt mảnh volatile-free).
+        // C99 6.7.3: a single scan — any volatile token ⟹ disable optimization (sound-by-
+        // construction: the IR carries no volatile, so only volatile-free fragments are optimized).
         has_volatile: p.toks.iter().any(|t| {
             matches!(t, Tok::Ident(n) if matches!(n.as_str(), "volatile" | "__volatile" | "__volatile__"))
         }),
     })
 }
 
-// L"..": nguồn là UTF-8 → giải mã ra code point cho wchar_t (byte escape lẻ
-// >127 không phải UTF-8 hợp lệ sẽ thành U+FFFD — chấp nhận)
+// L"..": the source is UTF-8 → decode to code points for wchar_t (a stray escape byte
+// >127 that is not valid UTF-8 becomes U+FFFD — accepted)
 fn wchars(b: &[u8]) -> Vec<u32> {
     String::from_utf8_lossy(b)
         .chars()
@@ -4227,16 +4232,16 @@ fn wchars(b: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-// f64 → binary128 little-endian (nới EXACT, không rounding): sign giữ nguyên,
-// exponent rebias 1023→16383, mantissa 52 bit dồn lên đỉnh field 112 bit;
-// subnormal double normalize lại (f128 range dư sức chứa), inf/nan giữ dạng.
+// f64 → binary128 little-endian (EXACT widening, no rounding): the sign is preserved,
+// the exponent is rebiased 1023→16383, the 52-bit mantissa is packed at the top of the 112-bit
+// field; a subnormal double is renormalized (the f128 range easily contains it), inf/nan keep their form.
 fn f128_bytes(v: f64) -> [u8; 16] {
     let b = v.to_bits();
     let (sg, e, m) = (b >> 63, (b >> 52) & 0x7ff, b & ((1u64 << 52) - 1));
     let (e2, m2): (u128, u128) = match e {
         0 if m == 0 => (0, 0),
         0 => {
-            let sh = m.leading_zeros() - 11; // đưa bit dẫn về vị trí 52 (hidden)
+            let sh = m.leading_zeros() - 11; // move the leading bit to position 52 (hidden)
             (
                 16383 - 1022 - sh as u128,
                 ((((m as u128) << sh) & ((1 << 52) - 1))) << 60,

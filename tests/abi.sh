@@ -1,10 +1,10 @@
 #!/bin/sh
-# Gate ABI: phủ transition automaton (kiểu × trạng thái GPR/FPR/stack) sinh bởi
-# gen_abi.py, link CHÉO cc↔zcc cả hai chiều + hai control cùng-compiler.
-# Lỗi ABI cùng-compiler tự triệt tiêu — chỉ link chéo mới phơi ra.
+# ABI gate: covers the transition automaton (type × GPR/FPR/stack state) generated
+# by gen_abi.py, CROSS-linking cc↔zcc in both directions + two same-compiler
+# controls. A same-compiler ABI error self-cancels — only cross-linking exposes it.
 set -e
 cd "$(dirname "$0")/.."
-# ZCC đặt sẵn từ env (chạy trong box Linux, không cargo) — không thì tự build
+# ZCC preset from the env (running in the Linux box, no cargo) — otherwise self-build
 if [ -z "$ZCC" ]; then
     cargo build --quiet 2>/dev/null || cargo build
     ZCC=target/debug/zcc
@@ -26,4 +26,4 @@ for pair in "cc zcc" "zcc cc" "zcc zcc" "cc cc"; do
     out=$("$D/run") || { echo "ABI FAIL callee=$1 caller=$2"; echo "$out" | grep FAIL | head -20; fail=1; }
     echo "callee=$1 caller=$2: $out" | tail -1
 done
-[ "$fail" = 0 ] && echo "ABI PASS (4 hướng link)" || exit 1
+[ "$fail" = 0 ] && echo "ABI PASS (4 link directions)" || exit 1

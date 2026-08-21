@@ -1,7 +1,9 @@
-/* limits.h — zcc đóng vai "limits.h của compiler" (như clang/gcc tự ship):
-   định nghĩa ISO C rồi #include_next xuống limits.h của libc (POSIX, IOV_MAX…).
-   Linux/glibc: glibc chỉ tự định nghĩa ISO khi !__GNUC__; với __GNUC__ nó chờ
-   compiler đưa qua _GCC_LIMITS_H_ — zcc định nghĩa hộ rồi mới nhường glibc. */
+/* limits.h — zcc plays the role of the "compiler's limits.h" (as clang/gcc ship
+   their own): it defines the ISO C limits, then #include_next descends to the
+   libc limits.h (POSIX, IOV_MAX…). On Linux/glibc, glibc defines the ISO limits
+   itself only when !__GNUC__; under __GNUC__ it waits for the compiler to supply
+   them via _GCC_LIMITS_H_ — zcc defines them on its behalf, then yields to
+   glibc. */
 #ifndef _ZCC_LIMITS_H
 #define _ZCC_LIMITS_H
 #define _GCC_LIMITS_H_ 1

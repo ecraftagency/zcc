@@ -1,199 +1,232 @@
-# zcc IR — Reference Semantics ⟦·⟧ (NẤC-1, mechanized reference semantics)
+# zcc IR — Reference Semantics ⟦·⟧
 
-> **Trạng thái (thành thật, luật suy-đoán-tội áp vào cả doc):** đây là **mechanized
-> reference semantics** — ngữ nghĩa tham chiếu hình thức hoá, HIỆN THỰC bằng
-> `src/ir.rs::interp` (test-side), và ĐƯỢC KIỂM bằng vét-cạn-cấu-trúc (`opt.rs::
-> commuting_square_structural_exhaustion`). **KHÔNG phải machine-checked proof.**
-> Cấm dán nhãn "verified"/"CompCert-level". Rice's theorem chặn tương đương phổ
-> quát ⟹ mọi định lý dưới đây phát biểu trên LỚP HÌNH DẠNG hữu hạn (decidable), và
-> được ĐO cơ học, không CHỨNG phổ quát. Đây là NỀN (nấc-1) cho translation-
-> validation (nấc-2) và per-pass machine-check (nấc-3) — xem memory
-> `zcc-formal-verification-roadmap`.
+**Status.** This document is a *mechanized reference semantics*: a formal
+denotational semantics for the CORE intermediate representation, realized by the
+interpreter `src/ir.rs::tests::interp` and validated by structural exhaustion in
+`src/opt.rs::commuting_square_structural_exhaustion`. It is **not** a
+machine-checked proof. By Rice's theorem, semantic equivalence of programs is
+undecidable in general, so every theorem stated below is quantified over a
+*finite class of program shapes* (a decidable fragment) and is *checked
+mechanically*, not proved universally. This artifact is the foundation on which
+translation validation and per-pass machine-checked proofs are intended to build.
 
-Tài liệu này là **định nghĩa toán học của mỗi `Inst`** (yêu cầu NẤC-1). Nó là
-*spec của code*, không phải nguyện vọng: mỗi rule map 1-1 tới một arm trong
-`ir.rs::tests::interp` / một hàm nghĩa nguyên tử (`eval_bin`/`eval_cast`/`canon`)
-đã sống ở phần **non-test** của `ir.rs` (dùng CHUNG với const-fold ⟹ faithfulness).
+This document is the *mathematical definition of every `Inst`*. It is a
+*specification of the code*, not an aspiration: each rule maps one-to-one onto an
+arm of `ir.rs::tests::interp`, or onto one of the atomic semantic functions
+(`eval_bin` / `eval_cast` / `canon`) that live in the **non-test** part of
+`ir.rs` and are shared with the constant folder — establishing *faithfulness*
+(the folder and the interpreter are one and the same denotation function).
 
-Liên quan: `IR.md` §3b/§3c (contract), `THEORY.md` §A7 (denotational semantics),
-`tests/alg.sh` (commuting-square fold↔runtime tầng SOURCE — bản này nâng lên IR).
-
----
-
-## 1. Miền giá trị (value domain)
-
-Một **machine value** `Val` là một từ 64-bit *canonical*, khớp hợp đồng "canonical
-register" của `ast.rs`:
-
-```
-𝕍 = { canon_τ(z) : z ∈ ℤ }              cho kiểu nguyên τ (bề rộng w=size(τ)·8, dấu s)
-   ∪ { bits(x) : x ∈ 𝔽₆₄ }             cho float (LƯU BIT-PATTERN f64; float 32-bit nâng lên f64)
-```
-
-- **Số nguyên:** giá trị mang trong ℤ/2^w với dấu s. `canon_τ` (⇐ `ir.rs::canon`)
-  chuẩn hoá `z ∈ ℤ` về đại diện canonical: mask w bit thấp rồi sign-extend nếu s.
-  Đây CHÍNH là `ext(ct)` của backend — "số học int wrap tại w bit" (THEORY §B5,
-  two's-complement = modulo 2^w).
-- **Float:** giá trị là bit-pattern IEEE-754 f64. Float C 32-bit (`float`) nâng lên
-  f64 khi nạp register (`Load` sz=4 → `f32→f64`), hạ lại khi ghi (`Store` sz=4).
-  Bit-pattern giữ nguyên (không reassociate — FP KHÔNG kết hợp, THEORY §B5).
-
-`TypeId τ` mang **cấu trúc đại số**: Op là ký hiệu thuần; ℤ/2^w (int, có dấu) hay ℝ
-(≈ f64, float) do τ quyết định. Tách "phép" khỏi "cấu trúc" (ir.rs::Op doc).
+See also: `IR.md` §3b/§3c (the IR contract), `THEORY.md` §A7 (denotational
+semantics), and `tests/alg.sh` (the source-level fold-vs-runtime commuting
+square that this document lifts to the IR level).
 
 ---
 
-## 2. Trạng thái máy (machine state) Σ
+## 1. Value domain
+
+A *machine value* `Val` is a canonical 64-bit word, matching the "canonical
+register" contract of `ast.rs`:
+
+```
+𝕍 = { canon_τ(z) : z ∈ ℤ }        for an integer type τ (width w = size(τ)·8, signedness s)
+   ∪ { bits(x)   : x ∈ 𝔽₆₄ }      for a floating type (stored as the f64 BIT PATTERN;
+                                     32-bit float is widened to f64 in registers)
+```
+
+- **Integers.** A value lives in ℤ/2^w with signedness s. `canon_τ` (see
+  `ir.rs::canon`) normalizes any `z ∈ ℤ` to its canonical representative: mask
+  the low w bits, then sign-extend when s is signed. This is exactly the
+  backend's register normalization — "integer arithmetic wraps at w bits"
+  (two's-complement is arithmetic modulo 2^w).
+- **Floats.** A value is the IEEE-754 f64 bit pattern. A 32-bit C `float` is
+  widened to f64 when loaded into a register (`Load` with size 4 performs
+  `f32→f64`) and narrowed when stored (`Store` with size 4). The bit pattern is
+  preserved verbatim; floating-point addition is not associative, so folds must
+  not reassociate float operands.
+
+A `TypeId τ` carries the *algebraic structure*: an `Op` is a pure symbol, while
+the interpretation — ℤ/2^w (integer, with signedness) versus ℝ (approximated by
+f64, floating) — is determined by τ. This separates "operation" from
+"structure".
+
+---
+
+## 2. Machine state Σ
 
 ```
 Σ  =  ⟨ ρ , μ ⟩
-ρ  :  Tmp → 𝕍            register file (bảng temp; ρ[t] = giá trị canonical của t)
-μ  :  [0, frame) → Byte  bộ nhớ local phẳng (mảng byte cỡ frame khung stack)
+ρ  :  Tmp → 𝕍              register file (ρ[t] is the canonical value of temporary t)
+μ  :  [0, frame) → Byte    flat local memory (a byte array the size of the stack frame)
 ```
 
-**Mô hình bộ nhớ (⇐ interp):** chỉ local frame được mô hình hoá. Địa chỉ local =
-`x29 − off`; flat-mem index 0 ⟺ `x29 − frame` ⟹ `index(off) = frame − off`
-(`Lea Local`). `load_mem`/`store_mem` = little-endian byte-serialize (LP64 Darwin/
-AArch64-LE). **Global/Str KHÔNG mô hình hoá** → ⊥ (§4): hàm chạm chúng nằm NGOÀI
-không gian CORE.
+**Memory model** (see `interp`). Only the local frame is modeled. A local
+address is `x29 − off`; flat-memory index 0 corresponds to `x29 − frame`, hence
+`index(off) = frame − off` (`Lea Local`). `load_mem` / `store_mem` perform
+little-endian byte serialization (LP64, AArch64 little-endian). Global and
+string addresses are **not** modeled and evaluate to ⊥ (§4): a function that
+touches them lies outside the CORE space.
 
-**Seed tham số:** param `(off, τ)` thứ i ← `canon_τ(argᵢ)` ghi vào `μ` tại
-`index(off)`, width `size(τ)`. KHÔNG có param-temp: body đọc mọi biến (kể cả param)
-qua `Var→Load` (mô hình -O0 nhất quán, IR.md §4).
+**Parameter seeding.** The i-th parameter `(off, τ)` is seeded as
+`canon_τ(argᵢ)`, written into `μ` at `index(off)` with width `size(τ)`. There are
+no parameter temporaries: the body reads every variable (parameters included)
+through `Var→Load`, giving a uniform unoptimized (-O0) model.
 
-**Observable:** giá trị TRẢ (return value) — `⟦Func⟧(args) ∈ 𝕍`. (Trace I/O bỏ:
-CORE thuần tính toán; hàm có side-effect ngoài (Call extern, Asm) = exotic → ⊥.)
+**Observable.** The observable is the return value — `⟦Func⟧(args) ∈ 𝕍`. (I/O
+traces are omitted: CORE is pure computation; a function with external
+side effects, such as a call to an external symbol or inline assembly, is
+exotic and evaluates to ⊥.)
 
 ---
 
-## 3. Hàm nghĩa nguyên tử (atomic denotations) — KEYSTONE faithfulness
+## 3. Atomic denotations — the faithfulness keystone
 
-Ba hàm sau sống ở phần **non-test** `ir.rs` và ĐƯỢC GỌI BỞI CẢ interp (proof-side)
-LẪN const-fold (`opt.rs`, release). MỘT định nghĩa ⟹ folder và interpreter KHÔNG
-THỂ lệch: `⟦fold(e)⟧ = ⟦e⟧` đúng **by construction** (THEORY §A7 term-rewriting
-soundness, §III keystone).
+The three functions below live in the **non-test** part of `ir.rs` and are
+called by *both* the interpreter (semantics side) and the constant folder
+(`opt.rs`, release side). A single definition guarantees that the folder and the
+interpreter cannot diverge: `⟦fold(e)⟧ = ⟦e⟧` holds *by construction*
+(term-rewriting soundness).
 
 ### 3.1 `canon_τ : ℤ → 𝕍`  (`ir.rs::canon`)
 ```
-canon_τ(v) = v                                    nếu float(τ) ∨ size(τ) ≥ 8
-           = sext_w( v mod 2^w )                   nếu int có dấu,   w = size(τ)·8
-           = ( v mod 2^w )                         nếu int không dấu
+canon_τ(v) = v                          if float(τ) ∨ size(τ) ≥ 8
+           = sext_w( v mod 2^w )         if τ is a signed integer,   w = size(τ)·8
+           = ( v mod 2^w )               if τ is an unsigned integer
 ```
 
 ### 3.2 `⟦op⟧_τ : 𝕍 × 𝕍 → 𝕍 ∪ {⊥}`  (`ir.rs::eval_bin`)
-- **float(τ):** giải bit→f64, áp op ∈ {+,−,×,÷} trong 𝔽₆₄ (IEEE-754), so sánh →
-  {0,1}. (÷ float KHÔNG ⊥: theo IEEE cho ±∞/NaN.)
-- **int(τ):** số học trong ℤ/2^w với dấu s, kết quả `canon_τ`:
-  - `+,−,×` = wrapping (modulo 2^w).
-  - `÷,%` : **`y=0 → ⊥`** (UB — const-fold PHẢI bỏ qua, giữ lệnh cho runtime).
-    Ngược lại chia cắt-về-0 (signed `wrapping_div`, unsigned `u64`).
-  - `& | ^` bitwise; `<<` = wrapping_shl; `>>` = arith (signed) / logic (unsigned).
-  - `== != < ≤ > ≥` → {0,1}, so sánh có dấu theo s.
+- **float(τ):** decode bits to f64, apply op ∈ {+, −, ×, ÷} in 𝔽₆₄ (IEEE-754);
+  comparisons yield {0, 1}. (Float ÷ is not ⊥: it follows IEEE-754 for
+  ±∞ / NaN.)
+- **int(τ):** arithmetic in ℤ/2^w with signedness s, canonicalized by `canon_τ`:
+  - `+, −, ×` are wrapping (modulo 2^w).
+  - `÷, %` : **`y = 0 ⟹ ⊥`** (undefined behavior — the folder must decline to
+    fold, leaving the instruction for the target). Otherwise division truncates
+    toward zero (signed `wrapping_div`; unsigned via `u64`).
+  - `& | ^` are bitwise; `<<` is `wrapping_shl`; `>>` is arithmetic (signed) or
+    logical (unsigned).
+  - `== != < ≤ > ≥` yield {0, 1}, compared according to s.
 
-### 3.3 `⟦cast⟧_{σ→τ} : 𝕍 → 𝕍`  (`ir.rs::eval_cast`)  (C99 6.3.1.2 / 6.3.1.4)
+### 3.3 `⟦cast⟧_{σ→τ} : 𝕍 → 𝕍`  (`ir.rs::eval_cast`), per C99 6.3.1.2 / 6.3.1.4
 ```
-int→int   : _Bool ⟹ (v≠0);        ngược lại canon_τ(v)         (trunc/ext)
-int→float : (float)v  (unsigned dùng u64→f64)
-float→int : _Bool ⟹ (f≠0);        ngược lại canon_τ(⌊f⌋)       (trunc-về-0)
-float→float: v                     (f64 canonical cả hai)
+int→int    : _Bool ⟹ (v ≠ 0);   otherwise canon_τ(v)        (truncate / extend)
+int→float  : (float)v            (unsigned uses u64→f64)
+float→int  : _Bool ⟹ (f ≠ 0);   otherwise canon_τ(⌊f⌋)      (truncate toward zero)
+float→float: v                   (f64 is canonical for both)
 ```
 
 ---
 
-## 4. Ngữ nghĩa lệnh ⟦Inst⟧ : Σ → Σ  (CORE — big-step, ⇐ interp `match inst`)
+## 4. Instruction semantics ⟦Inst⟧ : Σ → Σ  (CORE, big-step)
 
-Ký hiệu `⟨v⟩ρ` = fetch: `Tmp t↦ρ[t]`, `Imm x↦x`, `FImm b↦b`. `ρ[d↦u]` = cập nhật.
+This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
+`Tmp t ↦ ρ[t]`, `Imm x ↦ x`, `FImm b ↦ b`, and `ρ[d ↦ u]` for register update.
 
-| Inst | ⟦·⟧ : Σ → Σ (rule) |
+| Inst | ⟦·⟧ : Σ → Σ |
 |---|---|
-| `Bin(d,op,τ,a,b)` | `ρ' = ρ[d ↦ ⟦op⟧_τ(⟨a⟩ρ, ⟨b⟩ρ)]`   (⊥ nếu op ⊥) |
+| `Bin(d,op,τ,a,b)` | `ρ' = ρ[d ↦ ⟦op⟧_τ(⟨a⟩ρ, ⟨b⟩ρ)]`   (⊥ if op is ⊥) |
 | `Un(d,⊝,τ,a)` | `ρ[d ↦ canon_τ(−⟨a⟩)]` (Neg int) / `bits(−f)` (Neg float) / `canon_τ(¬⟨a⟩)` (BNot) |
 | `Copy(d,τ,a)` | `ρ[d ↦ canon_τ(⟨a⟩ρ)]` |
-| `Load(d,τ,a)` | `ρ[d ↦ decode_τ(μ, ⟨a⟩ρ)]`  (đọc size(τ) byte; f32→f64 nếu float sz=4) |
-| `Store(τ,a,v)` | `μ' = μ[⟨a⟩ρ ↦ encode_τ(⟨v⟩ρ)]`  (ghi size(τ) byte; f64→f32 nếu sz=4) |
-| `Memcpy(d,s,n)` | `μ' = μ[⟨d⟩ρ ..+n ↦ μ(⟨s⟩ρ ..+n)]`  (copy n byte xuôi — struct-assign C99 6.5.16) |
-| `Lea(d, Local off)` | `ρ[d ↦ frame − off]`   (`Global`/`Str` → ⊥) |
+| `Load(d,τ,a)` | `ρ[d ↦ decode_τ(μ, ⟨a⟩ρ)]`   (read size(τ) bytes; f32→f64 when float, size 4) |
+| `Store(τ,a,v)` | `μ' = μ[⟨a⟩ρ ↦ encode_τ(⟨v⟩ρ)]`   (write size(τ) bytes; f64→f32 when size 4) |
+| `Memcpy(d,s,n)` | `μ' = μ[⟨d⟩ρ ..+n ↦ μ(⟨s⟩ρ ..+n)]`   (copy n bytes forward; struct assignment, C99 6.5.16) |
+| `Lea(d, Local off)` | `ρ[d ↦ frame − off]`   (`Global` / `Str` ↦ ⊥) |
 | `Cast(d,σ,τ,a)` | `ρ[d ↦ ⟦cast⟧_{σ→τ}(⟨a⟩ρ)]` |
-| `Call(Some d, Sym g, ā, _)` | `ρ[d ↦ canon_{τd}( ⟦g⟧(⟨ā⟩ρ) )]`  (đệ quy big-step; `Ptr`/depth>500 → ⊥) |
+| `Call(Some d, Sym g, ā, _)` | `ρ[d ↦ canon_{τd}( ⟦g⟧(⟨ā⟩ρ) )]`   (recursive big-step; `Ptr` / depth > 500 ↦ ⊥) |
 
-**EXOTIC (⊥ — impure, NGOÀI không gian CORE):** `FunAddr, LabelAddr, Zero, VaStart,
-VaArg, Overflow, VaArea, GotoPtr, Alloca, CallX, Sync, Asm`. Interp trả `Err` ⟹
-input rơi vào hàm chứa exotic = "không thuần" ⟹ commuting-square SKIP (giống UB).
-Đây là hàng rào CORE/EXOTIC-typed của IR.md §2b: pass CHỈ đụng CORE, nên chỉ cần
-⟦·⟧ trên CORE để chứng pass giao hoán.
+**Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
+`LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
+`Alloca`, `CallX`, `Sync`, `Asm`. The interpreter returns an error, meaning the
+input has reached a function containing an exotic instruction — an impure
+function — so the commuting square skips it (as it does for undefined behavior).
+This is the CORE / EXOTIC-typed partition of the IR (IR.md §2b): passes touch
+only CORE, so only ⟦·⟧ over CORE is needed to establish that a pass commutes.
 
-## 4b. Ngữ nghĩa terminator ⟦Term⟧ : Σ → (BlockId ⊎ Halt)  (⇐ interp `match term`)
+## 4b. Terminator semantics ⟦Term⟧ : Σ → (BlockId ⊎ Halt)  (mirrors `match term`)
 
 ```
 ⟦Jmp b⟧          =  goto b
 ⟦Br c b_t b_e⟧   =  goto (⟨c⟩ρ ≠ 0 ? b_t : b_e)
-⟦Ret v?⟧         =  Halt(⟨v⟩ρ)   (Halt(0) nếu None)
-⟦Unreachable⟧    =  ⊥            (chạm = IR hỏng hoặc dead-code thật sự bất khả đạt)
+⟦Ret v?⟧         =  Halt(⟨v⟩ρ)    (Halt(0) when None)
+⟦Unreachable⟧    =  ⊥             (reaching it means malformed IR, or genuinely unreachable dead code)
 ```
 
-## 4c. Big-step hàm ⟦Func⟧ : 𝕍* → 𝕍 ∪ {⊥}
+## 4c. Function big-step ⟦Func⟧ : 𝕍* → 𝕍 ∪ {⊥}
 
 ```
-⟦f⟧(ā) = eval từ block 0 với Σ₀ = ⟨ρ=0̄, μ=seed(ā)⟩; chạy ⟦inst⟧ tuần tự trong
-         block, rồi ⟦term⟧ chuyển block; dừng tại Halt(v) ⟹ v. Chốt an toàn:
-         budget bước (lặp vô hạn → ⊥) + depth Call ≤ 500 (đệ quy host → ⊥).
+⟦f⟧(ā) evaluates from block 0 with Σ₀ = ⟨ρ = 0̄, μ = seed(ā)⟩; it runs each ⟦inst⟧
+       in order within a block, then ⟦term⟧ selects the next block; it halts at
+       Halt(v), yielding v. Two safety bounds: a step budget (non-termination ↦ ⊥)
+       and a call depth ≤ 500 (host-stack recursion ↦ ⊥).
 ```
-`⊥` (Err) = "input NGOÀI không gian mô hình" (UB div0, exotic, global, đệ quy sâu,
-lặp quá ngân sách). Diff-tại-⊥ vô nghĩa (luật gốc) ⟹ commuting-square bỏ qua.
+
+Here ⊥ (an interpreter error) means "the input lies outside the modeled space":
+undefined behavior (division by zero), an exotic instruction, a global address,
+recursion deeper than the bound, or exceeding the step budget. A difference at ⊥
+is meaningless, so the commuting square skips it.
 
 ---
 
-## 5. ĐỊNH LÝ commuting-square (executable) — nâng từ `alg.sh`
+## 5. The commuting-square theorem (executable)
 
-`alg.sh` chứng giao hoán fold↔runtime ở tầng **SOURCE** (diff hai binary sinh bởi
-cc/zcc trên không gian đại số vét cạn). NẤC-1 nâng lên tầng **IR + reference
-semantics** (in-process, zero-dep, KHÔNG cần cc):
+`alg.sh` establishes the fold-vs-runtime commuting square at the **source**
+level (it diffs two binaries, produced by the system compiler and by zcc, over
+an exhaustively enumerated algebraic space). This document lifts that square to
+the **IR + reference semantics** level (in-process, dependency-free, without the
+system compiler):
 
-> **Định lý (metamorphic / translation-validation vét-cạn-cấu-trúc).**
-> Với mọi pass `P ∈ {const_fold, copy_prop, cse, dce, optimize}`, mọi biểu thức
-> `e` trong không gian sinh có cấu trúc `𝔼_struct`, và mọi input `i ∈ battery`:
+> **Theorem (metamorphic / structurally-exhaustive translation validation).**
+> For every pass `P ∈ {const_fold, copy_prop, cse, dce, optimize}`, every
+> expression `e` in the generated structural space `𝔼_struct`, and every input
+> `i` in the battery:
 > $$ ⟦lower(e)⟧(i) \ne ⊥ \;\Longrightarrow\; ⟦P(lower(e))⟧(i) = ⟦lower(e)⟧(i). $$
 
-Nói cách khác biểu đồ sau GIAO HOÁN với mọi `e ∈ 𝔼_struct`:
+Equivalently, the following square commutes for every `e ∈ 𝔼_struct`:
 
 ```
       lower(e) ───────⟦·⟧──────▶  v
          │                        ‖
-         P                        ‖   (BẮT BUỘC bằng, ∀ i mà ⟦·⟧≠⊥)
+         P                        ‖   (equal for every i with ⟦·⟧ ≠ ⊥)
          ▼                        ‖
      P(lower(e)) ────⟦·⟧──────▶  v
 ```
 
-**Kiểm cơ học:** `opt.rs::tests::commuting_square_structural_exhaustion`.
-`𝔼_struct` = hợp **năm HỌ shape**, mỗi họ vét cạn op trên một cấu trúc riêng ⟹ phủ
-mọi loại Inst (Bin/Un/Copy/Load/Store/Lea/Cast) + cả hai loại Term (Jmp/Br):
+**Mechanical check:** `opt.rs::tests::commuting_square_structural_exhaustion`.
+`𝔼_struct` is the union of **five shape families**, each exhausting the operator
+set over a distinct structure, so together they cover every kind of `Inst`
+(Bin/Un/Copy/Load/Store/Lea/Cast) and both terminators (Jmp/Br):
 
-| họ | shape | cỡ | kích pass/Inst |
+| family | shape | size | passes / Inst exercised |
 |---|---|---|---|
-| A | arith straight-line (`POOL³`) | 216 | fold+CSE+copy+DCE, Bin |
-| B | div/mod (`POOL×{/,%}`) | 12 | UB-skip đối xứng, fold-từ-chối-div0 |
-| C | shift (`POOL×{<<,>>}`) | 12 | Shl/Shr (>> xét dấu) |
-| D | con trỏ/bộ nhớ (`POOL²`) | 36 | Lea/Load/Store, **memory-kill CSE** (pr84169) |
-| E | vòng lặp/CFG (`POOL²`) | 36 | Br/Jmp back-edge, copy-prop/DCE qua biên block |
+| A | straight-line arithmetic (`POOL³`) | 216 | fold + CSE + copy-prop + DCE, Bin |
+| B | div / mod (`POOL × {/,%}`) | 12 | symmetric UB skip; folder declines div-by-zero |
+| C | shift (`POOL × {<<,>>}`) | 12 | Shl / Shr (arithmetic `>>`) |
+| D | pointer / memory (`POOL²`) | 36 | Lea / Load / Store, **CSE memory-kill** (GCC PR84169) |
+| E | loop / CFG (`POOL²`) | 36 | Br / Jmp back-edge, copy-prop / DCE across blocks |
 
-Tổng **312 biểu thức** × 5 pass = **1560 ô commuting-square** đóng xanh. `⟦·⟧` =
-`interp`; equiv so trên `battery` (vét-cạn-miền-nhỏ [−6,6]ⁿ + biên INT_MAX/MIN,
-ir.rs::battery). Họ E dùng trip-count `b&7` ⟹ interp LUÔN dừng (non-vacuous).
-Evidence trail cơ học (số expr + số ô) assert cứng — cấm "pass rỗng" (luật input-sạch).
+Total: **312 expressions × 5 passes = 1560 commuting squares**, all green. Here
+⟦·⟧ is `interp`, and equivalence is checked over the `battery` (small-domain
+exhaustion [−6, 6]ⁿ plus the INT_MAX / INT_MIN boundaries; see `ir.rs::battery`).
+Family E bounds its trip count with `b & 7`, so the interpreter always
+terminates (the check is non-vacuous). A mechanical evidence trail (the
+expression count and the square count) is asserted exactly, forbidding a vacuous
+"passing" run.
 
-**Anti-blindness:** `commuting_square_selfproof` đột biến (xoá một `Store` → mất
-ghi-mem) và đòi commuting-square PHẢI bắt — nếu equiv mù thì mọi verdict vô giá
-trị (tự-chứng công cụ chứng).
+**Anti-blindness.** `commuting_square_selfproof` injects a mutation (deleting a
+`Store`, removing a memory write) and requires the commuting square to catch it;
+if the equivalence check were blind, every verdict would be worthless.
 
 ---
 
-## 6. Giới hạn (thành thật) & lối lên nấc trên
+## 6. Limitations and the path forward
 
-- ⟦·⟧ mô hình **local memory + return value**; KHÔNG mô hình global/heap/I/O/
-  concurrency ⟹ chỉ chứng được pass trên hàm CORE-thuần. Đủ cho 5 pass hiện tại
-  (đều CORE), KHÔNG đủ cho tối ưu liên-thủ-tục / alias toàn cục.
-- Vét-cạn `𝔼_struct` là **cấu trúc hữu hạn**, KHÔNG phổ quát: bắt bug cấu trúc-đã-
-  sinh, KHÔNG chứng ∀ chương trình (Rice). Để lên **nấc-2** (translation validation
-  Tristan–Leroy: certificate + checker per-compilation) và **nấc-3** (machine-check
-  từng pass trong Coq/HOL4), reference semantics §1–§4 này là ĐỐI TƯỢNG được
-  formal hoá — đó là lý do nó phải phát biểu tường minh, map 1-1 với code, ở đây.
+- ⟦·⟧ models local memory and the return value only; it does not model globals,
+  the heap, I/O, or concurrency, so it can establish preservation only for pure
+  CORE functions. This suffices for the five current passes (all CORE) but not
+  for interprocedural optimization or global alias analysis.
+- Exhausting `𝔼_struct` is *finite structural coverage*, not universal: it
+  catches defects on the generated shapes but does not prove correctness for all
+  programs (Rice's theorem). The reference semantics of §1–§4 is the object to
+  be formalized for the next stages — translation validation (a per-compilation
+  certificate and checker) and per-pass machine-checked proofs — which is why it
+  is stated explicitly and mapped one-to-one onto the code here.

@@ -1,13 +1,13 @@
 #!/bin/sh
-# Gate lớp 2 — preprocessor như hệ viết lại hạng (lý thuyết + exclusion list:
-# đọc đầu tests/gen_cpp.py). Hai chương trình sinh ra:
-#   cpp_mech.c — ma trận tương tác cơ chế expansion, dạng chuẩn reify qua "#"
-#                thành string in ra runtime → diff stdout zcc↔cc
-#   cpp_if.c   — vét cạn số học #if (long/ulong, 3.8.1), oracle kép:
-#                zcc==cc VÀ cc==python (FAIL nội dòng nếu lệch python)
+# Layer-2 gate — the preprocessor as a term-rewriting system (theory + exclusion
+# list: read the head of tests/gen_cpp.py). Two programs are generated:
+#   cpp_mech.c — a matrix of expansion-mechanism interactions, reified via "#" into
+#                strings printed at runtime → diff stdout zcc↔cc
+#   cpp_if.c   — exhaustive #if arithmetic (long/ulong, 3.8.1), dual oracle:
+#                zcc==cc AND cc==python (in-line FAIL if it diverges from python)
 set -e
 cd "$(dirname "$0")/.."
-# ZCC đặt sẵn từ env (chạy trong box Linux, không cargo) — không thì tự build
+# ZCC preset from the env (running in the Linux box, no cargo) — otherwise self-build
 if [ -z "$ZCC" ]; then
     cargo build --quiet 2>/dev/null || cargo build
     ZCC=target/debug/zcc
@@ -19,7 +19,7 @@ python3 tests/gen_cpp.py "$D"
 
 fail=0
 for f in cpp_mech cpp_if; do
-    "$ZCC" "$D/$f.c" -o "$D/${f}_zcc" || { echo "CPP FAIL: zcc không compile $f.c"; exit 1; }
+    "$ZCC" "$D/$f.c" -o "$D/${f}_zcc" || { echo "CPP FAIL: zcc did not compile $f.c"; exit 1; }
     cc -std=c89 -w -O0 "$D/$f.c" -o "$D/${f}_cc"
     z=0; "$D/${f}_zcc" > "$D/${f}_zcc.out" || z=$?
     c=0; "$D/${f}_cc" > "$D/${f}_cc.out" || c=$?
@@ -30,18 +30,18 @@ for f in cpp_mech cpp_if; do
         fail=1
     fi
     if grep -q FAIL "$D/${f}_cc.out"; then
-        echo "CPP FAIL: generator lệch cc (python sai luật?)"
+        echo "CPP FAIL: generator diverges from cc (python rule wrong?)"
         grep FAIL "$D/${f}_cc.out" | head -5
         fail=1
     fi
     if grep -q FAIL "$D/${f}_zcc.out"; then
-        echo "CPP FAIL: zcc lệch python:"
+        echo "CPP FAIL: zcc diverges from python:"
         grep FAIL "$D/${f}_zcc.out" | head -5
         fail=1
     fi
 done
 if [ "$fail" = 0 ]; then
-    echo "CPP PASS: mech $(wc -l < "$D/cpp_mech_zcc.out" | tr -d ' ') dòng khớp + if: $(cat "$D/cpp_if_zcc.out")"
+    echo "CPP PASS: mech $(wc -l < "$D/cpp_mech_zcc.out" | tr -d ' ') lines match + if: $(cat "$D/cpp_if_zcc.out")"
 else
     exit 1
 fi

@@ -1,12 +1,14 @@
 #!/bin/sh
-# opt-parity.sh — ĐO cơ học (differential tự thân): với mỗi torture execute .c,
-# compile HAI lần — KHÔNG opt (ZCC_OPT unset) vs CÓ opt (ZCC_OPT=1) —
-# chạy cả hai, so exit code. Đường noopt đã ở parity với referee (đo trước),
-# nên opt≡noopt trên MỌI case ⟹ pipeline pass (const-fold/copy-prop/CSE/DCE) đúng
-# bắc-cầu, end-to-end trên ELF THẬT. DIVERGE = bug pass (in ra để trị). SKIP = case
-# một trong hai không compile (exotic/reject) — ngoài phạm vi đo passes.
+# opt-parity.sh — a mechanical MEASUREMENT (self-differential): for each torture
+# execute .c, compile TWICE — WITHOUT opt (ZCC_OPT unset) vs WITH opt (ZCC_OPT=1) —
+# run both, compare exit codes. The noopt path is already at parity with the
+# referee (measured beforehand), so opt≡noopt on EVERY case ⟹ the optimization
+# pipeline (const-fold/copy-prop/CSE/DCE) is correct by transitivity, end-to-end on
+# a REAL ELF. DIVERGE = a pass bug (printed for diagnosis). SKIP = a case where one
+# of the two does not compile (exotic/reject) — outside the scope of measuring the
+# passes.
 #
-# Chạy TRONG box:  ZCC=/usr/local/bin/zcc sh opt-parity.sh [N]   (N = giới hạn số case)
+# Run INSIDE the box:  ZCC=/usr/local/bin/zcc sh opt-parity.sh [N]   (N = case limit)
 set -u
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 C="${ZCC_SUITE_CACHE:-/suites}"
@@ -38,6 +40,6 @@ for f in "$DIR"/*.c; do
     fi
 done
 
-echo "opt-parity: $par PARITY / $div DIVERGE / $skip SKIP  (quét $n case)"
+echo "opt-parity: $par PARITY / $div DIVERGE / $skip SKIP  (scanned $n cases)"
 [ -n "$divlist" ] && echo "DIVERGE:$divlist"
 [ "$div" = 0 ]

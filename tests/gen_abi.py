@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-# Sinh harness ABI theo mô hình automaton: placement của một arg chỉ phụ thuộc
-# (kiểu T, số GPR đã dùng g, số FPR đã dùng f, offset stack) — phủ hết transition
-# = phủ hết ABI. Mỗi case: prefix g long + f double đẩy máy tới trạng thái đích,
-# payload T, rồi 2 sentinel (long, double) bắt lỗi lệch counter phía sau.
-# Callee trả tổng có trọng số 2^i (mọi phép toán exact trong double, giá trị bé)
-# — caller so sánh == với hằng tính sẵn ở đây. Test CHÉO cc↔zcc hai chiều:
-# cùng-compiler hai đầu thì lỗi ABI tự triệt tiêu, không bao giờ lộ.
+# Generates an ABI harness on an automaton model: the placement of an arg depends
+# only on (type T, GPRs used g, FPRs used f, stack offset) — covering every
+# transition = covering the whole ABI. Each case: a prefix of g long + f double
+# drives the machine to the target state, the payload T, then 2 sentinels (long,
+# double) catching a counter drift afterward. The callee returns a 2^i-weighted sum
+# (every operation exact in double, small values) — the caller compares == against a
+# constant precomputed here. Tested CROSS cc↔zcc in both directions: with the same
+# compiler on both ends an ABI error self-cancels and is never exposed.
 import sys
 
 STRUCTS = {
     "SI": [("int", "a"), ("int", "b")],          # 8B, 2 int
     "SL": [("long", "a"), ("long", "b")],        # 16B, 2 GPR
-    "SB": [("char", "a"), ("long", "b")],        # 16B, padding giữa
-    "S3": [("char", "a"), ("char", "b"), ("char", "c")],  # 3B — stack tròn 8
+    "SB": [("char", "a"), ("long", "b")],        # 16B, padding in between
+    "S3": [("char", "a"), ("char", "b"), ("char", "c")],  # 3B — stack rounded to 8
     "HF2": [("float", "a"), ("float", "b")],     # HFA 2 float
     "HD2": [("double", "a"), ("double", "b")],   # HFA 2 double
     "HF4": [("float", "a"), ("float", "b"), ("float", "c"), ("float", "d")],
-    "SBIG": [("long", "a"), ("long", "b"), ("long", "c")],  # >16B → con trỏ
+    "SBIG": [("long", "a"), ("long", "b"), ("long", "c")],  # >16B → pointer
     "SA16": [("long", "a"), ("long", "b")],      # 16B aligned(16) — AAPCS C.9
 }
-# thuộc tính đính kèm định nghĩa struct (SA16: gcc round NGRN chẵn — pr92904;
-# clang Darwin KHÔNG round — differential per-platform nên hai bên đều tự khớp)
+# attribute attached to the struct definition (SA16: gcc rounds NGRN to even —
+# pr92904; clang Darwin does NOT round — a per-platform differential, so each side
+# self-matches)
 ATTRS = {"SA16": " __attribute__((aligned(16)))"}
 SCALARS = ["char", "short", "int", "long", "float", "double"]
 FLOATKIND = {"float", "double", "HF2", "HD2", "HF4"}
@@ -32,7 +34,7 @@ def ctype(t):
 class Case:
     def __init__(self, name):
         self.name = name
-        self.params = []   # (ctype string, tên, [giá trị lá])
+        self.params = []   # (ctype string, name, [leaf values])
         self.leaf = 0
         self.expected = 0.0
     def add(self, t, values=None):
@@ -66,8 +68,8 @@ def emit_case(c, callee, caller):
             argv.append(n + "_v")
         else:
             argv.append("(%s)%d" % (t, vals[0]))
-    # gọi CẢ trực tiếp (bl) lẫn qua function pointer (blr) — ABI phải đồng
-    # nhất hai đường; fn-ptr chéo compiler là đúng chỗ nginx hay segfault
+    # call BOTH directly (bl) and through a function pointer (blr) — the ABI must be
+    # identical on both paths; a cross-compiler fn-ptr is exactly where real software segfaults
     sigt = ", ".join(ctype(t) for t, _, _ in c.params)
     args = ", ".join(argv)
     caller.append(
@@ -81,8 +83,9 @@ def emit_case(c, callee, caller):
 def main(outdir):
     callee, caller, decls = [], [], []
     cases = []
-    # phủ trạng thái: counter LIÊN QUAN của T quét đủ 0..8 (biên 7: struct 2-reg
-    # tràn kích hoạt khóa C.11; 5..8: HFA 4 member tràn), counter kia lấy 2 cực trị
+    # state coverage: the RELEVANT counter of T sweeps 0..8 (boundary 7: a 2-reg
+    # struct overflow triggers the C.11 lock; 5..8: a 4-member HFA overflows), the
+    # other counter takes its 2 extremes
     for t in ALL:
         rel_f = t in FLOATKIND
         for rel in range(9):
@@ -94,10 +97,10 @@ def main(outdir):
                 for _ in range(f):
                     c.add("double")
                 c.add(t)
-                c.add("long")    # sentinel bắt lệch counter GPR/stack
-                c.add("double")  # sentinel bắt lệch counter FPR/stack
+                c.add("long")    # sentinel catching a GPR/stack counter drift
+                c.add("double")  # sentinel catching an FPR/stack counter drift
                 cases.append(c)
-    # cặp T,T khi cạn sạch thanh ghi: kiểm tra packing hai arg stack KỀ NHAU
+    # T,T pair once registers are exhausted: checks the packing of two ADJACENT stack args
     for t in ALL:
         c = Case("f_pair_%s" % t)
         for _ in range(8):
@@ -106,15 +109,15 @@ def main(outdir):
             c.add("double")
         c.add(t)
         c.add(t)
-        c.add("char")  # sentinel packed ngay sau
+        c.add("char")  # sentinel packed immediately after
         cases.append(c)
     for c in cases:
         emit_case(c, callee, caller)
         sig = ", ".join(ctype(t) for t, _, _ in c.params)
         decls.append("double %s(%s);" % (c.name, sig))
 
-    # quét RETURN: mỗi kiểu một lần — phủ trả x0, cặp x0/x1, HFA v0..v3,
-    # sret qua x8 (>16B) — và trả CẢ qua function pointer (blr)
+    # RETURN sweep: each type once — covering return in x0, the x0/x1 pair, HFA
+    # v0..v3, sret via x8 (>16B) — and returning ALSO through a function pointer (blr)
     nret = 0
     for t in ALL:
         name = "r_%s" % t
@@ -145,8 +148,8 @@ def main(outdir):
             decls.append("%s %s(void);" % (t, name))
         nret += 1
 
-    # variadic: named prefix g long + int n, rồi 3 arg vô danh kiểu T (mỗi arg
-    # một slot 8 — va_arg bước 8); T char/short/float đến dạng promoted
+    # variadic: named prefix g long + int n, then 3 anonymous args of type T (each
+    # arg one 8-byte slot — va_arg steps by 8); T char/short/float arrive promoted
     va_callee, va_caller = [], []
     for t in SCALARS:
         pt = {"char": "int", "short": "int", "float": "double"}.get(t, t)

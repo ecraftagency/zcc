@@ -1,145 +1,175 @@
-# Sổ tài sản test của zcc
+# zcc test-asset ledger
 
-Nguyên tắc: **mọi tài sản test hoặc là script chạy được trong repo, hoặc được
-ghi ở đây kèm cách dựng lại**. Không có tài sản mồ côi.
+Principle: **every test asset is either a script runnable within the repo, or is
+documented here together with instructions to reconstruct it**. No orphan assets.
 
-**zcc bản chất HỌC THUẬT** (Vu 2026-08-20): mỗi dòng code map tới một định lý
-trình biên dịch — `[định lý toán/compiler] --compiled--> [rust source]
---compiled--> zcc`. Test chia HAI TẦNG:
+**zcc is fundamentally an ACADEMIC artifact**: each line of code maps to a
+compiler-theory theorem — `[math/compiler theorem] --compiled--> [rust source]
+--compiled--> zcc`. Tests are divided into TWO LAYERS:
 
-1. **Tầng KIỂM ĐỊNH LÝ — sci-gate (ground truth, quan trọng HƠN corpus)**: vét
-   cạn KHÔNG GIAN CẤU TRÚC để chứng nghiệm định lý. Tốc độ KHÔNG quan trọng,
-   completeness là tối thượng (chạy cả ngày cũng chấp nhận). Phải MỞ RỘNG thêm.
-2. **Tầng CHỨNG NGHIỆM THỰC TIỄN — corpus + app**: torture/csmith/linux/libc
-   chỉ là MẪU thực tế, tầng dưới, xác nhận định lý không lệch đời thực.
+1. **THEOREM-VERIFICATION layer — sci-gate (ground truth, more important than
+   the corpus)**: exhausts the STRUCTURAL SPACE to certify a theorem. Speed does
+   NOT matter; completeness is paramount (running for a whole day is acceptable).
+   It must be EXTENDED further.
+2. **PRACTICAL-CORROBORATION layer — corpus + app**: torture/csmith/linux/libc
+   are only real-world SAMPLES, the lower layer, confirming that the theorem does
+   not diverge from real-world practice.
 
-**Tối giản (Vu 2026-08-20)**: framework cũ (probe/gate-overnight/SOP/ledger +
-app-stack nginx/redis/git/sqlite + m8..m14) đã DẸP — over-automation làm
-iteration chậm & đẻ file quá nhiều (luật đo tốc độ, CLAUDE.md). App giữ DUY
-NHẤT musl libc (liên quan trực tiếp minimal-distro). **ELF = target
-AUTHORITATIVE; Mach-O/mac hiện chỉ giữ để clang làm ORACLE** (có thể fork bỏ
-Mach-O sau để chừa LOC).
+**Minimalism**: the old framework (probe/gate-overnight/SOP/ledger + the
+nginx/redis/git/sqlite app-stack + m8..m14) has been REMOVED — over-automation
+slowed iteration and generated too many files (measure-the-speed rule,
+CLAUDE.md). The only application retained is musl libc (directly relevant to the
+minimal-distro goal). **ELF is the AUTHORITATIVE target; Mach-O/mac is currently
+kept only to let clang serve as an ORACLE** (Mach-O may be forked out later to
+reclaim LOC).
 
 ```
 tests/
-├── shape.sh cpp.sh decay.sh alg.sh abi.sh   # SCI-GATE + gen_*.py (tầng định lý)
-├── gate.sh                # dispatcher: gate.sh <vùng>  (chạy đúng gate sở hữu vùng)
-├── box.sh                 # chạy 1 file / shell trong ELF box (iteration)
-├── run.sh  cases/ ext/    # base differential + case viết tay (+ cases.known-fail)
-├── suites/*.sh            # corpus ngoài (gate = FAIL ⊆ *.known-fail)
-├── halfsuite.sh           # alias mỏng: = fullsuite.sh base (vòng nhanh)
-└── fullsuite.sh           # RUNNER DUY NHẤT, 100% BOX: [TARGET] [SEEK] — tự build+docker
+├── shape.sh cpp.sh decay.sh alg.sh abi.sh   # SCI-GATE + gen_*.py (theorem layer)
+├── gate.sh                # dispatcher: gate.sh <area>  (runs exactly the gate owning the area)
+├── box.sh                 # run 1 file / shell inside the ELF box (iteration)
+├── run.sh  cases/ ext/    # base differential + hand-written cases (+ cases.known-fail)
+├── suites/*.sh            # external corpus (gate = FAIL ⊆ *.known-fail)
+├── halfsuite.sh           # thin alias: = fullsuite.sh base (fast loop)
+└── fullsuite.sh           # SOLE RUNNER, 100% BOX: [TARGET] [SEEK] — self-build+docker
 ```
 
-## Runner — 100% BOX (Vu 2026-08-20: box nhanh, runner mac đã bỏ)
+## Runner — 100% BOX (the box is fast; the mac runner has been removed)
 
-`fullsuite.sh` là cửa DUY NHẤT: trên mac tự build zcc-ELF (musl,release) + `docker
-run zcc-box` + gọi lại chính nó trong box. Mac chỉ còn để clang làm oracle ad-hoc,
-KHÔNG còn runner mac (static-musl trong box gần free, mac 2.7s/case codesign/dyld).
+`fullsuite.sh` is the SOLE entry point: on the mac it self-builds zcc-ELF
+(musl,release) + `docker run zcc-box` + re-invokes itself inside the box. The mac
+remains only to let clang serve as an ad-hoc oracle; there is NO mac runner any
+more (static-musl inside the box is nearly free, whereas the mac costs 2.7s/case
+for codesign/dyld).
 
-**`sh tests/fullsuite.sh [TARGET] [SEEK]`** — SEEK đến từng TẦNG, không chạy lại toàn bộ:
+**`sh tests/fullsuite.sh [TARGET] [SEEK]`** — SEEK reaches an individual LAYER
+without re-running the whole thing:
 
-| TARGET | chạy gì |
+| TARGET | what it runs |
 |---|---|
-| `all` (mặc định) | sci + corpus + app |
-| `sci` `corpus` `app` `base` | nhóm (`base` = run.sh cases+ext, vòng nhanh) |
+| `all` (default) | sci + corpus + app |
+| `sci` `corpus` `app` `base` | group (`base` = run.sh cases+ext, fast loop) |
 | `shape` `cpp` `decay` `alg` `abi` | 1 sci-gate |
 | `cases` `ext` | 1 base differential |
 | `torture` `cts` | 1 corpus suite |
 | `musl` | app libc |
 
-**`SEEK`** (đối số 2, tùy chọn) = chuỗi con tên case → seek sâu vào TỪNG UNIT trong
-1 suite. Vd: `fullsuite.sh torture pr22061`, `fullsuite.sh cases float`.
-Áp cho cases/ext + mọi corpus suite (lọc `grep -F` trên danh sách file). Sci-gate
-sinh case NỘI BỘ qua gen_*.py nên chưa nhận SEEK (mở rộng sau nếu cần).
+**`SEEK`** (2nd argument, optional) = a substring of a case name → seek deep into
+an INDIVIDUAL UNIT within 1 suite. E.g.: `fullsuite.sh torture pr22061`,
+`fullsuite.sh cases float`. Applies to cases/ext + every corpus suite (filtered
+with `grep -F` over the file list). Sci-gates generate cases INTERNALLY via
+gen_*.py and therefore do not yet accept SEEK (to be extended later if needed).
 
-**`sh tests/halfsuite.sh [SEEK]`** = alias `fullsuite.sh base [SEEK]` — vòng nhanh.
+**`sh tests/halfsuite.sh [SEEK]`** = alias for `fullsuite.sh base [SEEK]` — fast
+loop.
 
-## Sci-gate — tầng kiểm định lý (chạy trong box qua fullsuite.sh sci)
+## Sci-gate — theorem-verification layer (run inside the box via fullsuite.sh sci)
 
-| Gate | Nền tảng toán | Vét gì |
+| Gate | Mathematical foundation | What is exhausted |
 |---|---|---|
-| `shape.sh` | ngôn ngữ chính quy + grammar automata + record-layout đệ quy | integer-literal 3.1.3.2 × escape × maximal-munch; declarator sâu ≤3 (có gọi qua fn-ptr); layout struct/union/bitfield tổ hợp member ≤3 + offset từng member |
-| `cpp.sh` | hệ viết lại hạng (term rewriting, terminating nhờ sơn-xanh) | ma trận expansion (prescan/paste/stringize/rescan) + vét cạn số học `#if` (oracle kép zcc==cc==python) |
-| `decay.sh` | type-derivation lattice (lvalue conversion 6.3.2.1) | 12 cách sinh expr array × 11 ngữ cảnh × 2 nhánh; oracle differential trên observable |
-| `alg.sh` | semilattice UAC (3.2.1.5) + commuting-square (isomorphic oracle) | op × kiểu × kiểu × corner²: ~43k điểm runtime + ~21k fold; 4 phép so gồm fold↔runtime NỘI BỘ zcc (hai đường từ cùng AST phải gặp nhau) |
-| `abi.sh` | automaton hữu hạn (AAPCS64 = máy trạng thái NGRN/NSRN/NSAA) | 292 case × 4 hướng LINK CHÉO zcc↔gcc — lỗi ABI cùng-compiler tự triệt tiêu, chỉ cross-link mới phơi |
+| `shape.sh` | regular languages + grammar automata + recursive record-layout | integer-literal 3.1.3.2 × escape × maximal-munch; declarator depth ≤3 (including calls through a fn-ptr); struct/union/bitfield layout, member combinations ≤3 + per-member offset |
+| `cpp.sh` | term rewriting (terminating due to blue-painting) | expansion matrix (prescan/paste/stringize/rescan) + exhaustive `#if` arithmetic (dual oracle zcc==cc==python) |
+| `decay.sh` | type-derivation lattice (lvalue conversion 6.3.2.1) | 12 ways to produce an array expr × 11 contexts × 2 branches; differential oracle over observables |
+| `alg.sh` | UAC semilattice (3.2.1.5) + commuting-square (isomorphic oracle) | op × type × type × corner²: ~43k runtime points + ~21k fold; 4 comparisons including fold↔runtime INTERNAL to zcc (two paths from the same AST must meet) |
+| `abi.sh` | finite automaton (AAPCS64 = an NGRN/NSRN/NSAA state machine) | 292 cases × 4 directions CROSS-LINK zcc↔gcc — a same-compiler ABI error self-cancels; only cross-link exposes it |
 
-**"Vét cạn"** = vét không gian CẤU TRÚC + mẫu biên không gian giá trị (không
-phải toàn 2^64) — nói "proof" phải kèm câu này (giới hạn trung thực).
+**"Exhaustion"** = exhausting the STRUCTURAL space + boundary samples of the
+value space (not the full 2^64) — any claim of "proof" must be qualified with
+this sentence (honest bounds).
 
-**Điểm yếu lý thuyết cần củng cố (Vu 2026-08-20)**: tầng ABI/register/memory-
-layout/ELF KHÔNG có chuẩn ISO trấn giữ (chỉ AAPCS64 + ELF psABI). Ground truth
-ở đây = spec ABI + **reference impl gcc/ld** (khai thác qua cross-link automaton
-của abi.sh). abi.sh là guardian mỏng nhất → ưu tiên mở rộng: return HFA/composite,
-C.11 split reg↔stack, variadic edge, over-align, tích đầy đủ 9×9 khi counter trộn.
+**Theoretical weak points to be reinforced**: the ABI/register/memory-layout/ELF
+layer has NO ISO standard guarding it (only AAPCS64 + the ELF psABI). The ground
+truth here = the ABI spec + the **gcc/ld reference implementation** (exploited
+through abi.sh's cross-link automaton). abi.sh is the thinnest guardian → priority
+for extension: return HFA/composite, C.11 split reg↔stack, variadic edges,
+over-alignment, and the full 9×9 product when the counters are mixed.
 
-## Corpus — tầng chứng nghiệm thực tiễn (fullsuite.sh corpus)
+## Corpus — practical-corroboration layer (fullsuite.sh corpus)
 
-Khuôn chung: referee-filter (`cc` từ chối = ngoài scope → skip), differential
-exit+stdout, **gate = FAIL ⊆ baseline `*.known-fail`** (triage từng dòng).
-Chạy TUẦN TỰ (mỗi suite ăn đủ core).
+Common template: referee-filter (`cc` rejects = out of scope → skip), differential
+on exit+stdout, **gate = FAIL ⊆ baseline `*.known-fail`** (triaged line by line).
+Run SEQUENTIALLY (each suite consumes all cores).
 
-| Suite | Nguồn (clone --depth 1) | Ghi chú baseline |
+| Suite | Source (clone --depth 1) | Baseline notes |
 |---|---|---|
-| `torture.sh` | gcc-mirror/gcc (`gcc.c-torture/execute`) | **2-fact 3-đường** (xem dưới): PASS \| NOT-IMPL (`torture.not-impl`, nêu tên) \| FAIL. Gate = **0 FAIL**. Đã bắt bug thật (pr60017, pr33631, va_arg HFA, pr92904 aligned) |
-| `cts.sh` | c-testsuite/c-testsuite | oracle `.expected` (stdout-byte, không referee → rẻ/deterministic). 00162 `[const 5]`, 00219 `_Generic` (construct RIÊNG torture=0, Phase-3 pin), 00204 LD=fp128 (sổ nợ ELF) |
+| `torture.sh` | gcc-mirror/gcc (`gcc.c-torture/execute`) | **2-fact, 3-way** (see below): PASS \| NOT-IMPL (`torture.not-impl`, named) \| FAIL. Gate = **0 FAIL**. Has caught real bugs (pr60017, pr33631, va_arg HFA, pr92904 aligned) |
+| `cts.sh` | c-testsuite/c-testsuite | oracle `.expected` (stdout-byte, no referee → cheap/deterministic). 00162 `[const 5]`, 00219 `_Generic` (construct UNIQUE to torture=0, pinned in Phase-3), 00204 LD=fp128 (ELF debt) |
 
-**Đã BỎ (2026-08-21, coverage-diff cơ học):** `kr` (UB của đáp án — diff-invalid), `nora` (1630 case, 0 construct riêng — fingerprint dominated bởi torture mọi cột), `chibicc` (41 case, dup construct; `_Generic` đã có ở cts), `tcc` (Darwin-lock `xcrun`→zombie chết trong box ELF). Bằng chứng: torture áp đảo mọi construct 1-2 bậc; construct RIÊNG duy nhất của cả 4 = `_Generic`, giữ qua cts. Bootstrap-compiler (ý tưởng tcc) tái sinh ở tầng **third-party build** (đối trọng slimcc), không phải tầng construct-corpus.
+**REMOVED (mechanical coverage-diff):** `kr` (UB in the reference answer —
+diff-invalid), `nora` (1630 cases, 0 unique constructs — fingerprint dominated by
+torture in every column), `chibicc` (41 cases, duplicate constructs; `_Generic`
+already covered by cts), `tcc` (Darwin-locked `xcrun` → zombie dies inside the ELF
+box). Evidence: torture dominates every construct by 1-2 orders of magnitude; the
+only construct UNIQUE across all four = `_Generic`, retained via cts. The
+bootstrap-compiler idea (from tcc) is reborn at the **third-party build** layer
+(counterweight slimcc), not at the construct-corpus layer.
 
-### torture 2-fact — hợp đồng phân loại (chống skip ngầm)
+### torture 2-fact — classification contract (against silent skipping)
 
-`torture.sh` KHÔNG dùng known-fail/skip nữa. Referee = `cc -std=c99 -w -O0`
-(gcc trong box, trọng tài độc lập & native cho suite này). Mỗi case đúng 1 nhãn:
+`torture.sh` no longer uses known-fail/skip. Referee = `cc -std=c99 -w -O0` (gcc
+inside the box, an independent referee native to this suite). Each case receives
+exactly 1 label:
 
-- **PASS** — zcc compile chương trình C99-hợp-lệ → binary exit 0 (self-check abort()).
-- **NOT-IMPL** — không phải bug; ghi vào `torture.not-impl` NÊU ĐÍCH DANH lý do:
-  - `oracle-invalid` — referee c99 tự từ chối/không-chạy-sạch (gcc-ext, target-
-    specific, UB). Reason = dòng `error:` của gcc.
-  - `zcc-reject` — referee OK nhưng zcc in `zcc:…` rồi exit 1, KHÔNG đẻ binary,
-    KHÔNG crash (trung thực chưa cài). Reason = diagnostic zcc (`<case>:<ln>: msg`).
-- **FAIL** — zcc NUỐT C99-hợp-lệ rồi sai/crash (chỉ số phải = 0): `runtime`
-  (đẻ binary nhưng sai/abort), `backend` (exit 1 KHÔNG có `zcc:` → as/ld nghẹn
-  asm rác), `crash` (panic/signal). Đây là cái reviewer sợ: nuốt-rồi-crash thay
-  vì reject-lúc-compile.
+- **PASS** — zcc compiles a valid C99 program → binary exits 0 (self-check
+  abort()).
+- **NOT-IMPL** — not a bug; recorded in `torture.not-impl`, NAMING the specific
+  reason:
+  - `oracle-invalid` — the c99 referee itself rejects it / does not run cleanly
+    (gcc-ext, target-specific, UB). Reason = gcc's `error:` line.
+  - `zcc-reject` — the referee is OK but zcc prints `zcc:…` then exits 1, produces
+    NO binary and does NOT crash (honestly not yet implemented). Reason = the zcc
+    diagnostic (`<case>:<ln>: msg`).
+- **FAIL** — zcc SWALLOWS a valid C99 program then miscompiles/crashes (the count
+  must be = 0): `runtime` (produces a binary but wrong/abort), `backend` (exit 1
+  WITHOUT a `zcc:` line → as/ld chokes on junk asm), `crash` (panic/signal). This
+  is what a reviewer fears: swallow-then-crash instead of reject-at-compile.
 
-**LUẬT BẢO TOÀN** (enforce, không phải lời hứa): `pass+not-impl+fail` phải =
-số case nạp; mỗi case xuất hiện ĐÚNG 1 verdict. Case bốc hơi (worker chết/treo)
-hoặc trùng → harness TỰ ĐỎ ngay, không cho xanh giả. → verdict xanh chỉ hợp lệ
-khi đẳng thức đóng; reviewer/Vu đối chiếu 1 dòng, không cần tin Claude.
+**CONSERVATION LAW** (enforced, not a promise): `pass+not-impl+fail` must = the
+number of cases loaded; each case appears with exactly 1 verdict. A vanished case
+(worker died/hung) or a duplicate → the harness TURNS RED immediately, allowing no
+false green. → a green verdict is valid only when the equation is closed; a
+reviewer verifies one line, without having to trust any narration.
 
 ## App — musl libc (fullsuite.sh app)
 
 `musl-box.sh` / `musl.sh`: build musl 1.2.5 + libc-test, differential
-`F_zcc \ F_ref` (referee musl-gcc). LDBL64 port; sổ nợ `-shared`/.so, wide/mbc.
-Là phần mềm thật DUY NHẤT giữ lại (nền minimal-distro) — test kỹ.
+`F_zcc \ F_ref` (referee musl-gcc). LDBL64 port; outstanding debt `-shared`/.so,
+wide/mbc. It is the ONLY real software retained (foundation of the minimal-distro)
+— test it thoroughly.
 
-## float_h — lệch chuẩn CÓ SỔ (base differential)
+## float_h — a DOCUMENTED standard deviation (base differential)
 
-zcc chọn `long double = double` trên ELF (HỢP LỆ C99 §5.2.4.2.2 "LD ≥ double";
-MSVC cùng lựa chọn), `float.h` khai `LDBL_MANT_DIG=53` cho TỰ NHẤT QUÁN (memory
-vẫn binary128 cho ABI interop). Linux `cc` dùng binary128 (113) → `cases/
-float_h.c` diff, fail khách quan DUY NHẤT trong box, đã vào `cases.known-fail`.
-Trên mac (Darwin LD=double) case này pass.
+zcc chooses `long double = double` on ELF (VALID per C99 §5.2.4.2.2 "LD ≥ double";
+MSVC makes the same choice), and `float.h` declares `LDBL_MANT_DIG=53` for
+SELF-CONSISTENCY (memory layout stays binary128 for ABI interop). Linux `cc` uses
+binary128 (113) → `cases/float_h.c` differs, the ONLY objective failure inside the
+box, already recorded in `cases.known-fail`. On the mac (Darwin LD=double) this
+case passes.
 
-Nguyên tắc baseline: mỗi dòng known-fail phải có giải thích (bảng này / đầu file
-`*.known-fail` / commit). **Baseline KHÔNG phải thùng rác giấu bug** — fail mới
-không giải thích được = bug zcc cho tới khi chứng minh ngược lại (luật suy đoán
-tội, CLAUDE.md).
+Baseline principle: every known-fail line must carry an explanation (this table /
+the head of the `*.known-fail` file / the commit). **The baseline is NOT a trash
+can for hiding bugs** — a new, unexplained failure = a zcc bug until proven
+otherwise (presumption-of-guilt rule, CLAUDE.md).
 
-## Bẫy đã trả học phí (đọc trước khi debug "ma")
+## Traps already paid for (read before debugging "ghosts")
 
-- **Lỗi ABI cùng-compiler tự triệt tiêu** — integration test chạy ngon vẫn có
-  thể sai ABI; chỉ link CHÉO zcc↔gcc (abi.sh) mới phơi.
-- **Offset arg sống ở 3 nơi phải khớp từng byte**: codegen `call()`, codegen
-  spill prologue, parser `va_off`. Sửa 1 = sửa 3 + chạy abi.sh.
-- **Implicit-int cắt pointer/double**: libc thiếu prototype → return int → (1)
-  pointer sxtw cắt 64-bit → segfault phụ thuộc ASLR (heisenbug); (2) return
-  double ở d0 nhưng caller đọc x0 rác → sai LẶNG LẼ. Nghi: `nm -u` + đối chiếu
-  `src/headers/*.h`.
-- **Stale .o thế hệ cũ** → lỗi link "ma". `make distclean` trước khi debug link.
-- **Diff tại điểm UB là vô nghĩa** — chương trình đọc stdin/argv: feed source
-  làm stdin tự tạo UB (uninit var) = chính là lý do BỎ suite kr (đáp án UB).
-- **"thiếu image zcc-box" mà `docker images` VẪN liệt kê** — index tên của docker
-  bị stale: `docker image inspect zcc-box` fail nhưng inspect theo ID (716e3cce…)
-  OK. Vá: `docker tag <ID> zcc-box:latest` (thao tác local, không destructive).
+- **A same-compiler ABI error self-cancels** — an integration test that runs fine
+  may still have a wrong ABI; only cross-linking zcc↔gcc (abi.sh) exposes it.
+- **The arg offset lives in 3 places that must match byte-for-byte**: codegen
+  `call()`, the codegen spill prologue, and the parser's `va_off`. Change 1 =
+  change 3 + run abi.sh.
+- **implicit-int truncates pointer/double**: a libc missing a prototype → returns
+  int → (1) a pointer sxtw truncated to 64-bit → segfault dependent on ASLR
+  (heisenbug); (2) a returned double in d0 while the caller reads junk from x0 →
+  wrong SILENTLY. Suspect: `nm -u` + cross-check `src/headers/*.h`.
+- **A stale old-generation .o** → a "ghost" link error. Run `make distclean`
+  before debugging a link.
+- **A diff at a point of UB is meaningless** — a program reading stdin/argv:
+  feeding the source as stdin manufactures UB (uninitialized var) = exactly the
+  reason the kr suite (UB answers) was DROPPED.
+- **"missing image zcc-box" while `docker images` STILL lists it** — docker's
+  name index is stale: `docker image inspect zcc-box` fails but inspect-by-ID
+  (716e3cce…) is OK. Fix: `docker tag <ID> zcc-box:latest` (a local, non-
+  destructive operation).
+</content>
+</invoke>

@@ -1,14 +1,18 @@
-// AST + type arena — ĐƯỜNG BIÊN frontend/backend của zcc.
-// Frontend (lexer → parser) DỰNG các cấu trúc này; backend (codegen/<target>) chỉ ĐỌC.
-// Hai tầng không import lẫn nhau — mọi trao đổi đi qua file này.
-// Node tham chiếu nhau bằng NodeId(u32) vào arena Vec<Node>, không Box/reference.
-// Layout (size/align) đặt ở đây vì zcc lock họ ABI LP64 (arm64 lẫn x86_64:
-// int=4, char=1, long=ptr=8); mai này cần target ILP32 thì tham số hóa TyTab.
+// AST + type arena — the frontend/backend boundary of zcc.
+// The frontend (lexer → parser) BUILDS these structures; the backend
+// (codegen/<target>) only READS them. The two layers do not import each other;
+// all exchange passes through this file.
+// Nodes reference one another by NodeId(u32) into the arena Vec<Node>, not by
+// Box/reference.
+// Layout (size/align) lives here because zcc locks the LP64 ABI family (arm64 as
+// well as x86_64: int=4, char=1, long=ptr=8); a future ILP32 target would
+// parameterize TyTab.
 //
-// Quy ước giá trị runtime (hợp đồng parser ↔ codegen): mọi giá trị scalar sống
-// trong thanh ghi 64-bit "canonical" — số nguyên sign/zero-extend đúng theo kiểu,
-// float/double giữ BIT PATTERN f64 (float được nâng lên double ngay khi load).
-// Nhờ vậy default argument promotion (char/short→int, float→double) là no-op.
+// Runtime value convention (the parser ↔ codegen contract): every scalar value
+// lives in a 64-bit "canonical" register — integers are sign/zero-extended
+// according to their type, float/double retain the f64 BIT PATTERN (a float is
+// widened to double as soon as it is loaded). As a result, default argument
+// promotion (char/short→int, float→double) is a no-op.
 
 pub type NodeId = u32;
 pub type TypeId = u32;
@@ -16,7 +20,7 @@ pub type TypeId = u32;
 #[derive(Clone, Copy)]
 pub enum Ty {
     Void,
-    Char, // signed trên Darwin; "signed char" cũng map vào đây
+    Char, // signed on Darwin; "signed char" also maps here
     UChar,
     Short,
     UShort,
@@ -25,20 +29,21 @@ pub enum Ty {
     Long,
     ULong,
     Float,
-    Double, // long double = double trên arm64 Darwin
-    // C99: long double trên ELF (AAPCS64 Linux = binary128). Quy ước zcc:
-    // MEMORY là binary128 thật 16/16 (psABI đúng — struct/global/va-slot khớp
-    // gcc), REGISTER vẫn canonical f64; nới/hạ tại load/store/biên ABI bằng
-    // __extenddftf2/__trunctfdf2 (libgcc). Số học chạy double — float.h khai
-    // LDBL_MANT_DIG 53 nên tự nhất quán C99. Darwin KHÔNG sinh type này
-    // (parser map long double → DOUBLE, ABI Apple vốn thế).
+    Double, // long double = double on arm64 Darwin
+    // C99: long double on ELF (AAPCS64 Linux = binary128). zcc convention:
+    // MEMORY is true 16/16 binary128 (psABI-correct — struct/global/va-slot match
+    // gcc), the REGISTER stays canonical f64; widening/narrowing happens at
+    // load/store/ABI boundaries via __extenddftf2/__trunctfdf2 (libgcc).
+    // Arithmetic runs at double — float.h declares LDBL_MANT_DIG 53, so this is
+    // self-consistent under C99. Darwin does NOT produce this type (the parser
+    // maps long double → DOUBLE, which is the native Apple ABI).
     LDouble,
     Ptr(TypeId),
     Array(TypeId, u64),
-    Struct(u32), // index vào TyTab.structs; union cũng nằm đây (khác nhau lúc dựng offset)
-    Func(u32),   // index vào TyTab.fns
-    Bitfield(TypeId, u32, u32), // (kiểu chứa, bit offset trong đơn vị, độ rộng bit)
-    Bool,        // _Bool: store/cast normalize về 0/1
+    Struct(u32), // index into TyTab.structs; unions live here too (they differ only at offset construction)
+    Func(u32),   // index into TyTab.fns
+    Bitfield(TypeId, u32, u32), // (container type, bit offset within the unit, bit width)
+    Bool,        // _Bool: store/cast normalizes to 0/1
 }
 pub const VOID: TypeId = 0;
 pub const CHAR: TypeId = 1;
@@ -56,7 +61,7 @@ pub const LDOUBLE: TypeId = 12;
 
 #[derive(Clone)]
 pub struct StructDef {
-    pub members: Vec<(String, TypeId, u32)>, // (tên, kiểu, offset)
+    pub members: Vec<(String, TypeId, u32)>, // (name, type, offset)
     pub size: u32,
     pub align: u32,
     pub is_union: bool,
@@ -66,9 +71,9 @@ pub struct StructDef {
 pub struct FnSig {
     pub ret: TypeId,
     pub params: Vec<TypeId>,
-    pub pnames: Vec<String>, // tên param (rỗng nếu abstract); old-style: chỉ có tên
+    pub pnames: Vec<String>, // parameter names (empty if abstract); old-style: name only
     pub variadic: bool,
-    pub oldstyle: bool, // "()" hoặc ident-list: gọi không kiểm tra, arg đều "đặt tên"
+    pub oldstyle: bool, // "()" or ident-list: calls are unchecked, all args are "named"
 }
 
 pub struct TyTab {
@@ -80,7 +85,7 @@ pub struct TyTab {
 impl TyTab {
     pub fn new() -> Self {
         TyTab {
-            // thứ tự khớp các hằng VOID..DOUBLE phía trên
+            // order matches the VOID..DOUBLE constants above
             tys: vec![
                 Ty::Void,
                 Ty::Char,
@@ -102,7 +107,7 @@ impl TyTab {
     }
     pub fn size(&self, t: TypeId) -> u32 {
         match self.tys[t as usize] {
-            Ty::Void => 1, // EXT(gcc): void* arith; sizeof(void) C89 vốn không hợp lệ
+            Ty::Void => 1, // EXT(gcc): void* arithmetic; sizeof(void) is invalid under C89
             Ty::Char | Ty::UChar | Ty::Bool => 1,
             Ty::Short | Ty::UShort => 2,
             Ty::Int | Ty::UInt | Ty::Float => 4,
@@ -113,8 +118,9 @@ impl TyTab {
             Ty::Bitfield(b, ..) => self.size(b),
         }
     }
-    // sizeof cần u64: mảng khai trong sizeof(int[2^33][...]) hợp lệ dù không
-    // cấp phát được object cỡ đó (layout thật vẫn dùng size() u32)
+    // sizeof needs u64: an array declared in sizeof(int[2^33][...]) is valid even
+    // though no object of that size can be allocated (actual layout still uses
+    // size() u32)
     pub fn size64(&self, t: TypeId) -> u64 {
         match self.tys[t as usize] {
             Ty::Array(e, n) => self.size64(e) * n,
@@ -128,10 +134,10 @@ impl TyTab {
             _ => self.size(t),
         }
     }
-    // gcc DATA_ALIGNMENT/LOCAL_ALIGNMENT (aarch64): aggregate (array/struct)
-    // nâng align tối thiểu 8 (BITS_PER_WORD) để tăng tốc truy cập — zcc theo cho
-    // drop-in parity: static/stack array land như gcc (đo: gcc cho char[2..64]
-    // đều 8). Scalar giữ natural.
+    // gcc DATA_ALIGNMENT/LOCAL_ALIGNMENT (aarch64): an aggregate (array/struct)
+    // raises its alignment to at least 8 (BITS_PER_WORD) to speed up access — zcc
+    // follows for drop-in parity: static/stack arrays land as gcc does (measured:
+    // gcc aligns char[2..64] to 8). Scalars keep their natural alignment.
     pub fn data_align(&self, t: TypeId) -> u32 {
         match self.tys[t as usize] {
             Ty::Array(..) | Ty::Struct(_) => self.align(t).max(8),
@@ -169,8 +175,9 @@ impl TyTab {
                 | Ty::Bool
         )
     }
-    // HFA (AAPCS64): struct mà mọi member cùng là float hoặc cùng double, 1-4 cái
-    // → đi/về bằng v0-v7 thay vì GPR/gián tiếp. Trả (là double, số member).
+    // HFA (AAPCS64): a struct whose members are all float or all double, 1-4 of
+    // them → passed/returned in v0-v7 instead of GPRs/indirectly. Returns
+    // (is double, member count).
     pub fn hfa(&self, t: TypeId) -> Option<(bool, u32)> {
         let Ty::Struct(si) = self.tys[t as usize] else {
             return None;
@@ -189,7 +196,7 @@ impl TyTab {
         }
         Some((dbl, sd.members.len() as u32))
     }
-    // FnSig của một giá trị gọi được: hàm hoặc con trỏ hàm
+    // FnSig of a callable value: a function or a function pointer
     pub fn fnsig(&self, t: TypeId) -> Option<&FnSig> {
         match self.tys[t as usize] {
             Ty::Func(i) => Some(&self.fns[i as usize]),
@@ -209,37 +216,38 @@ impl TyTab {
     }
 }
 
-// EXT(gcc): họ builtin atomic __sync_* (M12) — bảng tên ở ext.rs, codegen phát
-// vòng LL/SC ldaxr/stlxr. Nằm ở ast.rs vì đây là boundary parser ↔ codegen.
+// EXT(gcc): the __sync_* atomic builtin family — the name table is in ext.rs,
+// codegen emits an LL/SC ldaxr/stlxr loop. It lives in ast.rs because this is the
+// parser ↔ codegen boundary.
 #[derive(Clone, Copy, Debug)]
 pub enum SyncOp {
-    FetchAdd, // __sync_fetch_and_add — trả giá trị CŨ
-    AddFetch, // __sync_add_and_fetch — trả giá trị MỚI
+    FetchAdd, // __sync_fetch_and_add — returns the OLD value
+    AddFetch, // __sync_add_and_fetch — returns the NEW value
     FetchSub,
     SubFetch,
-    ValCas,  // __sync_val_compare_and_swap — trả giá trị cũ
-    BoolCas, // __sync_bool_compare_and_swap — trả 1/0
+    ValCas,  // __sync_val_compare_and_swap — returns the old value
+    BoolCas, // __sync_bool_compare_and_swap — returns 1/0
     FetchAnd, // __sync_fetch_and_and — postgres18 atomics/generic-gcc.h
     FetchOr,  // __sync_fetch_and_or
     FetchXor, // __sync_fetch_and_xor
-    TestSet, // __sync_lock_test_and_set — atomic exchange, trả giá trị cũ
-    Release, // __sync_lock_release — ghi 0 với release barrier
+    TestSet, // __sync_lock_test_and_set — atomic exchange, returns the old value
+    Release, // __sync_lock_release — writes 0 with a release barrier
     Barrier, // __sync_synchronize — dmb ish
 }
 
 pub enum Node {
     Num(i64),
     FNum(f64),
-    Var(u32),               // offset local dưới frame pointer
-    GVar(u32),              // index vào Ast.globals
-    Member(NodeId, u32),    // địa chỉ base + offset; kiểu = kiểu member
+    Var(u32),               // local offset below the frame pointer
+    GVar(u32),              // index into Ast.globals
+    Member(NodeId, u32),    // base address + offset; type = member type
     Assign(NodeId, NodeId), // lvalue = expr
     Addr(NodeId),
     Deref(NodeId),
     Neg(NodeId),
-    Cast(NodeId), // kiểu đích = kiểu của chính node này trong Ast.types
-    Bin(&'static str, NodeId, NodeId), // op = chính punct: "+" "<=" ...
-    Cond(NodeId, NodeId, NodeId), // ?: — && || ! cũng desugar về đây/Bin
+    Cast(NodeId), // target type = this node's own type in Ast.types
+    Bin(&'static str, NodeId, NodeId), // op = the punctuator itself: "+" "<=" ...
+    Cond(NodeId, NodeId, NodeId), // ?: — && || ! also desugar to this/Bin
     Comma(NodeId, NodeId),
     Post(&'static str, NodeId, i64), // x++/x--: op "+"/"-", lvalue, delta (1 | sizeof pointee)
     Ret(Option<NodeId>),
@@ -247,68 +255,73 @@ pub enum Node {
     While(NodeId, NodeId),
     For(Option<NodeId>, Option<NodeId>, Option<NodeId>, NodeId),
     Do(NodeId, NodeId), // body, cond
-    // cond, body, (giá trị case → NodeId của Case), Case default. Label đích
-    // của case = "LC{node id của Case}" — id arena duy nhất nên khỏi cấp phát.
-    // cases = (lo, hi, Case-id); single value ⟺ lo==hi. EXT(gcc): case lo...hi.
+    // cond, body, (case value → NodeId of the Case), default Case. The target
+    // label of a case is "LC{node id of the Case}" — the arena id is unique, so
+    // no separate allocation is needed. cases = (lo, hi, Case-id); a single value
+    // ⟺ lo==hi. EXT(gcc): case lo...hi.
     Switch(NodeId, NodeId, Vec<(i64, i64, NodeId)>, Option<NodeId>),
     Case(NodeId),
     Break,
     Continue,
     Goto(String),
-    GotoPtr(NodeId),   // EXT(gcc): "goto *e" — br qua giá trị
-    LabelAddr(String), // EXT(gcc): "&&label" — địa chỉ label trong hàm hiện tại
+    GotoPtr(NodeId),   // EXT(gcc): "goto *e" — branch through a value
+    LabelAddr(String), // EXT(gcc): "&&label" — address of a label in the current function
     Label(String, NodeId),
     Block(Vec<NodeId>),
-    Call(String, Vec<NodeId>, u32), // gọi thẳng theo tên; nreg = số arg đầu "đặt tên"
-    CallPtr(NodeId, Vec<NodeId>, u32), // gọi qua con trỏ hàm (blr)
-    SRet(NodeId, u32, u32), // call trả struct ≤16B: (call, offset temp local, size) — giá trị = địa chỉ temp
-    Zero(NodeId, u32),      // ghi 0 lên `size` byte tại lvalue (zero-fill trước initializer)
-    FunAddr(String),        // địa chỉ hàm theo tên (qua GOT)
-    VaArea(u32),            // builtin __va_area__: x29 + offset (đầu vùng arg vô danh variadic)
-    // ELF/AAPCS: va_list = struct 32 byte, không phải char* — hai builtin thật
-    // (Darwin không sinh: stdarg.h nhánh Apple vẫn đi đường macro + VaArea)
-    VaStart(NodeId),       // __builtin_va_start(ap, last): điền 5 field từ prologue
-    // __builtin_va_arg(ap, T): chọn vùng GP/VR/stack theo T; u32 = offset local
-    // scratch (parser cấp khi T là struct — HFA từ VR save area nằm rải mỗi
-    // member 1 q-slot 16B, backend gather về scratch liên tục)
+    Call(String, Vec<NodeId>, u32), // direct call by name; nreg = count of leading "named" args
+    CallPtr(NodeId, Vec<NodeId>, u32), // call through a function pointer (blr)
+    SRet(NodeId, u32, u32), // call returning a struct ≤16B: (call, local temp offset, size) — value = temp address
+    Zero(NodeId, u32),      // write 0 over `size` bytes at an lvalue (zero-fill before an initializer)
+    FunAddr(String),        // address of a function by name (via GOT)
+    VaArea(u32),            // builtin __va_area__: x29 + offset (start of the variadic anonymous-arg area)
+    // ELF/AAPCS: va_list = a 32-byte struct, not char* — two real builtins
+    // (not produced on Darwin: the Apple branch of stdarg.h still goes via
+    // macros + VaArea)
+    VaStart(NodeId),       // __builtin_va_start(ap, last): fill 5 fields from the prologue
+    // __builtin_va_arg(ap, T): select the GP/VR/stack area according to T; u32 =
+    // local scratch offset (the parser allocates it when T is a struct — an HFA
+    // from the VR save area is scattered one 16B q-slot per member, and the
+    // backend gathers it into contiguous scratch)
     VaArg(NodeId, TypeId, u32),
-    Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = size operand 4|8
+    Sync(SyncOp, Vec<NodeId>, u32), // EXT(gcc): atomics; args = (ptr[, val[, val2]]), u32 = operand size 4|8
     // EXT(gcc): __builtin_{add,sub,mul}_overflow(a, b, res). op 0=+ 1=- 2=*.
-    // Ngữ nghĩa ℤ: tính a∘b vô hạn hạng, *res = cắt về typeof(*res), trả 1 nếu
-    // KHÔNG biểu diễn được. Signedness/width đọc từ types[] tại codegen.
+    // ℤ semantics: compute a∘b at infinite precision, *res = truncate to
+    // typeof(*res), return 1 if it is NOT representable. Signedness/width are read
+    // from types[] at codegen.
     Overflow(u8, NodeId, NodeId, NodeId),
-    // EXT(gcc): inline asm subset (xxhash/M14; musl/M17 nới constraint).
-    // Đánh số operand kiểu GCC: %0.. = outputs rồi inputs.
+    // EXT(gcc): inline asm subset (xxhash/M14; musl/M17 widens the constraints).
+    // GCC-style operand numbering: %0.. = outputs then inputs.
     Asm(String, Vec<AsmOp>),
-    Alloca(NodeId), // cấp phát động trên stack; epilogue mov sp,x29 tự thu hồi
+    Alloca(NodeId), // dynamic allocation on the stack; the epilogue mov sp,x29 reclaims it
     Str(u32),
 }
 
-// EXT(gcc): một operand asm — bề mặt musl đòi (syscall/atomic/math):
-// "r"/"=r"/"+r"/"=&r" (pool GP x9..x15), "w" các biến thể (pool FP v16..v22),
-// "Q"/"m" (truyền ĐỊA CHỈ, %k in "[xN]"), "0".. (chung reg với operand k),
-// pin từ `register long v __asm__("x8")`. Ở ast.rs vì là boundary parser↔codegen.
+// EXT(gcc): one asm operand — the surface musl requires (syscall/atomic/math):
+// "r"/"=r"/"+r"/"=&r" (GP pool x9..x15), "w" and its variants (FP pool v16..v22),
+// "Q"/"m" (pass an ADDRESS, %k prints "[xN]"), "0".. (share a register with
+// operand k), a pin from `register long v __asm__("x8")`. In ast.rs because it is
+// the parser↔codegen boundary.
 #[derive(Clone)]
 pub struct AsmOp {
     pub e: NodeId,
-    pub out: bool,        // thuộc section output
-    pub rw: bool,         // "+": nạp giá trị trước template
-    pub mem: bool,        // "Q"/"m": operand là địa chỉ bộ nhớ
+    pub out: bool,        // belongs to the output section
+    pub rw: bool,         // "+": load the value before the template
+    pub mem: bool,        // "Q"/"m": the operand is a memory address
     pub fp: bool,         // "w": v-register
-    pub tied: Option<u8>, // "k": dùng chung reg với operand k
-    pub pin: Option<u8>,  // số reg GP ghim cứng (x8 → 8)
+    pub tied: Option<u8>, // "k": share a register with operand k
+    pub pin: Option<u8>,  // a hard-pinned GP register number (x8 → 8)
 }
 
 #[derive(Clone)]
 pub enum GInit {
     None,
-    Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
+    Num(i64), // for a float type: this is the BIT PATTERN (f32/f64 depending on size)
     Str(u32),
-    Addr(String, i64), // symbol + offset byte: int *p = &g.m; (prefix \x01 = tên đủ, không thêm _)
-    Diff(String, String), // EXT(gcc): hiệu 2 symbol &&a - &&b (static jump table)
-    StrOff(u32, i64),  // địa chỉ vào giữa string literal: "abc" + 1, &"X"[0]
-    Bytes(Vec<u8>),    // char arr[] = "..." (đã pad đủ size)
-    List(Vec<(u32, u32, GInit)>), // initializer phẳng hóa: (offset, size, item)
+    Addr(String, i64), // symbol + byte offset: int *p = &g.m; (prefix \x01 = literal name, no leading _)
+    Diff(String, String), // EXT(gcc): difference of two symbols &&a - &&b (static jump table)
+    StrOff(u32, i64),  // address into the middle of a string literal: "abc" + 1, &"X"[0]
+    Bytes(Vec<u8>),    // char arr[] = "..." (already padded to size)
+    List(Vec<(u32, u32, GInit)>), // flattened initializer: (offset, size, item)
 }
 
 pub struct Global {
@@ -316,56 +329,61 @@ pub struct Global {
     pub ty: TypeId,
     pub init: GInit,
     pub is_static: bool,
-    pub is_extern: bool, // chỉ khai báo — không phát storage
-    // EXT(gcc): __thread — storage TLS Mach-O (__thread_data + descriptor
-    // __thread_vars), access qua @TLVPPAGE + gọi tlv_get_addr
+    pub is_extern: bool, // declaration only — no storage emitted
+    // EXT(gcc): __thread — Mach-O TLS storage (__thread_data + the __thread_vars
+    // descriptor), accessed via @TLVPPAGE + a call to tlv_get_addr
     pub is_tls: bool,
-    // EXT(gcc): __attribute__((weak)) — .weak thay .globl (musl libc.h `weak`)
+    // EXT(gcc): __attribute__((weak)) — .weak instead of .globl (musl libc.h `weak`)
     pub is_weak: bool,
 }
 
 pub struct Func {
     pub name: String,
-    pub params: Vec<(u32, TypeId)>, // (offset, kiểu) để spill thanh ghi arg vào slot
-    pub frame: u32,                 // đã tròn 16
+    pub params: Vec<(u32, TypeId)>, // (offset, type) for spilling argument registers to slots
+    pub frame: u32,                 // already rounded to 16
     pub body: NodeId,
     pub ret: TypeId,
     pub is_static: bool,
-    // EXT(gcc): định nghĩa inline (không có declaration trần C99 6.7.4p7):
-    // DCE khi không ai dùng (như clang); non-static thì phát external weak
-    // để nhiều TU cùng phát vẫn coalesce, không duplicate
+    // EXT(gcc): an inline definition (with no plain declaration, C99 6.7.4p7):
+    // subject to DCE when unused (as clang does); when non-static it is emitted as
+    // external weak so multiple TUs emitting it coalesce rather than duplicate
     pub is_inline: bool,
-    pub is_weak: bool, // EXT(gcc): __attribute__((weak)) trên definition
+    pub is_weak: bool, // EXT(gcc): __attribute__((weak)) on a definition
     pub variadic: bool,
-    pub sret: u32, // ≠0: slot giấu con trỏ x8 (trả struct >16B gián tiếp)
-    // C99 6.8.6.1: có VLA → codegen phải reset SP về base tại label (goto rời
-    // scope VLA phải dealloc; nếu không, VLA trong vòng lặp goto tràn stack)
+    pub sret: u32, // ≠0: the hidden x8-pointer slot (struct >16B returned indirectly)
+    // C99 6.8.6.1: presence of a VLA → codegen must reset SP to base at a label (a
+    // goto leaving the VLA scope must deallocate; otherwise a VLA inside a goto
+    // loop overflows the stack)
     pub has_vla: bool,
 }
 
-// Target duy nhất: AArch64 ELF (Linux). Hành vi ABI-specific (char signedness,
-// va, long double width) cố định ELF trong frontend; khi thêm target thứ 2 các
-// tham số đó về TyTab (không rải điều kiện) + backend file mới + nhánh IR-lowering.
+// Sole target: AArch64 ELF (Linux). ABI-specific behavior (char signedness, va,
+// long double width) is fixed to ELF in the frontend; adding a second target
+// would move those parameters into TyTab (rather than scattering conditionals) +
+// a new backend file + an IR-lowering branch.
 pub struct Ast {
     pub nodes: Vec<Node>,
-    pub types: Vec<TypeId>, // song song với nodes
+    pub types: Vec<TypeId>, // parallel to nodes
     pub tt: TyTab,
     pub funcs: Vec<Func>,
     pub globals: Vec<Global>,
-    pub strs: Vec<Vec<u8>>, // string literal, backend tự chọn section/label
-    // EXT(gcc): __asm__("...") cấp toàn cục — phát verbatim (musl crt_arch.h
-    // định nghĩa _start bằng asm trần)
+    pub strs: Vec<Vec<u8>>, // string literals; the backend chooses the section/label
+    // EXT(gcc): a top-level __asm__("...") — emitted verbatim (musl crt_arch.h
+    // defines _start with bare asm)
     pub raw_asm: Vec<String>,
-    // EXT(gcc): __attribute__((alias("old"))) — (tên mới, tên cũ, weak?);
-    // musl weak_alias() dệt toàn bộ bề mặt public symbol bằng món này
+    // EXT(gcc): __attribute__((alias("old"))) — (new name, old name, weak?);
+    // musl weak_alias() weaves its entire public-symbol surface out of this
     pub aliases: Vec<(String, String, bool)>,
-    // -fPIC (driver set sau parse): ELF .so — global non-static preemptible,
-    // backend phải đi GOT thay adrp trực tiếp
+    // -fPIC (set by the driver after parse): ELF .so — a non-static global is
+    // preemptible, so the backend must go through the GOT instead of a direct adrp
     pub pic: bool,
-    // EXT(gcc): prototype/extern mang weak — TU phát .weak để undef ref là weak
+    // EXT(gcc): a weak prototype/extern — the TU emits .weak so the undefined
+    // reference is weak
     pub weak_decls: Vec<String>,
-    // C99 6.7.3: TU có volatile. IR không mô hình volatile (qualifier bị nuốt) nên
-    // ⟦·⟧-preservation của opt-pass chỉ chứng cho input volatile-free → gate ZCC_OPT
-    // bỏ opt khi cờ này bật (opt chạy TRONG mảnh định lý giữ). Sound-by-construction.
+    // C99 6.7.3: the TU contains volatile. The IR does not model volatile (the
+    // qualifier is dropped), so ⟦·⟧-preservation of the opt pass is only proven
+    // for volatile-free input → the ZCC_OPT gate disables opt when this flag is
+    // set (opt then runs WITHIN the fragment the theorem covers). Sound by
+    // construction.
     pub has_volatile: bool,
 }

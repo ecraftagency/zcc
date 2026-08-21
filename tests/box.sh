@@ -1,13 +1,14 @@
 #!/bin/sh
-# box.sh — ITERATION zcc-ELF trong docker box (target THẬT + nhanh 35× so mac).
-# macOS clang compile+exec ~2.7s/lần → torture mac ~19ph; box static-musl ~16s.
-# Rebuild ELF debug (~2s) rồi chạy trong container ephemeral (--rm), ELF bind-mount
-# nên luôn tươi, không docker cp. Bug ELF-specific (fall-off-main, float_h) CHỈ
-# tái hiện ở đây. Cần image 'zcc-box' + cache suite (xem tests/README.md).
-# Dùng:
-#   tests/box.sh torture              # suite torture (16s) — gate ELF
-#   tests/box.sh c FILE.c             # compile+run 1 file, in exit code + output
-#   tests/box.sh s 'shell...'         # shell tùy ý; có $ZCC, /suites, /work/zcc
+# box.sh — ITERATION on zcc-ELF inside the docker box (the REAL target + 35× faster
+# than the mac). macOS clang compile+exec is ~2.7s per run → torture on the mac
+# ~19min; the static-musl box ~16s. Rebuild the ELF debug (~2s) then run inside an
+# ephemeral container (--rm); the ELF is bind-mounted so it is always fresh, no
+# docker cp. ELF-specific bugs (fall-off-main, float_h) reproduce ONLY here.
+# Requires the 'zcc-box' image + the suite cache (see tests/README.md).
+# Usage:
+#   tests/box.sh torture              # torture suite (16s) — ELF gate
+#   tests/box.sh c FILE.c             # compile+run 1 file, print exit code + output
+#   tests/box.sh s 'shell...'         # arbitrary shell; has $ZCC, /suites, /work/zcc
 set -eu
 cd "$(dirname "$0")/.."
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
@@ -22,5 +23,5 @@ case "$cmd" in
     c) f=$1; $DR sh -c 'b=$(basename "'"$f"'"); cp "/work/zcc/'"$f"'" /tmp/x.c 2>/dev/null || cp "'"$f"'" /tmp/x.c;
          if zcc /tmp/x.c -o /tmp/x 2>/tmp/e; then /tmp/x; echo "[exit=$?]"; else echo "COMPILE-FAIL:"; cat /tmp/e; fi' ;;
     s) $DR sh -c "$1" ;;
-    *) echo "box.sh: lệnh lạ '$cmd' (torture|c FILE|s SHELL)"; exit 2 ;;
+    *) echo "box.sh: unknown command '$cmd' (torture|c FILE|s SHELL)"; exit 2 ;;
 esac

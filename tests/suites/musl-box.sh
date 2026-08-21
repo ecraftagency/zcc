@@ -1,24 +1,25 @@
 #!/bin/sh
-# Suite 7b — musl libc FULL BUILD (thăng cấp musl.sh compile-only, trả nợ M17).
-# Chạy TRONG box Linux (zcc-box): cần $ZCC = binary zcc ELF static, cây nguồn
-# musl-1.2.5 + libc-test trong $SUITES (mặc định /suites = mount của
-# ~/.cache/zcc-suites). Referee 2 tầng: gcc+glibc cho smoke (khớp byte),
-# musl-gcc cho libc-test (F_zcc \ F_ref mới là nghi phạm — xem tests/README.md).
+# Suite 7b — musl libc FULL BUILD (an upgrade of the compile-only musl.sh).
+# Runs INSIDE the Linux box (zcc-box): requires $ZCC = a static ELF zcc binary, the
+# musl-1.2.5 source tree + libc-test in $SUITES (default /suites = a mount of
+# ~/.cache/zcc-suites). Two-tier referee: gcc+glibc for the smoke test (byte match),
+# musl-gcc for libc-test (only F_zcc \ F_ref are suspects — see tests/README.md).
 set -e
-: "${ZCC:?ZCC=/đường/dẫn/zcc (binary ELF)}"
+: "${ZCC:?ZCC=/path/to/zcc (ELF binary)}"
 S="${SUITES:-/suites}"
 M="$S/musl-1.2.5"
 INST="$S/musl-install"
 LT="$S/libc-test"
 
-# ---- 1. patch LDBL64 (quyết định M17: long double zcc = double → mượn nhánh
-# arm32 upstream của musl, 1 file, tự nhất quán; bản gốc giữ ở .orig)
+# ---- 1. patch LDBL64 (long double in zcc = double → borrow musl's upstream arm32
+# branch, 1 file, self-consistent; the original is kept at .orig)
 [ -f "$M/arch/aarch64/bits/float.h.orig" ] || \
     cp "$M/arch/aarch64/bits/float.h" "$M/arch/aarch64/bits/float.h.orig"
 cp "$M/arch/arm/bits/float.h" "$M/arch/aarch64/bits/float.h"
 
-# ---- 2. build sạch + install sysroot (AR/RANLIB trần: configure --target
-# sinh prefix aarch64-ar không tồn tại; SHARED_LIBS= tắt libc.so — nợ -shared)
+# ---- 2. clean build + install sysroot (bare AR/RANLIB: configure --target
+# generates the prefix aarch64-ar which does not exist; SHARED_LIBS= disables
+# libc.so — outstanding -shared debt)
 cd "$M"
 [ -f config.mak ] || ./configure CC="$ZCC" --target=aarch64
 make clean >/dev/null
@@ -28,7 +29,7 @@ rm -rf "$INST"
 make install prefix="$INST" CC="$ZCC" AR=ar RANLIB=ranlib SHARED_LIBS= >/dev/null
 echo "MUSL-BUILD-OK: $(find obj -name '*.o' | wc -l) obj, $(ls -l lib/libc.a | awk '{print $5}') byte libc.a"
 
-# ---- 3. smoke differential: cùng source, zcc+musl vs gcc+glibc, khớp byte
+# ---- 3. smoke differential: same source, zcc+musl vs gcc+glibc, byte match
 D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
 cat > "$D/sm.c" <<'EOF'
 #include <stdio.h>
@@ -59,9 +60,9 @@ EOF
 ZCC_SYSROOT="$INST" "$ZCC" "$D/sm.c" -o "$D/sm_zcc"
 gcc -O0 -w "$D/sm.c" -o "$D/sm_gcc"
 "$D/sm_zcc" > "$D/z.txt"; "$D/sm_gcc" > "$D/g.txt"
-cmp "$D/z.txt" "$D/g.txt" && echo "SMOKE-KHOP (byte-identical vs gcc+glibc)"
+cmp "$D/z.txt" "$D/g.txt" && echo "SMOKE-MATCH (byte-identical vs gcc+glibc)"
 
-# ---- 4. libc-test bằng zcc+sysroot; kết quả = danh sách .err (LC_ALL=C!)
+# ---- 4. libc-test with zcc+sysroot; result = the list of .err files (LC_ALL=C!)
 cd "$LT"
 find src -name '*.o' -o -name '*.exe' -o -name '*.err' -o -name '*.so' \
     -o -name '*.d' | xargs rm -f 2>/dev/null || true
@@ -69,15 +70,15 @@ printf 'CC = %s\nCFLAGS += -D_POSIX_C_SOURCE=200809L\nLDLIBS += -lpthread -lm -l
     "$ZCC" > config.mak
 ZCC_SYSROOT="$INST" make -k -j"${JOBS:-$(nproc)}" >/dev/null 2>&1 || true
 LC_ALL=C sh -c 'find src -name "*.err" -size +0c | sort' > ZCC-FAILS.txt
-echo "LIBC-TEST: $(wc -l < ZCC-FAILS.txt) err-file (danh sách: $LT/ZCC-FAILS.txt)"
+echo "LIBC-TEST: $(wc -l < ZCC-FAILS.txt) err-file (list: $LT/ZCC-FAILS.txt)"
 
-# ---- 5. differential vs referee musl-gcc (nếu đã dựng — xem tests/README.md)
+# ---- 5. differential vs the musl-gcc referee (if already built — see tests/README.md)
 REF="$S/libc-test-ref/REF-FAILS.txt"
 if [ -f "$REF" ]; then
     LC_ALL=C sort "$REF" > "$D/ref.txt"
-    echo "--- ZCC-ONLY (F_zcc \\ F_ref — nghi phạm cần triage):"
+    echo "--- ZCC-ONLY (F_zcc \\ F_ref — suspects to triage):"
     LC_ALL=C comm -23 ZCC-FAILS.txt "$D/ref.txt"
 else
-    echo "(chưa có referee musl-gcc: apt musl-tools + build libc-test-ref)"
+    echo "(no musl-gcc referee yet: apt musl-tools + build libc-test-ref)"
 fi
 echo "MUSL-BOX PASS"

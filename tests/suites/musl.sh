@@ -1,11 +1,11 @@
 #!/bin/sh
-# Suite 7 — musl libc, COMPILE-ONLY differential (musl = libc Linux: syscall +
-# ELF, không chạy được trên Darwin — full run đợi ngày có target ELF; hiến
-# chương cấm thiết kế trước). Gate đo: frontend zcc nuốt được source musl
-# (parse/typecheck/codegen ra .s) ở mọi file mà trọng tài nhận.
-# Trọng tài: clang -target aarch64-linux-musl (Mach-O không có attribute alias
-# mà weak_alias của musl đòi — phải mượn target ELF của clang; cùng LP64).
-# Gate: tập FAIL ⊆ baseline musl.known-fail.
+# Suite 7 — musl libc, COMPILE-ONLY differential (musl = the Linux libc: syscall +
+# ELF, not runnable on Darwin — a full run awaits the ELF target; the charter
+# forbids designing ahead). The gate measures: the zcc frontend accepts musl
+# source (parse/typecheck/codegen to .s) for every file the referee accepts.
+# Referee: clang -target aarch64-linux-musl (Mach-O lacks the alias attribute that
+# musl's weak_alias requires — clang's ELF target must be borrowed; same LP64).
+# Gate: the FAIL set ⊆ baseline musl.known-fail.
 set -e
 cd "$(dirname "$0")/../.."
 cargo build --quiet 2>/dev/null || cargo build
@@ -16,7 +16,7 @@ export SRC="$C/musl"
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
-# 3 header sinh (thay configure — trích từ Makefile musl, ARCH=aarch64)
+# 3 generated headers (replacing configure — extracted from the musl Makefile, ARCH=aarch64)
 mkdir -p "$D/obj/include/bits" "$D/obj/src/internal"
 sed -f "$SRC/tools/mkalltypes.sed" "$SRC/arch/aarch64/bits/alltypes.h.in" \
     "$SRC/include/alltypes.h.in" > "$D/obj/include/bits/alltypes.h"
@@ -45,6 +45,6 @@ sort "$(dirname "$0")/musl.known-fail" > "$D/known" 2>/dev/null || : > "$D/known
 new=$(comm -23 "$D/fails" "$D/known" || true)
 echo "musl (compile-only): $p pass, $s skip, $(wc -l < "$D/fails" | tr -d ' ') fail"
 if [ -n "$new" ]; then
-    echo "MUSL FAIL MỚI (ngoài baseline):"; echo "$new" | head -20; exit 1
+    echo "MUSL NEW FAIL (outside baseline):"; echo "$new" | head -20; exit 1
 fi
-echo "MUSL PASS (mọi fail đều trong baseline đã triage)"
+echo "MUSL PASS (every fail is in the triaged baseline)"

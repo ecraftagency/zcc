@@ -1,130 +1,141 @@
-// src/ir.rs — BOUNDARY MỚI frontend↔backend (contract IR).
+// src/ir.rs — the frontend↔backend boundary (the IR contract).
 //
-// Vị trí:  parser → AST (ast.rs) ──lower──▶ IR (đây) ──▶ codegen/<target> → .s
+// Position:  parser → AST (ast.rs) ──lower──▶ IR (here) ──▶ codegen/<target> → .s
 //
-// Bất biến: backend chỉ ĐỌC IR + TyTab, KHÔNG đọc AST/parser. IR là "văn phạm
-// trung gian" đã hạ hết ngữ nghĩa nguồn C (lvalue, scope, declarator) — mỗi Inst
-// là một hạng 3-address CÓ KIỂU; backend chỉ còn instruction-selection + ABI.
+// Invariant: the backend only READS the IR + TyTab; it does not read the AST or
+// parser. The IR is the "intermediate grammar" in which every C source semantic
+// (lvalue, scope, declarator) has already been lowered — each Inst is a TYPED
+// 3-address term; the backend is left with only instruction selection + ABI.
 //
-// Định lý nền (mỗi type dưới đây map một khái niệm):
-//   - Val    = toán hạng của đại số 3-address (biến t hoặc hằng).
-//   - Op     = KÝ HIỆU phép toán thuần; NGỮ NGHĨA (ring ℤ/2^n, field ℝ, dấu) do
-//              TypeId đi kèm quyết định — tách "phép" khỏi "cấu trúc đại số".
-//   - Block+Term = CFG tường minh: mỗi block kết đúng 1 terminator (đảm bảo bằng
-//              KIỂU — `term` là field, không phải phần tử cuối vector).
-//   - IrFunc = đồ thị điều khiển hữu hạn + bảng kiểu temp (Γ: Tmp → TypeId).
+// Foundational theorems (each type below maps to one concept):
+//   - Val    = an operand of the 3-address algebra (a temporary t or a constant).
+//   - Op     = a pure operator SYMBOL; the SEMANTICS (ring ℤ/2^n, field ℝ, signedness)
+//              are determined by the accompanying TypeId — separating "operation"
+//              from "algebraic structure".
+//   - Block+Term = an explicit CFG: every block ends in exactly one terminator
+//              (enforced by TYPE — `term` is a field, not the last vector element).
+//   - IrFunc = a finite control graph + the temporary type table (Γ: Tmp → TypeId).
 //
-// Baseline (Vu chốt 2026-08-20): CHỈ IR, KHOAN optimization. Pass layer để tương
-// lai — xem IR.md §5. interp/verifier là proof-checker (test-side, không tính
-// trần 10k); verifier ở đây vì nó nhẹ và là automaton kiểm ngay sau lowering.
-#![allow(dead_code)] // gỡ khi lowering (step 2) + backend IR→asm (step 3) tiêu thụ
+// Baseline: IR only, optimization deferred. The pass layer is future work — see
+// IR.md §5. The interpreter/verifier is a proof-checker (test-side; it does not
+// count against the 10k ceiling); the verifier lives here because it is light and
+// is an automaton that checks immediately after lowering.
+#![allow(dead_code)] // removed once lowering (step 2) + the backend IR→asm (step 3) consume it
 
 use crate::ast::{Ast, Node, NodeId, SyncOp, Ty, TyTab, TypeId, INT, ULONG, VOID};
 use std::collections::HashMap;
 
-pub type Tmp = u32; // định danh temp; đánh index vào IrFunc.temps (bảng kiểu Γ)
-pub type BlockId = u32; // đánh index vào IrFunc.blocks; blocks[0] = entry
+pub type Tmp = u32; // temporary identifier; indexes into IrFunc.temps (the type table Γ)
+pub type BlockId = u32; // indexes into IrFunc.blocks; blocks[0] = entry
 
-/// Toán hạng 3-address. KHÔNG lồng biểu thức — parser đã hạ cây thành chuỗi gán.
+/// A 3-address operand. Expressions are NOT nested — the parser has lowered the
+/// tree into a sequence of assignments.
 #[derive(Clone, Copy, Debug)]
 pub enum Val {
-    Tmp(Tmp),  // giá trị của một temp (SSA-free: temp có thể bị gán lại)
-    Imm(i64),  // hằng nguyên (kể cả con trỏ hằng, char, enum) — bề rộng theo ngữ cảnh
-    FImm(u64), // hằng dấu phẩy động dưới dạng BIT PATTERN (f32 ở 32 bit thấp / f64)
+    Tmp(Tmp),  // the value of a temporary (SSA-free: a temporary may be reassigned)
+    Imm(i64),  // integer constant (including constant pointers, char, enum) — width is contextual
+    FImm(u64), // floating-point constant as a BIT PATTERN (f32 in the low 32 bits / f64)
 }
 
-/// Ký hiệu phép toán nhị phân — THUẦN đại số. Dấu (signed/unsigned) và tính
-/// float lấy từ TypeId đi kèm Inst::Bin, không mã hoá ở đây. So sánh → {0,1}.
+/// A binary operator symbol — PURELY algebraic. Signedness (signed/unsigned) and
+/// floatness are taken from the TypeId accompanying Inst::Bin, not encoded here.
+/// Comparisons yield {0, 1}.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Op {
-    Add, Sub, Mul, Div, Rem, // số học: ℤ/2^n (int) hoặc ℝ (float); Div/Rem xét dấu
-    And, Or, Xor, Shl, Shr,  // bit: shr xét dấu (arith vs logic)
-    Eq, Ne, Lt, Le, Gt, Ge,  // quan hệ → 0/1; Lt..Ge xét dấu
+    Add, Sub, Mul, Div, Rem, // arithmetic: ℤ/2^n (int) or ℝ (float); Div/Rem are signedness-sensitive
+    And, Or, Xor, Shl, Shr,  // bitwise: shr is signedness-sensitive (arithmetic vs logical)
+    Eq, Ne, Lt, Le, Gt, Ge,  // relational → 0/1; Lt..Ge are signedness-sensitive
 }
 
-/// Phép toán một ngôi.
+/// A unary operator.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Un {
-    Neg,  // đối số học (int wrap 2^n / float)
-    BNot, // ~ (bù bit)
+    Neg,  // arithmetic negation (int wraps mod 2^n / float)
+    BNot, // ~ (bitwise complement)
 }
-// Ghi chú: `!` logic parser đã hạ thành `== 0` (Op::Eq với Imm 0) → không cần Un.
+// Note: logical `!` has already been lowered by the parser into `== 0` (Op::Eq with Imm 0), so no Un is needed.
 
-/// Nơi tính ĐỊA CHỈ tĩnh (Lea). Địa chỉ động (con trỏ + offset) = Bin(Add) trên
-/// giá trị con trỏ, KHÔNG có Inst riêng cho Member/Index (đã fold thành Add off).
+/// A site that computes a STATIC address (Lea). A dynamic address (pointer +
+/// offset) is Bin(Add) on the pointer value; there is no separate Inst for
+/// Member/Index (already folded into an Add of the offset).
 #[derive(Clone, Debug)]
 pub enum Place {
-    Local(u32),          // &biến local: offset khung fp-relative (tra frame)
-    Global(String, i64), // &global ± offset byte (symbol + hằng)
-    Str(u32),            // &string literal thứ i (index vào bảng strs)
+    Local(u32),          // &local variable: frame offset, fp-relative (consult the frame)
+    Global(String, i64), // &global ± byte offset (symbol + constant)
+    Str(u32),            // &the i-th string literal (index into the strs table)
 }
 
-/// Đích của lời gọi.
+/// The target of a call.
 #[derive(Clone, Debug)]
 pub enum Callee {
-    Sym(String), // gọi trực tiếp theo tên hàm
-    Ptr(Val),    // gọi gián tiếp qua con trỏ hàm
+    Sym(String), // direct call by function name
+    Ptr(Val),    // indirect call through a function pointer
 }
 
-/// Lệnh IR. Hai HẠNG (xem IR.md §2b):
-///   CORE   — interp evaluate được, verifier phủ, (tương lai) pass được đụng.
-///   OPAQUE — bọc construct exotic (va/atomic/asm/…), hạ 1-1 xuống backend Y NHƯ
-///            AST→asm cũ; interp coi hàm chứa nó là "không thuần" (bỏ qua fold).
+/// An IR instruction. Two CLASSES (see IR.md §2b):
+///   CORE   — evaluable by interp, covered by the verifier, (in future) touched by passes.
+///   OPAQUE — wraps an exotic construct (va/atomic/asm/…), lowered one-to-one to
+///            the backend exactly as the old AST→asm path did; interp treats any
+///            function containing one as "impure" (skips folding).
 #[derive(Clone, Debug)]
 pub enum Inst {
     // ---- CORE ----
-    Bin(Tmp, Op, TypeId, Val, Val), // dst = a ⟨op⟩ b, diễn giải trong TypeId
+    Bin(Tmp, Op, TypeId, Val, Val), // dst = a ⟨op⟩ b, interpreted in TypeId
     Un(Tmp, Un, TypeId, Val),       // dst = ⟨op⟩ a
-    Copy(Tmp, TypeId, Val),         // dst = a (đổi tên/nạp hằng)
-    Load(Tmp, TypeId, Val),         // dst = *(addr), bề rộng = size(TypeId)
+    Copy(Tmp, TypeId, Val),         // dst = a (rename / load a constant)
+    Load(Tmp, TypeId, Val),         // dst = *(addr), width = size(TypeId)
     Store(TypeId, Val, Val),        // *(addr) = val; (ty, addr, val)
-    Memcpy(Val, Val, u32),          // copy `size` byte *(src) → *(dst); (dst, src, size).
-    // Gán struct/union (C99 6.5.16). CORE, target-independent: interp thực thi được,
-    // mỗi backend tự hạ (loop / rep-movs / memcpy libcall) — KHÔNG cần biết AST.
-    Lea(Tmp, Place),                // dst = địa chỉ của Place
+    Memcpy(Val, Val, u32),          // copy `size` bytes *(src) → *(dst); (dst, src, size).
+    // struct/union assignment (C99 6.5.16). CORE, target-independent: interp can
+    // execute it, and each backend lowers it itself (loop / rep-movs / memcpy
+    // libcall) — no AST knowledge required.
+    Lea(Tmp, Place),                // dst = the address of Place
     Cast(Tmp, TypeId, TypeId, Val), // dst:to = cast(from → to) a  (trunc/ext/f↔i)
-    Call(Option<Tmp>, Callee, Vec<Val>, u32), // dst?, callee, args, nfix (ABI variadic)
-    // ---- EXOTIC typed (thay dần Opaque; operand-free trước) ----
-    // dst = &hàm (GOT nếu extern, adrp/add nếu static). Địa chỉ hằng-symbol,
-    // KHÔNG toán hạng Val. Giữ impure (như Opaque) → không DCE/CSE → asm bất biến.
-    FunAddr(Tmp, String),   // dst = địa chỉ hàm `name`
-    LabelAddr(Tmp, String), // EXT(gcc): dst = &&label (computed-goto) trong hàm hiện tại
-    // memset(addr, 0, sz): zero-init struct/array (C99 6.7.8). Void, side-effect
-    // ghi bộ nhớ → impure như Store, KHÔNG dst.
+    Call(Option<Tmp>, Callee, Vec<Val>, u32), // dst?, callee, args, nfix (variadic ABI)
+    // ---- EXOTIC typed (gradually replacing Opaque; operand-free first) ----
+    // dst = &function (GOT if extern, adrp/add if static). A constant-symbol
+    // address, with NO Val operand. Kept impure (like Opaque) → no DCE/CSE → invariant asm.
+    FunAddr(Tmp, String),   // dst = the address of function `name`
+    LabelAddr(Tmp, String), // EXT(gcc): dst = &&label (computed-goto) within the current function
+    // memset(addr, 0, sz): zero-initialize a struct/array (C99 6.7.8). Void, with a
+    // memory-write side effect → impure like Store, with NO dst.
     Zero(Val, u32), // *(addr .. addr+sz) = 0
-    // Variadic AAPCS64 (C99 7.15). Operand = &va_list. VaStart void; VaArg trả 1 giá
-    // trị (struct = địa chỉ). Impure (đọc/ghi va_list + save-area).
-    VaStart(Val),                    // khởi tạo *(&ap) từ trạng thái prologue
-    VaArg(Tmp, Val, TypeId, u32),    // dst = va_arg(*(&ap), t); tmp = scratch-local (HFA gather)
-    // EXT(gcc) __builtin_*_overflow: dst = (a op b tràn?); ghi kết quả vào *(rp).
-    // op = mã u8; ta/tb = kiểu toán hạng (dấu), rt = kiểu *(rp) (dấu+rộng). Impure.
+    // Variadic AAPCS64 (C99 7.15). Operand = &va_list. VaStart is void; VaArg
+    // returns one value (a struct as its address). Impure (reads/writes va_list + save-area).
+    VaStart(Val),                    // initialize *(&ap) from prologue state
+    VaArg(Tmp, Val, TypeId, u32),    // dst = va_arg(*(&ap), t); tmp = scratch local (HFA gather)
+    // EXT(gcc) __builtin_*_overflow: dst = (did a op b overflow?); the result is written to *(rp).
+    // op = u8 code; ta/tb = operand types (signedness), rt = the type of *(rp) (signedness+width). Impure.
     Overflow(Tmp, u8, TypeId, TypeId, TypeId, Val, Val, Val), // dst,op,ta,tb,rt,a,b,rp
-    VaArea(Tmp, u32), // builtin __va_area__: dst = x29 + off (đầu vùng arg vô danh)
-    // EXT(gcc): computed-goto "goto *e": br qua giá trị. Kết thúc khối theo runtime (block
-    // IR sau nó là dead — như Opaque cũ). Impure, KHÔNG dst.
+    VaArea(Tmp, u32), // builtin __va_area__: dst = x29 + off (start of the anonymous-argument area)
+    // EXT(gcc): computed-goto "goto *e": branch through a value. Ends the block at
+    // runtime (the IR block following it is dead — as with the old Opaque). Impure, with NO dst.
     GotoPtr(Val),
-    // C99 6.7.5.2 VLA / __builtin_alloca: dst = con trỏ tới `size` byte cấp trên
-    // stack (sub sp, làm tròn 16). Impure (đổi sp) → không DCE/CSE dù dst chết;
-    // epilogue `mov sp,x29` thu hồi, reset_sp_base tại label depth-0 (goto-lùi).
-    Alloca(Tmp, Val), // dst = &vùng cấp; operand = số byte
-    // Call ABI-đầy-đủ (composite arg/ret, tràn reg, float≠8B, long double) — automaton
-    // AAPCS64 C.1–C.11. Operand mang KIỂU từng arg (Val = giá trị scalar / ĐỊA CHỈ
-    // struct, khớp lower_expr). ret = kiểu trả; sret = local slot khi ret là struct
-    // (dst = &slot). Scalar-thuần vẫn đi Inst::Call (nhanh). Impure.
+    // C99 6.7.5.2 VLA / __builtin_alloca: dst = a pointer to `size` bytes allocated
+    // on the stack (sub sp, rounded to 16). Impure (mutates sp) → no DCE/CSE even if
+    // dst is dead; the epilogue `mov sp,x29` reclaims it, reset_sp_base at a depth-0 label (backward goto).
+    Alloca(Tmp, Val), // dst = &the allocated region; operand = the byte count
+    // Full-ABI call (composite arg/ret, register overflow, float≠8B, long double) —
+    // the AAPCS64 C.1–C.11 automaton. Each operand carries its arg TYPE (Val = a
+    // scalar value / a struct ADDRESS, matching lower_expr). ret = the return type;
+    // sret = the local slot when ret is a struct (dst = &slot). Pure-scalar calls
+    // still go through Inst::Call (faster). Impure.
     CallX(Option<Tmp>, Callee, Vec<(Val, TypeId)>, TypeId, u32), // dst?, callee, (val,ty)*, ret, sret-off
-    // EXT(gcc) atomics __sync_* (C11 mượn): LL/SC ldaxr/stlxr. Operand = (ptr[, val
-    // [, val2]]) → x0/x1/x2. sz = 4|8 (width), ret = kiểu kết quả (dấu, canon x0).
-    // dst None ⟺ void (Release/Barrier). Impure (ghi mem + hàng rào).
+    // EXT(gcc) atomics __sync_* (borrowed by C11): LL/SC ldaxr/stlxr. Operands =
+    // (ptr[, val [, val2]]) → x0/x1/x2. sz = 4|8 (width), ret = the result type
+    // (signedness, canonicalized x0). dst None ⟺ void (Release/Barrier). Impure (memory write + barrier).
     Sync(Option<Tmp>, SyncOp, Vec<Val>, u32, TypeId), // dst?, op, operands, size, ret
-    // EXT(gcc) inline asm: template + operand đã materialize thành Val (inp = giá trị
-    // input / địa chỉ mem nạp vào reg; wb = địa chỉ writeback cho output non-mem).
-    // Void, impure (ghi mem qua output/mem-operand + có thể clobber). KHÔNG dst.
+    // EXT(gcc) inline asm: template + operands already materialized into Val (inp =
+    // input value / memory address loaded into a register; wb = writeback address
+    // for a non-mem output). Void, impure (writes memory through output/mem-operands
+    // and may clobber). With NO dst.
     Asm(String, Vec<AsmIrOp>),
 }
 
-/// Operand inline-asm đã hạ về IR: metadata ràng buộc (giữ nguyên từ AsmOp) + kiểu
-/// + Val đã tính. inp = giá trị input / địa chỉ (mem) nạp vào reg phase-1 (None = pure
-/// output). wb = địa chỉ ghi ngược cho output non-mem (None = không ghi ngược).
+/// An inline-asm operand lowered to IR: constraint metadata (carried over from
+/// AsmOp) + type + the computed Val. inp = input value / (mem) address loaded into
+/// a register in phase 1 (None = pure output). wb = writeback address for a non-mem
+/// output (None = no writeback).
 #[derive(Clone, Debug)]
 pub struct AsmIrOp {
     pub out: bool,
@@ -138,48 +149,49 @@ pub struct AsmIrOp {
     pub wb: Option<Val>,
 }
 
-/// Terminator — chuyển điều khiển rời block. Automaton hữu hạn trên tập BlockId.
+/// Terminator — transfers control out of a block. A finite automaton over the BlockId set.
 #[derive(Clone, Debug)]
 pub enum Term {
-    Jmp(BlockId),                          // nhảy vô điều kiện
-    Br(Val, BlockId, BlockId),             // cond ≠ 0 → then, ngược lại → els
-    Ret(Option<Val>),                      // trả (void nếu None)
-    Unreachable,                           // sau noreturn / chốt fallthrough không tới
+    Jmp(BlockId),                          // unconditional jump
+    Br(Val, BlockId, BlockId),             // cond ≠ 0 → then, otherwise → els
+    Ret(Option<Val>),                      // return (void if None)
+    Unreachable,                           // after noreturn / a fallthrough sentinel that is never reached
 }
 
-/// Một khối cơ bản: chuỗi lệnh thẳng + đúng một terminator (bất biến bằng kiểu).
+/// A basic block: a straight-line instruction sequence + exactly one terminator (a type-level invariant).
 #[derive(Clone, Debug)]
 pub struct Block {
     pub insts: Vec<Inst>,
     pub term: Term,
 }
 
-/// Hàm ở dạng IR: CFG (blocks) + bảng kiểu temp (Γ) + khung stack.
+/// A function in IR form: the CFG (blocks) + the temporary type table (Γ) + the stack frame.
 #[derive(Clone)]
 pub struct IrFunc {
     pub name: String,
-    pub temps: Vec<TypeId>,        // Γ: temp i có kiểu temps[i]
-    pub params: Vec<(u32, TypeId)>, // (offset khung, kiểu) — param vào slot khung
-    // theo ABI (backend emit_params); interp seed thẳng vào mem. KHÔNG param-temp.
+    pub temps: Vec<TypeId>,        // Γ: temporary i has type temps[i]
+    pub params: Vec<(u32, TypeId)>, // (frame offset, type) — a parameter placed into its frame
+    // slot per the ABI (backend emit_params); interp seeds it directly into memory. NO parameter temporaries.
     pub blocks: Vec<Block>, // blocks[0] = entry
-    pub frame: u32,         // kích thước khung (đã tròn 16) — cho Lea(Local)
-    pub ret: TypeId,        // kiểu trả
-    // EXT(gcc): nhãn C (goto/&&label) → block. Backend phát thêm `lg_fname.name:`
-    // tại block để computed-goto (LabelAddr/GotoPtr) resolve được địa chỉ nhãn.
+    pub frame: u32,         // frame size (rounded to 16) — for Lea(Local)
+    pub ret: TypeId,        // return type
+    // EXT(gcc): C labels (goto/&&label) → blocks. The backend additionally emits
+    // `lg_fname.name:` at the block so that computed-goto (LabelAddr/GotoPtr) can resolve the label address.
     pub labels: Vec<(String, BlockId)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Verifier — automaton well-formedness (IR.md §3a). Chạy sau lowering / mỗi pass;
-// reject IR hỏng NGAY thay vì để trôi xuống asm rác. v1 (baseline) kiểm:
-//   (V1) ref-integrity: mọi Tmp id < |temps|, mọi BlockId đích < |blocks|.
-//   (V2) def-coverage : mọi temp được DÙNG phải được ĐỊNH NGHĨA ≥1 lần trong hàm.
-//   (V3) entry        : hàm có ≥1 block (blocks[0] = entry).
-// (Def-before-use TỪNG-ĐƯỜNG (dominance) là định lý mạnh hơn — mở khi có pass
-//  di chuyển lệnh; v1 chỉ cần bảo toàn tính hợp lệ tham chiếu sau lowering thẳng.)
+// Verifier — an automaton for well-formedness (IR.md §3a). Runs after lowering /
+// after every pass; rejects malformed IR IMMEDIATELY rather than letting it drift
+// down into garbage asm. v1 (baseline) checks:
+//   (V1) ref-integrity: every Tmp id < |temps|, every target BlockId < |blocks|.
+//   (V2) def-coverage : every temporary that is USED must be DEFINED ≥1 time in the function.
+//   (V3) entry        : the function has ≥1 block (blocks[0] = entry).
+// (Per-path def-before-use (dominance) is a stronger theorem — enabled once a pass
+//  moves instructions; v1 need only preserve reference validity after straight lowering.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Temp được ĐỊNH NGHĨA bởi lệnh này (đích), nếu có.
+/// The temporary DEFINED by this instruction (its destination), if any.
 pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
     match i {
         Inst::Bin(d, ..)
@@ -204,7 +216,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
     }
 }
 
-/// Gom mọi Tmp mà lệnh này DÙNG (đọc) vào `out`.
+/// Collect every Tmp that this instruction USES (reads) into `out`.
 pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
     let mut v = |x: &Val| {
         if let Val::Tmp(t) = x {
@@ -271,7 +283,7 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
     }
 }
 
-/// Gom mọi Tmp mà terminator DÙNG.
+/// Collect every Tmp that the terminator USES.
 pub(crate) fn term_uses(t: &Term, out: &mut Vec<Tmp>) {
     let mut v = |x: &Val| {
         if let Val::Tmp(t) = x {
@@ -285,7 +297,7 @@ pub(crate) fn term_uses(t: &Term, out: &mut Vec<Tmp>) {
     }
 }
 
-/// Đích block của một terminator (để kiểm ref-integrity CFG).
+/// The block targets of a terminator (for CFG ref-integrity checking).
 pub(crate) fn term_targets(t: &Term, out: &mut Vec<BlockId>) {
     match t {
         Term::Jmp(b) => out.push(*b),
@@ -297,23 +309,24 @@ pub(crate) fn term_targets(t: &Term, out: &mut Vec<BlockId>) {
     }
 }
 
-/// Kiểm well-formedness một hàm. Trả Err(mô tả) tại vi phạm ĐẦU TIÊN.
+/// Check the well-formedness of a function. Returns Err(description) at the FIRST violation.
 pub fn verify(f: &IrFunc) -> Result<(), String> {
-    // (V3) entry tồn tại
+    // (V3) entry exists
     if f.blocks.is_empty() {
-        return Err(format!("{}: hàm rỗng (không có entry block)", f.name));
+        return Err(format!("{}: empty function (no entry block)", f.name));
     }
     let nt = f.temps.len() as u32;
     let nb = f.blocks.len() as u32;
 
-    // Tập temp được định nghĩa. Param KHÔNG là temp (sống trong slot khung, backend
-    // đổ theo ABI) → mọi đọc param là Load(mem)→temp mới, không có use-before-def.
+    // The set of defined temporaries. A parameter is NOT a temporary (it lives in a
+    // frame slot, populated by the backend per the ABI) → every parameter read is a
+    // Load(mem)→new temporary, so there is no use-before-def.
     let mut defined = vec![false; nt as usize];
     for b in &f.blocks {
         for i in &b.insts {
             if let Some(d) = inst_def(i) {
                 if d >= nt {
-                    return Err(format!("{}: def temp t{d} ngoài bảng |temps|={nt}", f.name));
+                    return Err(format!("{}: def temp t{d} out of table |temps|={nt}", f.name));
                 }
                 defined[d as usize] = true;
             }
@@ -329,10 +342,10 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
             inst_uses(i, &mut uses);
             for &u in &uses {
                 if u >= nt {
-                    return Err(format!("{}: dùng temp t{u} ngoài bảng |temps|={nt}", f.name));
+                    return Err(format!("{}: use temp t{u} out of table |temps|={nt}", f.name));
                 }
                 if !defined[u as usize] {
-                    return Err(format!("{}: temp t{u} dùng nhưng không đâu định nghĩa", f.name));
+                    return Err(format!("{}: temp t{u} used but never defined", f.name));
                 }
             }
         }
@@ -340,17 +353,17 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
         term_uses(&b.term, &mut uses);
         for &u in &uses {
             if u >= nt {
-                return Err(format!("{}: term block{bi} dùng t{u} ngoài |temps|={nt}", f.name));
+                return Err(format!("{}: term block{bi} uses t{u} out of |temps|={nt}", f.name));
             }
             if !defined[u as usize] {
-                return Err(format!("{}: term block{bi} dùng t{u} chưa định nghĩa", f.name));
+                return Err(format!("{}: term block{bi} uses t{u} not yet defined", f.name));
             }
         }
         targets.clear();
         term_targets(&b.term, &mut targets);
         for &tg in &targets {
             if tg >= nb {
-                return Err(format!("{}: block{bi} nhảy tới block{tg} ngoài |blocks|={nb}", f.name));
+                return Err(format!("{}: block{bi} jumps to block{tg} out of |blocks|={nb}", f.name));
             }
         }
     }
@@ -358,20 +371,23 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Lowering AST → IR (IR.md §4) — CHỖ correctness sống. Mô hình -O0 cổ điển: mọi
-// biến C nằm trong BỘ NHỚ khung (offset đã do parser cấp); temp chỉ giữ giá trị
-// trung gian của biểu thức. lower_expr(n) phát lệnh, trả Val chứa kết quả;
-// lower_addr(n) trả Val = ĐỊA CHỈ của một lvalue; lower_stmt(n) dệt block+CFG.
-// Đuôi exotic (va/atomic/asm/nested/struct/Switch/goto) → Inst::Opaque(node) tạm,
-// backend bridge re-emit đường cũ (step 3 thay dần bằng lowering thật).
+// Lowering AST → IR (IR.md §4) — WHERE correctness lives. The classic -O0 model:
+// every C variable lives in frame MEMORY (offsets already assigned by the parser);
+// temporaries hold only the intermediate value of an expression. lower_expr(n)
+// emits instructions and returns a Val holding the result; lower_addr(n) returns a
+// Val = the ADDRESS of an lvalue; lower_stmt(n) weaves the blocks + CFG.
+// The exotic tail (va/atomic/asm/nested/struct/Switch/goto) → a temporary
+// Inst::Opaque(node), with the backend bridge re-emitting the old path (step 3
+// gradually replaces this with real lowering).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Element CUỐI của stmt-expr có phải câu-LỆNH VÔ-GIÁ-TRỊ (→ value = void) không?
-/// Node::Block KHÔNG thuộc đây: `{…}` compound-statement cuối là void nhưng
-/// `({…})` stmt-expr LỒNG mang value — hai cái CÙNG Node::Block, không phân biệt
-/// được bằng kiểu node, nên luôn recurse qua lower_expr (Block arm) để propagate
-/// value nếu có; value thừa của compound-statement vô hại (không ai đọc).
-/// Mirror phần còn lại các arm tường minh của lower_stmt; đồng bộ khi thêm stmt mới.
+/// Is the FINAL element of a stmt-expr a VALUELESS statement (→ value = void)?
+/// Node::Block does NOT belong here: a trailing `{…}` compound-statement is void,
+/// but a NESTED `({…})` stmt-expr carries a value — both are the SAME Node::Block
+/// and cannot be distinguished by node type, so always recurse through lower_expr
+/// (the Block arm) to propagate a value if there is one; the surplus value of a
+/// compound-statement is harmless (nobody reads it).
+/// Mirror the remaining explicit arms of lower_stmt; keep in sync when a new statement is added.
 fn is_stmt_node(n: &Node) -> bool {
     matches!(
         n,
@@ -395,7 +411,7 @@ fn map_op(s: &str) -> Op {
         "+" => Op::Add, "-" => Op::Sub, "*" => Op::Mul, "/" => Op::Div, "%" => Op::Rem,
         "&" => Op::And, "|" => Op::Or, "^" => Op::Xor, "<<" => Op::Shl, ">>" => Op::Shr,
         "==" => Op::Eq, "!=" => Op::Ne, "<" => Op::Lt, "<=" => Op::Le, ">" => Op::Gt, ">=" => Op::Ge,
-        _ => unreachable!("op không phải nhị phân: {s}"),
+        _ => unreachable!("operator is not binary: {s}"),
     }
 }
 
@@ -404,11 +420,11 @@ struct Lower<'a> {
     temps: Vec<TypeId>,
     blocks: Vec<Block>,
     cur: usize,
-    done: bool, // block hiện tại đã có terminator?
+    done: bool, // does the current block already have a terminator?
     brk: Vec<BlockId>,
     cont: Vec<BlockId>,
-    case_blk: HashMap<u32, BlockId>, // Case-node id → block (đích LC trong switch)
-    label_blk: HashMap<String, BlockId>, // tên goto-label → block (lazy, forward/back)
+    case_blk: HashMap<u32, BlockId>, // Case-node id → block (the case-label target within a switch)
+    label_blk: HashMap<String, BlockId>, // goto-label name → block (lazy, forward/back)
 }
 
 impl<'a> Lower<'a> {
@@ -449,9 +465,9 @@ impl<'a> Lower<'a> {
         tt.is_integer(ty) || tt.is_float(ty) || matches!(tt.tys[ty as usize], Ty::Ptr(_))
     }
 
-    /// Địa chỉ của một lvalue → Val (kiểu địa chỉ giữ ULONG, 64-bit không wrap).
+    /// The address of an lvalue → Val (the address type is ULONG, 64-bit, no wrapping).
     fn lower_addr(&mut self, n: NodeId) -> Val {
-        let a = self.a; // &'a Ast (Copy) — tách khỏi &mut self
+        let a = self.a; // &'a Ast (Copy) — detached from &mut self
         match &a.nodes[n as usize] {
             Node::Var(off) => {
                 let off = *off;
@@ -483,21 +499,22 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Lea(t, Place::Str(i)));
                 Val::Tmp(t)
             }
-            // lvalue exotic (SRet/Comma/Assign-struct/Cond/Block stmt-expr): giá trị
-            // kiểu-aggregate CHÍNH LÀ địa chỉ (mô hình by-ref) — khớp AST-walk
-            // addr()=expr(). Scalar-assign-làm-lvalue là invalid C nên không tới đây.
+            // exotic lvalue (SRet/Comma/Assign-struct/Cond/Block stmt-expr): an
+            // aggregate-typed value IS its address (the by-ref model) — matching the
+            // AST-walk addr()=expr(). A scalar assignment used as an lvalue is invalid
+            // C, so it never reaches here.
             _ => self.lower_expr(n),
         }
     }
 
-    /// Giá trị (rvalue) của một biểu thức → Val.
+    /// The value (rvalue) of an expression → Val.
     fn lower_expr(&mut self, n: NodeId) -> Val {
         let a = self.a;
         let ty = a.types[n as usize];
         match &a.nodes[n as usize] {
             Node::Num(v) => Val::Imm(*v),
             Node::FNum(f) => Val::FImm(f.to_bits()),
-            Node::Str(_) => self.lower_addr(n), // mảng ký tự decay → con trỏ
+            Node::Str(_) => self.lower_addr(n), // character array decays → pointer
             Node::Var(_) | Node::GVar(_) | Node::Member(..) | Node::Deref(_) => {
                 let addr = self.lower_addr(n);
                 if self.scalar(ty) {
@@ -505,7 +522,7 @@ impl<'a> Lower<'a> {
                     self.push(Inst::Load(t, ty, addr));
                     Val::Tmp(t)
                 } else {
-                    addr // mảng/struct: rvalue = địa chỉ (decay / by-ref)
+                    addr // array/struct: rvalue = the address (decay / by-ref)
                 }
             }
             Node::Addr(e) => self.lower_addr(*e),
@@ -518,8 +535,9 @@ impl<'a> Lower<'a> {
                     self.push(Inst::Store(lty, addr, v));
                     v
                 } else {
-                    // Gán struct/union: copy size(ty) byte; rvalue = địa chỉ đích
-                    // (C99 6.5.16). LHS-addr trước RHS (khớp thứ tự AST reference).
+                    // struct/union assignment: copy size(ty) bytes; rvalue = the
+                    // destination address (C99 6.5.16). LHS address before RHS
+                    // (matching the AST reference order).
                     let dst = self.lower_addr(l);
                     let src = self.lower_expr(r);
                     self.push(Inst::Memcpy(dst, src, a.tt.size(lty)));
@@ -528,11 +546,12 @@ impl<'a> Lower<'a> {
             }
             Node::Bin(op, l, r) => {
                 let (op, l, r) = (*op, *l, *r);
-                let opty = a.types[l as usize]; // kiểu chung sau UAC (parser đã cast)
-                // Sinh vế PHẢI trước (khớp đường AST — C99 6.5p3 để thứ tự operand
-                // unspecified, nhưng khớp reference thì differential không nhiễu:
-                // vd `x[i] |= foo()` cần foo() chạy trước khi đọc x[i]). Vị trí toán
-                // hạng giữ nguyên x=lhs, y=rhs; chỉ đổi thứ tự side-effect.
+                let opty = a.types[l as usize]; // the common type after UAC (already cast by the parser)
+                // Emit the RIGHT operand first (matching the AST path — C99 6.5p3
+                // leaves operand order unspecified, but matching the reference keeps
+                // the differential noise-free: e.g. `x[i] |= foo()` requires foo() to
+                // run before x[i] is read). The operand positions stay x=lhs, y=rhs;
+                // only the side-effect order changes.
                 let y = self.lower_expr(r);
                 let x = self.lower_expr(l);
                 let t = self.t(ty);
@@ -550,7 +569,7 @@ impl<'a> Lower<'a> {
                 let from = a.types[e as usize];
                 let v = self.lower_expr(e);
                 if from == ty || !self.scalar(from) || !self.scalar(ty) {
-                    v // reinterpret / no-op (kể cả tới/từ struct-ptr)
+                    v // reinterpret / no-op (including to/from a struct pointer)
                 } else {
                     let t = self.t(ty);
                     self.push(Inst::Cast(t, from, ty, v));
@@ -591,10 +610,11 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Store(lty, addr, Val::Tmp(nw)));
                 Val::Tmp(old)
             }
-            // Call thuần-scalar → Inst::Call (IR sạch). Có composite arg/ret (struct
-            // by-value, HFA, >16B, float≠8B, tràn reg) → ABI-automaton C.1–C.11 →
-            // Inst::CallX (operand mang KIỂU, emitter port self.call). ret struct đã
-            // được parser bọc SRet nên nhánh này ty luôn scalar/void.
+            // Pure-scalar call → Inst::Call (clean IR). Composite arg/ret (struct
+            // by-value, HFA, >16B, float≠8B, register overflow) → the ABI automaton
+            // C.1–C.11 → Inst::CallX (operands carry TYPES, the emitter ports
+            // self.call). A struct return has already been wrapped in SRet by the
+            // parser, so in this arm ty is always scalar/void.
             Node::Call(name, args, nfix) => {
                 let (name, nfix) = (name.clone(), *nfix);
                 let args = args.clone();
@@ -631,25 +651,26 @@ impl<'a> Lower<'a> {
                     Val::Tmp(t)
                 }
             }
-            // Call trả struct (parser bọc SRet(call, off, sz)): ABI đầy đủ + gom kết
-            // quả (v-reg HFA / x0:x1 ≤16B / x8-sret >16B) về local[off]; giá trị = &local.
+            // struct-returning call (the parser wraps SRet(call, off, sz)): full ABI +
+            // gathering the result (v-reg HFA / x0:x1 ≤16B / x8-sret >16B) into
+            // local[off]; the value = &local.
             Node::SRet(call, off, _sz) => {
                 let (call, off) = (*call, *off);
                 let (pe, name, cargs_nodes) = match &a.nodes[call as usize] {
                     Node::Call(nm, ar, _) => (None, Some(nm.clone()), ar.clone()),
                     Node::CallPtr(e, ar, _) => (Some(*e), None, ar.clone()),
-                    _ => unreachable!("SRet bọc non-call"),
+                    _ => unreachable!("SRet wraps a non-call"),
                 };
                 let callee = match name {
                     Some(nm) => Callee::Sym(nm),
                     None => Callee::Ptr(self.lower_expr(pe.unwrap())),
                 };
                 let cargs = self.lower_call_args(&cargs_nodes);
-                let d = self.t(ULONG); // địa chỉ struct-result (&local[off])
+                let d = self.t(ULONG); // address of the struct result (&local[off])
                 self.push(Inst::CallX(Some(d), callee, cargs, ty, off));
                 Val::Tmp(d)
             }
-            // exotic đã có Inst typed (operand-free) → hạ thẳng, không qua Opaque.
+            // exotic with an existing typed Inst (operand-free) → lower directly, not via Opaque.
             Node::FunAddr(name) => {
                 let name = name.clone();
                 let t = self.t(ty);
@@ -716,8 +737,8 @@ impl<'a> Lower<'a> {
                     Val::Tmp(d)
                 }
             }
-            // EXT(gcc) inline asm (void): materialize từng operand → Val. mem = địa chỉ;
-            // pure output = None (chỉ ghi ngược); input/rw = giá trị (+ địa chỉ wb nếu out).
+            // EXT(gcc) inline asm (void): materialize each operand → Val. mem = address;
+            // pure output = None (writeback only); input/rw = value (+ wb address if out).
             Node::Asm(tpl, ops) => {
                 let (tpl, ops) = (tpl.clone(), ops.clone());
                 let irops: Vec<AsmIrOp> = ops
@@ -749,10 +770,11 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Asm(tpl, irops));
                 Val::Imm(0) // asm expr = void
             }
-            // EXT(gcc): statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
-            // tuần tự các stmt (side-effect qua lower_stmt), giá trị = giá trị của
-            // stmt CUỐI nếu nó là expr-statement (C99-EXT gcc), ngược lại void.
-            // KHÔNG cần Inst mới — stmt-expr chỉ là "statements + 1 value" trong IR.
+            // EXT(gcc): statement-expression `({ s1; …; last })` in expression
+            // position: run the statements in sequence (side effects via lower_stmt),
+            // the value = the value of the LAST statement if it is an expr-statement
+            // (C99-EXT gcc), otherwise void. NO new Inst is needed — a stmt-expr is
+            // just "statements + 1 value" in the IR.
             Node::Block(v) => {
                 let v = v.clone();
                 let Some((&last, init)) = v.split_last() else {
@@ -766,28 +788,31 @@ impl<'a> Lower<'a> {
                     Val::Imm(0)
                 } else {
                     if self.done {
-                        // stmt cuối nằm trong dead-code (stmt trước seal terminator):
-                        // mở block tươi để value-expr lower nhất quán (mọi def push đủ),
-                        // tránh temp mồ côi (cùng lớp bug orphan-temp lower_stmt).
+                        // the last statement is in dead code (a prior statement sealed
+                        // the terminator): open a fresh block so the value-expression
+                        // lowers consistently (every def is pushed), avoiding an orphan
+                        // temporary (the same bug class as the lower_stmt orphan-temp).
                         let d = self.reserve();
                         self.goto(d);
                     }
                     self.lower_expr(last)
                 }
             }
-            // Mọi node biểu-thức C99 đã có arm typed (chứng cứ: probe 0 bridge-hit trên
-            // 3748 file thật). Node câu-LỆNH không lọt vào lower_expr (đi lower_stmt).
-            _ => unreachable!("lower_expr: node không phải biểu thức đã seal"),
+            // Every C99 expression node has a typed arm (evidence: a probe found 0
+            // bridge-hits over 3748 real files). A STATEMENT node never enters
+            // lower_expr (it goes through lower_stmt).
+            _ => unreachable!("lower_expr: node is not a sealed expression"),
         }
     }
 
-    /// Lower từng arg → (Val, kiểu). Val = giá trị scalar / ĐỊA CHỈ struct (khớp
-    /// self.expr): emitter ABI đọc kiểu để phân slot, đọc Val để nạp thanh ghi/stack.
+    /// Lower each arg → (Val, type). Val = a scalar value / a struct ADDRESS (matching
+    /// self.expr): the ABI emitter reads the type to assign a slot and reads the Val
+    /// to load a register/stack location.
     fn lower_call_args(&mut self, args: &[NodeId]) -> Vec<(Val, TypeId)> {
         args.iter().map(|&x| (self.lower_expr(x), self.a.types[x as usize])).collect()
     }
 
-    /// Push CallX (composite, ret scalar/void) và trả Val kết quả.
+    /// Push a CallX (composite, ret scalar/void) and return the result Val.
     fn emit_callx(&mut self, callee: Callee, cargs: Vec<(Val, TypeId)>, ty: TypeId) -> Val {
         if ty == VOID {
             self.push(Inst::CallX(None, callee, cargs, VOID, 0));
@@ -800,10 +825,11 @@ impl<'a> Lower<'a> {
     }
 
 
-    /// Call cần bridge sang self.call (ABI automaton C.1–C.11) thay vì Inst::Call
-    /// thuần-scalar? Đúng khi: (a) return composite, (b) có tham số composite
-    /// (struct by-value/HFA/>16B), hoặc (c) tràn thanh ghi (GP>8 hay FP>8 → arg
-    /// phải xuống stack). ir_call chỉ lo ca ≤8 GP + ≤8 FP scalar.
+    /// Does the call need to bridge to self.call (the ABI automaton C.1–C.11) rather
+    /// than a pure-scalar Inst::Call? Yes when: (a) it returns a composite, (b) it has
+    /// a composite parameter (struct by-value/HFA/>16B), or (c) it overflows the
+    /// registers (GP>8 or FP>8 → the arg must go on the stack). ir_call handles only
+    /// the ≤8 GP + ≤8 FP scalar case.
     fn call_composite(&self, args: &[NodeId], ret: TypeId) -> bool {
         let a = self.a;
         if ret != VOID && !self.scalar(ret) {
@@ -816,9 +842,9 @@ impl<'a> Lower<'a> {
                 return true;
             }
             if a.tt.is_float(ty) {
-                // ir_call truyền float qua d-reg (f64) — chỉ đúng cho `double` (8B).
-                // `float` (4B → s-reg fcvt) và `long double` (16B → q-reg) cần
-                // narrow ABI riêng → bridge sang self.call.
+                // ir_call passes floats through d-registers (f64) — correct only for
+                // `double` (8B). `float` (4B → s-reg fcvt) and `long double` (16B →
+                // q-reg) need their own narrow ABI → bridge to self.call.
                 if a.tt.size(ty) != 8 {
                     return true;
                 }
@@ -831,12 +857,14 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_stmt(&mut self, n: NodeId) {
-        // Code CHẾT sau terminator (return/goto/break/continue) vẫn được Block lower.
-        // `push` drop-khi-done nhưng `t()` cấp temp vô điều kiện → một Cond bên trong
-        // dead-code `goto` hồi sinh block ⟹ def của addr rớt (done) nhưng use sống lại
-        // → temp mồ côi (csmith c0041/c0126, verify V2 bắt). Fix: mở block TƯƠI cho mỗi
-        // stmt chết để nó lower NHẤT QUÁN (mọi def push đủ); block unreachable, well-formed,
-        // backend emit vô hại; nhãn goto-đích vẫn reachable qua label_block.
+        // DEAD code after a terminator (return/goto/break/continue) is still lowered by
+        // Block. `push` drops-when-done, but `t()` allocates a temporary
+        // unconditionally → a Cond inside dead-code `goto` revives a block ⟹ the def of
+        // an address is dropped (done) while its use comes back to life → an orphan
+        // temporary (csmith c0041/c0126, caught by verify V2). Fix: open a FRESH block
+        // for each dead statement so it lowers CONSISTENTLY (every def is pushed); the
+        // block is unreachable, well-formed, and harmless for the backend to emit; the
+        // goto-target label stays reachable via label_block.
         if self.done {
             let d = self.reserve();
             self.goto(d);
@@ -940,8 +968,9 @@ impl<'a> Lower<'a> {
                 let c = *self.cont.last().unwrap();
                 self.seal(Term::Jmp(c));
             }
-            // Switch: dispatch = chuỗi test range (v-lo ≤u hi-lo) → Br tới case-block;
-            // thân giữ nguyên thứ tự (fall-through), Case = ranh giới block, Break→merge.
+            // Switch: dispatch = a chain of range tests (v-lo ≤u hi-lo) → Br to the
+            // case-block; the body keeps its order (fall-through), Case = a block
+            // boundary, Break → merge.
             Node::Switch(c, b, cases, def) => {
                 let (c, b) = (*c, *b);
                 let cases = cases.clone();
@@ -977,7 +1006,7 @@ impl<'a> Lower<'a> {
                     self.goto(next);
                 }
                 self.seal(Term::Jmp(defblk));
-                let body = self.reserve(); // câu lệnh trước case đầu = bất khả đạt (C)
+                let body = self.reserve(); // statements before the first case = unreachable (C)
                 self.goto(body);
                 self.brk.push(merge);
                 self.lower_stmt(b);
@@ -987,8 +1016,8 @@ impl<'a> Lower<'a> {
             }
             Node::Case(st) => {
                 let st = *st;
-                let blk = self.case_blk[&n]; // id node Case = khoá (đã reserve ở Switch)
-                self.seal(Term::Jmp(blk)); // fall-through vào nhãn case
+                let blk = self.case_blk[&n]; // the Case node id = the key (already reserved in Switch)
+                self.seal(Term::Jmp(blk)); // fall-through into the case label
                 self.goto(blk);
                 self.lower_stmt(st);
             }
@@ -1003,13 +1032,13 @@ impl<'a> Lower<'a> {
                 let blk = self.label_block(name.clone());
                 self.seal(Term::Jmp(blk));
             }
-            // computed goto / non-local goto: còn exotic (đuôi bước 2)
+            // computed goto / non-local goto: still exotic (the step-2 tail)
             Node::GotoPtr(e) => {
                 let e = *e;
                 let target = self.lower_expr(e);
                 self.push(Inst::GotoPtr(target));
             }
-            // biểu thức dùng làm câu lệnh: phát side effect, bỏ kết quả
+            // an expression used as a statement: emit its side effects, discard the result
             _ => {
                 self.lower_expr(n);
             }
@@ -1017,7 +1046,7 @@ impl<'a> Lower<'a> {
     }
 }
 
-/// AST → danh sách IrFunc. Backend chỉ đọc kết quả này + TyTab.
+/// AST → a list of IrFunc. The backend reads only this result + the TyTab.
 pub fn lower(ast: &Ast) -> Vec<IrFunc> {
     let mut out = Vec::with_capacity(ast.funcs.len());
     for f in &ast.funcs {
@@ -1032,13 +1061,14 @@ pub fn lower(ast: &Ast) -> Vec<IrFunc> {
             case_blk: HashMap::new(),
             label_blk: HashMap::new(),
         };
-        // Param KHÔNG cần prologue trong IR: backend emit_params đổ arg vào slot
-        // khung theo ABI (scalar/float/struct/HFA/variadic) TRƯỚC khi body chạy;
-        // body đọc mọi biến (kể cả param) qua Var(off)→Load — mô hình -O0 nhất quán.
+        // Parameters need NO prologue in the IR: the backend emit_params populates the
+        // frame slots from the args per the ABI (scalar/float/struct/HFA/variadic)
+        // BEFORE the body runs; the body reads every variable (parameters included)
+        // through Var(off)→Load — a consistent -O0 model.
         lo.lower_stmt(f.body);
-        lo.seal(Term::Ret(None)); // rơi khỏi thân (void; main→0 do frontend chèn)
+        lo.seal(Term::Ret(None)); // fall off the body (void; main→0 is inserted by the frontend)
         let mut labels: Vec<(String, BlockId)> = lo.label_blk.into_iter().collect();
-        labels.sort(); // deterministic (HashMap iter order không ổn định)
+        labels.sort(); // deterministic (HashMap iteration order is not stable)
         out.push(IrFunc {
             name: f.name.clone(),
             temps: lo.temps,
@@ -1053,15 +1083,17 @@ pub fn lower(ast: &Ast) -> Vec<IrFunc> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Ngữ nghĩa số học CORE — HÀM NGHĨA nguyên tử, dùng CHUNG bởi interp (proof-side)
-// và const-fold (opt.rs, release). MỘT định nghĩa duy nhất ⟹ folder và interpreter
-// KHÔNG THỂ lệch: đây là điều kiện faithfulness của correctness-by-construction —
-// ⟦fold(Bin op a b)⟧ = ⟦Bin op a b⟧ theo đúng nghĩa vì fold GỌI CHÍNH eval_bin.
-// (THEORY.md Phần I §A4 partial-evaluation + §III keystone.)
+// CORE arithmetic semantics — the atomic DENOTATION functions, SHARED by interp
+// (proof side) and const-fold (opt.rs, release side). A SINGLE definition ⟹ the
+// folder and the interpreter CANNOT diverge: this is the faithfulness condition of
+// correctness-by-construction — ⟦fold(Bin op a b)⟧ = ⟦Bin op a b⟧ holds precisely
+// because fold CALLS eval_bin itself.
+// (THEORY.md Part I §A4 partial-evaluation + §III keystone.)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Chuẩn hoá giá trị nguyên về đúng bề rộng+dấu của `ty` (ℤ/2^n): định lý "số học
-/// int wrap tại size*8 bit" — chính là `ext(ct)` của backend. Float: bit pattern đi thẳng.
+/// Canonicalize an integer value to the exact width+signedness of `ty` (ℤ/2^n): the
+/// theorem "integer arithmetic wraps at size*8 bits" — exactly the backend's
+/// `ext(ct)`. Float: the bit pattern passes through unchanged.
 pub(crate) fn canon(tt: &TyTab, ty: TypeId, v: i64) -> i64 {
     if tt.is_float(ty) {
         return v;
@@ -1075,14 +1107,15 @@ pub(crate) fn canon(tt: &TyTab, ty: TypeId, v: i64) -> i64 {
     if tt.is_unsigned(ty) {
         masked as i64
     } else {
-        let sh = 64 - bits; // sign-extend từ `bits`
+        let sh = 64 - bits; // sign-extend from `bits`
         ((masked << sh) as i64) >> sh
     }
 }
 
-/// ⟦Bin⟧: Op thuần diễn giải trong cấu trúc đại số của `ty` (ℝ nếu float, ℤ/2^n với
-/// dấu nếu int). So sánh → {0,1}. Err tại UB (chia/mod 0) → const-fold PHẢI bỏ qua
-/// (không fold UB thành hằng: giữ nguyên lệnh, để runtime giữ hành vi target).
+/// ⟦Bin⟧: the pure Op interpreted in the algebraic structure of `ty` (ℝ if float,
+/// ℤ/2^n with signedness if int). Comparisons → {0,1}. Err at UB (div/mod by 0) →
+/// const-fold MUST skip it (do not fold UB into a constant: keep the instruction so
+/// the runtime preserves the target behavior).
 pub(crate) fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result<i64, String> {
     if tt.is_float(ty) {
         let (a, b) = (f64::from_bits(x as u64), f64::from_bits(y as u64));
@@ -1097,7 +1130,7 @@ pub(crate) fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result
             Op::Le => return Ok((a <= b) as i64),
             Op::Gt => return Ok((a > b) as i64),
             Op::Ge => return Ok((a >= b) as i64),
-            _ => return Err("eval_bin: op không hợp lệ trên float".into()),
+            _ => return Err("eval_bin: operator invalid on float".into()),
         };
         return Ok(r.to_bits() as i64);
     }
@@ -1106,8 +1139,8 @@ pub(crate) fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result
         Op::Add => x.wrapping_add(y),
         Op::Sub => x.wrapping_sub(y),
         Op::Mul => x.wrapping_mul(y),
-        Op::Div if y == 0 => return Err("eval_bin: chia 0 (UB)".into()),
-        Op::Rem if y == 0 => return Err("eval_bin: mod 0 (UB)".into()),
+        Op::Div if y == 0 => return Err("eval_bin: divide by 0 (UB)".into()),
+        Op::Rem if y == 0 => return Err("eval_bin: mod by 0 (UB)".into()),
         Op::Div if u => ((x as u64) / (y as u64)) as i64,
         Op::Div => x.wrapping_div(y),
         Op::Rem if u => ((x as u64) % (y as u64)) as i64,
@@ -1128,8 +1161,8 @@ pub(crate) fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result
     Ok(canon(tt, ty, r))
 }
 
-/// ⟦Cast⟧: chuyển giữa các miền (trunc/ext int, i↔f). _Bool normalize 0/1 (C99
-/// 6.3.1.2 / 6.3.1.4). Tổng (không UB) → const-fold luôn fold được cast hằng.
+/// ⟦Cast⟧: convert between domains (int trunc/ext, i↔f). _Bool normalizes to 0/1
+/// (C99 6.3.1.2 / 6.3.1.4). Total (no UB) → const-fold can always fold a constant cast.
 pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
     let is_bool = matches!(tt.tys[to as usize], Ty::Bool);
     match (tt.is_float(from), tt.is_float(to)) {
@@ -1149,29 +1182,34 @@ pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
             if is_bool {
                 (f != 0.0) as i64
             } else {
-                canon(tt, to, f as i64) // trunc về 0 (C99 6.3.1.4)
+                canon(tt, to, f as i64) // truncate toward 0 (C99 6.3.1.4)
             }
         }
-        (true, true) => v, // f64 canonical cả hai
+        (true, true) => v, // f64 is canonical for both
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Interp — REFERENCE SEMANTICS ⟦·⟧ của IR CORE (NẤC-1). Đây là HÀM NGHĨA hình thức
-// hoá: định nghĩa "IR này TÍNH RA gì", làm ground-truth cho commuting-square oracle
-// (pass đúng ⟺ giao hoán với interp). **Định nghĩa toán học đầy đủ mỗi Inst +
-// định lý commuting-square: `SEMANTICS.md`** (spec map 1-1 với code dưới đây; mọi
-// arm `match inst`/`match term` = một rule §4/§4b, mọi hàm nghĩa nguyên tử §3).
-// test-side (#[cfg(test)]) — KHÔNG vào binary release, KHÔNG tính trần 10k (IR.md
-// §7.1); là proof-checker, không phải logic compiler. Chưa machine-checked proof —
-// mechanized reference semantics ĐƯỢC KIỂM bằng vét-cạn-cấu-trúc (nền cho nấc-2/3).
+// Interp — the REFERENCE SEMANTICS ⟦·⟧ of the CORE IR. This is the denotation
+// function: it defines what a piece of IR computes, and serves as the ground
+// truth for the commuting-square oracle (a pass is correct iff it commutes with
+// interp). The full mathematical definition of every Inst and the
+// commuting-square theorem live in SEMANTICS.md; it specifies the code below
+// one-to-one (each `match inst` / `match term` arm is a rule of §4 / §4b, each
+// atomic semantic function a definition of §3). This is test-side (#[cfg(test)]):
+// it is excluded from the release binary and does not count against the source
+// ceiling (IR.md §7.1); it is a proof-checker, not compiler logic. It is not a
+// machine-checked proof — it is a mechanized reference semantics, validated by
+// structural exhaustion (the foundation for the later verification stages).
 //
-// Trạng thái máy Σ = ⟨ρ, μ⟩ (SEMANTICS.md §2): ρ: Tmp→𝕍 register file (mỗi temp
-// một giá trị 64-bit canonical — int sign/zero-extend đúng kiểu, float = BIT
-// PATTERN f64, float nâng lên double); μ: [0,frame)→Byte bộ nhớ local phẳng
-// (little-endian LP64), Lea(Local off) → index = frame−off. Observable = giá trị
-// TRẢ. Global/Str/exotic KHÔNG mô hình hoá → Err = ⊥ (hàm "không thuần", NGOÀI
-// không gian CORE ⟹ commuting-square SKIP như UB).
+// Machine state Σ = ⟨ρ, μ⟩ (SEMANTICS.md §2): ρ : Tmp → 𝕍 is the register file
+// (each temporary holds a canonical 64-bit value — integers sign/zero-extended
+// to their type, floats as an f64 bit pattern with 32-bit float widened to
+// double); μ : [0, frame) → Byte is flat local memory (little-endian, LP64),
+// with Lea(Local off) yielding index = frame − off. The observable is the return
+// value. Globals, string literals, and exotic instructions are not modeled and
+// evaluate to Err = ⊥ (an impure function, outside the CORE space, so the
+// commuting square skips it, as it does for undefined behavior).
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1192,26 +1230,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// Chạy IR: interp(entry, args) → giá trị trả. Đệ quy qua Call(Sym).
+    /// Run the IR: interp(entry, args) → the return value. Recurses through Call(Sym).
     pub(crate) fn interp(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64]) -> Result<i64, String> {
         interp_d(tt, funcs, entry, args, 0)
     }
 
-    /// interp có ĐẾM ĐỘ SÂU: interp dùng Rust-recursion cho Call, nên input ép đệ quy
-    /// lớn (vd fact(2^31)) làm tràn stack HOST — không phải bug IR. Chạm trần → Err
-    /// (input "ngoài không gian mô hình được" → equiv SKIP, giống UB). Trần chọn thấp
-    /// hơn stack thật nhiều lần để an toàn.
+    /// interp with DEPTH COUNTING: interp uses Rust recursion for Call, so an input
+    /// forcing deep recursion (e.g. fact(2^31)) would overflow the HOST stack — not an
+    /// IR bug. Hitting the bound → Err (an input "outside the modeled space" → equiv
+    /// SKIP, like UB). The bound is chosen many times lower than the real stack for safety.
     fn interp_d(tt: &TyTab, funcs: &[IrFunc], entry: &str, args: &[i64], depth: u32) -> Result<i64, String> {
         if depth > 500 {
-            return Err("interp: đệ quy quá sâu (input ngoài không gian mô hình)".into());
+            return Err("interp: recursion too deep (input outside the modeled space)".into());
         }
         let f = funcs
             .iter()
             .find(|f| f.name == entry)
-            .ok_or_else(|| format!("interp: không thấy hàm {entry}"))?;
+            .ok_or_else(|| format!("interp: function {entry} not found"))?;
         let mut reg = vec![0i64; f.temps.len()];
-        // Seed arg vào slot khung (backend emit_params làm điều tương tự theo ABI):
-        // param tại offset off ⇒ index mem = frame - off (khớp Lea Local bên dưới).
+        // Seed the args into the frame slots (the backend emit_params does the same
+        // per the ABI): a parameter at offset off ⇒ mem index = frame - off (matching
+        // Lea Local below).
         let mut mem = vec![0u8; f.frame as usize];
         for (i, &(off, pty)) in f.params.iter().enumerate() {
             let v = canon(tt, pty, *args.get(i).unwrap_or(&0));
@@ -1226,13 +1265,13 @@ pub(crate) mod tests {
         };
 
         let mut cur = 0usize;
-        let mut budget = 10_000_000u64; // chốt chống lặp vô hạn (test nhỏ)
+        let mut budget = 10_000_000u64; // guard against infinite loops (small tests)
         loop {
             let b = &f.blocks[cur];
             for inst in &b.insts {
                 budget -= 1;
                 if budget == 0 {
-                    return Err("interp: vượt ngân sách bước (lặp vô hạn?)".into());
+                    return Err("interp: step budget exceeded (infinite loop?)".into());
                 }
                 match inst {
                     Inst::Bin(d, op, ty, a, bb) => {
@@ -1277,15 +1316,15 @@ pub(crate) mod tests {
                     Inst::Memcpy(d, s, sz) => {
                         let (da, sa) = (fetch(&reg, d) as usize, fetch(&reg, s) as usize);
                         for k in 0..*sz as usize {
-                            mem[da + k] = mem[sa + k]; // copy xuôi (khớp backend)
+                            mem[da + k] = mem[sa + k]; // forward copy (matching the backend)
                         }
                     }
                     Inst::Lea(d, p) => match p {
-                        // ABI zcc: địa chỉ local = x29 − off; flat-mem [0,frame) với
-                        // index 0 = x29−frame ⟹ index = frame − off.
+                        // zcc ABI: a local address = x29 − off; flat memory [0,frame)
+                        // with index 0 = x29−frame ⟹ index = frame − off.
                         Place::Local(off) => reg[*d as usize] = (f.frame - *off) as i64,
                         Place::Global(..) | Place::Str(_) => {
-                            return Err("interp: địa chỉ global/str không mô hình hoá".into())
+                            return Err("interp: global/str address not modeled".into())
                         }
                     },
                     Inst::Cast(d, from, to, a) => {
@@ -1293,7 +1332,7 @@ pub(crate) mod tests {
                     }
                     Inst::Call(d, c, args, _) => {
                         let Callee::Sym(name) = c else {
-                            return Err("interp: gọi gián tiếp không mô hình hoá".into());
+                            return Err("interp: indirect call not modeled".into());
                         };
                         let av: Vec<i64> = args.iter().map(|v| fetch(&reg, v)).collect();
                         let r = interp_d(tt, funcs, name, &av, depth + 1)?;
@@ -1313,7 +1352,7 @@ pub(crate) mod tests {
                     | Inst::CallX(..)
                     | Inst::Sync(..)
                     | Inst::Asm(..) => {
-                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX/sync/asm — hàm không thuần)".into())
+                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX/sync/asm — impure function)".into())
                     }
                 }
             }
@@ -1321,12 +1360,12 @@ pub(crate) mod tests {
                 Term::Jmp(t) => cur = *t as usize,
                 Term::Br(c, t, e) => cur = if fetch(&reg, c) != 0 { *t } else { *e } as usize,
                 Term::Ret(v) => return Ok(v.map(|v| fetch(&reg, &v)).unwrap_or(0)),
-                Term::Unreachable => return Err("interp: chạm Unreachable".into()),
+                Term::Unreachable => return Err("interp: reached Unreachable".into()),
             }
         }
     }
 
-    // Dựng nhanh một IrFunc. params = (offset khung, kiểu) — param sống trong slot.
+    // Quickly build an IrFunc. params = (frame offset, type) — a parameter lives in a slot.
     pub(crate) fn mk(
         name: &str,
         temps: Vec<TypeId>,
@@ -1338,13 +1377,13 @@ pub(crate) mod tests {
         IrFunc { name: name.into(), temps, params, blocks, frame, ret, labels: vec![] }
     }
 
-    // ── Định lý 1: IR biểu đạt được đệ quy + rẽ nhánh + số học int (factorial).
-    // fact(n) = n<=1 ? 1 : n*fact(n-1).  Chứng verify OK + interp(5)=120.
+    // ── Theorem 1: the IR can express recursion + branching + integer arithmetic (factorial).
+    // fact(n) = n<=1 ? 1 : n*fact(n-1).  Proof: verify OK + interp(5)=120.
     #[test]
     fn factorial() {
         let tt = TyTab::new();
-        // param n ở slot khung off=16 (index frame−off=0). t0=&n, t1=n, t2=cond,
-        // t3=n−1, t4=rec, t5=prod. Mô hình mới: param Load từ slot, không param-temp.
+        // parameter n in frame slot off=16 (index frame−off=0). t0=&n, t1=n, t2=cond,
+        // t3=n−1, t4=rec, t5=prod. New model: parameters are Loaded from their slot, no parameter-temp.
         let f = mk(
             "fact",
             vec![ULONG, INT, INT, INT, INT, INT],
@@ -1376,8 +1415,8 @@ pub(crate) mod tests {
         assert_eq!(interp(&tt, std::slice::from_ref(&f), "fact", &[0]).unwrap(), 1);
     }
 
-    // ── Định lý 2: memory tường minh (Lea/Store/Load) round-trip đúng width.
-    // frame[0..4] ← 42 (INT); đọc lại + 8 = 50.
+    // ── Theorem 2: explicit memory (Lea/Store/Load) round-trips at the correct width.
+    // frame[0..4] ← 42 (INT); read back + 8 = 50.
     #[test]
     fn load_store() {
         let tt = TyTab::new();
@@ -1401,7 +1440,7 @@ pub(crate) mod tests {
         assert_eq!(interp(&tt, std::slice::from_ref(&f), "ls", &[]).unwrap(), 50);
     }
 
-    // ── Định lý 3: số học wrap tại 2^32 cho INT (canon), khác hẳn ULONG/64-bit.
+    // ── Theorem 3: arithmetic wraps at 2^32 for INT (canon), quite unlike ULONG/64-bit.
     #[test]
     fn int_wrap() {
         let tt = TyTab::new();
@@ -1409,19 +1448,19 @@ pub(crate) mod tests {
         assert_eq!(eval_bin(&tt, Op::Add, INT, i32::MAX as i64, 1).unwrap(), i32::MIN as i64);
         // unsigned: 0u - 1u = 0xFFFFFFFF (UINT)
         assert_eq!(eval_bin(&tt, Op::Sub, UINT, 0, 1).unwrap(), 0xFFFF_FFFF);
-        // so sánh unsigned: (uint)-1 > 0  (khác signed -1 < 0)
+        // unsigned comparison: (uint)-1 > 0  (unlike signed -1 < 0)
         assert_eq!(eval_bin(&tt, Op::Gt, UINT, canon(&tt, UINT, -1), 0).unwrap(), 1);
         assert_eq!(eval_bin(&tt, Op::Lt, INT, -1, 0).unwrap(), 1);
     }
 
-    // ── Định lý 4: cast i↔f và _Bool normalize (C99 6.3.1.2 / 6.3.1.4).
+    // ── Theorem 4: cast i↔f and _Bool normalization (C99 6.3.1.2 / 6.3.1.4).
     #[test]
     fn casts() {
         let tt = TyTab::new();
         // int 7 → double 7.0
         let d = eval_cast(&tt, INT, DOUBLE, 7);
         assert_eq!(f64::from_bits(d as u64), 7.0);
-        // double 3.9 → int 3 (trunc về 0)
+        // double 3.9 → int 3 (truncate toward 0)
         let i = eval_cast(&tt, DOUBLE, INT, (3.9f64).to_bits() as i64);
         assert_eq!(i, 3);
         // int 5 → _Bool 1 ; int 0 → _Bool 0
@@ -1430,11 +1469,12 @@ pub(crate) mod tests {
         assert_eq!(eval_cast(&tt, INT, BOOL, 0), 0);
     }
 
-    // ── Lowering thật: parse snippet C → lower → verify → interp (oracle).
-    // Chứng commuting-square ở tầng lowering: ⟦lower(AST)⟧ = nghĩa chương trình.
+    // ── Real lowering: parse a C snippet → lower → verify → interp (oracle).
+    // Establishes the commuting square at the lowering level: ⟦lower(AST)⟧ = the program meaning.
     pub(crate) fn compile(name: &str, src: &str) -> (crate::ast::Ast, Vec<IrFunc>) {
-        // Tên file DUY NHẤT theo băm(src): test chạy song song, trùng `name` khác
-        // `src` sẽ đua-ghi cùng file → parse rác. Băm src ⟹ khác src = khác file.
+        // A UNIQUE filename by hash(src): tests run in parallel, and a shared `name`
+        // with a different `src` would race-write the same file → garbage parse.
+        // Hashing src ⟹ a different src = a different file.
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         src.hash(&mut h);
@@ -1454,14 +1494,15 @@ pub(crate) mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // equiv — GATE chứng pass (commuting-square / translation-validation cơ học).
-    // Bất biến quản trị THAY trần LOC (Vu 2026-08-20): pass P đúng ⟺ ∀input,
-    // ⟦A⟧(input) = ⟦P(A)⟧(input). Ta không TIN bằng lý luận — ta ĐO bằng interp.
+    // equiv — the pass-proof GATE (commuting-square / mechanical translation-validation).
+    // The governing invariant that REPLACES the LOC ceiling: a pass P is correct ⟺
+    // ∀input, ⟦A⟧(input) = ⟦P(A)⟧(input). We do not TRUST by reasoning — we MEASURE with interp.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Battery input cho differential-interp. arity≤2: **VÉT CẠN** miền nhỏ [-6,6]^n
-    /// (exhaustive → complete cho biên value-space nhỏ) + biên INT_MAX/MIN mỗi toạ độ.
-    /// arity≥3: LCG deterministic 256 vector (Date/random cấm — deterministic để resume).
+    /// The input battery for differential interp. arity≤2: **EXHAUST** the small
+    /// domain [-6,6]^n (exhaustive → complete for the small value-space boundary) +
+    /// the INT_MAX/MIN boundary on each coordinate. arity≥3: a deterministic LCG of
+    /// 256 vectors (no Date/random — deterministic so it can resume).
     pub(crate) fn battery(arity: usize) -> Vec<Vec<i64>> {
         let bound: [i64; 8] = [0, 1, -1, i32::MAX as i64, i32::MIN as i64, 255, -256, 1000003];
         if arity == 0 {
@@ -1484,7 +1525,7 @@ pub(crate) mod tests {
                     }
                 }
                 for &b in &bound {
-                    out.push(vec![b, 1]); // toạ độ kia = 1 (tránh 0 nuốt phép nhân)
+                    out.push(vec![b, 1]); // the other coordinate = 1 (avoid 0 swallowing multiplication)
                     out.push(vec![1, b]);
                     out.push(vec![b, b]);
                 }
@@ -1503,55 +1544,57 @@ pub(crate) mod tests {
         out
     }
 
-    /// ⟦A⟧ ≡ ⟦B⟧ trên `entry`? Observable = giá trị TRẢ. Quy ước UB (diff-tại-UB vô
-    /// nghĩa): before Err ⟹ input ngoài không gian (UB/opaque) → SKIP; before Ok ∧
-    /// after Err ⟹ pass phá well-defined → FAIL; cả hai Ok ⟹ so. Anti-vacuous: nếu
-    /// KHÔNG input nào so được (hàm toàn opaque/UB) → Err (cấm pass "pass" rỗng).
+    /// ⟦A⟧ ≡ ⟦B⟧ on `entry`? Observable = the RETURN value. UB convention (a diff at
+    /// UB is meaningless): before Err ⟹ the input is outside the space (UB/opaque) →
+    /// SKIP; before Ok ∧ after Err ⟹ the pass broke a well-defined case → FAIL; both
+    /// Ok ⟹ compare. Anti-vacuous: if NO input can be compared (a wholly opaque/UB
+    /// function) → Err (forbidding a vacuous "passing" pass).
     pub(crate) fn equiv(tt: &TyTab, a: &[IrFunc], b: &[IrFunc], entry: &str) -> Result<(), String> {
-        let fa = a.iter().find(|f| f.name == entry).ok_or("equiv: thiếu entry ở A")?;
+        let fa = a.iter().find(|f| f.name == entry).ok_or("equiv: missing entry in A")?;
         let arity = fa.params.len();
         let mut compared = 0u32;
         for input in battery(arity) {
             match (interp(tt, a, entry, &input), interp(tt, b, entry, &input)) {
                 (Ok(x), Ok(y)) => {
                     if x != y {
-                        return Err(format!("equiv PHÁ VỠ: {entry}{input:?} → A={x} B={y}"));
+                        return Err(format!("equiv BROKEN: {entry}{input:?} → A={x} B={y}"));
                     }
                     compared += 1;
                 }
                 (Ok(x), Err(e)) => {
-                    return Err(format!("equiv: pass biến well-defined→lỗi: {entry}{input:?} A={x} B_err={e}"));
+                    return Err(format!("equiv: pass turned well-defined→error: {entry}{input:?} A={x} B_err={e}"));
                 }
-                (Err(_), _) => {} // before ngoài không gian → skip
+                (Err(_), _) => {} // before is outside the space → skip
             }
         }
         if compared == 0 {
-            return Err(format!("equiv VACUOUS: {entry} không input nào interp được — pass chưa được chứng"));
+            return Err(format!("equiv VACUOUS: {entry} no input could be interpreted — the pass is unproven"));
         }
         Ok(())
     }
 
-    // Tự-chứng equiv (chứng chính công cụ chứng — luật input-sạch): identity phải
-    // equiv; đột biến MỘT Op phải bị bắt. Nếu test này đỏ, mọi verdict pass vô giá trị.
+    // Self-proof of equiv (validating the validation tool itself — the clean-input
+    // rule): identity must be equiv; a SINGLE mutated Op must be caught. If this test
+    // is red, every passing verdict is worthless.
     #[test]
     fn equiv_selfproof() {
         let (ast, ir) = compile("eqv", "int f(int a,int b){return a*b + a - 7;}");
-        equiv(&ast.tt, &ir, &ir, "f").expect("identity phải equiv");
+        equiv(&ast.tt, &ir, &ir, "f").expect("identity must be equiv");
         let mut bad = ir.clone();
         let mut mutated = false;
         'outer: for f in bad.iter_mut().filter(|f| f.name == "f") {
             for blk in f.blocks.iter_mut() {
                 for inst in blk.insts.iter_mut() {
                     if let Inst::Bin(_, op @ Op::Mul, ..) = inst {
-                        *op = Op::Add; // Mul → Add: đột biến ngữ nghĩa
+                        *op = Op::Add; // Mul → Add: a semantic mutation
                         mutated = true;
                         break 'outer;
                     }
                 }
             }
         }
-        assert!(mutated, "phải có Bin(Mul) để đột biến");
-        assert!(equiv(&ast.tt, &ir, &bad, "f").is_err(), "đột biến Mul→Add phải bị equiv bắt");
+        assert!(mutated, "there must be a Bin(Mul) to mutate");
+        assert!(equiv(&ast.tt, &ir, &bad, "f").is_err(), "the Mul→Add mutation must be caught by equiv");
     }
 
     #[test]
@@ -1566,8 +1609,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn lower_struct_assign() {
-        // q = p là COPY (Inst::Memcpy, CORE) — sửa q KHÔNG đụng p. interp thực
-        // thi được ⟺ struct-assign đã là CORE (Opaque sẽ trả Err → panic).
+        // q = p is a COPY (Inst::Memcpy, CORE) — mutating q does NOT touch p. interp
+        // can execute it ⟺ struct-assign is already CORE (an Opaque would return Err → panic).
         // f(3,4): p={3,4}; q=p; q.x+=100 ⟹ 3*1000+4*10+103 = 3143.
         let s = "struct P{int x,y;};int f(int a,int b){struct P p,q;p.x=a;p.y=b;q=p;q.x=q.x+100;return p.x*1000+p.y*10+q.x;}";
         assert_eq!(run("sa", s, "f", &[3, 4]), 3143);
@@ -1592,10 +1635,10 @@ pub(crate) mod tests {
         assert_eq!(run("rec", "int fact(int n){if(n<=1)return 1;return n*fact(n-1);}", "fact", &[5]), 120);
     }
 
-    // ── Định lý 5: verifier BẮT IR hỏng (dùng temp không định nghĩa + block lạc).
+    // ── Theorem 5: the verifier CATCHES malformed IR (using an undefined temp + a stray block).
     #[test]
     fn verifier_rejects() {
-        // dùng t9 (không đâu def) → def-coverage vỡ
+        // uses t9 (never defined) → def-coverage broken
         let bad = mk(
             "bad",
             vec![INT],
@@ -1605,7 +1648,7 @@ pub(crate) mod tests {
             vec![Block { insts: vec![], term: Term::Ret(Some(Val::Tmp(9))) }],
         );
         assert!(verify(&bad).is_err());
-        // nhảy tới block không tồn tại → ref-integrity CFG vỡ
+        // jumps to a nonexistent block → CFG ref-integrity broken
         let bad2 = mk(
             "bad2",
             vec![INT],

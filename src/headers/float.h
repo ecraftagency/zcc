@@ -1,6 +1,6 @@
 #ifndef _FLOAT_H
 #define _FLOAT_H
-/* C89 2.2.4.2 đủ bộ — thiếu là #if user (redis double2ll) âm thầm ra 0 */
+/* The full C89 2.2.4.2 set — a missing macro makes a user #if (redis double2ll) silently evaluate to 0 */
 #define FLT_ROUNDS 1
 #define FLT_RADIX 2
 #define FLT_MANT_DIG 24
@@ -21,8 +21,8 @@
 #define DBL_EPSILON 2.2204460492503131e-16
 #define DBL_MIN 2.2250738585072014e-308
 #define DBL_MAX 1.7976931348623157e+308
-/* long double: ELF = binary128 tại biên ABI/memory nhưng số học vẫn double
-   (LDBL_MANT_DIG 53) — tự nhất quán C99, xem CLAUDE.md */
+/* long double: on ELF = binary128 at the ABI/memory boundary, but arithmetic
+   stays double (LDBL_MANT_DIG 53) — self-consistent under C99, see CLAUDE.md */
 #define LDBL_MANT_DIG 53
 #define LDBL_DIG 15
 #define LDBL_MIN_EXP (-1021)

@@ -1,325 +1,364 @@
-# THEORY.md — nền lý thuyết của zcc
+# THEORY.md — the theoretical foundations of zcc
 
-> Hiến chương (CLAUDE.md) luật gốc **MATHEMATIC FOUNDATION**. File này là catalog
-> **tất tần tật, đầy đủ** — hỏi "zcc dựa trên nền lý thuyết nào" → in file này.
-> Cập nhật mỗi khi thêm định lý/hằng/bảng mới.
+> This document realizes the **MATHEMATIC FOUNDATION** principle of the project
+> charter. It is the **complete, exhaustive catalog**: the answer to the question
+> "on what theoretical basis does zcc rest" is this file. It is updated whenever a
+> new theorem, constant, or table is added.
 
 ---
 
-## §0. LUẬT GỐC — định lý phân rã source code (nếu chỉ giữ 1 luật, giữ luật này)
+## §0. ROOT PRINCIPLE — the source-code decomposition theorem (if only one rule is kept, keep this one)
 
 ```
 zcc source  =  ( math / theory     → control-flow + data-structure + algorithm )
             ⊕  ( iso / os / arch / gcc spec → constant + param + value-table )
 ```
 
-**Mỗi dòng `src/` thuộc ĐÚNG một trong hai vế. Không có dòng thứ ba.**
+**Every line of `src/` belongs to EXACTLY one of the two sides. There is no third side.**
 
-- **Vế I (theory → cách TÍNH):** luồng điều khiển, cấu trúc dữ liệu, thuật toán —
-  đều rút ra từ một định lý / cấu trúc toán. Nếu một đoạn code không map được về
-  định lý nào ở Phần I → nghi sai kiến trúc.
-- **Vế II (spec → GIÁ TRỊ):** hằng số, tham số, bảng tra — chép từ văn bản chuẩn
-  (ISO C99 / AAPCS64 / System V / ELF / AArch64 ARM ARM / GNU). Không "magic number
-  không nguồn gốc" (luật số-liệu-của-Vu): mọi hằng phải truy được về một dòng spec.
+- **Side I (theory → the METHOD of computing):** control flow, data structures,
+  algorithms — each derived from a theorem or mathematical structure. If a fragment
+  of code cannot be mapped back to any theorem in Part I, the architecture is suspect.
+- **Side II (spec → the VALUE):** constants, parameters, and lookup tables copied
+  from a normative document (ISO C99 / AAPCS64 / System V / ELF / AArch64 ARM ARM /
+  GNU). No "magic number without provenance": every constant must be traceable to a
+  line of specification.
 
-Hệ quả kiểm tra: `grep 'EXT(' src/` phủ 100% bề mặt lệch chuẩn (vế II, nhánh gcc/apple);
-mọi hằng layout/ABI sống trong TyTab + file target (vế II); phần còn lại là vế I.
-
----
-
-## §0b. CORRECTNESS LÀ GÌ — real-software coverage là bằng chứng RẺ
-
-- Một compiler **10–15k LOC** có thể compile **250+ phần mềm thật** một cách dễ dàng —
-  vì C bảo thủ chỉ dùng một **tập con hẹp & chung** của ngôn ngữ. Phủ được nhiều
-  project ⟹ chứng minh **tính khả dụng**, KHÔNG chứng minh **tính đúng**.
-- Ngược lại: **chục compiler cùng cỡ vẫn TRƯỢT csmith/yarpgen** — random differential
-  tra tấn đúng các góc ngữ nghĩa mà phần mềm thật không bao giờ chạm (thứ tự eval,
-  UAC biên, bitfield packing, sign/overflow, alias, ABI hiếm).
-- ⟹ **Thang bằng chứng correctness (yếu → mạnh):**
-  `compile-được-app  <  chạy-đúng-app  <  differential-vs-oracle trên corpus  <  structural-exhaustion (sci-gate)  <  random-differential (csmith/yarpgen)  <  IR-equivalence-by-theorem`.
-- ⟹ Lý do tồn tại của **tầng sci-gate** (vét cạn cấu trúc, ground truth) và của hướng
-  **IR→IR_ops chứng bằng định lý**: chúng bắt lỗi mà 250 app không bao giờ lộ.
-  App-stack là chứng nghiệm THỰC TIỄN (tầng dưới); định lý là ground truth (tầng trên).
+Verification corollary: `grep 'EXT(' src/` covers 100% of the nonconforming surface
+(Side II, the gcc/apple branches); every layout/ABI constant lives in TyTab plus the
+target file (Side II); everything else is Side I.
 
 ---
 
-# PHẦN I — THEORY → CONTROL-FLOW / DATA-STRUCTURE / ALGORITHM
+## §0b. WHAT CORRECTNESS IS — real-software coverage is CHEAP evidence
 
-> Vế I của §0: *cách zcc tính*. Tra theo 4 trục: **A** pha pipeline · **B** ngành toán
-> thuần · **C** computability/complexity · **D** sci-gate. Trạng thái: **[DÙNG]** đã
-> hiện thực+gate · **[SẼ DÙNG]** IR/opt tier · **[NỀN]** ngầm (mọi quyết định tựa vào).
+- A compiler of **10–15k LOC** can compile **250+ real programs** with ease, because
+  conservative C uses only a **narrow, shared subset** of the language. Covering many
+  projects demonstrates **usability**, NOT **correctness**.
+- Conversely, **dozens of compilers of the same size still FAIL csmith/yarpgen** —
+  random differential torture probes exactly the semantic corners that real software
+  never reaches (evaluation order, UAC boundaries, bitfield packing, sign/overflow,
+  aliasing, rare ABI cases).
+- Hence the **correctness-evidence ladder (weak → strong):**
+  `compiles-an-app  <  runs-an-app-correctly  <  differential-vs-oracle over a corpus  <  structural-exhaustion (sci-gate)  <  random-differential (csmith/yarpgen)  <  IR-equivalence-by-theorem`.
+- Hence the reason the **sci-gate tier** exists (structural exhaustion, ground truth)
+  and the reason for the **IR→IR_ops proven-by-theorem** direction: they catch defects
+  that 250 applications never expose. The application stack is PRACTICAL corroboration
+  (lower tier); the theorems are ground truth (upper tier).
 
-## A — THEO PHA PIPELINE
+---
 
-### A1. Lexing `[DÙNG]`
-| khái niệm/định lý | mô tả | zcc |
+# PART I — THEORY → CONTROL-FLOW / DATA-STRUCTURE / ALGORITHM
+
+> Side I of §0: *how zcc computes*. Indexed along four axes: **A** pipeline phase ·
+> **B** pure mathematics · **C** computability/complexity · **D** sci-gate. Status:
+> **[IN USE]** implemented and gated · **[PLANNED]** IR/opt tier · **[FOUNDATION]**
+> implicit (every decision rests on it).
+
+## A — BY PIPELINE PHASE
+
+### A1. Lexing `[IN USE]`
+| concept/theorem | description | zcc |
 |---|---|---|
-| Regular language | token = ngôn ngữ chính quy | `lexer.rs`, `gate shape` |
-| Finite automaton (DFA/NFA), Kleene | máy trạng thái hữu hạn; RE↔DFA | `lexer.rs` |
-| Maximal munch / longest-match | token dài nhất (`>>`,`->`) | `lexer.rs` |
-| Chomsky hierarchy (Type-3 ⊂ Type-2) | token chính quy ⊂ CFG parser | `lexer.rs`↔`parser.rs` |
-| Translation phases (8 pha, 5.1.1.2) | splice `\`, comment, token, macro | `lexer.rs`+`preprocess.rs` |
+| Regular language | a token is a regular language | `lexer.rs`, `gate shape` |
+| Finite automaton (DFA/NFA), Kleene | finite-state machine; RE↔DFA | `lexer.rs` |
+| Maximal munch / longest-match | longest token (`>>`, `->`) | `lexer.rs` |
+| Chomsky hierarchy (Type-3 ⊂ Type-2) | regular tokens ⊂ CFG parser | `lexer.rs`↔`parser.rs` |
+| Translation phases (8 phases, 5.1.1.2) | line splicing `\`, comments, tokens, macros | `lexer.rs`+`preprocess.rs` |
 
-### A2. Preprocessing `[DÙNG]`
-| khái niệm/định lý | mô tả | zcc |
+### A2. Preprocessing `[IN USE]`
+| concept/theorem | description | zcc |
 |---|---|---|
-| Term rewriting system (TRS) | macro expand = viết lại hạng → normal form | `preprocess.rs`, `gate cpp` |
-| Confluence (Church–Rosser) | kết quả expand xác định | `preprocess.rs` |
-| Termination / well-foundedness | expansion phải dừng | `preprocess.rs` |
-| Hideset / blue paint | chống đệ quy macro | `preprocess.rs` |
-| Constant-expression eval (#if) | eval hằng nguyên (grammar con+interp) | `gate cpp` |
+| Term rewriting system (TRS) | macro expansion = term rewriting → normal form | `preprocess.rs`, `gate cpp` |
+| Confluence (Church–Rosser) | the expansion result is deterministic | `preprocess.rs` |
+| Termination / well-foundedness | expansion must terminate | `preprocess.rs` |
+| Hideset / blue paint | prevents recursive macro expansion | `preprocess.rs` |
+| Constant-expression evaluation (#if) | evaluates integer constants (sub-grammar + interpreter) | `gate cpp` |
 
-### A3. Parsing `[DÙNG]`
-| khái niệm/định lý | mô tả | zcc |
+### A3. Parsing `[IN USE]`
+| concept/theorem | description | zcc |
 |---|---|---|
-| Context-free grammar (Type-2) | ngữ pháp C = CFG | `parser.rs`, `gate shape` |
-| Recursive descent (LL, top-down) | đệ quy xuống theo luật | `parser.rs` |
-| Precedence climbing / Pratt | leo ưu tiên toán tử nhị phân | `parser.rs` (`mkbin`+bp) |
-| Lexer hack (typedef feedback) | `T*x` decl vs mul cần bảng typedef | `parser.rs` (`is_type_word`) |
-| Dangling-else resolution | `else` khớp `if` gần nhất | `parser.rs` |
-| Inductive datatype / term algebra | AST = arena + `NodeId(u32)`, không Box | `ast.rs` |
+| Context-free grammar (Type-2) | the C grammar is a CFG | `parser.rs`, `gate shape` |
+| Recursive descent (LL, top-down) | recursion descending by production | `parser.rs` |
+| Precedence climbing / Pratt | operator-precedence climbing for binary operators | `parser.rs` (`mkbin`+bp) |
+| Lexer hack (typedef feedback) | `T*x` declaration vs. multiplication requires a typedef table | `parser.rs` (`is_type_word`) |
+| Dangling-else resolution | `else` binds to the nearest `if` | `parser.rs` |
+| Inductive datatype / term algebra | AST = arena + `NodeId(u32)`, no `Box` | `ast.rs` |
 
-### A4. Type system & static semantics `[DÙNG]`
-| khái niệm/định lý | mô tả | zcc |
+### A4. Type system & static semantics `[IN USE]`
+| concept/theorem | description | zcc |
 |---|---|---|
-| Type-derivation lattice | dẫn xuất ptr/array/func; decay array→ptr | `gate decay` |
-| UAC = join-semilattice | least-upper-bound trên rank | `parser.rs` (`common_ty`), `gate alg` |
-| Integer promotion / rank order (6.3.1.1) | thứ tự trên rank | `parser.rs` (`promote`) |
-| Typing judgment Γ⊢e:τ | môi trường kiểu + scope/shadowing | `parser.rs` (`locals`,`typedefs`) |
-| Record-layout automaton | struct/union/bitfield = cursor có trạng thái | `gate shape` |
-| Constant folding = partial evaluation | eval hằng lúc dịch | `parser.rs` (`fold`), `gate alg` |
+| Type-derivation lattice | pointer/array/function derivation; array→pointer decay | `gate decay` |
+| UAC = join-semilattice | least upper bound over rank | `parser.rs` (`common_ty`), `gate alg` |
+| Integer promotion / rank order (6.3.1.1) | ordering over rank | `parser.rs` (`promote`) |
+| Typing judgment Γ⊢e:τ | type environment + scope/shadowing | `parser.rs` (`locals`, `typedefs`) |
+| Record-layout automaton | struct/union/bitfield = a stateful cursor | `gate shape` |
+| Constant folding = partial evaluation | evaluate constants at translation time | `parser.rs` (`fold`), `gate alg` |
 | Commuting square fold↔runtime | fold(e)=run(e) | `gate alg` |
 
-### A5. Codegen & ABI `[DÙNG]`
-| khái niệm/định lý | mô tả | zcc |
+### A5. Codegen & ABI `[IN USE]`
+| concept/theorem | description | zcc |
 |---|---|---|
-| Instruction selection = per-node simulation | mô phỏng node AST→asm (maximal munch trên cây) | `codegen/arm64_elf.rs` |
-| ABI = finite automaton | phân loại arg (NGRN/NSRN/NSAA) | `gate abi` |
-| Cross-link cancellation | lỗi ABI cùng-compiler tự khử → gate 4 hướng | `gate abi` |
+| Instruction selection = per-node simulation | simulate AST node → asm (maximal munch over the tree) | `codegen/arm64_elf.rs` |
+| ABI = finite automaton | argument classification (NGRN/NSRN/NSAA) | `gate abi` |
+| Cross-link cancellation | same-compiler ABI errors cancel → 4-way gate | `gate abi` |
 | Activation record / frame layout | fp-relative, spill, variadic save | `codegen/arm64_elf.rs` |
 
-### A6. IR — dạng trung gian `[SẼ DÙNG, khung đã dựng]`
-| khái niệm/định lý | mô tả | zcc |
+### A6. IR — the intermediate form `[PLANNED, scaffolding built]`
+| concept/theorem | description | zcc |
 |---|---|---|
-| Control-flow graph (CFG) | hàm = đồ thị block | `ir.rs` (`IrFunc.blocks`) |
-| Basic block | chuỗi thẳng + đúng 1 terminator | `ir.rs` (`Block`) |
-| Terminator = automaton trên BlockId | Jmp/Br/Ret/Switch/Unreachable | `ir.rs` (`Term`) |
-| Virtual registers / temps (SSA-free) | temp có kiểu Γ | `ir.rs` (`temps`) |
-| CORE vs EXOTIC-typed two-tier | CORE (Bin/Un/Copy/Load/Lea/Cast) opt đụng được; EXOTIC-typed (Call/Store/Overflow/Va*/Sync/Asm…) impure, không DCE/CSE (Inst::Opaque đã XÓA) | `ir.rs` (`Inst`) |
-| Well-formedness verifier | ref-integrity+def-coverage+entry | `ir.rs` (`verify`) |
-| SSA + φ-node *(mở khi cần)* | mỗi temp gán 1 lần | *[chưa]* |
+| Control-flow graph (CFG) | a function is a graph of blocks | `ir.rs` (`IrFunc.blocks`) |
+| Basic block | a straight-line sequence + exactly one terminator | `ir.rs` (`Block`) |
+| Terminator = automaton over BlockId | Jmp/Br/Ret/Switch/Unreachable | `ir.rs` (`Term`) |
+| Virtual registers / temps (SSA-free) | a temporary carries a type from Γ | `ir.rs` (`temps`) |
+| CORE vs. EXOTIC-typed two-tier | CORE (Bin/Un/Copy/Load/Lea/Cast) is reachable by passes; EXOTIC-typed (Call/Store/Overflow/Va*/Sync/Asm…) is impure, no DCE/CSE (Inst::Opaque has been REMOVED) | `ir.rs` (`Inst`) |
+| Well-formedness verifier | reference integrity + def coverage + entry | `ir.rs` (`verify`) |
+| SSA + φ-node *(opened when needed)* | each temp assigned once | *[not yet]* |
 
-### A7. Optimization — chứng minh pass `[DÙNG: IR→IR proven]` (mỗi pass provable, thay trần LOC)
+### A7. Optimization — proving each pass `[IN USE: IR→IR proven]` (each pass provable, in place of a LOC ceiling)
 
-> Hiện trạng 2026-08-21: 5 pass đã hiện thực + CHỨNG ở IR→IR (`src/opt.rs`, 29 test):
-> const-fold / DCE / copy-prop / CSE gate bằng `ir::tests::equiv` (commuting-square,
-> ⟦A⟧≡⟦P(A)⟧ trên battery vét-cạn-miền-nhỏ + biên) + `verify`; regalloc (liveness
-> dataflow-fixpoint → interference → Chaitin coloring → `verify_coloring`) gate bằng
-> BẤT BIẾN GIAO THOA (bisimulation-đổi-tên). Orchestrator `optimize()` = fixpoint 1-4,
-> chạy sau cờ `ZCC_OPT` trên đường IR mặc định (đo box: torture opt≡noopt end-to-end).
-| khái niệm/định lý | mô tả |
+> Current status: 5 passes implemented and PROVEN at the IR→IR level (`src/opt.rs`,
+> 29 tests): const-fold / DCE / copy-prop / CSE are gated by `ir::tests::equiv`
+> (commuting square, ⟦A⟧≡⟦P(A)⟧ over the small-domain-exhaustive battery plus
+> boundaries) plus `verify`; regalloc (liveness dataflow-fixpoint → interference →
+> Chaitin coloring → `verify_coloring`) is gated by the INTERFERENCE INVARIANT
+> (rename bisimulation). The orchestrator `optimize()` is a fixpoint over passes 1–4,
+> run behind the `ZCC_OPT` flag on the default IR path (measured in-box: torture
+> opt≡noopt end-to-end).
+
+| concept/theorem | description |
 |---|---|
-| Denotational semantics ⟦·⟧:State→State | pass đúng ⟺ ⟦f⟧=⟦f'⟧ — hình thức hoá: `SEMANTICS.md` §1-4 (NẤC-1) |
-| Operational semantics (small/big-step) | interp = hiện thực ⟦·⟧ (Σ=⟨ρ,μ⟩); định lý executable `SEMANTICS.md` §5 |
-| Translation validation (Pnueli/Necula) | validate MỖI LẦN chạy pass |
-| Bisimulation / simulation | khớp trạng thái edge-by-edge (regalloc) |
-| Symbolic execution | biến ký hiệu→term đóng; COMPLETE loop-free |
-| Value numbering / congruence / e-graph | chuẩn hoá + nền CSE |
+| Denotational semantics ⟦·⟧:State→State | a pass is correct ⟺ ⟦f⟧=⟦f'⟧ — formalized in `SEMANTICS.md` §1-4 (LEVEL-1) |
+| Operational semantics (small/big-step) | interp realizes ⟦·⟧ (Σ=⟨ρ,μ⟩); executable theorem, `SEMANTICS.md` §5 |
+| Translation validation (Pnueli/Necula) | validate EACH execution of a pass |
+| Bisimulation / simulation | match states edge-by-edge (regalloc) |
+| Symbolic execution | symbolic variable → closed term; COMPLETE loop-free |
+| Value numbering / congruence / e-graph | normalization + the basis of CSE |
 | Term-rewriting soundness ⟦L⟧=⟦R⟧ | correctness BY CONSTRUCTION |
-| Newman's lemma | terminating+local-confluent → confluent |
-| Dataflow = monotone framework trên lattice | leo fixpoint |
+| Newman's lemma | terminating + locally confluent → confluent |
+| Dataflow = monotone framework over a lattice | climb to fixpoint |
 | Fixpoint Kleene / Knaster–Tarski | least/greatest fixpoint |
-| Liveness / reaching-defs / available-expr | nền DCE/copy-prop/CSE |
-| Dominance / dom-tree (Lengauer–Tarski) | A dom B; nền copy-prop, SSA |
-| Graph coloring / interference (Chaitin–Briggs) | regalloc = tô màu |
+| Liveness / reaching-defs / available-expr | basis of DCE/copy-prop/CSE |
+| Dominance / dom-tree (Lengauer–Tarjan) | A dom B; basis of copy-prop, SSA |
+| Graph coloring / interference (Chaitin–Briggs) | regalloc = coloring |
 
-**5 pass → định lý (đều DECIDABLE, không tái-cấu-trúc loop → thoát Rice):**
-const-fold=rewrite-soundness · DCE=liveness · copy-prop=dominance+Leibniz ·
-CSE=value-numbering · regalloc=bisimulation-đổi-tên.
+**5 passes → theorem (all DECIDABLE; no loop restructuring → outside Rice):**
+const-fold = rewrite-soundness · DCE = liveness · copy-prop = dominance + Leibniz ·
+CSE = value-numbering · regalloc = rename-bisimulation.
 
-### A8. Testing & proof methodology `[DÙNG]`
+### A8. Testing & proof methodology `[IN USE]`
 Differential testing · Metamorphic (commuting-square) · Property/boundary-value ·
-Structural exhaustion · UB filtering · 2-fact (PASS|NOT-IMPL|FAIL, gate=0 FAIL) ·
-Translation-validation-as-gate (`ir.sh`, kế hoạch) · Evidence-trail (input-sạch).
+Structural exhaustion · UB filtering · 2-fact (PASS|NOT-IMPL|FAIL, gate = 0 FAIL) ·
+Translation-validation-as-gate (`ir.sh`, planned) · Evidence-trail (clean input).
 
-## B — THEO NGÀNH TOÁN THUẦN (index ngược)
+## B — BY PURE-MATHEMATICS BRANCH (reverse index)
 
-- **B1. Rời rạc & đồ thị:** automata/formal-lang (A1–A3), đồ thị có hướng (CFG, dom-tree,
-  interference), cây (AST, expr-tree), tổ hợp/đếm (generator vét cạn), quan hệ tương đương
-  (bisimulation, value-number classes). Thuật: DFS/postorder, reverse-postorder, SCC.
-- **B2. Đại số:** semilattice (UAC join, dataflow meet), lattice/complete-lattice (type,
-  dataflow; nền Tarski), term-algebra tự do (AST/IR), monoid/associativity (nối token/block/fold),
-  Boolean algebra (`#if`, branch, bit-ops), đại số tuyến tính thưa (offset/stride mảng nhiều
-  chiều = ánh xạ affine index→address, VLA-2D `i·rowsz+j·esz`).
-- **B3. Thứ tự (order):** poset (rank, dominance, lattice), monotone+fixpoint (Kleene chain,
-  Knaster–Tarski), well-founded/termination (macro, rewriting), Galois connection [NỀN, abstract-interp].
-- **B4. Logic & proof theory:** typing judgment/natural-deduction (Γ⊢), Hoare logic/wp [SẼ DÙNG],
-  FOL/SMT-style (symbolic path condition, decidable loop-free) [SẼ DÙNG], Leibniz equality (copy-prop),
-  SAT [NỀN].
-- **B5. Giải tích & số học máy (vai trò HẸP nhưng thật):** IEEE-754 FP semantics (rounding/NaN/Inf/
-  signed-zero — codegen giữ bit-pattern), real-analysis [NỀN] (FP KHÔNG kết hợp → cấm reorder fold
-  float), monotone convergence (dataflow đạt fixpoint hữu hạn), number-theory/modular (align=modulo
-  2^k, two's-complement=modulo 2^n, `%`/`/` truncation-toward-zero C99).
-- **B6. Xác suất (phương pháp test):** random differential / fuzzing (csmith/yarpgen, kế hoạch) —
-  kỳ vọng phủ lỗi ∝ số mẫu, dưới structural-exhaustion về độ chắc (xem §0b).
+- **B1. Discrete & graph theory:** automata/formal languages (A1–A3), directed graphs
+  (CFG, dom-tree, interference), trees (AST, expression tree), combinatorics/counting
+  (exhaustive generator), equivalence relations (bisimulation, value-number classes).
+  Algorithms: DFS/postorder, reverse-postorder, SCC.
+- **B2. Algebra:** semilattice (UAC join, dataflow meet), lattice/complete-lattice
+  (types, dataflow; the basis of Tarski), free term algebra (AST/IR),
+  monoid/associativity (token/block/fold concatenation), Boolean algebra (`#if`,
+  branching, bit operations), sparse linear algebra (multidimensional array
+  offset/stride = an affine map index→address, the 2-D VLA `i·rowsz+j·esz`).
+- **B3. Order theory:** poset (rank, dominance, lattice), monotone + fixpoint (Kleene
+  chain, Knaster–Tarski), well-founded/termination (macros, rewriting), Galois
+  connection [FOUNDATION, abstract interpretation].
+- **B4. Logic & proof theory:** typing judgment / natural deduction (Γ⊢), Hoare
+  logic/wp [PLANNED], FOL/SMT-style (symbolic path condition, decidable loop-free)
+  [PLANNED], Leibniz equality (copy-prop), SAT [FOUNDATION].
+- **B5. Analysis & machine arithmetic (a NARROW but genuine role):** IEEE-754
+  floating-point semantics (rounding/NaN/Inf/signed-zero — codegen preserves the bit
+  pattern), real analysis [FOUNDATION] (floating point is NOT associative → no
+  reordering of float folds), monotone convergence (dataflow reaches a finite
+  fixpoint), number theory/modular arithmetic (align = modulo 2^k, two's-complement =
+  modulo 2^n, `%`/`/` truncation-toward-zero per C99).
+- **B6. Probability (test methodology):** random differential / fuzzing (csmith/yarpgen,
+  planned) — expected defect coverage ∝ sample count, below structural-exhaustion in
+  certainty (see §0b).
 
-## C — COMPUTABILITY & COMPLEXITY (arch complexity)
+## C — COMPUTABILITY & COMPLEXITY (architectural complexity)
 
-**C1. Computability:** Halting problem/undecidability (gốc mọi giới hạn) · **Rice's theorem**
-(⟦f⟧=⟦f'⟧ tổng quát bất khả quyết → pass phải ràng-buộc-hình-dạng vào lớp decidable) ·
-decidable fragment (loop-free/bounded → symbolic-equiv COMPLETE) · recursively-enumerable (tập chương trình hợp-lệ).
+**C1. Computability:** the Halting problem / undecidability (the root of every limit) ·
+**Rice's theorem** (⟦f⟧=⟦f'⟧ is undecidable in general → a pass must constrain shape
+into a decidable class) · decidable fragment (loop-free/bounded → symbolic equivalence
+is COMPLETE) · recursively enumerable (the set of valid programs).
 
-**C2. Complexity từng phase:** lexing **O(n)** · preprocess **O(n)** amortized (hideset chặn blow-up) ·
-parse recursive-descent **O(n)** (không backtrack lũy thừa) · type/layout **O(n)** · codegen **O(n)** ·
-dataflow **O(n·h·|lattice|)** · dom-tree **O(n·α(n))** Lengauer–Tarski · value-numbering **O(n)–O(n log n)** ·
-**register allocation NP-complete** (Chaitin) → heuristic simplify/spill · SSA construction **O(n·α(n))**.
+**C2. Complexity per phase:** lexing **O(n)** · preprocess **O(n)** amortized (hideset
+bounds blow-up) · recursive-descent parsing **O(n)** (no exponential backtracking) ·
+type/layout **O(n)** · codegen **O(n)** · dataflow **O(n·h·|lattice|)** · dom-tree
+**O(n·α(n))** Lengauer–Tarjan · value-numbering **O(n)–O(n log n)** · **register
+allocation NP-complete** (Chaitin) → simplify/spill heuristic · SSA construction
+**O(n·α(n))**.
 
-**C3. Lớp phức tạp:** P (frontend + hầu hết analysis) · NP-complete (regalloc — vì sao heuristic,
-không "tối ưu tuyệt đối"; nhưng *đúng-màu* verify được trong P) · undecidable (equivalence tổng quát
-→ chỉ structural + translation-validation per-run) · **complexity của CHÍNH compiler** (bất biến `src/`
-≤ trần: compiler=định lý phải đọc được).
+**C3. Complexity classes:** P (frontend + most analyses) · NP-complete (regalloc —
+hence the heuristic rather than "absolute optimum"; but *valid-coloring* is verifiable
+in P) · undecidable (equivalence in general → only structural + per-run translation
+validation) · **the complexity of the compiler ITSELF** (invariant: `src/` ≤ ceiling —
+a compiler is a theorem and must remain readable).
 
-## D — SCI-GATE ↔ ĐỊNH LÝ (ground truth tier)
-| gate | không gian vét cạn | định lý |
+## D — SCI-GATE ↔ THEOREM (ground-truth tier)
+| gate | space exhausted | theorem |
 |---|---|---|
 | `shape` | lexer/declarator/layout | grammar automata + record-layout automaton |
 | `cpp` | preprocessor | term rewriting system + #if const-eval |
-| `decay` | dẫn xuất kiểu | type-derivation lattice |
+| `decay` | type derivation | type-derivation lattice |
 | `alg` | UAC + fold | join-semilattice + commuting-square fold↔runtime |
 | `abi` | ABI classify + link | finite automaton + cross-link cancellation |
-| `ir` *(`cargo test`)* | IR + 5 pass + ref-semantics | reference semantics ⟦·⟧ (`SEMANTICS.md`, NẤC-1) + ĐỊNH LÝ executable commuting-square vét-cạn 𝔼_struct (312 expr×5 pass=1560 ô) + interference-invariant (regalloc) |
+| `ir` *(`cargo test`)* | IR + 5 passes + reference semantics | reference semantics ⟦·⟧ (`SEMANTICS.md`, LEVEL-1) + executable THEOREM: commuting-square exhaustion of 𝔼_struct (312 expr × 5 passes = 1560 squares) + interference invariant (regalloc) |
 
 ---
 
-# PHẦN II — SPEC → CONSTANT / PARAM / VALUE-TABLE
+# PART II — SPEC → CONSTANT / PARAM / VALUE-TABLE
 
-> Vế II của §0: *giá trị zcc chép từ chuẩn*. Mọi hằng phải truy được về một dòng spec
-> (luật số-liệu-của-Vu). Nơi sống: **TyTab trong `ast.rs`** (layout, LP64) + **file target**
-> (ABI/section/asm) + **`ext.rs` + marker `EXT(...)`** (bề mặt vendor). Target: AArch64 ELF Linux.
+> Side II of §0: *the values zcc copies from the standards*. Every constant must be
+> traceable to a line of specification. Where they live: **TyTab in `ast.rs`** (layout,
+> LP64) + **the target file** (ABI/section/asm) + **`ext.rs` plus the `EXT(...)` marker**
+> (vendor surface). Target: AArch64 ELF Linux.
 
-### II-1. ISO C99 — hằng ngôn ngữ
-| bảng/hằng | nguồn spec | zcc |
+### II-1. ISO C99 — language constants
+| table/constant | spec source | zcc |
 |---|---|---|
 | integer conversion rank | 6.3.1.1 | `parser.rs` promote/common_ty |
 | `<limits.h>` (INT_MAX, CHAR_BIT=8…) | 5.2.4.2.1 | header + TyTab size |
-| UAC bảng chuyển | 6.3.1.8 | `common_ty` |
-| escape/trigraph, số literal suffix | 6.4.4 | `lexer.rs` |
-| source/exec char set = UTF-8 multibyte (decode-table RFC 3629: mask `0x1f/0x0f/0x07/0x3f`, shift 6) | 5.1.1.2 + 6.4.5 | `lexer.rs` `utf8_cp` |
-| `%`,`/` truncation-toward-zero; overflow signed = UB | 6.5.5 | codegen + UB-filter |
-| char = **unsigned** (AAPCS64 aarch64 default, khóa) | 6.2.5 + AAPCS64 | TyTab (`char`→UCHAR) |
+| UAC conversion table | 6.3.1.8 | `common_ty` |
+| escape/trigraph, numeric literal suffixes | 6.4.4 | `lexer.rs` |
+| source/exec char set = UTF-8 multibyte (decode table RFC 3629: masks `0x1f/0x0f/0x07/0x3f`, shift 6) | 5.1.1.2 + 6.4.5 | `lexer.rs` `utf8_cp` |
+| `%`, `/` truncation-toward-zero; signed overflow = UB | 6.5.5 | codegen + UB-filter |
+| char = **unsigned** (AAPCS64 aarch64 default, locked) | 6.2.5 + AAPCS64 | TyTab (`char`→UCHAR) |
 
-### II-2. Memory model — kích thước & alignment (LP64, khóa)
-| kiểu | size | align | nguồn |
+### II-2. Memory model — size & alignment (LP64, locked)
+| type | size | align | source |
 |---|---|---|---|
 | char/short/int/long/long long | 1/2/4/8/8 | =size | LP64 (System V AArch64) |
 | pointer | 8 | 8 | LP64 |
 | float/double | 4/8 | =size | LP64 |
-| long double | **16** | **16** | binary128 memory/ABI (AAPCS64); *số học* làm như double (float.h `LDBL_MANT_DIG=53`), libgcc `__extenddftf2`/`__trunctfdf2` ở biên — lựa-chọn có sổ |
-| struct/union | Σ có padding | max field, aggregate ≥ **8** cho `data_align` | AAPCS64 §5.1 |
-| bitfield | packing theo storage-unit | — | 6.7.2.1 + ABI |
+| long double | **16** | **16** | binary128 memory/ABI (AAPCS64); *arithmetic* performed as double (float.h `LDBL_MANT_DIG=53`), libgcc `__extenddftf2`/`__trunctfdf2` at the boundary — a documented design choice |
+| struct/union | Σ with padding | max field, aggregate ≥ **8** for `data_align` | AAPCS64 §5.1 |
+| bitfield | packing by storage unit | — | 6.7.2.1 + ABI |
 
-Nơi sống: **`ast.rs` TyTab** (`size/align/data_align`). Đổi model = **tham số hóa TyTab**,
-KHÔNG rải điều kiện (luật kiến trúc).
+Where they live: **`ast.rs` TyTab** (`size/align/data_align`). Changing the model =
+**parameterizing TyTab**, NOT scattering conditionals (architectural rule).
 
-### II-3. Calling convention — AAPCS64 (bảng register + phân loại)
-| tham số | giá trị | nguồn |
+### II-3. Calling convention — AAPCS64 (register table + classification)
+| parameter | value | source |
 |---|---|---|
 | integer/pointer arg regs | x0–x7 (NGRN 0–7) | AAPCS64 §6.4 |
 | FP/SIMD arg regs | v0–v7 (NSRN 0–7) | §6.4 |
-| return | x0 (+x1 cho 16B), v0 | §6.4 |
-| stack arg (NSAA) | tràn sau x7/v7, align 8 | §6.4 |
-| sp trước `bl` | thẳng 16 byte | §6.2.2 |
+| return | x0 (+x1 for 16B), v0 | §6.4 |
+| stack arg (NSAA) | overflow after x7/v7, align 8 | §6.4 |
+| sp before `bl` | aligned to 16 bytes | §6.2.2 |
 | callee-saved | x19–x28, x29(fp), x30(lr) | §6.1.1 |
-| composite tràn khóa NGRN=8 (C.11); HFA tràn KHÔNG khóa | — | §6.8 rule C.11 |
+| composite overflow locks NGRN=8 (C.11); HFA overflow does NOT lock | — | §6.8 rule C.11 |
 | prologue | `stp x29,x30,[sp,#-16]!` | §6.2.2 |
 
-Nơi sống: **`codegen/arm64_elf.rs`**. Thuật toán offset arg sống **3 nơi phải khớp từng byte**
-(codegen call / codegen spill / parser va_off) — sửa 1 = sửa 3 + `gate abi`.
+Where it lives: **`codegen/arm64_elf.rs`**. The argument-offset algorithm lives in
+**three places that must agree byte-for-byte** (codegen call / codegen spill / parser
+va_off) — changing one means changing all three, plus running `gate abi`.
 
-### II-4. Object format — ELF / section (AArch64 Linux)
-| hằng | giá trị | nguồn |
+### II-4. Object format — ELF / sections (AArch64 Linux)
+| constant | value | source |
 |---|---|---|
 | sections | `.text`/`.rodata`/`.data`/`.bss` | System V ABI |
-| symbol: **KHÔNG** underscore (khác Darwin) | — | ELF |
-| relocation local | `adrp`+`:lo12:` (PAGE/PAGEOFF) | AArch64 ELF |
+| symbol: **NO** underscore (unlike Darwin) | — | ELF |
+| local relocation | `adrp`+`:lo12:` (PAGE/PAGEOFF) | AArch64 ELF |
 | extern/GOT | `:got:`+`:got_lo12:` | ELF |
 | TLS | `:tprel_*` / TLS model | ELF TLS |
 
-Nơi sống: **`codegen/arm64_elf.rs`**. (Đặc sản Darwin cũ — `_`, `@PAGE`, `@TLVPPAGE`,
-variadic-lên-stack — đã BỎ khi drop Mach-O; ghi ở CLAUDE.md để tránh nhầm.)
+Where it lives: **`codegen/arm64_elf.rs`**. (The former Darwin idiosyncrasies —
+`_`, `@PAGE`, `@TLVPPAGE`, variadic-args-on-stack — were removed when Mach-O was
+dropped; they are recorded in CLAUDE.md to avoid confusion.)
 
 ### II-5. Arch — AArch64 instruction/encoding constants
 Register file (x0–x30, sp, v0–v31), immediate ranges (add/sub 12-bit, logical bitmask,
 branch offset ±128MB), condition codes (eq/ne/lt…), addressing modes (`[base,#off]`,
-`[base,index,lsl]`). Nguồn: **ARM ARM (DDI 0487)**. Nơi sống: `codegen/arm64_elf.rs` (asm text).
+`[base,index,lsl]`). Source: **ARM ARM (DDI 0487)**. Where it lives:
+`codegen/arm64_elf.rs` (asm text).
 
-### II-6. GCC/vendor spec — bề mặt lệch chuẩn (`EXT(...)`)
-| món | trạng thái | marker |
+### II-6. GCC/vendor spec — the nonconforming surface (`EXT(...)`)
+| feature | status | marker |
 |---|---|---|
-| stmt-expr `({...})`, `__extension__` | DÙNG | `EXT(gcc)` |
-| `__attribute__((aligned/packed/weak/alias/transparent_union))` | DÙNG | `EXT(gcc)` |
-| `__attribute__((mode(QI/HI/SI/DI/word/SF/DF/TF)))` → remap width | DÙNG (bảng machmode Vế-II; TI/XF reject) | `EXT(gcc)` `parser.rs apply_mode` |
-| `__builtin_*` (whitelist), `typeof`, `__GNUC__=4`, `types_compatible_p` | DÙNG chọn lọc | `EXT(gcc)` |
-| labels-as-values (`&&label`, `goto *e`), stmt-expr, range `case lo…hi`/`[lo…hi]`, elvis `?:` | DÙNG | `EXT(gcc)` |
-| extended-asm (template + constraint hẹp, musl-critical) | DÙNG subset | `EXT(gcc)` |
-| `vector_size`, `scalar_storage_order`, nested-func, `mode(TI/XF)` | **REJECT sạch** → NOT-IMPL | `EXT(gcc)` |
+| stmt-expr `({...})`, `__extension__` | IN USE | `EXT(gcc)` |
+| `__attribute__((aligned/packed/weak/alias/transparent_union))` | IN USE | `EXT(gcc)` |
+| `__attribute__((mode(QI/HI/SI/DI/word/SF/DF/TF)))` → width remap | IN USE (Side-II machmode table; TI/XF rejected) | `EXT(gcc)` `parser.rs apply_mode` |
+| `__builtin_*` (whitelist), `typeof`, `__GNUC__=4`, `types_compatible_p` | IN USE, selectively | `EXT(gcc)` |
+| labels-as-values (`&&label`, `goto *e`), stmt-expr, range `case lo…hi`/`[lo…hi]`, elvis `?:` | IN USE | `EXT(gcc)` |
+| extended asm (template + narrow constraints, musl-critical) | IN USE, subset | `EXT(gcc)` |
+| `vector_size`, `scalar_storage_order`, nested functions, `mode(TI/XF)` | **cleanly REJECTED** → NOT-IMPL | `EXT(gcc)` |
 
-Nơi sống: **`src/ext.rs`** + điểm chạm đánh `EXT(...)`. Kiểm chứng bằng phép cắt:
-bỏ ext.rs + nhánh marker → phần còn lại pass nguyên suite C89 (`grep 'EXT(' src/` phủ 100%).
-
----
-
-# PHẦN III — KEYSTONE: correctness-by-construction & vì sao Gödel nằm ngoài
-
-**Mệnh đề (Vu 2026-08-21):** nếu KHÔNG một dòng `src/` nào nằm ngoài không gian
-{theory-fact ∪ spec-fact} — mỗi dòng là hiện thực **trung thành** của một định lý (vế I)
-hoặc một hằng-spec (vế II) — thì zcc **tất yếu pass mọi suite**. Không thể phủ định.
-
-**Vì sao đúng (điều kiện chặt — "trung thành" là bản lề):** suite = differential vs referee
-(`cc`); cả zcc lẫn referee đều là **bóng của CÙNG một spec** (ISO C99 + AAPCS64 + ELF + AArch64)
-trên cùng nền toán. Hai bóng trung thành của một vật thì trùng nhau — mismatch ⟹ một bên đọc sai
-spec ⟹ **bug NẰM TRONG không gian** (hiện thực sai, không phải "ngoài không gian"), bắt được bằng
-gate. Ba điều kiện của "trung thành":
-1. **Faithfulness** — code thực sự hiện thực ĐÚNG định lý; hằng thực sự khớp ĐÚNG dòng spec.
-   Bug không nấp "ngoài không gian" mà nấp ở "hiện thực SAI bên trong không gian".
-2. **Completeness** — theory+spec phủ trọn ngôn ngữ suite chạm; lỗ hổng = **NOT-IMPL** (reject
-   trung thực), KHÔNG phải miscompile. Đúng kỷ luật 2-fact: **0 FAIL**, không đòi 0 NOT-IMPL.
-3. **Shared ground truth** — zcc và referee cùng gốc spec ⟹ agreement là tất yếu, không may rủi.
-
-⟹ Toàn bộ cỗ máy engineering (sci-gate cho vế-I, differential-vs-referee cho vế-II, evidence-trail)
-CHÍNH LÀ phép **kiểm toán cơ học tính trung thành**. Triết học và bộ test là MỘT, nhìn từ hai phía.
-
-**Gödel (bất toàn) tuy đúng nhưng nằm NGOÀI quan hệ compiler↔suite.** Bất toàn chặn: một hệ hình
-thức đủ mạnh không tự chứng minh được tính nhất quán của CHÍNH nó / mọi mệnh đề số học đúng. Quan hệ
-compiler↔suite KHÔNG phải bài toán đó:
-- **Per-case decidable** — chạy zcc và referee trên input cụ thể rồi so: hữu hạn, dừng.
-- **Correctness-by-construction** chứng ở tầng rewrite-rule / không-gian-cấu-trúc-hữu-hạn — mỗi mảnh
-  đều decidable (lý do 5 pass được CHỌN để ở trong fragment decidable, §C1). Rice/Halting/Gödel chỉ
-  cắn nếu ta đòi thuật toán quyết định tương đương MỌI chương trình, hoặc bắt hệ tự-chứng-mình — ta
-  KHÔNG làm thế.
-- **Lối thoát khỏi tự-quy-chiếu = oracle NGOÀI.** Differential dùng referee độc lập: zcc không bao
-  giờ phải tự chứng mình nhất quán, chỉ phải ĐỒNG Ý với một nhân chứng độc lập trên input cụ thể.
-  Gödel cấm một hệ tự chứng consistency; KHÔNG cấm hai hệ độc lập đồng ý trên một vị từ decidable.
-  → Cùng lý do CLAUDE.md rút Claude khỏi trust-path (kẻ-kể-chuyện-không-tin-được → chỉ verdict-cơ-học
-  mới hợp lệ): dời trọng tài ra NGOÀI hệ là cách né đồng thời cả Gödel lẫn nghịch lý self-trust.
-
-**Hệ quả DEBUG (Vu 2026-08-21) — fix THEO PHÂN RÃ, cấm patch cảm tính.** Khi zcc fail
-suite (nhất là csmith/yarpgen), GIẢ ĐỊNH lý thuyết cho feature đó hợp lý ⟹ fail chỉ có
-thể do 1 trong 3 (hoặc kết hợp), THỨ TỰ ưu tiên điều tra: **(1)** từ theorem phân rã ra SAI
-control-flow/algorithm → có ≥1 LOC **nằm ngoài theorem** (vế I); **(2)** **spec-constant**
-ISO/OS/arch apply SAI (vế II); **(3)** test/oracle/referee/generator lỗi hoặc thu input rác
-(xác suất THẤP, ≠0) — RÀNG bởi LUẬT SUY-ĐOÁN-TỘI: compiler có tội tới khi chứng minh vô tội,
-nên cause-3 là hạng CHÓT, chỉ tuyên sau proof ĐA CHIỀU cơ học + trọng tài độc lập; cấm dùng
-làm phản xạ đổ lỗi, cấm cớ "clang/gcc cũng fail". Ta code theo phân rã ⟹ fix theo phân rã:
-ĐỊNH VỊ lỗi bằng phép đo cơ học (bisect pass/module, diff asm, seek case) TRƯỚC, phân loại
-vế-I/II/III SAU, sửa đúng chỗ đó. Nếu sửa mà phải thêm dòng-không-map-định-lý → sai hướng.
-MEASURE đè mọi hypothesis — hypothesis-fix đầu tiên sai là bình thường, cứ đo tiếp (case mẫu
-pr43220: đoán CSE-vế-I → đo bác bỏ → thực ra vế-II hằng frame-layout ở backend). (Chi tiết:
-memory `zcc-debug-by-decomposition`.)
+Where it lives: **`src/ext.rs`** plus touch points marked `EXT(...)`. Verified by
+excision: remove ext.rs plus the marked branches → the remainder still passes the full
+C89 suite (`grep 'EXT(' src/` covers 100%).
 
 ---
 
-*Vu 2026-08-21: "1(theory→control-flow/data-structure/algorithm) ⊕ 2(iso/os/abi/arch/gcc spec
-→ constant/param/value-table) = zcc source code — nếu chỉ giữ 1 luật trong CLAUDE.md thì giữ luật
-này." + "phủ 250+ app dễ; pass csmith/yarpgen mới khó — chục compiler cùng cỡ vẫn trượt."
-Vu sẽ bổ sung một list dài — merge vào đúng Phần/Ngành/Bảng.*
+# PART III — KEYSTONE: correctness-by-construction & why Gödel lies outside
+
+**Proposition:** if NO line of `src/` lies outside the space {theory-fact ∪ spec-fact}
+— each line being a **faithful** realization of a theorem (Side I) or a spec-constant
+(Side II) — then zcc **necessarily passes every suite**. This cannot be negated.
+
+**Why it holds (the tight condition — "faithfulness" is the hinge):** a suite is a
+differential test against the referee (`cc`); both zcc and the referee are **shadows of
+the SAME specification** (ISO C99 + AAPCS64 + ELF + AArch64) over the same mathematical
+ground. Two faithful shadows of one object coincide — a mismatch ⟹ one side reads the
+spec wrong ⟹ the **bug lies WITHIN the space** (a faithless realization, not "outside
+the space"), and it is caught by a gate. The three conditions of "faithfulness":
+1. **Faithfulness** — the code genuinely realizes the theorem CORRECTLY; the constant
+   genuinely matches the correct line of spec. A bug does not hide "outside the space"
+   but hides in a "WRONG realization inside the space".
+2. **Completeness** — theory + spec cover the entire fragment of the language the suite
+   touches; a gap is a **NOT-IMPL** (an honest rejection), NOT a miscompile. This is the
+   2-fact discipline: **0 FAIL**, without requiring 0 NOT-IMPL.
+3. **Shared ground truth** — zcc and the referee share a spec origin ⟹ agreement is
+   necessary, not accidental.
+
+Hence the entire engineering apparatus (sci-gate for Side I, differential-vs-referee for
+Side II, evidence trail) IS the **mechanical audit of faithfulness**. The philosophy and
+the test suite are ONE, seen from two sides.
+
+**Gödel's incompleteness, though true, lies OUTSIDE the compiler↔suite relation.**
+Incompleteness states that a sufficiently strong formal system cannot prove its OWN
+consistency / every true arithmetic proposition. The compiler↔suite relation is not that
+problem:
+- **Per-case decidable** — run zcc and the referee on a concrete input and compare: this
+  is finite and terminating.
+- **Correctness-by-construction** is proved at the level of rewrite rules / a finite
+  structural space — each piece decidable (the reason the 5 passes are CHOSEN to lie in
+  the decidable fragment, §C1). Rice/Halting/Gödel bite only if one demands an algorithm
+  deciding equivalence for ALL programs, or forces the system to prove ITSELF — which is
+  not done here.
+- **The escape from self-reference is an EXTERNAL oracle.** Differential testing uses an
+  independent referee: zcc never has to prove its own consistency; it only has to AGREE
+  with an independent witness on a concrete input. Gödel forbids a system from proving its
+  own consistency; it does NOT forbid two independent systems from agreeing on a decidable
+  predicate. This is the same reason the charter removes any unreliable narrator from the
+  trust path (only mechanical verdicts are valid): moving the referee OUTSIDE the system is
+  how one evades both Gödel and the self-trust paradox at once.
+
+**DEBUG corollary — fix BY DECOMPOSITION, no ad-hoc patching.** When zcc fails a suite
+(especially csmith/yarpgen), and the theory for that feature is ASSUMED sound, the failure
+can only be one of three (or a combination), in this order of investigation: **(1)** the
+decomposition from theorem produced the WRONG control-flow/algorithm → there is ≥1 LOC
+**outside the theorem** (Side I); **(2)** an ISO/OS/arch **spec-constant** is applied
+WRONG (Side II); **(3)** the test/oracle/referee/generator is faulty or collected garbage
+input (LOW probability, but ≠0) — CONSTRAINED by the presumption-of-guilt rule: the
+compiler is guilty until proven innocent, so cause 3 is the LAST resort, asserted only
+after MECHANICAL multi-angle proof plus an independent referee; it may not be used as a
+reflexive excuse, and "clang/gcc also fail" is not a valid excuse. We code by
+decomposition ⟹ we fix by decomposition: LOCALIZE the fault by mechanical measurement
+(bisect pass/module, diff asm, seek the case) FIRST, classify Side-I/II/III SECOND, then
+fix precisely there. If a fix requires adding a line that maps to no theorem, the
+direction is wrong. Measurement overrides every hypothesis — the first hypothesis-fix
+being wrong is normal; keep measuring (illustrative case pr43220: guessed CSE-Side-I →
+measurement refuted it → the true cause was a Side-II frame-layout constant in the
+backend).
+
+---
+
+*Founding statements: "1 (theory → control-flow/data-structure/algorithm) ⊕ 2
+(iso/os/abi/arch/gcc spec → constant/param/value-table) = zcc source code — if only one
+rule is kept in CLAUDE.md, keep this one." And: "covering 250+ applications is easy;
+passing csmith/yarpgen is the hard part — dozens of compilers of the same size still
+fail." Further entries are merged into the appropriate Part/Branch/Table as they arise.*

@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-# Vét cạn đại số biểu thức C89 trên miền hữu hạn: (op × kiểu × kiểu × corner ×
-# corner). Usual arithmetic conversions (C89 3.2.1.5) là semilattice hữu hạn
-# trên 10 kiểu số học — phủ hết mọi cặp kiểu + giá trị biên là phủ hết không
-# gian chuyển kiểu. Oracle = differential với cc, nên phải LỌC UB tại đây
-# (signed overflow, chia 0, INT_MIN/-1, shift tràn, float→int ngoài miền):
-# tại điểm UB cả hai compiler đều "đúng" — diff ở đó vô nghĩa. Impl-defined
-# (narrowing, % âm, >> âm) GIỮ vì trọng tài cùng platform (khóa LP64 Darwin).
+# Exhaustion of C89 expression algebra over a finite domain: (op × type × type ×
+# corner × corner). The usual arithmetic conversions (C89 3.2.1.5) form a finite
+# semilattice over the 10 arithmetic types — covering every type pair + boundary
+# value covers the whole conversion space. Oracle = differential against cc, so UB
+# must be FILTERED here (signed overflow, div by 0, INT_MIN/-1, shift overflow,
+# float→int out of range): at a UB point both compilers are "correct" — a diff
+# there is meaningless. Impl-defined cases (narrowing, negative %, negative >>) are
+# KEPT because the referee is on the same platform (LP64 Darwin locked).
 #
-# Sinh 3 họ chương trình (thứ tự enumerate GIỐNG HỆT nhau để diff theo dòng):
-#   run_*.c  — toán hạng đi qua BIẾN (chặn const-fold), in kết quả full width
-#   fold_*.c — cùng biểu thức nhưng literal trong enum { E = (int)(...) }
-#              (bắt buộc đi đường const-eval của compiler)
-#   fri_*.c  — mirror của fold qua biến (đường runtime codegen)
-# diff(run zcc, run cc) + diff(fold zcc, fold cc) = đúng so trọng tài;
-# diff(fold zcc, fri zcc) = biểu đồ giao hoán fold∘parse = runtime∘parse NỘI BỘ.
+# Generates 3 program families (with an IDENTICAL enumeration order for line-wise
+# diffing):
+#   run_*.c  — operands pass through a VARIABLE (blocks const-fold), prints the
+#              full-width result
+#   fold_*.c — the same expression but as a literal in enum { E = (int)(...) }
+#              (forced onto the compiler's const-eval path)
+#   fri_*.c  — a mirror of fold via variables (the runtime codegen path)
+# diff(run zcc, run cc) + diff(fold zcc, fold cc) = correct against the referee;
+# diff(fold zcc, fri zcc) = the commuting diagram fold∘parse = runtime∘parse INTERNAL.
 import sys
 
 ITYPES = [("char", 8, True), ("unsigned char", 8, False),
           ("short", 16, True), ("unsigned short", 16, False),
           ("int", 32, True), ("unsigned int", 32, False),
           ("long", 64, True), ("unsigned long", 64, False)]
-# long long ≡ long trên LP64 (cùng biểu diễn) — không thêm điểm mới vào không gian
+# long long ≡ long on LP64 (same representation) — adds no new point to the space
 IINFO = {n: (w, s) for n, w, s in ITYPES}
 RANK = {"char": 1, "unsigned char": 1, "short": 2, "unsigned short": 2,
         "int": 3, "unsigned int": 3, "long": 4, "unsigned long": 4}
@@ -36,20 +39,20 @@ def icorners(t):
     m = (1 << w) - 1
     return [0, 1, m, 1 << (w - 1), m // 3]  # m//3 = 0x5555...
 
-FCORNERS = {"float": [0.0, 1.0, -2.5, 0.5, 325000000.0],   # đều exact trong float
+FCORNERS = {"float": [0.0, 1.0, -2.5, 0.5, 325000000.0],   # all exact in float
             "double": [0.0, 1.0, -2.5, 0.001, 325000000.0]}
 
 def promote(t):
-    return "int" if RANK[t] < 3 else t  # mọi giá trị char/short lọt int (LP64)
+    return "int" if RANK[t] < 3 else t  # every char/short value fits int (LP64)
 
 def uac(t1, t2):
     a, b = promote(t1), promote(t2)
     if RANK[b] > RANK[a] or (RANK[b] == RANK[a] and not IINFO[b][1]):
         a, b = b, a
-    # a = rank cao hơn (unsigned thắng khi đồng rank)
+    # a = the higher rank (unsigned wins at equal rank)
     if IINFO[a][1] == IINFO[b][1] or IINFO[a][1] is False:
         return a
-    # a signed rank cao, b unsigned rank thấp: LP64 long chứa hết unsigned int
+    # a signed higher rank, b unsigned lower rank: LP64 long contains all unsigned int
     return a if IINFO[a][0] > IINFO[b][0] else "unsigned " + a
 
 def wrap(t, v):
@@ -62,7 +65,7 @@ def fits(t, v):
     return -(1 << (w - 1)) <= v < (1 << (w - 1)) if s else 0 <= v < (1 << w)
 
 def ieval(op, t, a, b):
-    """Kết quả op trong kiểu t, None = UB (lọc khỏi oracle)."""
+    """The result of op in type t; None = UB (filtered out of the oracle)."""
     w, s = IINFO[t]
     if op in ("+", "-", "*"):
         r = a + b if op == "+" else a - b if op == "-" else a * b
@@ -74,7 +77,7 @@ def ieval(op, t, a, b):
             return None
         q = abs(a) // abs(b)
         if (a < 0) != (b < 0):
-            q = -q  # C: chia cắt về 0; % cùng dấu số bị chia (khóa platform)
+            q = -q  # C: division truncates toward 0; % takes the sign of the dividend (platform-locked)
         return q if op == "/" else a - q * b
     if op in BITS:
         m = (1 << w) - 1
@@ -91,22 +94,22 @@ def clit(t, v):
         return "(%s)(-9223372036854775807L - 1)" % t
     return "(%s)(%d%s)" % (t, v, "UL" if v >= (1 << 63) else "L")
 
-def prfmt(t):  # (format, cast) in kết quả chuẩn hoá full width
+def prfmt(t):  # (format, cast) printing the full-width normalized result
     if t in FTYPES:
         return ("%a", "(double)")
     return ("%lu", "(unsigned long)") if not IINFO[t][1] else ("%ld", "(long)")
 
 def enum_cases():
-    """Sinh (t1,v1,t2,v2,op,rt) hợp lệ — thứ tự cố định, mọi họ chương trình dùng chung."""
+    """Generates valid (t1,v1,t2,v2,op,rt) — fixed order, shared by all program families."""
     out = []
-    # int × int: đủ 14 op
+    # int × int: all 14 ops
     for t1, _, _ in ITYPES:
         for t2, _, _ in ITYPES:
             rt = uac(t1, t2)
             for op in ARITH + BITS + RELS:
                 for v1 in icorners(t1):
                     for v2 in icorners(t2):
-                        a, b = wrap(rt, v1), wrap(rt, v2)  # convert lên rt (giá trị bảo toàn/wrap)
+                        a, b = wrap(rt, v1), wrap(rt, v2)  # convert up to rt (value preserved/wrapped)
                         r = ieval(op, rt, a, b)
                         if r is None:
                             continue
@@ -127,7 +130,7 @@ def float_cases():
                 for v1 in c1:
                     for v2 in c2:
                         if op == "/" and float(v2) == 0.0:
-                            continue  # chia 0 float: UB theo C89 (không ép IEEE)
+                            continue  # float div by 0: UB per C89 (does not mandate IEEE)
                         out.append((t1, v1, t2, v2, op, "int" if op in RELS else rt))
     return out
 
@@ -140,10 +143,10 @@ def shift_cases():
             pv = wrap(p, v)
             for sh in (0, 1, w - 1):
                 if s and pv < 0 and sh > 0:
-                    continue  # << số âm / >> giữ (impl-def arithmetic, khóa platform)
+                    continue  # << of a negative / >> kept (impl-def arithmetic, platform-locked)
                 if not (s and pv < 0):
                     if s and not fits(p, pv << sh):
-                        pass  # << tràn signed = UB
+                        pass  # << signed overflow = UB
                     else:
                         out.append((t1, v, "int", sh, "<<", p))
                 out.append((t1, v, "int", sh, ">>", p))
@@ -157,14 +160,14 @@ def cast_cases():
             cs = FCORNERS[src] if src in FTYPES else icorners(src)
             for v in cs:
                 if src in FTYPES and dst not in FTYPES:
-                    tv = int(v)  # truncate về 0
+                    tv = int(v)  # truncate toward 0
                     if not fits(dst, tv):
-                        continue  # float→int ngoài miền = UB
+                        continue  # float→int out of range = UB
                 out.append((src, v, dst))
     return out
 
 def unary_cases():
-    """(t, v, op, rt) — unary trên int: kết quả trong kiểu promote(t)."""
+    """(t, v, op, rt) — unary on int: the result in type promote(t)."""
     out = []
     for t, _, _ in ITYPES:
         p = promote(t)
@@ -177,8 +180,8 @@ def unary_cases():
     return out
 
 def compound_cases():
-    """a op= b ≡ a = (T1)((UAC) a op (UAC) b) — đường parse/codegen RIÊNG so
-    với binary thường (đọc-sửa-ghi + convert ngược về T1, narrowing khoá LP64)."""
+    """a op= b ≡ a = (T1)((UAC) a op (UAC) b) — a DISTINCT parse/codegen path vs the
+    plain binary one (read-modify-write + convert back to T1, narrowing locked LP64)."""
     out = []
     for t1, _, _ in ITYPES:
         for t2, _, _ in ITYPES:
@@ -192,22 +195,23 @@ def compound_cases():
     return out
 
 def incdec_cases():
-    """++/-- tiền/hậu tố: giá trị mới + giá trị biểu thức phải cùng đúng."""
+    """++/-- prefix/postfix: the new value + the expression value must both be correct."""
     out = []
     for t, w, s in ITYPES:
         for v in icorners(t):
             if not (s and v == (1 << (w - 1)) - 1):
-                out.append((t, v, "++"))  # tránh tràn signed = UB
+                out.append((t, v, "++"))  # avoid signed overflow = UB
             if not (s and v == -(1 << (w - 1))):
                 out.append((t, v, "--"))
     return out
 
 def complex_cases():
-    """ℂ = trường trên ℝ² (C99 6.2.5). Vét field ops +,−,× trên _Complex
-    float/double × lưới góc (giá trị exact trong float ⇒ × cũng exact, khớp cc
-    bit-đối-bit — KHÔNG gồm / vì __divdc3 Smith của cc lệch ULP với công thức
-    thẳng, deviation đã tuyên trong cplx_bin). Cũng phủ liên hợp ~ và phép
-    chiếu __real__/__imag__ (π₁,π₂). Hằng ảo `Nif` khớp lexer INum."""
+    """ℂ = a field over ℝ² (C99 6.2.5). Exhausts field ops +,−,× over _Complex
+    float/double × a corner grid (values exact in float ⇒ × is exact too, matching cc
+    bit-for-bit — EXCLUDES / because cc's Smith __divdc3 deviates by a ULP from the
+    straight formula, a deviation documented in cplx_bin). Also covers the conjugate
+    ~ and the __real__/__imag__ projections (π₁,π₂). The imaginary constant `Nif`
+    matches the lexer's INum."""
     out = []
     corners = [0.0, 1.0, -2.0, 3.0]
     for t in ("float", "double"):
@@ -228,7 +232,7 @@ def main(outdir):
     cps = compound_cases()
     ids = incdec_cases()
 
-    # ---- họ run_*.c: mọi case qua biến ----
+    # ---- family run_*.c: every case via variables ----
     blocks = []
     for t1, v1, t2, v2, op, rt in bins + flts + shs:
         fmt, cast = prfmt(rt)
@@ -243,7 +247,7 @@ def main(outdir):
         fmt, cast = prfmt(rt)
         blocks.append("{ %s a = %s; %s r = %s a; printf(\"%s\\n\", %sr); }"
                       % (t, clit(t, v), rt, op, fmt, cast))
-    for t in FTYPES:  # unary float: - và ! (không ~)
+    for t in FTYPES:  # unary float: - and ! (not ~)
         for v in FCORNERS[t]:
             blocks.append("{ %s a = %s; %s r = -a; printf(\"%%a\\n\", (double)r); }"
                           % (t, clit(t, v), t))
@@ -261,23 +265,23 @@ def main(outdir):
         blocks.append(
             "{ %s a = %s; %s p = %sa; printf(\"%s %s\\n\", %sa, %sp); }"
             % (t, clit(t, v), t, op, fmt, fmt, cast, cast))
-    # ---- complex: field ops + liên hợp + chiếu (runtime, trọng tài cc) ----
+    # ---- complex: field ops + conjugate + projection (runtime, cc referee) ----
     for t, are, aim, bre, bim, op in complex_cases():
-        sfx = "if" if t == "float" else "i"  # hằng ảo khớp lexer INum
+        sfx = "if" if t == "float" else "i"  # imaginary constant matches the lexer's INum
         ce = lambda v: "%r%s" % (v, "f" if t == "float" else "")
         blocks.append(
             "{ %s _Complex a = %s + (%s)*1.0%s; %s _Complex b = %s + (%s)*1.0%s;"
             " %s _Complex r = a %s b;"
             " printf(\"%%a %%a\\n\", (double)__real__ r, (double)__imag__ r); }"
             % (t, ce(are), ce(aim), sfx, t, ce(bre), ce(bim), sfx, t, op))
-        if op == "+":  # liên hợp ~z = (re,−im) một lần cho mỗi cặp (a)
+        if op == "+":  # conjugate ~z = (re,−im), once per pair (a)
             blocks.append(
                 "{ %s _Complex a = %s + (%s)*1.0%s; %s _Complex r = ~a;"
                 " printf(\"%%a %%a\\n\", (double)__real__ r, (double)__imag__ r); }"
                 % (t, ce(are), ce(aim), sfx, t))
     write_prog(outdir, "run", blocks)
 
-    # ---- họ fold_*.c + fri_*.c: chỉ int (miền const-expr C89), binary + unary ----
+    # ---- families fold_*.c + fri_*.c: int only (the C89 const-expr domain), binary + unary ----
     folds, fris = [], []
     for t1, v1, t2, v2, op, rt in bins:
         k = len(folds)

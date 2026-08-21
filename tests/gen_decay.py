@@ -1,47 +1,51 @@
 #!/usr/bin/env python3
-# Gate decay: định lý lvalue conversion C99 6.3.2.1p3 — mọi biểu thức type
-# T[N] phải convert thành T* trỏ phần tử đầu ở MỌI ngữ cảnh trừ {sizeof,
-# unary &, string literal khởi tạo mảng}; hệ quả 6.5.15 (ternary 2 vế
-# array → composite pointer) + 6.5.2.2p6 (default arg promotion decay
-# trước khi thành arg). Án B 18/8 (git merge segv theo layout ASLR) sống
-# đúng ô ternary-string-literal × vararg-stack: type giữ char[2] → store
-# strh 2 byte → glibc vsnprintf đọc con trỏ rác.
-# Vét cấu trúc: SOURCES (cách sinh expr type array) × CONTEXTS (chỗ tiêu
-# thụ) × 2 nhánh ternary. Oracle differential cc trên observable DẪN XUẤT
-# (nội dung chuỗi, ký tự, sizeof, so sánh) — không bao giờ in địa chỉ thô.
+# decay gate: the lvalue-conversion theorem C99 6.3.2.1p3 — every expression of
+# type T[N] must convert to a T* pointing at the first element in EVERY context
+# except {sizeof, unary &, a string literal initializing an array}; corollaries
+# 6.5.15 (a ternary with two array operands → a composite pointer) + 6.5.2.2p6
+# (default argument promotion decays before becoming an arg). A defect (an
+# ASLR-layout-dependent git-merge segv) lived exactly in the
+# ternary-string-literal × vararg-stack cell: the type kept char[2] → a 2-byte strh
+# store → glibc vsnprintf read a junk pointer.
+# Structural exhaustion: SOURCES (ways to produce an array-typed expr) × CONTEXTS
+# (consumption sites) × 2 ternary branches. Differential oracle cc over DERIVED
+# observables (string content, character, sizeof, comparison) — never printing a
+# raw address.
 #
-# ── PROOF (miền hợp lệ của oracle differential) ───────────────────────────
-# decay(E)=&A[0], A = object mà E chỉ định. Tách 2 thành phần: (a) object A —
-# do chuẩn quy định; (b) GIÁ TRỊ SỐ của &A[0] — implementation đặt tự do, KHÔNG
-# spec-determined. Oracle sound trên observable o ⟺ o spec-determined (mọi impl
-# tuân chuẩn cho cùng o). ⟹ o là hàm của nội dung/định danh A thì hợp lệ; hàm
-# của (b) thì vô hiệu.
-#   Bổ đề định danh: context `eq` = (p1==p2). Cả hai là &A_i[0] (không null/one-
-#   past) ⟹ theo 6.5.9p6, (p1==p2) ⟺ (A1≡A2). Vậy eq spec-determined ⟺ "A1≡A2"
+# ── PROOF (the valid domain of the differential oracle) ───────────────────
+# decay(E)=&A[0], A = the object E designates. Separate 2 components: (a) the object
+# A — fixed by the standard; (b) the NUMERIC VALUE of &A[0] — chosen freely by the
+# implementation, NOT spec-determined. The oracle is sound over an observable o ⟺ o
+# is spec-determined (every conforming impl yields the same o). ⟹ o that is a
+# function of A's content/identity is valid; a function of (b) is invalid.
+#   Identity lemma: context `eq` = (p1==p2). Both are &A_i[0] (not null/one-past) ⟹
+#   by 6.5.9p6, (p1==p2) ⟺ (A1≡A2). So eq is spec-determined ⟺ "A1≡A2" is
 #   spec-determined:
-#     • CASE 1 A=named object: 6.2.1 bind về đúng 1 object/declaration ⟹ A1≡A2
-#       spec-det = TRUE ⟹ eq=1 duy nhất → oracle HỢP LỆ.
-#     • CASE 2 A=mảng string literal: 6.4.5p6 "unspecified whether these arrays
-#       are distinct" ⟹ eq ∈ {1,2} đều tuân chuẩn → KHÔNG spec-det → oracle VÔ
-#       HIỆU (zcc .rodata trơn=distinct=2; gcc .rodata.str mergeable=1 — cả hai
-#       hợp lệ). KHÔNG phải bug decay.
-#   Vét cạn: trục định danh phân hoạch TOÀN PHẦN {named, literal-array} (ngoài
-#   6.4.5p6 không construct C99 nào cho 2 lần eval cùng lvalue ra 2 object khác
-#   cùng nội dung); c∈{0,1} quét cả 2 nhánh ternary. Cell vô hiệu = {(S,eq):
-#   S∈CASE2}. id_stable=False đánh dấu ĐÚNG các S đó (soundness: mỗi cái có 1
-#   eval rơi CASE 2; completeness: mọi S chỉ-named đều id_stable=True). Chỉ cắt
-#   context eq — GIỮ va_stk/idx/arith/szof của chính literal (hàm của nội dung
-#   6.4.5p5, spec-det) ⟹ decay của literal VẪN được chứng; chỉ bỏ ĐỊNH DANH,
-#   thứ không thuộc định lý decay. Gate sau cắt = decision procedure sound+
-#   complete trên lattice observable spec-determined.
+#     • CASE 1 A=named object: 6.2.1 binds to exactly 1 object/declaration ⟹ A1≡A2
+#       spec-det = TRUE ⟹ eq=1 uniquely → the oracle is VALID.
+#     • CASE 2 A=string-literal array: 6.4.5p6 "unspecified whether these arrays
+#       are distinct" ⟹ eq ∈ {1,2} are both conforming → NOT spec-det → the oracle
+#       is INVALID (zcc plain .rodata=distinct=2; gcc .rodata.str mergeable=1 — both
+#       valid). NOT a decay bug.
+#   Exhaustion: the identity axis TOTALLY partitions {named, literal-array} (outside
+#   6.4.5p6 no C99 construct makes 2 evaluations of the same lvalue yield 2 distinct
+#   objects with the same content); c∈{0,1} sweeps both ternary branches. The
+#   invalid cell = {(S,eq): S∈CASE2}. id_stable=False marks EXACTLY those S
+#   (soundness: each has 1 eval falling in CASE 2; completeness: every named-only S
+#   has id_stable=True). Only the eq context is cut — the literal's own
+#   va_stk/idx/arith/szof are KEPT (functions of content 6.4.5p5, spec-det) ⟹ the
+#   literal's decay is STILL proven; only IDENTITY, which is not part of the decay
+#   theorem, is dropped. The gate after the cut = a decision procedure sound +
+#   complete over the spec-determined observable lattice.
 # ──────────────────────────────────────────────────────────────────────────
 import sys
 
-# (tên, biểu thức, lvalue?, id_stable?)
-#   lvalue?    — rvalue như ternary/comma cấm unary & (loại CTX_ADDR)
-#   id_stable? — TRUE ⟺ mọi eval của E chỉ định NAMED object (CASE 1 ở PROOF)
-#     ⟹ eq spec-determined. FALSE ⟺ có eval chỉ định string literal (CASE 2,
-#     6.4.5p6 unspecified) ⟹ eq bị loại. Xem bổ đề định danh trên header.
+# (name, expression, lvalue?, id_stable?)
+#   lvalue?    — an rvalue such as ternary/comma forbids unary & (excludes CTX_ADDR)
+#   id_stable? — TRUE ⟺ every eval of E designates a NAMED object (CASE 1 in the
+#     PROOF) ⟹ eq spec-determined. FALSE ⟺ some eval designates a string literal
+#     (CASE 2, 6.4.5p6 unspecified) ⟹ eq is excluded. See the identity lemma in the
+#     header.
 SOURCES = [
     ("lit",     '"LIT"',                        True,  False),
     ("loc",     "la",                           True,  True),
@@ -50,35 +54,35 @@ SOURCES = [
     ("pmem",    "ps->arr",                      True,  True),
     ("row",     "m[1]",                         True,  True),
     ("paren",   "(la)",                         True,  True),
-    ("ter_ll",  'c ? "T" : ""',                 False, False),  # ổ án B (2 vế literal)
-    ("ter_la",  'c ? la : "xy"',                False, False),  # nhánh c==0 = literal
+    ("ter_ll",  'c ? "T" : ""',                 False, False),  # the defect cell (both literal operands)
+    ("ter_la",  'c ? la : "xy"',                False, False),  # the c==0 branch = literal
     ("ter_row", "c ? m[0] : m[2]",              False, True),
-    ("ter_nst", 'c ? (c ? "a" : "bb") : "ccc"', False, False),  # toàn literal lồng
+    ("ter_nst", 'c ? (c ? "a" : "bb") : "ccc"', False, False),  # all-literal, nested
     ("comma",   "(0, la)",                      False, True),
 ]
 
-# template dùng {E}; mọi lần thế đều bọc ({E})
+# template uses {E}; every substitution is wrapped as ({E})
 CONTEXTS = [
-    # variadic arg còn thanh ghi
+    # variadic arg still in registers
     ("va_reg",  'printf("%s\\n", ({E}));'),
-    # variadic arg TRÀN STACK (5 int ăn x3..x7 sau buf/size/fmt) — ổ án B
+    # variadic arg OVERFLOWING THE STACK (5 int take x3..x7 after buf/size/fmt) — the defect cell
     ("va_stk",  'snprintf(buf, sizeof buf, "%d%d%d%d%d[%s]", 1, 2, 3, 4, 5, ({E})); puts(buf);'),
-    # hai decay kề nhau trên stack
+    # two adjacent decays on the stack
     ("va_stk2", 'snprintf(buf, sizeof buf, "%d%d%d%d%d[%s|%s]", 1, 2, 3, 4, 5, ({E}), ({E})); puts(buf);'),
-    # named arg thanh ghi / tràn stack (6.5.2.2p7 qua prototype)
+    # named arg in register / overflowing stack (6.5.2.2p7 via prototype)
     ("nm_reg",  "puts(pick1(({E})));"),
     ("nm_stk",  "puts(pick9(1, 2, 3, 4, 5, 6, 7, 8, ({E})));"),
-    # simple assignment 6.5.16.1 (phủ luôn ngữ nghĩa return)
+    # simple assignment 6.5.16.1 (also covers return semantics)
     ("assign",  "{ char *q = ({E}); puts(q); }"),
     ("idx",     'printf("%d\\n", (int)({E})[0]);'),
     ("arith",   'printf("%d\\n", (int)*(({E}) + 0));'),
-    # hai decay cùng mảng → con trỏ bằng nhau
+    # two decays of the same array → equal pointers
     ("eq",      'printf("%d\\n", ({E}) == ({E}) ? 1 : 2);'),
-    # NGOẠI LỆ định lý: sizeof KHÔNG decay (lvalue array giữ N; ternary đã
-    # decay từ operand nên = sizeof(char*))
+    # theorem EXCEPTION: sizeof does NOT decay (an lvalue array keeps N; a ternary
+    # has already decayed from its operand so = sizeof(char*))
     ("szof",    'printf("%d\\n", (int)sizeof({E}));'),
 ]
-# NGOẠI LỆ định lý: unary & không decay — &E type T(*)[N], chỉ lvalue
+# theorem EXCEPTION: unary & does not decay — &E has type T(*)[N], lvalue only
 CTX_ADDR = ("addr", 'printf("%d\\n", (int)sizeof(*&({E})));')
 
 def main(outdir):
@@ -87,7 +91,7 @@ def main(outdir):
         body = []
         for cn, tpl in CONTEXTS + ([CTX_ADDR] if lval else []):
             if cn == "eq" and not id_stable:
-                continue  # 6.4.5p6: pointer identity của literal là unspecified
+                continue  # 6.4.5p6: the pointer identity of a literal is unspecified
             body.append('    printf("%s.%s ");' % (sn, cn))
             body.append("    " + tpl.replace("{E}", e))
         fns.append(

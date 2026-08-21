@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 # =============================================================================
-# HARNESS LỚP 1 — LEXER: ngôn ngữ chính quy + bảng phân loại hữu hạn
+# LAYER-1 HARNESS — LEXER: regular languages + a finite classification table
 # =============================================================================
-# Ba không gian hữu hạn của lexer, vét được:
+# The three finite spaces of the lexer, all exhaustible:
 #
-# 1. PHÂN LOẠI INTEGER LITERAL (C89 3.1.3.2): kiểu của một literal là hàm của
-#    (base × suffix × giá trị) — dec không suffix leo int→long→ulong, oct/hex
-#    leo int→uint→long→ulong (khác nhau!), U ép unsigned, L ép ≥long.
-#    Không gian = 3 base × 4 suffix × các giá trị biên (INT_MAX±1, UINT_MAX±1,
-#    LONG_MAX, ULONG_MAX) — hữu hạn, liệt kê hết.
-#    Observable: (giá trị bit, sizeof, signedness) — 3 probe đủ tách mọi kiểu:
-#      %lu của (unsigned long)LIT   → giá trị
-#      sizeof(LIT)                  → 4 vs 8 (int-họ vs long-họ, LP64)
-#      (LIT) - (LIT) - 1 < 0        → 1 nếu kiểu signed (kết quả -1), 0 nếu
-#                                     unsigned (wrap thành max) — probe không
-#                                     UB (trừ rồi trừ 1 không tràn)
+# 1. INTEGER-LITERAL CLASSIFICATION (C89 3.1.3.2): a literal's type is a function
+#    of (base × suffix × value) — a suffixless dec climbs int→long→ulong, oct/hex
+#    climb int→uint→long→ulong (different!), U forces unsigned, L forces ≥long.
+#    Space = 3 bases × 4 suffixes × the boundary values (INT_MAX±1, UINT_MAX±1,
+#    LONG_MAX, ULONG_MAX) — finite, fully enumerated.
+#    Observable: (bit value, sizeof, signedness) — 3 probes suffice to separate
+#    every type:
+#      %lu of (unsigned long)LIT    → value
+#      sizeof(LIT)                  → 4 vs 8 (int-family vs long-family, LP64)
+#      (LIT) - (LIT) - 1 < 0        → 1 if the type is signed (result -1), 0 if
+#                                     unsigned (wraps to max) — a UB-free probe
+#                                     (subtract then subtract 1 does not overflow)
 #
-# 2. ESCAPE SEQUENCE (3.1.3.4): bảng escape hữu hạn (simple + octal 1-3 chữ số
-#    + hex) × 2 ngữ cảnh (char-const, string). Observable: giá trị %d (char
-#    signed Darwin) và sizeof string.
+# 2. ESCAPE SEQUENCE (3.1.3.4): a finite escape table (simple + 1-3-digit octal +
+#    hex) × 2 contexts (char-const, string). Observable: the %d value (char signed
+#    on Darwin) and the string sizeof.
 #
-# 3. MAXIMAL MUNCH (3.1): điểm nhập nhằng hữu hạn của bảng token C89 —
-#    `a+++b` = (a++)+b, `a---b` = (a--)-b, `x+++++y` là LỖI (loại), `..` vs
-#    `...`, `>>=` vs `> >=`... test các cắt hợp lệ.
+# 3. MAXIMAL MUNCH (3.1): the finite ambiguity points of the C89 token table —
+#    `a+++b` = (a++)+b, `a---b` = (a--)-b, `x+++++y` is an ERROR (excluded), `..`
+#    vs `...`, `>>=` vs `> >=`... testing the valid tokenizations.
 #
-# UB/loại trừ: literal vượt ULONG_MAX (3.1.3.2: lỗi), '\x' quá miền char
-# (impl-def — GIỮ vì khoá platform), multi-char 'ab' (impl-def — giữ, khoá).
+# UB/exclusions: a literal beyond ULONG_MAX (3.1.3.2: error), '\x' beyond the char
+# range (impl-def — KEPT because it is platform-locked), multi-char 'ab' (impl-def
+# — kept, locked).
 # =============================================================================
 import sys
 
@@ -51,9 +53,9 @@ def escapes():
     for e in simple + octs + hexs:
         label = e.replace("\\", "\\\\").replace('"', '\\"')
         em("    printf(\"E [%s] %%d\\n\", '%s');", label, e)
-    # escape trong string: sizeof đếm đúng số byte sau dịch escape
+    # escape in a string: sizeof counts the correct byte count after escape translation
     em('    printf("ES %%d %%d\\n", (int)sizeof("\\x41\\102z"), (int)sizeof("a\\0b"));')
-    # multi-char const: impl-defined, khoá theo trọng tài cùng platform
+    # multi-char const: impl-defined, locked to the same-platform referee
     em("    printf(\"MC %%d\\n\", ('ab' == 'ab') ? 1 : 0);")
 
 def munch():
@@ -69,7 +71,7 @@ def main(outdir):
     int_literals(); escapes(); munch()
     with open(outdir + "/lex_cases.c", "w") as fp:
         fp.write("#include <stdio.h>\nint main(void) {\n%s\n    return 0;\n}\n" % "\n".join(L))
-    print("lex=%d dòng" % len(L))
+    print("lex=%d lines" % len(L))
 
 if __name__ == "__main__":
     main(sys.argv[1])

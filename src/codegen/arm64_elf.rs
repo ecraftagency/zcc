@@ -1,24 +1,28 @@
-// Codegen AArch64 ELF (Linux). Sinh từ arm64_darwin.rs — `diff` hai file chính là
-// tài liệu "Mach-O vs ELF khác gì" (giữ cấu trúc song song CÓ CHỦ ĐÍCH, đừng
-// refactor lệch). Khác biệt: không prefix `_`, section ELF (.text/.data/.bss/
-// .rodata/.tdata/.tbss), reloc :lo12:/:got: thay @PAGE/@GOTPAGE, TLS local-exec
-// (mrs tpidr_el0 + :tprel_*) thay descriptor @TLVPPAGE, .weak thay
-// .weak_definition, KHÔNG .subsections_via_symbols, variadic vô danh vào
-// x0-x7/v0-v7 như named (AAPCS chuẩn — bỏ đặc sản Apple stack-only), stack arg
-// scalar slot 8 tròn (bỏ packing natural-align). Ngữ nghĩa -O0, máy tính biểu
-// thức kiểu chibicc:
-// kết quả luôn ở x0; binary op sinh vế phải trước, push xuống stack (16 byte giữ
-// alignment), sinh vế trái, pop vế phải vào x1 rồi `x0 = x0 op x1`.
+// Code generation for AArch64 ELF (Linux). Derived from arm64_darwin.rs — a `diff`
+// of the two files is itself the documentation of "how Mach-O and ELF differ" (the
+// parallel structure is intentional; do not refactor them apart). Differences: no
+// `_` prefix, ELF sections (.text/.data/.bss/.rodata/.tdata/.tbss), :lo12:/:got:
+// relocations instead of @PAGE/@GOTPAGE, local-exec TLS (mrs tpidr_el0 + :tprel_*)
+// instead of the @TLVPPAGE descriptor, .weak instead of .weak_definition, NO
+// .subsections_via_symbols, anonymous variadic arguments passed in x0-x7/v0-v7 like
+// named ones (standard AAPCS — dropping the Apple stack-only convention), stack
+// scalar arguments in rounded 8-byte slots (dropping natural-alignment packing).
+// Semantics are -O0, with a chibicc-style expression evaluator:
+// the result is always in x0; a binary op emits the right operand first, pushes it
+// to the stack (16 bytes to preserve alignment), emits the left operand, pops the
+// right operand into x1, then computes `x0 = x0 op x1`.
 //
-// Hợp đồng giá trị (khớp ast.rs): mọi scalar sống trong x0 dạng "canonical" 64-bit
-// — int sign/zero-extend đúng theo kiểu, float/double là BIT PATTERN f64 (float
-// nâng lên double ngay khi load, hạ xuống f32 lúc store). Kiểu của node (Ast.types)
-// quyết định chọn lệnh: signed/unsigned (sdiv/udiv, lt/lo...), float (fadd, fcmp).
-// Sau op 32-bit phải re-canonicalize (sxtw/mov w) để giữ ngữ nghĩa wrap của int.
+// Value contract (matching ast.rs): every scalar lives in x0 as a 64-bit "canonical"
+// value — integers sign/zero-extended per type, float/double as the f64 BIT PATTERN
+// (a float is widened to double on load and narrowed to f32 on store). The node type
+// (Ast.types) selects the instruction: signed/unsigned (sdiv/udiv, lt/lo...), float
+// (fadd, fcmp). After a 32-bit op the value must be re-canonicalized (sxtw/mov w) to
+// preserve integer wrapping semantics.
 //
-// ABI: args int x0-x7, float v0-v7 (2 counter riêng), quá thì stack 8-byte/slot;
-// vô danh variadic đi reg như named (AAPCS chuẩn). Return: x0 / d0.
-// Label: "L{n}" tuần tự; "LC{id}" đích case; "lg_{fn}.{tên}" label goto.
+// ABI: integer args in x0-x7, float args in v0-v7 (two separate counters); overflow
+// goes to the stack in 8-byte slots. Anonymous variadic arguments go in registers
+// like named ones (standard AAPCS). Return: x0 / d0.
+// Labels: "L{n}" sequential; "LC{id}" case targets; "lg_{fn}.{name}" goto labels.
 use crate::ast::{Ast, GInit, SyncOp, Ty, TypeId, VOID};
 use crate::ir::{self, Callee, Inst, IrFunc, Op, Place, Term, Tmp, Un, Val};
 use std::fmt::Write;
@@ -31,23 +35,24 @@ struct Cg<'a> {
     lbl: u32,
     fname: String,
     fret: TypeId,
-    fsret: u32, // ≠0: slot chứa con trỏ x8 (hàm trả struct >16B)
-    // hàm variadic hiện tại (cho VaStart): named đã ăn (gp, fp), byte stack
-    // named, frame — save area 192B nằm NGAY DƯỚI frame: [x29-frame-192, x29-frame)
-    // = VR 128B rồi GP 64B; gr_top = x29-frame, vr_top = x29-frame-64
+    fsret: u32, // ≠0: slot holding the x8 pointer (function returning a struct >16B)
+    // Current variadic function (for VaStart): named args consumed (gp, fp), named
+    // stack bytes, frame — the 192B save area sits DIRECTLY BELOW the frame:
+    // [x29-frame-192, x29-frame) = VR 128B then GP 64B; gr_top = x29-frame, vr_top = x29-frame-64
     va: (u32, u32, u32, u32),
-    // VLA dealloc (C99 6.8.6.1): base SP = x29 - (frame + variadic?192:0); tại
-    // label ở VLA-depth 0 restore SP về base (goto rời scope VLA phải dealloc).
+    // VLA deallocation (C99 6.8.6.1): base SP = x29 - (frame + variadic?192:0); at a
+    // label at VLA-depth 0, SP is restored to base (a goto leaving a VLA scope must deallocate).
     fframe: u32,
     fvariadic: bool,
     fhasvla: bool,
-    // đường IR (migrate): base offset vùng temp-slot (= frame; temp i tại
-    // x29 − (ir_tbase + 8 + i*8)); ir_temps = bảng kiểu temp hàm hiện tại.
+    // IR path: base offset of the temp-slot region (= frame; temp i lives at
+    // x29 − (ir_tbase + 8 + i*8)); ir_temps = the type table of the current function's temps.
     ir_tbase: u32,
     ir_temps: Vec<TypeId>,
-    // IR mode: kích thước vùng temp-slot (tbytes) nằm DƯỚI khung C. VLA-dealloc
-    // (reset_sp_base) phải trừ THÊM vùng này, nếu không sp về trên vùng temp và
-    // VLA kế `sub sp` ghi đè temp (pr43220). 0 ở AST mode → không đụng.
+    // IR mode: size of the temp-slot region (tbytes), located BELOW the C frame. VLA
+    // deallocation (reset_sp_base) must additionally subtract this region, otherwise sp
+    // returns above the temp region and the next VLA's `sub sp` overwrites temps
+    // (GCC PR43220). 0 in AST mode → untouched.
     ir_tspill: u32,
 }
 
@@ -55,8 +60,9 @@ struct Cg<'a> {
 fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
     let ast = g.a;
     if f.variadic {
-        // register-save area AAPCS: đổ NGUYÊN 8 q-reg + 8 x-reg (kể cả phần
-        // named — thừa vô hại, đỡ phân nhánh); phải trước spill (đọc reg gốc)
+        // AAPCS register-save area: spill ALL 8 q-regs + 8 x-regs (including the
+        // named portion — harmless redundancy that avoids branching); must precede
+        // parameter spilling (which reads the original registers)
         g.sp_adjust("sub", 192);
         g.imm("x9", (f.frame + 192) as i64);
         g.s += "\tsub x9, x29, x9\n";
@@ -77,15 +83,16 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
         g.lea_local("x9", f.sret);
         g.s += "\tstr x8, [x9]\n";
     }
-    // spill param theo ABI: 2 counter gp/fp, tràn thì đọc lại từ vùng stack
-    // caller tại [x29 + 16 + boff]. AAPCS chuẩn: scalar tràn mỗi cái một
-    // slot 8 tròn, composite align 8 size tròn 8 (over-alignment aligned(16+)
-    // bị BỎ QUA — gcc arm64 verify asm: named x3,x4 / stack [sp,8], pr92904),
-    // composite tràn khóa gp=8 (C.11). PHẢI khớp từng byte với call().
+    // Spill parameters per ABI: two counters gp/fp; on overflow, re-read from the
+    // caller's stack region at [x29 + 16 + boff]. Standard AAPCS: an overflowing
+    // scalar takes one rounded 8-byte slot; a composite has alignment 8 and size
+    // rounded to 8 (over-alignment aligned(16+) is IGNORED — verified against gcc
+    // arm64 asm: named x3,x4 / stack [sp,8], GCC PR92904); a composite overflow
+    // locks gp=8 (C.11). This MUST match call() byte-for-byte.
     let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
     let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
     for &(off, t) in &f.params {
-        // struct by value ≤16B: đến trong 1-2 GPR liên tiếp (hoặc stack)
+        // struct by value ≤16B: arrives in 1-2 consecutive GPRs (or on the stack)
         if let Some((dbl, n)) = ast.tt.hfa(t) {
             if fp + n <= 8 {
                 g.lea_local("x9", off);
@@ -98,7 +105,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
                 }
                 fp += n;
             } else {
-                fp = 8; // AAPCS C.3: HFA tràn khóa v-reg còn lại
+                fp = 8; // AAPCS C.3: an HFA overflow locks the remaining v-regs
                 let sz = ast.tt.size(t);
                 let o = alup(boff, 8);
                 boff = o + sz.div_ceil(8) * 8;
@@ -115,12 +122,12 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
         if matches!(ast.tt.tys[t as usize], Ty::Struct(_)) {
             let sz = ast.tt.size(t);
             if sz > 16 {
-                // >16B: đến dưới dạng CON TRỎ (1 GPR / 1 slot) — copy về slot local
+                // >16B: arrives as a POINTER (1 GPR / 1 slot) — copy into a local slot
                 if gp < 8 {
                     _ = writeln!(g.s, "\tmov x11, x{gp}");
                     gp += 1;
                 } else {
-                    let o = alup(boff, 8); // con trỏ = scalar 8 byte
+                    let o = alup(boff, 8); // pointer = 8-byte scalar
                     boff = o + 8;
                     _ = writeln!(g.s, "\tldr x11, [x29, #{}]", 16 + o);
                 }
@@ -145,7 +152,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             } else {
                 let o = alup(boff, 8);
                 boff = o + 8 * need;
-                gp = 8; // AAPCS C.11: composite tràn stack khóa NGRN
+                gp = 8; // AAPCS C.11: a composite overflow to the stack locks NGRN
                 _ = writeln!(g.s, "\tldr x8, [x29, #{}]", 16 + o);
                 g.store_narrow(0, sz.min(8));
                 if sz > 8 {
@@ -160,7 +167,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             g.lea_local("x9", off);
             match ast.tt.size(t) {
                 4 => _ = writeln!(g.s, "\tstr s{fp}, [x9]"),
-                16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: nguyên binary128
+                16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: full binary128
                 _ => _ = writeln!(g.s, "\tstr d{fp}, [x9]"),
             }
             fp += 1;
@@ -174,11 +181,11 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             };
             gp += 1;
         } else {
-            // scalar trên stack caller: slot 8 tròn tại [x29 + 16 + boff]
-            // (AAPCS chuẩn); load đúng width — giá trị nằm low bytes slot
+            // scalar on the caller's stack: rounded 8-byte slot at [x29 + 16 + boff]
+            // (standard AAPCS); load at the correct width — the value is in the slot's low bytes
             let sz = ast.tt.size(t);
             if sz == 16 {
-                // long double tràn: stack arg quad — slot 16, align 16 (AAPCS B/C)
+                // long double overflow: quad stack arg — slot 16, align 16 (AAPCS B/C)
                 let o = alup(boff, 16);
                 boff = o + 16;
                 g.lea_local("x9", off);
@@ -205,12 +212,12 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
 }
 
 
-// Đuôi module (globals/TLS/strings/weak/aliases/nested-stack) — dùng CHUNG
-// cho emit() (AST) và emit_ir() (IR). Chỉ đọc ast + phát vào g.s.
+// Module tail (globals/TLS/strings/weak/aliases/nested-stack) — SHARED by emit()
+// (AST) and emit_ir() (IR). Reads ast only, and emits into g.s.
 fn emit_module_tail(g: &mut Cg, ast: &Ast) {
     for gl in &ast.globals {
         if gl.is_extern {
-            // EXT(gcc): extern weak (musl _DYNAMIC) — ref phải là weak undef
+            // EXT(gcc): extern weak (musl _DYNAMIC) — the reference must be a weak undef
             if gl.is_weak {
                 _ = writeln!(g.s, ".weak {}", gl.name);
             }
@@ -220,13 +227,13 @@ fn emit_module_tail(g: &mut Cg, ast: &Ast) {
         let globl = if gl.is_static {
             String::new()
         } else if gl.is_weak {
-            format!(".weak {}\n", gl.name) // EXT(gcc): .weak bao hàm global
+            format!(".weak {}\n", gl.name) // EXT(gcc): .weak subsumes global
         } else {
             format!(".globl {}\n", gl.name)
         };
         if gl.is_tls {
-            // TLS ELF: symbol chính LÀ label trong .tdata/.tbss ("awT" = TLS),
-            // không descriptor — access qua tpidr_el0 + :tprel (xem addr())
+            // ELF TLS: the symbol IS the label in .tdata/.tbss ("awT" = TLS),
+            // with no descriptor — accessed via tpidr_el0 + :tprel (see addr())
             match &gl.init {
                 GInit::None => {
                     _ = writeln!(
@@ -253,11 +260,11 @@ fn emit_module_tail(g: &mut Cg, ast: &Ast) {
         }
         match &gl.init {
             GInit::None if gl.is_static => {
-                // GNU .comm: alignment tính BYTE (Darwin tính log2)
+                // GNU .comm: alignment is in BYTES (Darwin uses log2)
                 _ = writeln!(g.s, ".local {0}\n.comm {0},{1},{2}", gl.name, sz.max(1), al);
             }
             GInit::None => {
-                // tentative definition → common symbol (nhiều TU cùng "int x;" hợp nhất)
+                // tentative definition → common symbol (multiple TUs each with "int x;" are merged)
                 _ = writeln!(g.s, ".comm {},{},{}", gl.name, sz.max(1), al);
             }
             init => {
@@ -274,9 +281,9 @@ fn emit_module_tail(g: &mut Cg, ast: &Ast) {
     }
     if !ast.strs.is_empty() {
         for (i, bytes) in ast.strs.iter().enumerate() {
-            // ELF: .rodata trơn cho MỌI string — không có mergeable-dedup theo
-            // nội-dung-đến-NUL phải né (khác Darwin __cstring, nơi string chứa NUL
-            // nhúng "\0abc" phải tách qua __const kẻo linker merge nhầm).
+            // ELF: plain .rodata for EVERY string — there is no content-to-NUL
+            // mergeable dedup to avoid (unlike Darwin __cstring, where a string with an
+            // embedded NUL "\0abc" must be split via __const lest the linker merge it wrongly).
             g.s += ".section .rodata\n";
             _ = write!(g.s, "l_str{}:\n\t.asciz \"", i);
             for &b in bytes {
@@ -289,11 +296,11 @@ fn emit_module_tail(g: &mut Cg, ast: &Ast) {
             g.s += "\"\n";
         }
     }
-    // EXT(gcc): weak prototype — undef ref hạ về weak (link không đòi symbol)
+    // EXT(gcc): weak prototype — an undef reference is lowered to weak (the link does not require the symbol)
     for w in &ast.weak_decls {
         _ = writeln!(g.s, ".weak {}", w);
     }
-    // EXT(gcc): __attribute__((alias)) — musl weak_alias: symbol mới = symbol cũ
+    // EXT(gcc): __attribute__((alias)) — musl weak_alias: new symbol = old symbol
     for (new, old, weak) in &ast.aliases {
         let vis = if *weak { ".weak" } else { ".globl" };
         _ = writeln!(g.s, "{} {}\n.set {}, {}", vis, new, new, old);
@@ -301,7 +308,7 @@ fn emit_module_tail(g: &mut Cg, ast: &Ast) {
 }
 
 impl Cg<'_> {
-    // phát data cho một GInit; sz = size vùng phải phủ (List chèn .space vào lỗ hổng)
+    // Emit data for a GInit; sz = size of the region to cover (List inserts .space into gaps)
     fn gdata(&mut self, init: &GInit, sz: u32) {
         _ = match init {
             GInit::Num(v) => match sz {
@@ -312,7 +319,7 @@ impl Cg<'_> {
             },
             GInit::Str(i) => writeln!(self.s, "\t.quad l_str{i}"),
             GInit::StrOff(i, k) => writeln!(self.s, "\t.quad l_str{i} + {k}"),
-            // prefix \x01 = symbol nội bộ đã đủ tên (label &&); ELF không prefix
+            // \x01 prefix = an internal symbol whose name is already complete (&& label); ELF has no prefix
             GInit::Addr(n, k) => {
                 let sym = match n.strip_prefix('\x01') {
                     Some(raw) => raw.to_string(),
@@ -349,8 +356,8 @@ impl Cg<'_> {
             GInit::None => unreachable!(),
         };
     }
-    // ghi `sz` byte (≤8) thấp của x8 vào [x9, #off..] — chính xác từng mảnh,
-    // không đè slot bên cạnh (x8 bị dịch nát, x9 giữ nguyên)
+    // Write the low `sz` bytes (≤8) of x8 into [x9, #off..] — piece by piece,
+    // without touching the adjacent slot (x8 is shifted apart, x9 is preserved)
     fn store_narrow(&mut self, mut off: u32, mut sz: u32) {
         while sz > 0 {
             if sz >= 8 {
@@ -386,7 +393,7 @@ impl Cg<'_> {
             }
         }
     }
-    // reg = x29 - off (off có thể vượt imm12)
+    // reg = x29 - off (off may exceed imm12)
     fn lea_local(&mut self, reg: &str, off: u32) {
         if off <= 4095 {
             _ = writeln!(self.s, "\tsub {reg}, x29, #{off}");
@@ -403,23 +410,23 @@ impl Cg<'_> {
             _ = writeln!(self.s, "\t{op} sp, sp, x10");
         }
     }
-    // C99 6.8.6.1: SP về base cố định của frame = x29 - (frame + reg-save variadic).
-    // Dùng khi tới label depth-0 trong hàm có VLA: mọi VLA đã cấp bằng `sub sp`
-    // (địa chỉ động) phải được thu hồi trước khi thân label chạy tiếp, nếu không
-    // goto-lùi trong vòng lặp làm SP trôi xuống mãi → tràn stack.
+    // C99 6.8.6.1: SP returns to the frame's fixed base = x29 - (frame + variadic reg-save).
+    // Used on reaching a depth-0 label in a function with a VLA: every VLA allocated by
+    // `sub sp` (a dynamic address) must be reclaimed before the label body continues,
+    // otherwise a backward goto in a loop drifts SP ever downward → stack overflow.
     fn reset_sp_base(&mut self) {
         let off = self.fframe + if self.fvariadic { 192 } else { 0 } + self.ir_tspill;
         self.lea_local("x9", off);
         _ = writeln!(self.s, "\tmov sp, x9");
     }
-    // re-canonicalize x0 theo kiểu (sau op 32-bit / thu hẹp)
+    // Re-canonicalize x0 per type (after a 32-bit op / narrowing)
     fn ext(&mut self, t: TypeId) {
         if matches!(self.a.tt.tys[t as usize], Ty::Bool) {
             self.s += "\tcmp x0, #0\n\tcset x0, ne\n";
             return;
         }
-        // Bitfield: cắt về w bit theo dấu của base — giá trị của (l.m = v)
-        // là v SAU truncate (921016-1)
+        // Bitfield: truncate to w bits per the base's signedness — the value of (l.m = v)
+        // is v AFTER truncation (GCC torture 921016-1)
         if let Ty::Bitfield(b, _, w) = self.a.tt.tys[t as usize] {
             let sh = 64 - w;
             let op = if self.a.tt.is_unsigned(b) {
@@ -433,7 +440,7 @@ impl Cg<'_> {
         let u = self.a.tt.is_unsigned(t);
         self.s += match (self.a.tt.size(t), u) {
             (1, false) => "\tsxtb x0, w0\n",
-            (1, true) => "\tuxtb w0, w0\n", // ghi w → upper 32 tự zero
+            (1, true) => "\tuxtb w0, w0\n", // writing w → the upper 32 bits are auto-zeroed
             (2, false) => "\tsxth x0, w0\n",
             (2, true) => "\tuxth w0, w0\n",
             (4, false) => "\tsxtw x0, w0\n",
@@ -444,10 +451,10 @@ impl Cg<'_> {
     fn load(&mut self, t: TypeId) {
         match self.a.tt.tys[t as usize] {
             Ty::Float => self.s += "\tldr s0, [x0]\n\tfcvt d0, s0\n\tfmov x0, d0\n",
-            // long double: memory binary128 → hạ về f64 canonical (libgcc round đúng)
+            // long double: memory binary128 → narrowed to canonical f64 (libgcc rounds correctly)
             Ty::LDouble => self.s += "\tldr q0, [x0]\n\tbl __trunctfdf2\n\tfmov x0, d0\n",
             Ty::Bitfield(b, boff, w) => {
-                // nạp nguyên đơn vị chứa (unsigned) rồi lắc trái/phải cắt đúng field
+                // load the whole containing unit (unsigned), then shift left/right to isolate the field
                 self.s += match self.a.tt.size(b) {
                     1 => "\tldrb w0, [x0]\n",
                     2 => "\tldrh w0, [x0]\n",
@@ -476,7 +483,7 @@ impl Cg<'_> {
             }
         }
     }
-    // store x{reg} → [x1] theo kiểu
+    // store x{reg} → [x1] per type
     fn store(&mut self, reg: u32, t: TypeId) {
         match self.a.tt.tys[t as usize] {
             Ty::Bool => {
@@ -489,14 +496,14 @@ impl Cg<'_> {
                 _ = writeln!(self.s, "\tfmov d7, x{reg}\n\tfcvt s7, d7\n\tstr s7, [x1]");
             }
             Ty::LDouble => {
-                // bl clobber x1 (caller-saved) — che địa chỉ qua stack
+                // bl clobbers x1 (caller-saved) — shield the address via the stack
                 _ = writeln!(
                     self.s,
                     "\tstr x1, [sp, #-16]!\n\tfmov d0, x{reg}\n\tbl __extenddftf2\n\tldr x1, [sp], #16\n\tstr q0, [x1]"
                 );
             }
             Ty::Bitfield(b, boff, w) => {
-                // read-modify-write đơn vị chứa
+                // read-modify-write the containing unit
                 let usz = self.a.tt.size(b);
                 self.s += match usz {
                     1 => "\tldrb w3, [x1]\n",
@@ -526,8 +533,8 @@ impl Cg<'_> {
             }
         }
     }
-    // copy `sz` byte: src (x0) → dst (x1), xuôi. Để lại địa chỉ dst ở x0 (rvalue
-    // của gán struct = địa chỉ đích). Dùng chung: AST-path + IR Inst::Memcpy.
+    // Copy `sz` bytes: src (x0) → dst (x1), forward. Leaves the dst address in x0 (the
+    // rvalue of a struct assignment = the destination address). Shared: AST-path + IR Inst::Memcpy.
     fn blk_copy(&mut self, sz: u32) {
         self.s += "\tmov x4, x1\n";
         if sz > 0 {
@@ -537,9 +544,9 @@ impl Cg<'_> {
             self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
             _ = writeln!(self.s, "\tb.ne L{n}");
         }
-        self.s += "\tmov x0, x4\n"; // giá trị = địa chỉ dst
+        self.s += "\tmov x0, x4\n"; // value = dst address
     }
-    // chuyển kiểu giá trị canonical trong x0: from → to
+    // Convert the canonical value in x0: from → to
     fn cast_op(&mut self, from: TypeId, to: TypeId) {
         let tt = &self.a.tt;
         if matches!(
@@ -587,11 +594,12 @@ impl Cg<'_> {
             }
         }
     }
-    // Địa chỉ hàm → x0. Dùng chung bởi AST-walk (Node::FunAddr) và IR (Inst::FunAddr)
-    // → asm BYTE-IDENTICAL. hàm static = symbol LOCAL: cấm đi GOT — gas hạ reloc local
-    // thành .text+addend, GNU ld tạo GOT entry BỎ addend → con trỏ trỏ nhầm hàm đầu
-    // section (musl libc_start_main_stage2 → nhảy vào __syscall3). Local cùng TU →
-    // adrp/add trực tiếp.
+    // Function address → x0. Shared by the AST-walk (Node::FunAddr) and IR (Inst::FunAddr)
+    // → BYTE-IDENTICAL asm. A static function is a LOCAL symbol: it must NOT go through the
+    // GOT — gas lowers a local relocation to .text+addend, and GNU ld creates a GOT entry
+    // that DROPS the addend → the pointer points to the wrong function at the start of the
+    // section (musl libc_start_main_stage2 → jumps into __syscall3). Local within the same
+    // TU → adrp/add directly.
     fn emit_funaddr(&mut self, name: &str) {
         let sy = sym(name);
         if self.a.funcs.iter().any(|f| f.name == name && f.is_static) {
@@ -600,8 +608,8 @@ impl Cg<'_> {
             _ = writeln!(self.s, "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]", sy);
         }
     }
-    // memset(x0, 0, sz): zero sz byte kể từ địa chỉ đang ở x0. Dùng chung AST-walk
-    // (Node::Zero) và IR (Inst::Zero). sz==0 → no-op.
+    // memset(x0, 0, sz): zero sz bytes starting at the address in x0. Shared by the
+    // AST-walk (Node::Zero) and IR (Inst::Zero). sz==0 → no-op.
     fn emit_zero(&mut self, sz: u32) {
         if sz == 0 {
             return;
@@ -612,7 +620,7 @@ impl Cg<'_> {
         self.s += "\tstrb wzr, [x0], #1\n\tsubs x2, x2, #1\n";
         _ = writeln!(self.s, "\tb.ne L{n}");
     }
-    // EXT(gcc): &&label (computed-goto) → x0. Nhãn cục bộ trong hàm hiện tại.
+    // EXT(gcc): &&label (computed-goto) → x0. A local label within the current function.
     fn emit_labeladdr(&mut self, name: &str) {
         _ = writeln!(
             self.s,
@@ -620,16 +628,16 @@ impl Cg<'_> {
             self.fname, name
         );
     }
-    // __builtin_*_overflow: x0=a, x1=b, x9=&res. Kết quả bool → x0. Dùng chung
-    // AST-walk (Node::Overflow) + IR (Inst::Overflow). ta/tb/rt = kiểu a/b/*rp.
+    // __builtin_*_overflow: x0=a, x1=b, x9=&res. bool result → x0. Shared by the
+    // AST-walk (Node::Overflow) + IR (Inst::Overflow). ta/tb/rt = types of a/b/*rp.
     fn emit_overflow(&mut self, op: u8, ta: TypeId, tb: TypeId, rt: TypeId) {
         let a_sg = !self.a.tt.is_unsigned(ta);
         let b_sg = !self.a.tt.is_unsigned(tb);
         let (r_sg, rw) = (!self.a.tt.is_unsigned(rt), self.a.tt.size(rt));
         crate::ext::overflow_emit(&mut self.s, op, a_sg, b_sg, r_sg, rw);
     }
-    // va_start: x0 = &ap. Điền va_list AAPCS từ trạng thái prologue (va=gp,fp,stk,frame).
-    // Dùng chung AST-walk (Node::VaStart) + IR (Inst::VaStart).
+    // va_start: x0 = &ap. Fill the AAPCS va_list from the prologue state (va=gp,fp,stk,frame).
+    // Shared by the AST-walk (Node::VaStart) + IR (Inst::VaStart).
     fn emit_vastart(&mut self) {
         let (gp, fp, stk, frame) = self.va;
         self.imm("x9", (16 + stk) as i64);
@@ -640,8 +648,8 @@ impl Cg<'_> {
         _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #24]", (gp as i64 - 8) * 8);
         _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #28]", (fp as i64 - 8) * 16);
     }
-    // va_arg(*(&ap)→ ở x0, kiểu t, scratch-local tmp cho HFA gather) → kết quả x0.
-    // Dùng chung AST-walk (Node::VaArg) + IR (Inst::VaArg). Chi tiết AAPCS: xem cũ.
+    // va_arg(*(&ap) in x0, type t, scratch-local tmp for HFA gather) → result in x0.
+    // Shared by the AST-walk (Node::VaArg) + IR (Inst::VaArg). AAPCS details below.
     fn emit_vaarg(&mut self, t: TypeId, tmp: u32) {
         let st = matches!(self.a.tt.tys[t as usize], Ty::Struct(_));
         let sz = self.a.tt.size(t);
@@ -664,8 +672,9 @@ impl Cg<'_> {
         } else {
             8
         };
-        // pr92904 AAPCS: composite by-value KHÔNG split reg/stack — consume offs
-        // trước, chỉ đi reg khi offs MỚI ≤ 0; vắt qua 0 → rơi nguyên khối xuống stack.
+        // AAPCS (GCC PR92904): a composite by-value is NOT split across reg/stack —
+        // consume offs first, going to a register only when the NEW offs ≤ 0; crossing 0
+        // → the whole block falls to the stack.
         let blk = st && (sz <= 16 || hfa.is_some());
         let l = self.labels(2);
         _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]");
@@ -701,8 +710,8 @@ impl Cg<'_> {
         _ = writeln!(self.s, "L{}:\n\tmov x0, x10", l + 1);
         if st {
             if sz > 16 && hfa.is_none() {
-                self.s += "\tldr x0, [x0]\n"; // >16B: slot chứa CON TRỎ
-            } // struct: giá trị = địa chỉ (quy ước struct-expr của zcc)
+                self.s += "\tldr x0, [x0]\n"; // >16B: the slot holds a POINTER
+            } // struct: value = address (zcc's struct-expression convention)
         } else {
             self.load(t);
         }
@@ -710,7 +719,7 @@ impl Cg<'_> {
 
 }
 
-// EXT(gcc): symbol emit — prefix \x01 (asm-label/label &&) = đã đủ tên; ELF không prefix '_'
+// EXT(gcc): symbol emit — a \x01 prefix (asm-label / && label) = name already complete; ELF has no '_' prefix
 fn sym(n: &str) -> String {
     match n.strip_prefix('\x01') {
         Some(raw) => raw.to_string(),
@@ -719,15 +728,14 @@ fn sym(n: &str) -> String {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ĐƯỜNG IR → asm — đường DUY NHẤT (AST-walk đã xoá, seal-ir-10k). Mô hình
-// naive-stack-slot: mỗi temp một slot 8B dưới frame (x29 − (frame+8+i*8)); load
-// operand vào x0/x1, tính, str kết quả về slot. Tái dùng method value-contract
-// (load/store/cast_op/ext/imm/lea_local). Mọi construct C99 lower thành typed Inst;
-// không còn Opaque bridge — không node nào tái-emit subtree AST.
+// IR → asm PATH — the SOLE path (the AST-walk has been removed). Naive stack-slot
+// model: each temp gets an 8B slot below the frame (x29 − (frame+8+i*8)); load
+// operands into x0/x1, compute, and str the result back to the slot. Reuses the
+// value-contract methods (load/store/cast_op/ext/imm/lea_local). Every C99 construct
+// lowers to a typed Inst; there is no Opaque bridge — no node re-emits an AST subtree.
 // ═══════════════════════════════════════════════════════════════════════════
-// Slot AAPCS cho ir_call_abi (bản độc lập của Slot cục bộ trong self.call — sẽ là
-// bản DUY NHẤT khi Stage D xoá AST-walk). G=x-reg, F=v-reg float(4B cần fcvt),
-// S=scalar→stack, St=struct→GPR(2 reg?), StS=struct→stack, H=HFA→v-reg, Q=ldouble q.
+// AAPCS slot for ir_call_abi. G=x-reg, F=v-reg float (4B needs fcvt), S=scalar→stack,
+// St=struct→GPR (2 regs?), StS=struct→stack, H=HFA→v-reg, Q=ldouble q.
 #[derive(Clone, Copy)]
 enum ASlot {
     G(u32),
@@ -755,7 +763,7 @@ impl<'a> Cg<'a> {
         match v {
             Val::Tmp(t) => self.tmp_load(t, reg),
             Val::Imm(x) => self.imm(reg, x),
-            Val::FImm(b) => self.imm(reg, b as i64), // bit pattern f64 trong GPR
+            Val::FImm(b) => self.imm(reg, b as i64), // f64 bit pattern in a GPR
         }
     }
     fn ir_label(&self, b: u32) -> String {
@@ -768,8 +776,8 @@ impl<'a> Cg<'a> {
             Val::Tmp(t) => self.a.tt.is_float(self.ir_temps[t as usize]),
         }
     }
-    // x0 = &global (+ off). Mirror addr() nhánh GVar: TLS local-exec / GOT (extern
-    // hoặc -fPIC non-static) / adrp+:lo12: (local). Flag tra từ ast.globals theo tên.
+    // x0 = &global (+ off). Mirrors the GVar arm of addr(): local-exec TLS / GOT (extern
+    // or -fPIC non-static) / adrp+:lo12: (local). Flags looked up in ast.globals by name.
     fn lea_global_x0(&mut self, name: &str, off: i64) {
         let (is_tls, is_got) = {
             let gl = self.a.globals.iter().find(|g| g.name.as_str() == name);
@@ -793,8 +801,8 @@ impl<'a> Cg<'a> {
         }
     }
 
-    // x0 = lhs, x1 = rhs → x0 = lhs ⟨op⟩ rhs, canonical theo ct. Bản sao ngữ nghĩa
-    // của Node::Bin (dùng chung khi xoá đường AST); Op enum thay punct.
+    // x0 = lhs, x1 = rhs → x0 = lhs ⟨op⟩ rhs, canonical per ct. A semantic copy of
+    // Node::Bin (shared once the AST path was removed); the Op enum replaces punctuation.
     fn ir_bin(&mut self, op: Op, ct: TypeId) {
         if self.a.tt.is_float(ct) {
             self.s += "\tfmov d0, x0\n\tfmov d1, x1\n";
@@ -839,7 +847,7 @@ impl<'a> Cg<'a> {
                     _ => unreachable!(),
                 };
                 _ = writeln!(self.s, "\tcmp x0, x1\n\tcset x0, {cond}");
-                return; // 0/1, khỏi ext
+                return; // 0/1, no ext needed
             }
         }
         if self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4 {
@@ -847,8 +855,8 @@ impl<'a> Cg<'a> {
         }
     }
 
-    // canonical hóa giá trị trả (x0) theo self.fret rồi đặt vào reg ABI (bản sao
-    // Node::Ret; dùng self.fret/self.fsret do emit_ir set).
+    // Canonicalize the return value (x0) per self.fret, then place it in the ABI register
+    // (a copy of Node::Ret; uses self.fret/self.fsret set by emit_ir).
     fn ir_ret_conv(&mut self) {
         match self.a.tt.tys[self.fret as usize] {
             Ty::Double => self.s += "\tfmov d0, x0\n",
@@ -897,7 +905,7 @@ impl<'a> Cg<'a> {
                 self.ld_val(a, &r);
                 gp += 1;
             }
-            // TODO(expand): arg tràn stack (>8) + struct/HFA by value
+            // TODO(expand): stack-overflow args (>8) + struct/HFA by value
         }
         match callee {
             Callee::Sym(name) => _ = writeln!(self.s, "\tbl {}", sym(name)),
@@ -908,8 +916,8 @@ impl<'a> Cg<'a> {
         }
         if let Some(d) = dst {
             let rt = self.ir_temps[*d as usize];
-            // canonical hóa return (khớp AST call): int → ext theo width (callee
-            // extern trả w0 bit-cao rác), float → f64 canonical.
+            // Canonicalize the return value (matching the AST call): int → ext per width
+            // (an extern callee returns w0 with garbage high bits), float → canonical f64.
             match self.a.tt.tys[rt as usize] {
                 Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
                 Ty::Double => self.s += "\tfmov x0, d0\n",
@@ -921,10 +929,10 @@ impl<'a> Cg<'a> {
         }
     }
 
-    // Call ABI-đầy-đủ trên IR: PORT nguyên cấu trúc self.call (push/pop stack, AAPCS
-    // C.1–C.11) — chỉ thay `self.expr(arg)` bằng `ld_val(val, "x0")` vì operand đã
-    // materialize thành Val (temp x29-relative). Val struct = ĐỊA CHỈ (khớp expr).
-    // ret struct: gom v-reg(HFA)/x0:x1(≤16B)/x8-sret(>16B) về local[sret_off], x0=&local.
+    // Full ABI call on IR: a direct PORT of self.call's structure (stack push/pop, AAPCS
+    // C.1–C.11) — replacing only `self.expr(arg)` with `ld_val(val, "x0")`, since operands
+    // are already materialized as Val (x29-relative temps). A struct Val = an ADDRESS (matching expr).
+    // struct return: gather v-regs(HFA)/x0:x1(≤16B)/x8-sret(>16B) into local[sret_off], x0=&local.
     fn ir_call_abi(
         &mut self,
         dst: &Option<Tmp>,
@@ -957,7 +965,7 @@ impl<'a> Cg<'a> {
                     plan.push(ASlot::StS(o, sz));
                     off = o + sz.div_ceil(8) * 8;
                     if hfa.is_none() {
-                        gp = 8; // C.11 (HFA tràn C.3 KHÔNG khóa NGRN)
+                        gp = 8; // C.11 (an HFA overflow, C.3, does NOT lock NGRN)
                     }
                 }
                 continue;
@@ -1007,7 +1015,7 @@ impl<'a> Cg<'a> {
                     }
                 }
                 ASlot::StS(o, sz) => {
-                    self.ld_val(val, "x0"); // x0 = địa chỉ struct
+                    self.ld_val(val, "x0"); // x0 = struct address
                     let mut k = 0;
                     while k < sz {
                         _ = writeln!(self.s, "\tldr x8, [x0, #{k}]\n\tstr x8, [sp, #{}]", o + k);
@@ -1028,7 +1036,7 @@ impl<'a> Cg<'a> {
             .map(|(&(v, _), &sl)| (v, sl))
             .collect();
         for &(val, sl) in &regargs {
-            self.ld_val(val, "x0"); // struct: x0 = địa chỉ
+            self.ld_val(val, "x0"); // struct: x0 = address
             if matches!(sl, ASlot::Q(_)) {
                 self.s += "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
             } else {
@@ -1064,7 +1072,7 @@ impl<'a> Cg<'a> {
                 ASlot::S(..) | ASlot::StS(..) => unreachable!(),
             }
         }
-        // ret struct >16B: callee ghi thẳng qua x8 (đặt SAU pop reg, không bị đè)
+        // struct return >16B: the callee writes directly via x8 (set AFTER popping registers, so it is not clobbered)
         let ret_struct = matches!(self.a.tt.tys[ret as usize], Ty::Struct(_));
         if ret_struct && self.a.tt.size(ret) > 16 && self.a.tt.hfa(ret).is_none() {
             self.lea_local("x8", sret_off);
@@ -1076,7 +1084,7 @@ impl<'a> Cg<'a> {
         if pad > 0 {
             self.sp_adjust("add", pad);
         }
-        // canonical hóa / gom kết quả
+        // canonicalize / gather the result
         match self.a.tt.tys[ret as usize] {
             Ty::Void => {}
             Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
@@ -1100,7 +1108,7 @@ impl<'a> Cg<'a> {
                         self.s += "\tstr x1, [x9, #8]\n";
                     }
                 }
-                self.lea_local("x0", sret_off); // giá trị = &local
+                self.lea_local("x0", sret_off); // value = &local
             }
             _ => self.ext(ret),
         }
@@ -1109,10 +1117,10 @@ impl<'a> Cg<'a> {
         }
     }
 
-    // EXT(gcc) atomics trên IR: PORT thân LL/SC self.expr(Node::Sync), thay arg-eval
-    // bằng ld_val (operand đã là Val). x0=ptr, x1=val, x2=val2; vòng dùng x9/x10/x11.
+    // EXT(gcc) atomics on IR: a PORT of the LL/SC body of self.expr(Node::Sync), replacing
+    // arg evaluation with ld_val (operands are already Val). x0=ptr, x1=val, x2=val2; the loop uses x9/x10/x11.
     fn ir_sync(&mut self, dst: &Option<Tmp>, op: SyncOp, operands: &[Val], sz: u32, ret: TypeId) {
-        // nạp HẾT operand trước khi vòng chiếm x9 (ld_val dùng x9 làm scratch địa chỉ)
+        // load ALL operands before the loop claims x9 (ld_val uses x9 as an address scratch)
         if let Some(v) = operands.first() {
             self.ld_val(*v, "x0");
         }
@@ -1190,10 +1198,10 @@ impl<'a> Cg<'a> {
         }
     }
 
-    // EXT(gcc) inline asm trên IR: PORT thân self.expr(Node::Asm). Operand đã materialize
-    // (op.inp = giá trị/địa chỉ; op.wb = địa chỉ writeback) → thay expr/addr bằng ld_val.
+    // EXT(gcc) inline asm on IR: a PORT of the body of self.expr(Node::Asm). Operands are
+    // already materialized (op.inp = value/address; op.wb = writeback address) → replacing expr/addr with ld_val.
     fn ir_asm(&mut self, tpl: &str, ops: &[crate::ir::AsmIrOp]) {
-        // gán reg: pin > tied > pool (GP x9.., FP v16.. — caller-saved); mem dùng pool GP
+        // register assignment: pin > tied > pool (GP x9.., FP v16.. — caller-saved); mem uses the GP pool
         let (mut gp, mut vp) = (9u32, 16u32);
         let mut regs: Vec<u32> = Vec::with_capacity(ops.len());
         for op in ops {
@@ -1211,7 +1219,7 @@ impl<'a> Cg<'a> {
             regs.push(r);
         }
         let sizes: Vec<u32> = ops.iter().map(|o| self.a.tt.size(o.ty)).collect();
-        // phase 1: nạp input/mem-addr lên stack (pure output = inp None → bỏ qua)
+        // phase 1: load inputs/mem-addresses onto the stack (a pure output = inp None → skipped)
         let mut pushed: Vec<usize> = Vec::new();
         for (k, op) in ops.iter().enumerate() {
             if let Some(v) = op.inp {
@@ -1220,7 +1228,7 @@ impl<'a> Cg<'a> {
                 pushed.push(k);
             }
         }
-        // phase 2: pop ngược vào reg đích (FP: bit double → demote s nếu size4)
+        // phase 2: pop in reverse into the target registers (FP: double bits → demote to s if size 4)
         for &k in pushed.iter().rev() {
             if ops[k].fp {
                 _ = writeln!(self.s, "\tldr d{}, [sp], #16", regs[k]);
@@ -1272,7 +1280,7 @@ impl<'a> Cg<'a> {
         if !sub.is_empty() {
             _ = writeln!(self.s, "\t{}", sub.replace('\n', "\n\t"));
         }
-        // writeback output non-mem (mem tự ghi qua [xN]): giá trị lên stack trước
+        // writeback of non-mem outputs (mem writes itself via [xN]): value onto the stack first
         let wb: Vec<usize> = (0..ops.len()).filter(|&k| ops[k].wb.is_some()).collect();
         for &k in &wb {
             if ops[k].fp {
@@ -1285,7 +1293,7 @@ impl<'a> Cg<'a> {
             }
         }
         for &k in wb.iter().rev() {
-            self.ld_val(ops[k].wb.unwrap(), "x0"); // địa chỉ đích
+            self.ld_val(ops[k].wb.unwrap(), "x0"); // destination address
             self.s += "\tmov x1, x0\n\tldr x2, [sp], #16\n";
             self.store(2, ops[k].ty);
         }
@@ -1367,7 +1375,7 @@ impl<'a> Cg<'a> {
                 self.tmp_store(*d, "x0");
             }
             Inst::Zero(a, sz) => {
-                self.ld_val(*a, "x0"); // địa chỉ → x0
+                self.ld_val(*a, "x0"); // address → x0
                 self.emit_zero(*sz);
             }
             Inst::VaStart(a) => {
@@ -1380,9 +1388,10 @@ impl<'a> Cg<'a> {
                 self.tmp_store(*d, "x0");
             }
             Inst::Overflow(d, op, ta, tb, rt, a, b, rp) => {
-                // a→x0, b→x1, rp→x9. tmp_load DÙNG x9 làm scratch địa chỉ → phải nạp
-                // rp vào x9 SAU CÙNG (nạp a/b trước sẽ đè x9, nhưng nạp rp cuối thì
-                // không gì đè nữa). Sai thứ tự = ghi kết quả sai địa chỉ (pr64006/68381…).
+                // a→x0, b→x1, rp→x9. tmp_load USES x9 as an address scratch → rp must be
+                // loaded into x9 LAST (loading a/b first would clobber x9, but loading rp last
+                // means nothing clobbers it afterward). Wrong order = writing the result to the
+                // wrong address (GCC PR64006/68381…).
                 self.ld_val(*a, "x0");
                 self.ld_val(*b, "x1");
                 self.ld_val(*rp, "x9");
@@ -1398,7 +1407,7 @@ impl<'a> Cg<'a> {
                 self.s += "\tbr x0\n";
             }
             Inst::Alloca(d, size) => {
-                self.ld_val(*size, "x0"); // số byte
+                self.ld_val(*size, "x0"); // byte count
                 self.s += "\tadd x0, x0, #15\n\tand x0, x0, #0xfffffffffffffff0\n\tsub sp, sp, x0\n\tmov x0, sp\n";
                 self.tmp_store(*d, "x0");
             }
@@ -1423,28 +1432,29 @@ impl<'a> Cg<'a> {
                 }
                 self.s += EPILOGUE;
             }
-            // rơi khỏi hàm không được: chốt bằng default (giống blanket đường AST)
+            // falling off the end of a function is not allowed: seal with a default (like the AST-path blanket)
             Term::Unreachable => self.s += "\tmov x0, #0\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n",
         }
     }
 
     fn emit_ir_body(&mut self, irf: &IrFunc) {
-        // Temp IR sống DƯỚI khung C (và dưới vùng variadic-save 192 nếu có, do
-        // emit_params đã sub trước). Param đã nằm sẵn trong slot khung (emit_params
-        // theo ABI) → body đọc qua Var(off)→Load, KHÔNG cần param-temp.
+        // IR temps live BELOW the C frame (and below the 192B variadic-save region if
+        // present, which emit_params already subtracted). Parameters already sit in frame
+        // slots (emit_params, per ABI) → the body reads them via Var(off)→Load, needing NO param-temp.
         self.ir_tbase = irf.frame + if self.fvariadic { 192 } else { 0 };
         self.ir_temps = irf.temps.clone();
         let tbytes = (irf.temps.len() as u32 * 8).next_multiple_of(16);
-        self.ir_tspill = tbytes; // reset_sp_base (VLA-dealloc) phải trừ luôn vùng này
+        self.ir_tspill = tbytes; // reset_sp_base (VLA-dealloc) must also subtract this region
         if tbytes > 0 {
             self.sp_adjust("sub", tbytes);
         }
         for (bi, blk) in irf.blocks.iter().enumerate() {
             _ = writeln!(self.s, "{}:", self.ir_label(bi as u32));
-            // EXT(gcc): nhãn C tại block này → phát `lg_fname.name:` cho computed-goto
-            // (&&label / goto *). Có nhãn ⟹ đích goto: C99 6.8.6.1 đòi SP=base mọi
-            // lối vào (goto-lùi từ trong scope VLA phải dealloc). goto CẤM nhảy VÀO
-            // scope VLA nên đích luôn ở depth ≤ hiện tại → reset base an toàn.
+            // EXT(gcc): a C label at this block → emit `lg_fname.name:` for computed-goto
+            // (&&label / goto *). Having a label ⟹ a goto target: C99 6.8.6.1 requires SP=base
+            // on every entry (a backward goto from within a VLA scope must deallocate). A goto
+            // may NOT jump INTO a VLA scope, so the target is always at depth ≤ the current one
+            // → resetting the base is safe.
             let is_label = irf.labels.iter().any(|(_, b)| *b == bi as u32);
             for (name, _) in irf.labels.iter().filter(|(_, b)| *b == bi as u32) {
                 _ = writeln!(self.s, "lg_{}.{}:", self.fname, name);
@@ -1460,19 +1470,20 @@ impl<'a> Cg<'a> {
     }
 }
 
-/// Điểm vào backend — đường DUY NHẤT: lower(AST) → IR → passes → asm. Phủ trọn
-/// suite/csmith/musl; AST-walk emit() đã xoá (seal-ir-10k). Backend simulate per-inst.
+/// Backend entry point — the SOLE path: lower(AST) → IR → passes → asm. Covers the
+/// full suite/csmith/musl; the AST-walk emit() has been removed. The backend simulates per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
     let mut funcs = ir::lower(ast);
-    // Pipeline pass tối ưu (const-fold→copy-prop→CSE→DCE tới fixpoint). Mỗi pass đã
-    // chứng bảo-toàn-⟦·⟧ ở IR→IR (opt.rs::tests, equiv commuting-square). Gate ZCC_OPT
-    // để A/B trong box trước khi bật mặc định (đo-trước-khi-tuyên; verify chặn IR hỏng).
-    // has_volatile khoá opt: IR không mô hình volatile (6.7.3) nên ⟦·⟧-preservation
-    // chỉ chứng cho input volatile-free — opt chạy TRONG mảnh định lý giữ.
+    // Optimization pass pipeline (const-fold→copy-prop→CSE→DCE to a fixpoint). Each pass
+    // is proven ⟦·⟧-preserving at the IR→IR level (opt.rs::tests, commuting-square equivalence).
+    // Gated by ZCC_OPT for A/B testing in the box before being enabled by default (measure
+    // before asserting; verify rejects broken IR). has_volatile disables opt: the IR does not
+    // model volatile (6.7.3), so ⟦·⟧-preservation is proven only for volatile-free input — opt
+    // runs WITHIN the preserved theorem fragment.
     if std::env::var_os("ZCC_OPT").is_some() && !ast.has_volatile {
         for f in funcs.iter_mut() {
             crate::opt::optimize(&ast.tt, f);
-            debug_assert!(ir::verify(f).is_ok(), "opt sinh IR hỏng: {}", f.name);
+            debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
         }
     }
     let mut g = Cg {
@@ -1516,8 +1527,8 @@ pub fn emit_ir(ast: &Ast) -> String {
         if f.frame > 0 {
             g.sp_adjust("sub", f.frame);
         }
-        // Prologue param-ABI CHUNG với emit() (nested-chain/variadic-save/sret/
-        // spill scalar+struct+HFA) → param nằm sẵn trong slot khung cho IR body.
+        // Prologue parameter-ABI SHARED with emit() (nested-chain/variadic-save/sret/
+        // spill scalar+struct+HFA) → parameters sit ready in frame slots for the IR body.
         emit_params(&mut g, f);
         g.emit_ir_body(&funcs[fi]);
         g.s += "\t.cfi_endproc\n";

@@ -1,9 +1,10 @@
 // zcc — C89+ compiler, target: AArch64 ELF (Linux).
-// CLI tương thích cc để drop-in vào Makefile (CC=zcc):
-//   zcc [-c | -S] [-o out] [flag cc khác: nuốt im lặng] <in.c>
-//   mặc định: .s tạm → `as` → .o tạm → `ld` (trực tiếp, không qua cc driver)
-//   ra ELF executable `a.out`. -c dừng ở .o (`<stem>.o`), -S ở .s (`<stem>.s`).
-//   ld: entry qua crt1.o (_start → __libc_start_main → main), ctor/dtor crti/crtn.
+// A cc-compatible CLI for drop-in use in a Makefile (CC=zcc):
+//   zcc [-c | -S] [-o out] [other cc flags: swallowed silently] <in.c>
+//   default: temp .s → `as` → temp .o → `ld` (directly, not via the cc driver)
+//   producing the ELF executable `a.out`. -c stops at .o (`<stem>.o`), -S at .s
+//   (`<stem>.s`). ld: entry via crt1.o (_start → __libc_start_main → main),
+//   ctor/dtor via crti/crtn.
 mod ast;
 mod codegen;
 mod ext;
@@ -31,9 +32,10 @@ fn write_or_die(path: &str, data: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    // Đệ quy parser sâu theo TU thật (sqlite testfixture 88 TU đụng mép stack
-    // 8MB mặc định — segv lúc có lúc không vì cỡ env xê dịch điểm xuất phát,
-    // 2026-08-18). Cấp tường minh 256MB: trần cứng thay vì biên may rủi.
+    // The parser recurses deeply on real TUs (sqlite testfixture's 88 TUs reach
+    // the edge of the default 8MB stack — an intermittent segv because the env
+    // size shifts the starting point). Allocate 256MB explicitly: a hard ceiling
+    // instead of a chance margin.
     std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(drive)
@@ -50,14 +52,16 @@ fn drive() -> ExitCode {
         Vec::<String>::new(),
         Vec::<String>::new(),
     );
-    // -l/-L giữ nguyên thứ tự CLI, forward thẳng cho ld; -MMD/-MF sinh .d cho make
+    // -l/-L keep their CLI order and are forwarded straight to ld; -MMD/-MF
+    // generate a .d file for make
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
-    let mut shared = false; // -shared → ld -dylib (xxhash của redis build dylib)
-    let mut pic = false; // -fPIC → backend ELF đi GOT cho global non-static
+    let mut shared = false; // -shared → ld -dylib (redis's xxhash builds a dylib)
+    let mut pic = false; // -fPIC → the ELF backend goes through the GOT for non-static globals
     let (mut nostdinc, mut bundle) = (false, false);
-    let mut export_dyn = false; // -rdynamic → ld --export-dynamic (backtrace_symbols resolve tên hàm)
-    // IR→ops→asm là đường DUY NHẤT (đã phủ trọn suite/csmith/musl); AST-walk emit()
-    // đã xoá (seal-ir-10k). Không còn cờ chọn backend — không compiler thật để cờ đó.
+    let mut export_dyn = false; // -rdynamic → ld --export-dynamic (backtrace_symbols resolves function names)
+    // IR→ops→asm is the ONLY path (it fully covers suite/csmith/musl); the
+    // AST-walk emit() has been removed. There is no backend-selection flag — no
+    // real compiler warrants one.
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -83,21 +87,23 @@ fn drive() -> ExitCode {
             "-v" | "--version" => {
                 println!("zcc — C89+ compiler, target aarch64-linux-gnu (ELF)");
                 if args.len() == 2 {
-                    return ExitCode::SUCCESS; // configure dò `$CC -v`: phải exit 0
+                    return ExitCode::SUCCESS; // configure probes `$CC -v`: must exit 0
                 }
             }
             "-shared" | "-dynamiclib" => shared = true,
-            // ELF .so: global non-static = preemptible, PHẢI qua GOT (ld từ chối
-            // adrp trực tiếp khi -shared); redis module build .xo bằng -fPIC
+            // ELF .so: a non-static global is preemptible and MUST go through the
+            // GOT (ld rejects a direct adrp under -shared); redis modules build .xo
+            // with -fPIC
             "-fPIC" | "-fpic" => pic = true,
-            "-bundle" => bundle = true, // dlopen module → .so (redis test modules)
+            "-bundle" => bundle = true, // a dlopen module → .so (redis test modules)
             "-rdynamic" | "-export-dynamic" | "--export-dynamic" => export_dyn = true,
-            // flag Darwin có đối số rời (không dùng trên ELF) — nuốt CẢ CẶP kẻo
-            // đối số bị coi là input file ("-undefined dynamic_lookup", "--target …")
+            // Darwin flags with a separate argument (unused on ELF) — swallow the
+            // WHOLE PAIR, otherwise the argument is treated as an input file
+            // ("-undefined dynamic_lookup", "--target …")
             "-undefined" | "--target" | "-target" => i += 1,
-            "-nostdinc" => nostdinc = true, // musl: chỉ dùng -I, bỏ header nhúng + SDK
-            "-MMD" | "-MD" => depgen = true, // .d chỉ chứa header thật (nhúng <..> bỏ)
-            "-MP" => {}                     // deps của mình đều 1 dòng, phony khỏi cần
+            "-nostdinc" => nostdinc = true, // musl: use -I only, drop embedded headers + SDK
+            "-MMD" | "-MD" => depgen = true, // the .d contains real headers only (embedded <..> dropped)
+            "-MP" => {}                     // our deps are all one line, no phony targets needed
             "-MF" => {
                 i += 1;
                 depfile = args.get(i).cloned();
@@ -106,10 +112,10 @@ fn drive() -> ExitCode {
             s if s.starts_with("-I") => incs.push(s[2..].to_string()),
             s if s.starts_with("-U") => undefs.push(s[2..].to_string()),
             s if s.starts_with("-l") || s.starts_with("-L") => libs.push(s.to_string()),
-            // flag có đối số rời: nuốt cả cặp
+            // flags with a separate argument: swallow the whole pair
             "-arch" | "-isysroot" | "-framework" | "-include" | "-x" | "-MT" | "-MQ"
             | "-Xlinker" => i += 1,
-            s if s.starts_with('-') => {} // -O -g -W… -std=… : nuốt để tương thích cc
+            s if s.starts_with('-') => {} // -O -g -W… -std=… : swallowed for cc compatibility
             s => inputs.push(s),
         }
         i += 1;
@@ -119,27 +125,31 @@ fn drive() -> ExitCode {
         return ExitCode::FAILURE;
     }
     if output.is_some() && mode != "ld" && inputs.len() > 1 {
-        eprintln!("zcc: -o không dùng được với nhiều input khi có -c/-S");
+        eprintln!("zcc: cannot use -o with multiple inputs when -c/-S is given");
         return ExitCode::FAILURE;
     }
-    // ELF: ZCC_SYSROOT=<musl install> — header + crt + libc lấy TRỌN từ musl
-    // (libc-test M17 đòi: test phải compile/link против musl do zcc build,
-    // không phải glibc của box); không set thì glibc của box như cũ.
+    // ELF: ZCC_SYSROOT=<musl install> — headers + crt + libc are taken ENTIRELY
+    // from musl (libc-test M17 requires it: tests must compile/link against the
+    // musl that zcc built, not the box's glibc); if unset, the box's glibc as
+    // before.
     let sysroot = std::env::var("ZCC_SYSROOT").ok();
-    // -nostdinc (chuẩn cc): sentinel \x01 đầu incs tắt bảng nhúng.
+    // -nostdinc (standard cc): a \x01 sentinel at the head of incs disables the
+    // embedded table.
     if nostdinc {
         incs.insert(0, "\u{1}nostdinc".to_string());
     } else if let Some(s) = &sysroot {
-        // musl headers trọn bộ — tắt bảng nhúng (header nhúng mang giá trị libc box)
+        // full musl headers — disable the embedded table (the embedded headers
+        // carry the box libc's values)
         incs.insert(0, "\u{1}nostdinc".to_string());
         incs.push(format!("{s}/include"));
     } else {
-        // sentinel: bảng nhúng chỉ phục vụ header compiler-owned, libc = glibc box
+        // sentinel: the embedded table serves only compiler-owned headers, libc =
+        // the box's glibc
         incs.insert(0, "\u{1}elf".to_string());
         incs.push("/usr/include/aarch64-linux-gnu".to_string());
         incs.push("/usr/include".to_string());
     }
-    // .c → (asm text, danh sách file thật đã đọc — cho -MMD); .o/.a đi thẳng linker
+    // .c → (asm text, list of real files read — for -MMD); .o/.a go straight to the linker
     let emit_asm = |path: &str| -> Option<(String, Vec<String>)> {
         match preprocess::preprocess(path, &defs, &undefs, &incs).and_then(
             |(t, locs, files)| {
@@ -159,7 +169,7 @@ fn drive() -> ExitCode {
             }
         }
     };
-    // make đọc "<obj>: <src> <headers>"; header nhúng (<stdio.h>…) không phải file
+    // make reads "<obj>: <src> <headers>"; an embedded header (<stdio.h>…) is not a file
     let write_deps = |obj: &str, files: &[String]| -> bool {
         let d = depfile
             .clone()
@@ -182,7 +192,7 @@ fn drive() -> ExitCode {
     };
     let ok = match mode {
         "e" => {
-            // dump token đã preprocess (debug); mỗi token cách 1 space, xuống dòng theo line gốc
+            // dump the preprocessed tokens (debug); one space between tokens, newline follows the original line
             let mut ok = true;
             for path in &inputs {
                 match preprocess::preprocess(path, &defs, &undefs, &incs) {
@@ -211,9 +221,10 @@ fn drive() -> ExitCode {
         "s" | "o" => {
             let mut ok = true;
             for path in &inputs {
-                // luật driver drop-in: build system thật (musl) đưa file .s
-                // thẳng cho $CC -c — chuyển nguyên văn cho as, không qua C;
-                // .S (viết hoa) = asm cần C preprocessor (musl memset.S #define reg)
+                // drop-in driver rule: a real build system (musl) hands a .s file
+                // straight to $CC -c — pass it verbatim to as, not through C;
+                // .S (uppercase) = asm that needs the C preprocessor (musl
+                // memset.S #defines regs)
                 if path.ends_with(".s") || path.ends_with(".S") {
                     let stem = stem_of(path);
                     let default = format!("{stem}.o");
@@ -263,7 +274,7 @@ fn drive() -> ExitCode {
             ok
         }
         _ => {
-            // Nhánh toolchain ELF (as → ld trực tiếp); target mới thêm nhánh ở đây
+            // The ELF toolchain branch (as → ld directly); a new target adds its branch here
             let out = output.unwrap_or("a.out");
             let (mut objs, mut tmps, mut ok) = (Vec::new(), Vec::new(), true);
             for (k, path) in inputs.iter().enumerate() {
@@ -285,10 +296,10 @@ fn drive() -> ExitCode {
                     break;
                 }
             }
-            // glibc: atexit nằm trong libc_nonshared.a tham chiếu __dso_handle
-            // (hidden) — gcc cấp qua crtbegin.o; zcc link as→ld trực tiếp nên tự
-            // phát stub (self-address: hợp lệ cho cả exe lẫn .so, chỉ là tag
-            // identity cho __cxa_atexit)
+            // glibc: atexit lives in libc_nonshared.a and references __dso_handle
+            // (hidden) — gcc supplies it via crtbegin.o; zcc links as→ld directly,
+            // so it emits the stub itself (a self-address: valid for both an exe
+            // and a .so, it is only an identity tag for __cxa_atexit)
             if ok && sysroot.is_none() {
                 let (ds, do_) = (format!("{out}.zccdso.s"), format!("{out}.zccdso.o"));
                 ok = write_or_die(
@@ -301,8 +312,8 @@ fn drive() -> ExitCode {
             }
             if ok {
                 let mut ld: Vec<&str> = Vec::new();
-                // ELF executable: entry qua crt1.o (_start → __libc_start_main → main),
-                // ctor/dtor qua crti/crtn — khác Darwin (LC_MAIN, không cần crt).
+                // ELF executable: entry via crt1.o (_start → __libc_start_main → main),
+                // ctor/dtor via crti/crtn — unlike Darwin (LC_MAIN, no crt needed).
                 let crt = match &sysroot {
                     Some(s) => format!("{s}/lib"),
                     None => "/usr/lib/aarch64-linux-gnu".to_string(),
@@ -312,8 +323,8 @@ fn drive() -> ExitCode {
                     format!("{crt}/crti.o"),
                     format!("{crt}/crtn.o"),
                 );
-                // long double ELF: __extenddftf2/__trunctfdf2 sống trong libgcc.a
-                // (soft-fp, freestanding — không kéo dep libc); glob version dir
+                // long double ELF: __extenddftf2/__trunctfdf2 live in libgcc.a
+                // (soft-fp, freestanding — pulls in no libc dep); glob the version dir
                 let gccl = fs::read_dir("/usr/lib/gcc/aarch64-linux-gnu")
                     .ok()
                     .and_then(|d| {
@@ -325,23 +336,23 @@ fn drive() -> ExitCode {
                     ld.extend([crt1.as_str(), crti.as_str()]);
                 }
                 ld.extend(objs.iter().map(|s| s.as_str()));
-                ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L theo thứ tự CLI
-                // PT_GNU_EH_FRAME (.eh_frame_hdr) để runtime unwinder tra được
-                // CFI — glibc backtrace()/_Unwind_Backtrace cần segment này
+                ld.extend(libs.iter().map(|s| s.as_str())); // -l/-L in CLI order
+                // PT_GNU_EH_FRAME (.eh_frame_hdr) so the runtime unwinder can look
+                // up CFI — glibc backtrace()/_Unwind_Backtrace needs this segment
                 ld.push("--eh-frame-hdr");
                 if export_dyn {
-                    ld.push("--export-dynamic"); // -rdynamic: dynsym đủ để backtrace_symbols tra tên
+                    ld.push("--export-dynamic"); // -rdynamic: enough dynsym for backtrace_symbols to resolve names
                 }
                 if shared || bundle {
                     ld.push("-shared");
                 } else {
                     ld.push(&crtn);
                     if sysroot.is_none() {
-                        // musl sysroot chỉ có libc.a → static, không cần ld.so
+                        // a musl sysroot has only libc.a → static, no ld.so needed
                         ld.extend(["-dynamic-linker", "/lib/ld-linux-aarch64.so.1"]);
                     }
                 }
-                // musl install có libm.a rỗng nên -lm vô hại; glibc tách riêng
+                // a musl install has an empty libm.a so -lm is harmless; glibc keeps it separate
                 ld.extend(["-o", out, "-lc", "-lm", "-L", &crt]);
                 if let Some(g) = &gccl {
                     ld.extend(["-L", g, "-lgcc"]);

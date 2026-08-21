@@ -1,12 +1,14 @@
-// Preprocessor C89 (M7): token-based, chạy giữa lexer và parser.
-// Vào: đường dẫn file; ra: Vec<Tok> sạch directive cho parser.
-// Hỗ trợ (do test đòi): #include "..." (tương đối thư mục file đang xử lý),
-// #define object/function (# stringize, ## paste, rescan đệ quy có chặn vòng
-// bằng hide-stack), #undef, #if/#ifdef/#ifndef/#elif/#else/#endif (constexpr
-// đủ toán tử C + defined), #error; #line/#pragma nuốt im lặng.
-// Macro sẵn: __LINE__ __FILE__ __STDC__ + bảng builtin GCC. #include <...>:
-// tra bảng header nhúng trước, rồi các thư mục -I (filesystem). Mỗi token mang
-// (file, line, hideset) — hideset theo luật chuẩn để macro không expand lặp.
+// C89 preprocessor (M7): token-based, running between the lexer and the parser.
+// In: a file path; out: a Vec<Tok> cleared of directives, ready for the parser.
+// Supported constructs: #include "..." (relative to the directory of the file
+// being processed), #define object/function (# stringization, ## paste,
+// recursive rescan with cycle prevention via a hide-stack), #undef,
+// #if/#ifdef/#ifndef/#elif/#else/#endif (constant expressions with the full C
+// operator set + defined), #error; #line/#pragma are consumed silently.
+// Predefined macros: __LINE__ __FILE__ __STDC__ + the GCC builtin table.
+// #include <...>: consult the embedded-header table first, then the -I
+// directories (filesystem). Each token carries (file, line, hideset) — the
+// hideset follows the standard rule so a macro does not expand repeatedly.
 
 use crate::lexer::{NumK, PTok, Tok, lex, lex_t};
 use std::collections::HashMap;
@@ -19,13 +21,14 @@ enum Macro {
 }
 type Macros = HashMap<String, Macro>;
 
-// Header hệ thống NHÚNG vào binary (zero dependency, target lock arm64 ELF
-// nên nội dung cố định). #include <...> tra bảng này, không đọc filesystem.
-// Chỉ 7 header COMPILER-OWNED freestanding (C99 4): compiler phải tự cấp vì
-// chúng khai builtin của mình (va_list, offsetof, INT_MAX...). Header library
-// (stdio/stdlib/string/math/...) do glibc box hoặc musl sysroot phục vụ trên
-// ELF — bản nhúng Darwin cũ đã xoá khi bỏ Mach-O (embed_src chặn chúng qua
-// sentinel \x01elf).
+// System headers EMBEDDED into the binary (zero dependency; the target is
+// locked to arm64 ELF, so the contents are fixed). #include <...> consults this
+// table, it does not read the filesystem. Only 7 COMPILER-OWNED freestanding
+// headers (C99 4): the compiler must supply these itself because they declare
+// its own builtins (va_list, offsetof, INT_MAX...). Library headers
+// (stdio/stdlib/string/math/...) are served on ELF by the box's glibc or a musl
+// sysroot — the old embedded Darwin versions were removed when Mach-O was
+// dropped (embed_src blocks them via the \x01elf sentinel).
 const HEADERS: [(&str, &str); 7] = [
     ("stdbool.h", include_str!("headers/stdbool.h")),
     ("stdalign.h", include_str!("headers/stdalign.h")),
@@ -54,33 +57,35 @@ fn preprocess_pt(
     incs: &[String],
 ) -> Result<(Vec<PTok>, Vec<String>), String> {
     let mut macros = Macros::new();
-    // EXT(gcc): bảng predefined macro (target arm64 ELF Linux, LP64 little-endian) —
-    // __LP64__/__aarch64__/__CHAR_BIT__/__SIZEOF_*/__*_TYPE__/__builtin_* là gcc-predefined,
-    // KHÔNG ISO; chỉ __STDC__/__STDC_VERSION__ trong bảng là ISO (6.10.8). Phép-cắt: bỏ
-    // bảng này → còn C89 thuần (không TU nào thấy macro gcc → fallback path chuẩn).
+    // EXT(gcc): predefined-macro table (target arm64 ELF Linux, LP64 little-endian) —
+    // __LP64__/__aarch64__/__CHAR_BIT__/__SIZEOF_*/__*_TYPE__/__builtin_* are gcc-predefined,
+    // NOT ISO; only __STDC__/__STDC_VERSION__ in the table are ISO (6.10.8). By the cut test:
+    // remove this table → plain C89 remains (no translation unit sees a gcc macro → standard fallback path).
     let ones = [
         "__STDC__", "__LP64__", "__arm64__", "__aarch64__",
         "__linux__",
-        "__linux", // gcc/clang định nghĩa cả bản bare; redis setproctitle.c + config.h dò `defined __linux`
+        "__linux", // gcc/clang define the bare form too; redis setproctitle.c + config.h probe `defined __linux`
         "__gnu_linux__",
         "__unix__",
-        "__unix", // đối xứng: gcc định nghĩa cả __unix lẫn __unix__
+        "__unix", // symmetric: gcc defines both __unix and __unix__
         "__ELF__",
-        "__CHAR_UNSIGNED__", // plain char unsigned trên Linux arm64 (AAPCS)
+        "__CHAR_UNSIGNED__", // plain char is unsigned on Linux arm64 (AAPCS)
     ];
     for m in ones {
         macros.insert(m.into(), Macro::Obj(vec![synth(Tok::Num(1, NumK::I))]));
     }
     for (m, v) in [
-        // EXT(gcc): SDK Darwin CHỈ viết nhánh arm64 dưới #ifdef __GNUC__ (nhánh
-        // non-GNUC là x86-only, thiếu cả _OSSwapInt16) → phải xưng GNUC dialect
-        // như clang vẫn xưng (4.2.1). KHÔNG xưng __clang__ (né feature riêng).
+        // EXT(gcc): the Darwin SDK writes the arm64 branch ONLY under #ifdef
+        // __GNUC__ (the non-GNUC branch is x86-only and even lacks _OSSwapInt16),
+        // so the GNUC dialect must be claimed, as clang also claims it (4.2.1).
+        // __clang__ is NOT claimed (avoiding clang-specific features).
         ("__GNUC__", "4"),
         ("__GNUC_MINOR__", "2"),
         ("__GNUC_PATCHLEVEL__", "1"),
-        // C99: git-compat-util.h #error khi < 199901L — xưng dialect C99
-        // như đã xưng GNUC cho SDK (M11); bề mặt C89+ hiện hành đủ phần C99
-        // git đạp (designated/mixed-decl/long long/vamacro), thiếu đâu vá đó
+        // C99: git-compat-util.h issues #error when < 199901L — claim the C99
+        // dialect, as GNUC was claimed for the SDK (M11); the current C89+ surface
+        // covers the C99 features git relies on (designated/mixed-decl/long
+        // long/variadic macros), patched further as gaps appear
         ("__STDC_VERSION__", "199901L"),
         ("__CHAR_BIT__", "8"),
         ("__SCHAR_MAX__", "127"),
@@ -101,8 +106,8 @@ fn preprocess_pt(
         ("__ORDER_BIG_ENDIAN__", "4321"),
         ("__ORDER_PDP_ENDIAN__", "3412"),
         ("__BYTE_ORDER__", "1234"),
-        // Hằng float.h GCC predefine (IEEE754): FLT_MIN=2^-126, FLT_MAX=(2-2^-23)·2^127,
-        // DBL_MANT_DIG=53 bit mantissa. Chỉ 3 macro corpus torture thật đòi (test-first).
+        // GCC-predefined float.h constants (IEEE754): FLT_MIN=2^-126, FLT_MAX=(2-2^-23)·2^127,
+        // DBL_MANT_DIG=53 mantissa bits. Only the 3 macros the torture corpus actually requires (test-first).
         ("__FLT_MIN__", "1.17549435082228750797e-38F"),
         ("__FLT_MAX__", "3.40282346638528859812e+38F"),
         ("__DBL_MANT_DIG__", "53"),
@@ -128,21 +133,22 @@ fn preprocess_pt(
         let toks = lex(v).map_err(|e| e.to_string())?;
         macros.insert(m.into(), Macro::Obj(toks));
     }
-    // __USER_LABEL_PREFIX__: glibc __REDIRECT/__ASMNAME stringize nó thành
-    // prefix symbol asm (scanf → __isoc99_scanf); thiếu định nghĩa là
-    // "#__USER_LABEL_PREFIX__" dính nguyên văn vào tên symbol. ELF: rỗng.
+    // __USER_LABEL_PREFIX__: glibc __REDIRECT/__ASMNAME stringize it into the asm
+    // symbol prefix (scanf → __isoc99_scanf); if left undefined, the literal
+    // "#__USER_LABEL_PREFIX__" would be pasted into the symbol name. On ELF: empty.
     macros.insert("__USER_LABEL_PREFIX__".into(), Macro::Obj(Vec::new()));
-    // __builtin_va_list: va_list = struct AAPCS (stdarg.h định nghĩa),
-    // va_start/va_arg KHÔNG macro — parser hạ xuống Node::VaStart/VaArg.
-    // typedef qua tên struct trần: hợp lệ cả khi incomplete (glibc __va_list.h
-    // typedef trước khi ai include stdarg.h).
+    // __builtin_va_list: va_list = an AAPCS struct (defined by stdarg.h);
+    // va_start/va_arg are NOT macros — the parser lowers them to
+    // Node::VaStart/VaArg. A typedef through the bare struct name is valid even
+    // while incomplete (glibc __va_list.h typedefs it before anyone includes stdarg.h).
     macros.insert(
         "__builtin_va_list".into(),
         Macro::Obj(lex("struct __zcc_va_list").map_err(|e| e.to_string())?),
     );
-    // inf/nan (musl math.h GNUC>=3.3 đòi, thiếu là thành call trần): 1e10000
-    // tràn parse f64 → inf đúng chuẩn; nan qua 0/0 (fold ra NaN). Function-like
-    // 0 tham số vì code gọi kèm ngoặc: __builtin_inff().
+    // inf/nan (required by musl math.h under GNUC>=3.3; if missing they become
+    // bare calls): 1e10000 overflows the f64 parse → inf per the standard; nan
+    // via 0/0 (folds to NaN). Function-like with 0 parameters because the code
+    // calls them with parentheses: __builtin_inff().
     for (m, ps, body) in [
         ("__builtin_inf", vec![], "(1e10000)"),
         ("__builtin_inff", vec![], "(1e10000f)"),
@@ -152,11 +158,11 @@ fn preprocess_pt(
         ("__builtin_nanf", vec!["s"], "(0.0f/0.0f)"),
         ("__builtin_va_end", vec!["ap"], "((void)(ap))"),
         ("__builtin_va_copy", vec!["d", "s"], "((d) = (s))"),
-        ("__builtin_constant_p", vec!["e"], "0"), // 0 luôn hợp lệ theo GCC doc
+        ("__builtin_constant_p", vec!["e"], "0"), // 0 is always valid per the GCC docs
         ("__builtin_unreachable", vec![], "((void)0)"),
         ("__builtin_trap", vec![], "abort()"),
         ("__builtin_return_address", vec!["n"], "((void *)0)"),
-        // signbit qua -0.0: 1.0/x = -inf phân biệt được dấu của zero
+        // signbit via -0.0: 1.0/x = -inf distinguishes the sign of zero
         (
             "__builtin_signbit",
             vec!["x"],
@@ -167,8 +173,8 @@ fn preprocess_pt(
         let ps = ps.into_iter().map(String::from).collect();
         macros.insert(m.into(), Macro::Fun(ps, false, toks));
     }
-    // __builtin_prefetch(addr, rw?, locality?) → no-op NHƯNG vẫn eval addr
-    // (side effect trong arg phải chạy — GCC doc; rw/locality là hằng, bỏ được)
+    // __builtin_prefetch(addr, rw?, locality?) → no-op BUT still evaluates addr
+    // (a side effect in the argument must run — GCC docs; rw/locality are constants, discardable)
     macros.insert(
         "__builtin_prefetch".into(),
         Macro::Fun(
@@ -177,7 +183,7 @@ fn preprocess_pt(
             lex("((void)(a))").map_err(|e| e.to_string())?,
         ),
     );
-    // builtin GCC hay gặp: __builtin_expect(e, c) → (e)
+    // common GCC builtin: __builtin_expect(e, c) → (e)
     macros.insert(
         "__builtin_expect".into(),
         Macro::Fun(
@@ -190,7 +196,7 @@ fn preprocess_pt(
             ],
         ),
     );
-    // EXT(gcc): họ __atomic_* → macro đổ về __sync_*; builtin bit-manip (ext.rs)
+    // EXT(gcc): the __atomic_* family → macros routed to __sync_*; bit-manipulation builtins (ext.rs)
     for (m, ps, body) in crate::ext::ATOMIC_MACROS
         .iter()
         .chain(crate::ext::BIT_MACROS)
@@ -205,7 +211,7 @@ fn preprocess_pt(
             Macro::Obj(vec![synth(Tok::Num(i as i64, NumK::I))]),
         );
     }
-    // -Dname[=val] từ CLI (mặc định =1, như cc); -Uname xóa (kể cả builtin)
+    // -Dname[=val] from the CLI (default =1, like cc); -Uname removes it (including builtins)
     for d in defs {
         let (n, v) = d.split_once('=').unwrap_or((d, "1"));
         let toks = lex(v).map_err(|e| e.to_string())?;
@@ -216,7 +222,7 @@ fn preprocess_pt(
     }
     let mut files = Vec::new();
     let pts = pp_file(path, &mut macros, 0, incs, &mut files, true)?; // ELF: char unsigned
-    // C99: _Pragma("...") operator — nuốt như #pragma (SDK dùng trong macro)
+    // C99: the _Pragma("...") operator — consumed like #pragma (the SDK uses it inside macros)
     let (mut out, mut i) = (Vec::with_capacity(pts.len()), 0);
     while i < pts.len() {
         if matches!(&pts[i].tok, Tok::Ident(n) if n == "_Pragma")
@@ -233,9 +239,10 @@ fn preprocess_pt(
     Ok((out, files))
 }
 
-// EXT(gcc): file .S (musl memset.S aarch64) = asm PHẢI qua C preprocessor.
-// Spell lại từ PTok cần ws/raw: "v0.16B" tách thành 3 token C ("v0" ".16" "B")
-// phải ghép lại không space; token khác dòng gốc thì xuống dòng (mỗi lệnh 1 dòng).
+// EXT(gcc): a .S file (musl memset.S aarch64) = assembly that MUST pass through
+// the C preprocessor. Re-spelling from PTok needs ws/raw: "v0.16B" splits into
+// 3 C tokens ("v0" ".16" "B") that must be rejoined without a space; a token on
+// a different source line starts a new line (one instruction per line).
 pub fn preprocess_asm(
     path: &str,
     defs: &[String],
@@ -267,11 +274,12 @@ fn inc_find(incs: &[String], name: &str) -> Option<String> {
         .map(|d| format!("{}/{}", d, name))
         .find(|p| std::path::Path::new(p).exists())
 }
-// Tra bảng header nhúng. Sentinel \x01 đầu incs do driver cắm:
-// \x01nostdinc (musl sysroot / -nostdinc) — tắt trọn bảng;
-// \x01elf — chỉ nhúng header COMPILER-OWNED (mô hình gcc: stdarg/stddef/...),
-// header libc nhường glibc của box — nội dung nhúng mang giá trị Darwin
-// (MAP_ANON 0x1000 vs Linux 0x20, jmp_buf lệch layout) → sai ABI runtime.
+// Look up the embedded-header table. A \x01 sentinel at the head of incs is
+// injected by the driver:
+// \x01nostdinc (musl sysroot / -nostdinc) — disables the whole table;
+// \x01elf — embeds only COMPILER-OWNED headers (the gcc model: stdarg/stddef/...),
+// leaving libc headers to the box's glibc — the embedded contents carry Darwin
+// values (MAP_ANON 0x1000 vs Linux 0x20, a differently laid-out jmp_buf) → wrong runtime ABI.
 fn embed_src(incs: &[String], name: &str, skip: bool) -> Option<&'static str> {
     let sent = incs.first().map(String::as_str);
     if skip || sent == Some("\u{1}nostdinc") {
@@ -318,13 +326,13 @@ fn pp_file(
     depth: u32,
     incs: &[String],
     files: &mut Vec<String>,
-    cu: bool, // char_uns theo target — đi vào lex_t của mọi nguồn file thật
+    cu: bool, // char_uns per target — passed into lex_t for every real source file
 ) -> Result<Vec<PTok>, String> {
     if depth > 32 {
-        return Err(format!("{}: include lồng quá sâu", path));
+        return Err(format!("{}: include nesting too deep", path));
     }
     let bytes = fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
-    // lex THẲNG trên byte thô — giữ nguyên byte non-UTF8 trong string literal
+    // lex DIRECTLY over the raw bytes — preserving non-UTF8 bytes in string literals
     let mut toks = lex_t(&bytes, cu).map_err(|e| format!("{}: {}", path, e))?;
     files.push(path.to_string());
     let fid = files.len() as u32 - 1;
@@ -334,8 +342,9 @@ fn pp_file(
     process(&toks, path, macros, depth, incs, files, cu)
 }
 
-// Trạng thái một tầng #if: parent = tầng ngoài có active không; taken = đã có
-// nhánh nào trúng chưa (chặn #elif sau đó); active = nhánh hiện tại đang phát.
+// State of one #if level: parent = whether the enclosing level is active; taken
+// = whether some branch has already matched (blocks a later #elif); active =
+// whether the current branch is being emitted.
 struct Cond {
     parent: bool,
     taken: bool,
@@ -350,11 +359,11 @@ fn process(
     depth: u32,
     incs: &[String],
     files: &mut Vec<String>,
-    cu: bool, // char_uns theo target
+    cu: bool, // char_uns per target
 ) -> Result<Vec<PTok>, String> {
     let (mut out, mut i) = (Vec::new(), 0);
     let mut conds: Vec<Cond> = Vec::new();
-    let mut delta: i64 = 0; // #line n → __LINE__ báo n tại dòng kế
+    let mut delta: i64 = 0; // #line n → __LINE__ reports n on the next line
     let mut saved: HashMap<String, Vec<Option<Macro>>> = HashMap::new(); // push_macro
 
     while i < toks.len() {
@@ -368,7 +377,7 @@ fn process(
             }
             continue;
         }
-        // Directive line = từ sau '#' đến token bol kế (splice đã xoá bol giả).
+        // A directive line runs from just after '#' to the next bol token (splicing has already cleared spurious bol flags).
         let mut j = i + 1;
         while j < toks.len() && !toks[j].bol {
             j += 1;
@@ -377,16 +386,16 @@ fn process(
         i = j;
         let kw = match d.first().map(|t| &t.tok) {
             Some(Tok::Ident(k)) => k.as_str(),
-            None => continue, // "#" trơ: hợp lệ, bỏ qua
+            None => continue, // a bare "#": valid, ignored
             _ if !active => continue,
-            _ => return Err(err(file, lno, "directive lạ")),
+            _ => return Err(err(file, lno, "unknown directive")),
         };
         match kw {
             "ifdef" | "ifndef" => {
                 let v = active && {
                     let name = ident_of(d.get(1))
-                        .ok_or_else(|| err(file, lno, "thiếu tên sau #ifdef/#ifndef"))?;
-                    // EXT(clang): __has_include + họ __has_* "defined" sẵn
+                        .ok_or_else(|| err(file, lno, "missing name after #ifdef/#ifndef"))?;
+                    // EXT(clang): __has_include + the __has_* family are "defined" builtins
                     (macros.contains_key(name)
                         || name == "__has_include"
                         || crate::ext::has_operator_zero(name))
@@ -412,9 +421,9 @@ fn process(
                 let need = {
                     let c = conds
                         .last()
-                        .ok_or_else(|| err(file, lno, "#elif không có #if"))?;
+                        .ok_or_else(|| err(file, lno, "#elif without #if"))?;
                     if c.in_else {
-                        return Err(err(file, lno, "#elif sau #else"));
+                        return Err(err(file, lno, "#elif after #else"));
                     }
                     c.parent && !c.taken
                 };
@@ -426,9 +435,9 @@ fn process(
             "else" => {
                 let c = conds
                     .last_mut()
-                    .ok_or_else(|| err(file, lno, "#else không có #if"))?;
+                    .ok_or_else(|| err(file, lno, "#else without #if"))?;
                 if c.in_else {
-                    return Err(err(file, lno, "#else kép"));
+                    return Err(err(file, lno, "duplicate #else"));
                 }
                 c.active = c.parent && !c.taken;
                 c.taken = true;
@@ -437,32 +446,32 @@ fn process(
             "endif" => {
                 conds
                     .pop()
-                    .ok_or_else(|| err(file, lno, "#endif không có #if"))?;
+                    .ok_or_else(|| err(file, lno, "#endif without #if"))?;
             }
-            _ if !active => {} // directive khác trong nhánh chết: bỏ
+            _ if !active => {} // any other directive in a dead branch: discard
             "define" => {
                 let name = ident_of(d.get(1))
-                    .ok_or_else(|| err(file, lno, "thiếu tên sau #define"))?
+                    .ok_or_else(|| err(file, lno, "missing name after #define"))?
                     .to_string();
-                // Function-like ⟺ '(' dính SÁT tên (không whitespace) — luật C.
+                // Function-like ⟺ '(' immediately follows the name (no whitespace) — the C rule.
                 let m = if matches!(d.get(2), Some(p) if p.tok == Tok::Punct("(") && !p.ws) {
                     let (mut params, mut k, mut va) = (Vec::new(), 3, false);
                     if matches!(d.get(k).map(|t| &t.tok), Some(Tok::Punct(")"))) {
                         k += 1;
                     } else {
                         loop {
-                            // "..." (C99, clang chấp nhận): phần dư → __VA_ARGS__
+                            // "..." (C99, accepted by clang): the remainder → __VA_ARGS__
                             if matches!(d.get(k).map(|t| &t.tok), Some(Tok::Punct("..."))) {
                                 params.push("__VA_ARGS__".to_string());
                                 va = true;
                                 k += 1;
                             } else {
                                 let p = ident_of(d.get(k))
-                                    .ok_or_else(|| err(file, lno, "tham số macro phải là ident"))?;
+                                    .ok_or_else(|| err(file, lno, "macro parameter must be an identifier"))?;
                                 params.push(p.to_string());
                                 k += 1;
                                 // EXT(gcc): named variadic "#define F(args...)" —
-                                // param cuối tự hứng phần dư như __VA_ARGS__
+                                // the last parameter absorbs the remainder like __VA_ARGS__
                                 if matches!(d.get(k).map(|t| &t.tok), Some(Tok::Punct("..."))) {
                                     va = true;
                                     k += 1;
@@ -474,7 +483,7 @@ fn process(
                                     k += 1;
                                     break;
                                 }
-                                _ => return Err(err(file, lno, "thiếu ')' trong #define")),
+                                _ => return Err(err(file, lno, "missing ')' in #define")),
                             }
                         }
                     }
@@ -486,17 +495,18 @@ fn process(
             }
             "undef" => {
                 let name =
-                    ident_of(d.get(1)).ok_or_else(|| err(file, lno, "thiếu tên sau #undef"))?;
+                    ident_of(d.get(1)).ok_or_else(|| err(file, lno, "missing name after #undef"))?;
                 macros.remove(name);
             }
-            // EXT(gcc): #include_next — subset: như #include <..> nhưng BỎ bảng
-            // nhúng (đủ cho vai trò duy nhất: header nhúng của zcc đóng vai
-            // "header của compiler" rồi chuyển tiếp xuống libc thật, như clang;
-            // include_next của glibc không bao giờ nổ vì guard _GCC_LIMITS_H_)
+            // EXT(gcc): #include_next — a subset: like #include <..> but SKIPPING
+            // the embedded table (sufficient for its sole role: zcc's embedded
+            // header plays "the compiler's header" and then forwards down to the
+            // real libc, as clang does; glibc's include_next never fails because
+            // of the _GCC_LIMITS_H_ guard)
             "include" | "include_next" => {
                 let skip_embedded = kw == "include_next";
-                // #include MACRO (computed include, C89 §3.8.2): không khớp hai
-                // dạng chuẩn thì expand macro rồi mới dispatch (rax.c redis)
+                // #include MACRO (computed include, C89 §3.8.2): when neither
+                // standard form matches, expand the macro before dispatching (redis rax.c)
                 let nd: Vec<PTok>;
                 let d: &[PTok] = if matches!(d.get(1).map(|t| &t.tok), Some(Tok::Ident(_))) {
                     let mut v = vec![d[0].clone()];
@@ -518,7 +528,7 @@ fn process(
                                 None => name,
                             }
                         };
-                        // không có file thật → thử bảng header nhúng ("stddef.h"...)
+                        // no real file → try the embedded-header table ("stddef.h"...)
                         let mut path = path;
                         if !std::path::Path::new(&path).exists() {
                             if let Some(src) = embed_src(incs, &bare, skip_embedded) {
@@ -539,14 +549,14 @@ fn process(
                         out.extend(pp_file(&path, macros, depth + 1, incs, files, cu)?);
                     }
                     Some(Tok::Punct("<")) => {
-                        // tên = spelling các token đến '>' (lexer tách "stdio.h" = 3 token)
+                        // the name = the spelling of the tokens up to '>' (the lexer splits "stdio.h" into 3 tokens)
                         let mut name = String::new();
                         let mut k = 2;
                         while k < d.len() && d[k].tok != Tok::Punct(">") {
                             name.push_str(&spell(&d[k].tok));
                             k += 1;
                         }
-                        // header nhúng thắng (libc stub của zcc); không có thì tra -I
+                        // the embedded header wins (zcc's libc stub); otherwise consult -I
                         match embed_src(incs, &name, skip_embedded) {
                             Some(src) => {
                                 let hname = format!("<{}>", name);
@@ -560,17 +570,17 @@ fn process(
                             }
                             None => {
                                 let p2 = inc_find(incs, &name).ok_or_else(|| {
-                                    err(file, lno, &format!("không có header nhúng <{}>", name))
+                                    err(file, lno, &format!("no embedded header <{}>", name))
                                 })?;
                                 out.extend(pp_file(&p2, macros, depth + 1, incs, files, cu)?);
                             }
                         }
                     }
-                    _ => return Err(err(file, lno, "#include cần \"file\"")),
+                    _ => return Err(err(file, lno, "#include expects \"file\"")),
                 }
             }
             "error" => return Err(err(file, lno, &format!("#error {}", spell_seq(&d[1..])))),
-            // EXT(gcc): #warning — báo rồi đi tiếp (không có trong C89)
+            // EXT(gcc): #warning — report and continue (not present in C89)
             "warning" => eprintln!(
                 "{}",
                 err(file, lno, &format!("#warning {}", spell_seq(&d[1..])))
@@ -578,7 +588,7 @@ fn process(
             "line" => {
                 let ex = expand_seq(&d[1..], macros, &Vec::new(), file, delta)?;
                 if let Some(Tok::Num(n, _)) = ex.first().map(|t| &t.tok) {
-                    delta = n - (lno as i64 + 1); // dòng KẾ TIẾP directive mang số n
+                    delta = n - (lno as i64 + 1); // the line FOLLOWING the directive takes number n
                 }
             }
             "pragma" => {
@@ -601,16 +611,16 @@ fn process(
                         }
                 }
             }
-            _ => return Err(err(file, lno, &format!("directive lạ #{}", kw))),
+            _ => return Err(err(file, lno, &format!("unknown directive #{}", kw))),
         }
     }
     if !conds.is_empty() {
-        return Err(format!("{}: thiếu #endif", file));
+        return Err(format!("{}: missing #endif", file));
     }
     Ok(out)
 }
 
-// ---- Macro expansion (rescan đệ quy; hide = stack tên đang mở để chặn vòng) ----
+// ---- Macro expansion (recursive rescan; hide = stack of names currently open, to prevent cycles) ----
 
 fn expand_seq(
     toks: &[PTok],
@@ -632,7 +642,7 @@ fn expand_at(
     macros: &Macros,
     hide: &Vec<String>,
     file: &str,
-    delta: i64, // #line dịch số dòng báo ra (chỉ ảnh hưởng __LINE__)
+    delta: i64, // #line shifts the reported line number (affects __LINE__ only)
     out: &mut Vec<PTok>,
 ) -> Result<usize, String> {
     let t = &toks[i];
@@ -680,20 +690,20 @@ fn expand_at(
             i + 1
         }
         Some(Macro::Fun(params, va, body)) => {
-            // Tên macro hàm không có '(' theo sau: là ident thường.
+            // A function-like macro name not followed by '(': an ordinary identifier.
             if !matches!(toks.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("("))) {
                 out.push(t.clone());
                 return Ok(i + 1);
             }
             let (mut args, next) = collect_args(toks, i + 2, file, t.line)?;
             if params.is_empty() && args.len() == 1 && args[0].is_empty() {
-                args.clear(); // F() = 0 đối số
+                args.clear(); // F() = 0 arguments
             }
             if *va {
                 if args.len() < params.len() {
-                    args.push(Vec::new()); // F(a) với (a, ...): __VA_ARGS__ rỗng
+                    args.push(Vec::new()); // F(a) with (a, ...): __VA_ARGS__ empty
                 }
-                // arg dư gộp lại thành __VA_ARGS__ (nối lại dấu phẩy đã tách)
+                // surplus arguments are merged into __VA_ARGS__ (rejoining the commas that were split)
                 let extra = args.split_off(params.len().min(args.len()));
                 if let Some(last) = args.last_mut() {
                     for e in extra {
@@ -707,7 +717,7 @@ fn expand_at(
                     file,
                     t.line,
                     &format!(
-                        "macro {} cần {} đối số, nhận {}",
+                        "macro {} expects {} arguments, got {}",
                         name,
                         params.len(),
                         args.len()
@@ -715,7 +725,7 @@ fn expand_at(
                 ));
             }
             let sub = substitute(body, params, &args, macros, hide, file, delta, t.line)?;
-            // luật hideset chuẩn: HS kết quả = (HS(tên) ∩ HS(")" đóng)) ∪ {tên}
+            // standard hideset rule: result HS = (HS(name) ∩ HS(closing ")")) ∪ {name}
             let close = &toks[next - 1];
             let callhs: Vec<String> = t
                 .hide
@@ -734,8 +744,9 @@ fn expand_at(
             next
         }
     };
-    // Rescan QUA RANH GIỚI (C89 6.8.3.4): kết quả expand đuôi là tên macro hàm
-    // mà '(' nằm ở stream gốc phía sau → ghép lại và expand tiếp.
+    // Rescan ACROSS THE BOUNDARY (C89 6.8.3.4): the tail of the expansion is a
+    // function-like macro name whose '(' lies further along in the original
+    // stream → rejoin and continue expanding.
     loop {
         let is_fun = match out.last().map(|l| &l.tok) {
             Some(Tok::Ident(n)) => {
@@ -757,8 +768,9 @@ fn expand_at(
     Ok(next)
 }
 
-// Token thân macro mang line của CHỖ GỌI (đúng luật __LINE__), ws token đầu
-// thừa kế chỗ gọi để stringize lồng nhau giữ khoảng cách hợp lý.
+// Macro-body tokens carry the line of the CALL SITE (per the __LINE__ rule); the
+// first token's ws is inherited from the call site so nested stringization keeps
+// reasonable spacing.
 fn retag(body: &[PTok], at: &PTok, callhs: &[String]) -> Vec<PTok> {
     body.iter()
         .enumerate()
@@ -778,7 +790,7 @@ fn retag(body: &[PTok], at: &PTok, callhs: &[String]) -> Vec<PTok> {
         .collect()
 }
 
-// Gom đối số từ sau '(': tách bởi ',' ở depth 0, ngoặc lồng giữ nguyên.
+// Collect arguments after '(': split on ',' at depth 0, keeping nested parentheses intact.
 fn collect_args(
     toks: &[PTok],
     mut i: usize,
@@ -789,7 +801,7 @@ fn collect_args(
     loop {
         let t = toks
             .get(i)
-            .ok_or_else(|| err(file, lno, "thiếu ')' đóng đối số macro"))?;
+            .ok_or_else(|| err(file, lno, "missing ')' to close macro arguments"))?;
         match &t.tok {
             Tok::Punct("(") => {
                 depth += 1;
@@ -814,8 +826,9 @@ fn param_of(t: Option<&PTok>, params: &[String]) -> Option<usize> {
     ident_of(t).and_then(|n| params.iter().position(|p| p == n))
 }
 
-// Thay tham số vào thân macro: #p = stringize arg THÔ, p cạnh ## = arg thô,
-// p thường = arg đã expand đầy đủ; ## dán token cuối trái với token đầu phải.
+// Substitute parameters into the macro body: #p = stringize the RAW argument, p
+// adjacent to ## = the raw argument, an ordinary p = the fully expanded
+// argument; ## pastes the last token of the left onto the first token of the right.
 fn substitute(
     body: &[PTok],
     params: &[String],
@@ -831,7 +844,7 @@ fn substitute(
         let t = &body[i];
         if t.tok == Tok::Punct("#") {
             let p = param_of(body.get(i + 1), params)
-                .ok_or_else(|| err(file, lno, "# phải đứng trước tham số macro"))?;
+                .ok_or_else(|| err(file, lno, "# must be followed by a macro parameter"))?;
             let sb = stringize(&args[p]);
             let cps = sb.iter().map(|&x| x as u32).collect();
             out.push(PTok {
@@ -847,9 +860,10 @@ fn substitute(
         } else if t.tok == Tok::Punct("##") {
             let r = body
                 .get(i + 1)
-                .ok_or_else(|| err(file, lno, "## ở cuối thân macro"))?;
-            // EXT(gcc): ", ## __VA_ARGS__" — arg rỗng thì XÓA dấu phẩy, có arg
-            // thì giữ nguyên phẩy + args (không paste thật; rescan expand sau)
+                .ok_or_else(|| err(file, lno, "## at end of macro body"))?;
+            // EXT(gcc): ", ## __VA_ARGS__" — when the argument is empty, DROP the
+            // comma; when it is present, keep the comma + args (no actual paste;
+            // rescan expands it later)
             if let Some(p) = param_of(Some(r), params)
                 && matches!(out.last().map(|x| &x.tok), Some(Tok::Punct(","))) {
                     if args[p].is_empty() {
@@ -866,12 +880,13 @@ fn substitute(
             };
             let l = out
                 .pop()
-                .ok_or_else(|| err(file, lno, "## ở đầu thân macro"))?;
+                .ok_or_else(|| err(file, lno, "## at start of macro body"))?;
             if rhs.is_empty() {
                 out.push(l);
             } else {
-                // spelling GỐC (raw) khi có — spell() từ giá trị làm rớt suffix
-                // số (199506L → "199506", cdefs.h paste ra sai tên macro)
+                // use the ORIGINAL (raw) spelling when available — spell() from the
+                // value drops a numeric suffix (199506L → "199506", making cdefs.h
+                // paste an incorrect macro name)
                 let sp = |p: &PTok| {
                     if p.raw.is_empty() {
                         spell(&p.tok)
@@ -889,7 +904,7 @@ fn substitute(
                             None
                         }
                     })
-                    .ok_or_else(|| err(file, lno, &format!("## tạo token không hợp lệ '{}'", s)))?;
+                    .ok_or_else(|| err(file, lno, &format!("## formed an invalid token '{}'", s)))?;
                 out.push(PTok {
                     tok: one,
                     bol: false,
@@ -923,7 +938,7 @@ fn substitute(
     Ok(out)
 }
 
-// ---- Spelling (cho # stringize, ## paste, #error) ----
+// ---- Spelling (for # stringization, ## paste, #error) ----
 
 pub fn spell(t: &Tok) -> String {
     match t {
@@ -951,7 +966,7 @@ pub fn spell(t: &Tok) -> String {
     }
 }
 
-// Ghép spelling, whitespace bất kỳ giữa 2 token → đúng 1 space (luật # C89).
+// Join spellings; any whitespace between two tokens → exactly one space (the C89 # rule).
 fn spell_seq(ts: &[PTok]) -> String {
     let mut s = String::new();
     for (k, t) in ts.iter().enumerate() {
@@ -961,7 +976,7 @@ fn spell_seq(ts: &[PTok]) -> String {
         if t.raw.is_empty() {
             s.push_str(&spell(&t.tok));
         } else {
-            s.push_str(&t.raw); // spelling gốc: 0xff, 'a', "s\n"
+            s.push_str(&t.raw); // original spelling: 0xff, 'a', "s\n"
         }
     }
     s
@@ -971,7 +986,7 @@ fn stringize(arg: &[PTok]) -> Vec<u8> {
     spell_seq(arg).into_bytes()
 }
 
-// ---- #if constexpr: defined trước, expand, ident sót → 0, rồi eval i64 ----
+// ---- #if constant expression: resolve defined first, expand, remaining identifiers → 0, then eval as i64 ----
 
 fn eval_if(
     d: &[PTok],
@@ -983,24 +998,24 @@ fn eval_if(
 ) -> Result<bool, String> {
     let pre = if_resolve(d, macros, file, lno, incs)?;
     let ex = expand_seq(&pre, macros, &Vec::new(), file, delta)?;
-    // macro có thể expand RA defined(...)/__has_include (SDK pthread.h) → resolve lần 2
+    // a macro may expand INTO defined(...)/__has_include (SDK pthread.h) → resolve a second time
     let ex = if_resolve(&ex, macros, file, lno, incs)?;
     let ts: Vec<Tok> = ex
         .into_iter()
         .map(|t| match t.tok {
-            Tok::Ident(_) => Tok::Num(0, NumK::I), // ident không phải macro → 0 (luật C)
+            Tok::Ident(_) => Tok::Num(0, NumK::I), // a non-macro identifier → 0 (the C rule)
             tok => tok,
         })
         .collect();
     let mut p = 0;
     let v = ternary(&ts, &mut p).map_err(|e| err(file, lno, &e))?;
     if p != ts.len() {
-        return Err(err(file, lno, "token thừa trong biểu thức #if"));
+        return Err(err(file, lno, "extra tokens in #if expression"));
     }
     Ok(v.0 != 0)
 }
 
-// resolve defined(X) / __has_include(...) thành 0|1 trong biểu thức #if
+// resolve defined(X) / __has_include(...) to 0|1 within an #if expression
 fn if_resolve(
     d: &[PTok],
     macros: &Macros,
@@ -1014,8 +1029,8 @@ fn if_resolve(
             let paren = matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("(")));
             let at = if paren { i + 2 } else { i + 1 };
             let name =
-                ident_of(d.get(at)).ok_or_else(|| err(file, lno, "defined cần tên macro"))?;
-            // EXT(clang): __has_include + họ __has_* là operator builtin — "defined" = 1
+                ident_of(d.get(at)).ok_or_else(|| err(file, lno, "defined requires a macro name"))?;
+            // EXT(clang): __has_include + the __has_* family are builtin operators — "defined" = 1
             let def = macros.contains_key(name)
                 || name == "__has_include"
                 || crate::ext::has_operator_zero(name);
@@ -1023,7 +1038,7 @@ fn if_resolve(
             i = at + 1;
             if paren {
                 if !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(")"))) {
-                    return Err(err(file, lno, "defined( thiếu ')'"));
+                    return Err(err(file, lno, "defined( missing ')'"));
                 }
                 i += 1;
             }
@@ -1031,14 +1046,14 @@ fn if_resolve(
             && matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("(")))
         {
             // EXT(clang): __has_feature/extension/builtin/attribute(...) → 0,
-            // nuốt ngoặc cân bằng (arg chỉ là ident nhưng cứ đề phòng lồng nhau)
+            // consuming balanced parentheses (the argument is only an identifier, but guard against nesting anyway)
             i += 2;
             let mut depth = 1;
             while depth > 0 {
                 match d.get(i).map(|t| &t.tok) {
                     Some(Tok::Punct("(")) => depth += 1,
                     Some(Tok::Punct(")")) => depth -= 1,
-                    None => return Err(err(file, lno, "__has_*( thiếu ')'")),
+                    None => return Err(err(file, lno, "__has_*( missing ')'")),
                     _ => {}
                 }
                 i += 1;
@@ -1046,11 +1061,11 @@ fn if_resolve(
             pre.push(synth(Tok::Num(0, NumK::I)));
         } else if matches!(&d[i].tok, Tok::Ident(n) if n == "__has_include" || n == "__has_include_next")
         {
-            // EXT(clang): __has_include(<h> | "h") — eval TRƯỚC expand (tên header
-            // không phải macro); __has_include_next luôn 0 (không có include stack)
+            // EXT(clang): __has_include(<h> | "h") — evaluated BEFORE expansion (a
+            // header name is not a macro); __has_include_next is always 0 (there is no include stack)
             let next = matches!(&d[i].tok, Tok::Ident(n) if n == "__has_include_next");
             if !matches!(d.get(i + 1).map(|t| &t.tok), Some(Tok::Punct("("))) {
-                return Err(err(file, lno, "__has_include cần '('"));
+                return Err(err(file, lno, "__has_include requires '('"));
             }
             i += 2;
             let name = match d.get(i).map(|t| &t.tok) {
@@ -1068,10 +1083,10 @@ fn if_resolve(
                     i += 1; // '>'
                     s
                 }
-                _ => return Err(err(file, lno, "__has_include cần <h> hoặc \"h\"")),
+                _ => return Err(err(file, lno, "__has_include requires <h> or \"h\"")),
             };
             if !matches!(d.get(i).map(|t| &t.tok), Some(Tok::Punct(")"))) {
-                return Err(err(file, lno, "__has_include( thiếu ')'"));
+                return Err(err(file, lno, "__has_include( missing ')'"));
             }
             i += 1;
             let found = !next
@@ -1094,10 +1109,11 @@ fn eat(ts: &[Tok], p: &mut usize, op: &str) -> bool {
     }
 }
 
-// Giá trị #if = (bit, unsigned): C89 3.8.1 — mọi số học trong #if tính bằng
-// long/unsigned long, UAC thu về 1 bit "có toán hạng unsigned không". Bỏ bit
-// này (eval thuần i64) là sai / % >> so-sánh khi trộn dấu: -1L < 0xFF..FFUL
-// phải bằng 0. Bug bắt bởi tests/cpp.sh (họ F, vét cạn #if).
+// An #if value = (bits, unsigned): C89 3.8.1 — all arithmetic in #if is computed
+// in long/unsigned long, and the usual arithmetic conversions reduce to one bit
+// "is there an unsigned operand". Dropping this bit (pure i64 eval) gives wrong
+// / % >> comparisons on mixed signedness: -1L < 0xFF..FFUL must be 0. This
+// defect is caught by tests/cpp.sh (the F family, exhausting #if).
 type PV = (i64, bool);
 
 fn ternary(ts: &[Tok], p: &mut usize) -> Result<PV, String> {
@@ -1107,14 +1123,14 @@ fn ternary(ts: &[Tok], p: &mut usize) -> Result<PV, String> {
     }
     let a = ternary(ts, p)?;
     if !eat(ts, p, ":") {
-        return Err("thiếu ':' của '?'".into());
+        return Err("missing ':' for '?'".into());
     }
     let b = ternary(ts, p)?;
-    // kiểu chung của ?: là UAC hai nhánh, giá trị lấy theo nhánh chọn
+    // the common type of ?: is the usual arithmetic conversion of both branches; the value follows the selected branch
     Ok((if c.0 != 0 { a.0 } else { b.0 }, a.1 | b.1))
 }
 
-// Bậc ưu tiên nhị phân C, thấp → cao.
+// C binary-operator precedence levels, lowest → highest.
 const LEVELS: [&[&str]; 10] = [
     &["||"],
     &["&&"],
@@ -1140,9 +1156,9 @@ fn binlv(ts: &[Tok], p: &mut usize, lv: usize) -> Result<PV, String> {
         };
         *p += 1;
         let r = binlv(ts, p, lv + 1)?;
-        let u = l.1 | r.1; // UAC: một bên unsigned → phép toán unsigned
+        let u = l.1 | r.1; // usual arithmetic conversions: one unsigned side → unsigned operation
         let b = |x: bool| (x as i64, false);
-        // wrapping: overflow là UB bên C, đừng panic bên Rust
+        // wrapping: overflow is UB in C, so do not panic in Rust
         l = match op {
             "||" => b(l.0 != 0 || r.0 != 0),
             "&&" => b(l.0 != 0 && r.0 != 0),
@@ -1159,14 +1175,14 @@ fn binlv(ts: &[Tok], p: &mut usize, lv: usize) -> Result<PV, String> {
             ">" => b(l.0 > r.0),
             "<=" => b(l.0 <= r.0),
             ">=" => b(l.0 >= r.0),
-            // shift: kiểu kết quả = kiểu VẾ TRÁI (3.3.7 — không UAC)
+            // shift: the result type = the type of the LEFT operand (3.3.7 — no usual arithmetic conversions)
             "<<" => (l.0.wrapping_shl(r.0 as u32), l.1),
             ">>" if l.1 => (((l.0 as u64).wrapping_shr(r.0 as u32)) as i64, true),
             ">>" => (l.0.wrapping_shr(r.0 as u32), l.1),
             "+" => (l.0.wrapping_add(r.0), u),
             "-" => (l.0.wrapping_sub(r.0), u),
             "*" => (l.0.wrapping_mul(r.0), u),
-            // chia 0 trong nhánh chết của && || phải vô hại (eval eager) → cho 0
+            // division by 0 in a dead branch of && || must be harmless (eager eval) → yield 0
             "/" | "%" if r.0 == 0 => (0, u),
             "/" if u => (((l.0 as u64) / (r.0 as u64)) as i64, true),
             "%" if u => (((l.0 as u64) % (r.0 as u64)) as i64, true),
@@ -1191,13 +1207,13 @@ fn unary(ts: &[Tok], p: &mut usize) -> Result<PV, String> {
     } else if eat(ts, p, "(") {
         let v = ternary(ts, p)?;
         if !eat(ts, p, ")") {
-            return Err("thiếu ')' trong #if".into());
+            return Err("missing ')' in #if".into());
         }
         Ok(v)
     } else if let Some(&Tok::Num(n, k)) = ts.get(*p) {
         *p += 1;
         Ok((n, matches!(k, NumK::U | NumK::UL)))
     } else {
-        Err("biểu thức #if hỏng".into())
+        Err("malformed #if expression".into())
     }
 }

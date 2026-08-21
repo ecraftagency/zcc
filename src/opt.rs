@@ -1,14 +1,16 @@
-// src/opt.rs — PASS tối ưu trên IR (THEORY.md Phần I §A7).
+// src/opt.rs — optimization PASSES over the IR (THEORY.md Part I §A7).
 //
-// BẤT BIẾN QUẢN TRỊ (Vu 2026-08-20, thay trần 10k LOC ở fork production): mỗi pass P
-// phải BẢO TOÀN NGỮ NGHĨA ⟦·⟧, và điều đó KHÔNG được tin bằng lý luận — phải ĐO cơ
-// học bằng `ir::tests::equiv` (commuting-square: ⟦A⟧ ≡ ⟦P(A)⟧ trên battery input) +
-// `ir::verify` (well-formed sau pass). Test-gate chạy qua `cargo test opt::` — RẺ hơn
-// full-suite nhiều bậc (luật đo-tốc-độ), và mạnh hơn (chứng ở IR→IR_ops, không phải md5 binary).
+// GOVERNING INVARIANT (replacing the 10k-LOC ceiling in the production fork): every
+// pass P must PRESERVE the SEMANTICS ⟦·⟧, and this must NOT be trusted by reasoning —
+// it must be MEASURED mechanically by `ir::tests::equiv` (the commuting square:
+// ⟦A⟧ ≡ ⟦P(A)⟧ over the input battery) + `ir::verify` (well-formed after the pass).
+// The test gate runs via `cargo test opt::` — orders of magnitude CHEAPER than the
+// full suite (the speed-of-iteration rule), and stronger (proved at IR→IR_ops, not md5-of-binary).
 //
-// Mỗi pass là hàm THUẦN IR→IR (mutate tại chỗ), trả số rewrite (đo hội tụ). Backend
-// KHÔNG cần biết pass nào đã chạy — nó chỉ đọc IR well-formed.
-#![allow(dead_code)] // gỡ khi driver nối pipeline --O1 vào emit_ir
+// Each pass is a PURE IR→IR function (mutating in place) that returns the rewrite
+// count (a convergence measure). The backend does NOT need to know which pass ran —
+// it only reads well-formed IR.
+#![allow(dead_code)] // removed once the driver wires the --O1 pipeline into emit_ir
 
 use crate::ast::{TyTab, ULONG};
 use crate::ir::{
@@ -17,8 +19,9 @@ use crate::ir::{
 };
 use std::collections::{HashMap, HashSet};
 
-// Walker MUTATE mọi toán hạng (Val được ĐỌC) của một lệnh — dùng bởi copy/CSE để
-// thay use. KHÔNG đụng temp-đích (def). Đối xứng với ir::inst_uses (bản read-only).
+// A walker that MUTATES every operand (each READ Val) of an instruction — used by
+// copy/CSE to substitute uses. Does NOT touch the destination temporary (def).
+// Symmetric with ir::inst_uses (the read-only version).
 fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
     match i {
         Inst::Bin(_, _, _, a, b) => {
@@ -90,16 +93,17 @@ fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 1 — CONSTANT FOLDING (partial evaluation).
 //
-// Định lý (rewrite-soundness, THEORY §A7): ⟦Bin(op, Imm a, Imm b)⟧ = ⟦Imm(eval_op(a,b))⟧,
-// tương tự Un/Cast hằng. Đúng BY CONSTRUCTION vì fold GỌI CHÍNH `eval_bin/eval_cast/canon`
-// mà interp dùng — folder và interpreter là MỘT hàm nghĩa, không thể lệch (faithfulness).
+// Theorem (rewrite-soundness, THEORY §A7): ⟦Bin(op, Imm a, Imm b)⟧ = ⟦Imm(eval_op(a,b))⟧,
+// and similarly for constant Un/Cast. Correct BY CONSTRUCTION because fold CALLS the
+// very `eval_bin/eval_cast/canon` that interp uses — the folder and the interpreter
+// are ONE denotation function and cannot diverge (faithfulness).
 //
-// Phạm vi (thận trọng, tránh UB & rounding):
-//   • CHỈ integer immediate. Float (FImm) HOÃN: interp mô hình f64, fold f32 có thể
-//     lệch rounding so với backend s-reg → giữ nguyên lệnh, để hardware quyết định.
-//   • Div/Rem cho 0 → eval_bin trả Err → KHÔNG fold (giữ lệnh, giữ hành vi UB của target).
-//   • const-branch: Br(Imm c)→Jmp (mở đường DCE xoá block chết sau này).
-// KHÔNG propagate hằng qua temp (đó là copy_prop, pass 3) — pass này chỉ fold toán hạng-hằng-sẵn.
+// Scope (conservative, avoiding UB & rounding):
+//   • integer immediates ONLY. Float (FImm) is DEFERRED: interp models f64, so folding
+//     f32 could round differently from the backend s-register → keep the instruction and let the hardware decide.
+//   • Div/Rem by 0 → eval_bin returns Err → do NOT fold (keep the instruction, preserving the target's UB behavior).
+//   • const-branch: Br(Imm c)→Jmp (opening the way for DCE to remove the dead block later).
+// Constants are NOT propagated through temporaries (that is copy_prop, pass 3) — this pass folds only already-constant operands.
 // ─────────────────────────────────────────────────────────────────────────────
 pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
     let mut n = 0u32;
@@ -107,7 +111,7 @@ pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
         for inst in blk.insts.iter_mut() {
             let repl: Option<Inst> = match inst {
                 Inst::Bin(d, op, ty, Val::Imm(x), Val::Imm(y)) if !tt.is_float(*ty) => {
-                    // Err (chia/mod 0) → None: KHÔNG fold UB thành hằng.
+                    // Err (div/mod by 0) → None: do NOT fold UB into a constant.
                     eval_bin(tt, *op, *ty, *x, *y).ok().map(|r| Inst::Copy(*d, *ty, Val::Imm(r)))
                 }
                 Inst::Un(d, op, ty, Val::Imm(x)) if !tt.is_float(*ty) => {
@@ -142,15 +146,17 @@ pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 2 — DEAD CODE ELIMINATION (liveness).
 //
-// Định lý (THEORY §A7): một lệnh THUẦN (không side-effect) mà temp-đích KHÔNG được
-// đọc ở đâu ⟹ xoá nó bảo toàn ⟦·⟧ (kết quả quan sát không phụ thuộc giá trị chết).
-// Thuần = Bin/Un/Copy/Lea/Cast/Load (Load chỉ ĐỌC mem, không ghi → xoá vô hại trong
-// mô hình CORE, không volatile). KHÔNG thuần = Call (side-effect), Store/Memcpy (ghi
-// mem), Opaque (bảo thủ, chưa biết) → GIỮ dù đích chết.
+// Theorem (THEORY §A7): a PURE instruction (no side effect) whose destination
+// temporary is NOT read anywhere ⟹ removing it preserves ⟦·⟧ (the observable result
+// does not depend on a dead value). Pure = Bin/Un/Copy/Lea/Cast/Load (Load only READS
+// memory, does not write → removing it is harmless in the CORE, non-volatile model).
+// Impure = Call (side effect), Store/Memcpy (memory write), Opaque (conservative,
+// unknown) → KEPT even if the destination is dead.
 //
-// Liveness dùng ở đây là flow-INSENSITIVE (dù-ở-đâu-cũng-tính-sống): xấp xỉ AN TOÀN
-// (giữ NHIỀU hơn cần) — chỉ xoá temp KHÔNG đọc ở BẤT KỲ đâu ⟹ chắc chắn chết. Lặp
-// tới fixpoint: xoá lệnh làm toán hạng của nó thành chết → vòng sau xoá tiếp.
+// The liveness used here is flow-INSENSITIVE (live-if-used-anywhere): a SAFE
+// approximation (keeps MORE than necessary) — only a temporary NOT read ANYWHERE is
+// removed ⟹ certainly dead. Iterate to a fixpoint: removing an instruction can make
+// its operands dead → a later round removes them too.
 // ─────────────────────────────────────────────────────────────────────────────
 fn is_pure(i: &Inst) -> bool {
     matches!(
@@ -163,7 +169,7 @@ pub fn dce(f: &mut IrFunc) -> u32 {
     let mut removed = 0u32;
     let mut buf: Vec<u32> = Vec::new();
     loop {
-        // Liveness: temp nào được đọc ở BẤT KỲ inst/term nào?
+        // Liveness: which temporaries are read by ANY instruction/terminator?
         let mut used = vec![false; f.temps.len()];
         for b in &f.blocks {
             for i in &b.insts {
@@ -183,7 +189,7 @@ pub fn dce(f: &mut IrFunc) -> u32 {
         for b in f.blocks.iter_mut() {
             let before = b.insts.len();
             b.insts.retain(|i| match inst_def(i) {
-                Some(d) if !used[d as usize] && is_pure(i) => false, // chết + thuần → xoá
+                Some(d) if !used[d as usize] && is_pure(i) => false, // dead + pure → remove
                 _ => true,
             });
             let cut = before - b.insts.len();
@@ -200,18 +206,19 @@ pub fn dce(f: &mut IrFunc) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pass 3 — COPY PROPAGATION (Leibniz: thay-bằng-bằng).
+// Pass 3 — COPY PROPAGATION (Leibniz: substitution of equals).
 //
-// Định lý (THEORY §A7): với `t = Copy(src)`, thay mọi USE của t bằng src bảo toàn
-// ⟦·⟧ MIỄN LÀ giá trị của src tại điểm dùng = giá trị tại điểm copy. Điều kiện đủ
-// AN TOÀN (không cần dominator-tree):
-//   • src = Imm/FImm: HẰNG — bất biến ở mọi điểm chương trình ⟹ luôn thay được.
-//   • src = Tmp(s) với s SINGLE-DEF: giá trị s bất biến (định nghĩa đúng 1 lần), và
-//     copy đọc s ⟹ def(s) đứng trước copy ⟹ trước mọi use của t (lowering có cấu
-//     trúc: use-sau-def). ⟹ thay t bằng s an toàn.
-// Chỉ propagate temp t SINGLE-DEF (đa-def như `res` của Cond: giá trị phụ thuộc
-// đường đi → KHÔNG thay). Giải chuỗi copy (t←u←Imm) về nguồn gốc. KHÔNG xoá lệnh
-// Copy (để DCE dọn khi thành chết) — pass này chỉ rewrite USE. equiv gate double-check.
+// Theorem (THEORY §A7): for `t = Copy(src)`, replacing every USE of t with src
+// preserves ⟦·⟧ PROVIDED the value of src at the use point = its value at the copy
+// point. SAFE sufficient conditions (no dominator tree required):
+//   • src = Imm/FImm: a CONSTANT — invariant at every program point ⟹ always substitutable.
+//   • src = Tmp(s) with s SINGLE-DEF: the value of s is invariant (defined exactly
+//     once), and the copy reads s ⟹ def(s) precedes the copy ⟹ precedes every use of
+//     t (structured lowering: use-after-def). ⟹ replacing t with s is safe.
+// Propagate only a SINGLE-DEF temporary t (a multi-def like the `res` of a Cond
+// depends on the path taken → do NOT substitute). Resolve a copy chain (t←u←Imm) back
+// to its origin. Do NOT remove the Copy instruction (let DCE clean it up once dead) —
+// this pass only rewrites USES. The equiv gate double-checks.
 // ─────────────────────────────────────────────────────────────────────────────
 fn resolve(subst: &[Option<Val>], v: Val) -> Val {
     let mut cur = v;
@@ -237,7 +244,7 @@ pub fn copy_prop(f: &mut IrFunc) -> u32 {
             }
         }
     }
-    // Bảng thay: temp single-def bởi Copy(src) với src hằng hoặc single-def-tmp.
+    // Substitution table: a single-def temporary defined by Copy(src) where src is a constant or a single-def temp.
     let mut subst: Vec<Option<Val>> = vec![None; nt];
     for b in &f.blocks {
         for i in &b.insts {
@@ -280,17 +287,17 @@ pub fn copy_prop(f: &mut IrFunc) -> u32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 4 — COMMON SUBEXPRESSION ELIMINATION (value numbering).
 //
-// Định lý (THEORY §A7): hai lệnh THUẦN cùng (op, kiểu, toán-hạng) sinh CÙNG giá trị
-// ⟹ lệnh sau thay bằng Copy(kết-quả-lệnh-trước). Phạm vi AN TOÀN không cần alias-
-// analysis / dominator-tree:
-//   • BLOCK-LOCAL (reset cache mỗi block): trong 1 block, temp là single-def (lowering
-//     có cấu trúc) ⟹ value-number = chính Val toán hạng, không cần đánh số lại.
-//   • Số học Bin/Un/Cast: THUẦN giá trị (không đọc mem) ⟹ cache sống suốt block.
-//     Op giao hoán (Add/Mul/And/Or/Xor/Eq/Ne) canonical-hoá thứ tự toán hạng (a+b≡b+a).
-//   • Load: value-number theo (địa-chỉ, kiểu), nhưng cache load bị XOÁ SẠCH (bảo thủ)
-//     tại BẤT KỲ ghi-mem nào (Store/Memcpy/Call/Opaque) — không giả định non-alias.
-//     ⟹ chỉ CSE hai Load cùng địa chỉ khi KHÔNG có ghi-mem xen giữa (available-loads).
-// Thay lệnh trùng bằng Copy (DCE/copy-prop dọn sau). equiv gate double-check aliasing.
+// Theorem (THEORY §A7): two PURE instructions with the same (op, type, operands)
+// produce the SAME value ⟹ the later one is replaced with Copy(result-of-the-earlier).
+// SAFE scope without alias analysis / a dominator tree:
+//   • BLOCK-LOCAL (the cache is reset per block): within one block a temporary is
+//     single-def (structured lowering) ⟹ the value-number is the operand Val itself, with no renumbering.
+//   • Bin/Un/Cast arithmetic: a PURE value (no memory read) ⟹ the cache lives for the
+//     whole block. Commutative Ops (Add/Mul/And/Or/Xor/Eq/Ne) canonicalize operand order (a+b≡b+a).
+//   • Load: value-numbered by (address, type), but the load cache is FLUSHED
+//     (conservatively) at ANY memory write (Store/Memcpy/Call/Opaque) — no non-alias
+//     assumption. ⟹ two Loads of the same address are CSE'd only when NO memory write intervenes (available-loads).
+// Replace the duplicate instruction with a Copy (DCE/copy-prop clean up afterward). The equiv gate double-checks aliasing.
 // ─────────────────────────────────────────────────────────────────────────────
 fn enc(v: &Val) -> (u8, i64) {
     match v {
@@ -299,7 +306,7 @@ fn enc(v: &Val) -> (u8, i64) {
         Val::FImm(b) => (2, *b as i64),
     }
 }
-/// Khoá value-number nhị phân: (tag-op, kiểu, toán-hạng-1, toán-hạng-2). Giao hoán → sort.
+/// A binary value-number key: (op-tag, type, operand-1, operand-2). Commutative → sort.
 fn bin_key(op: Op, ty: u32, a: &Val, b: &Val) -> (u16, u32, (u8, i64), (u8, i64)) {
     let commutative = matches!(op, Op::Add | Op::Mul | Op::And | Op::Or | Op::Xor | Op::Eq | Op::Ne);
     let (mut o1, mut o2) = (enc(a), enc(b));
@@ -312,20 +319,21 @@ fn bin_key(op: Op, ty: u32, a: &Val, b: &Val) -> (u16, u32, (u8, i64), (u8, i64)
 pub fn cse(f: &mut IrFunc) -> u32 {
     let mut n = 0u32;
     for b in f.blocks.iter_mut() {
-        // arith: khoá (op-tag, ty, o1, o2). Un tag=100+, Cast tag=200 (from ở o2).
+        // arith: key (op-tag, ty, o1, o2). Un tag=100+, Cast tag=200 (from in o2).
         let mut arith: HashMap<(u16, u32, (u8, i64), (u8, i64)), Tmp> = HashMap::new();
-        // loads: khoá (địa-chỉ-enc, ty). Xoá sạch tại mọi ghi-mem.
+        // loads: key (encoded-address, ty). Flushed at every memory write.
         let mut loads: HashMap<((u8, i64), u32), Tmp> = HashMap::new();
         for i in b.insts.iter_mut() {
-            // memory-kill BY-CONSTRUCTION: giữ load-cache CHỈ qua inst chứng-minh-KHÔNG-
-            // ghi-mem; mọi thứ khác xoá. Đảo allowlist-writer cũ (correct-by-vigilance:
-            // sót Overflow/Zero/VaStart/VaArg — đều ghi mem → dùng lại load cũ = miscompile
-            // pr84169). Inst exotic mới mặc định kill → an toàn, không âm thầm giữ load.
+            // memory-kill BY-CONSTRUCTION: keep the load cache ONLY across instructions
+            // PROVEN not to write memory; flush for everything else. This inverts the old
+            // writer allowlist (which was correct-by-vigilance: it missed
+            // Overflow/Zero/VaStart/VaArg — all of which write memory → reusing a stale
+            // load = miscompile, GCC PR84169). A new exotic Inst kills by default → safe, never silently retaining a load.
             if !matches!(i,
                 Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Load(..) | Inst::Lea(..)
                 | Inst::Cast(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) | Inst::VaArea(..)
             ) {
-                loads.clear(); // ghi-mem (hoặc không rõ) → memory-kill bảo thủ
+                loads.clear(); // memory write (or unknown) → conservative memory-kill
             }
             let repl: Option<Inst> = match i {
                 Inst::Bin(d, op, ty, a, bb) => {
@@ -368,8 +376,9 @@ pub fn cse(f: &mut IrFunc) -> u32 {
                         }
                     }
                 }
-                // Lea(Local off) THUẦN, giá trị = địa chỉ khung (bất biến) → VN được,
-                // dedup địa-chỉ để load-CSE khớp qua pipeline (Global/Str bỏ qua).
+                // Lea(Local off) is PURE, its value = a frame address (invariant) → it
+                // can be value-numbered, deduplicating addresses so load-CSE matches
+                // across the pipeline (Global/Str are skipped).
                 Inst::Lea(d, Place::Local(off)) => {
                     let k = (300u16, 0u32, (3, *off as i64), (9, 0));
                     match arith.get(&k) {
@@ -394,20 +403,22 @@ pub fn cse(f: &mut IrFunc) -> u32 {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 5 — REGISTER ALLOCATION (graph coloring, Chaitin–Briggs).
 //
-// NP-complete (THEORY §C2 — tô màu đồ thị) ⟹ dùng HEURISTIC simplify/spill, KHÔNG
-// đòi tối ưu tuyệt đối. Nhưng TÍNH ĐÚNG (coloring hợp lệ) verify được trong P.
+// NP-complete (THEORY §C2 — graph coloring) ⟹ use a HEURISTIC simplify/spill, NOT
+// demanding a strict optimum. But CORRECTNESS (a valid coloring) is verifiable in P.
 //
-// Correctness ở đây KHÁC 4 pass trên: interp KHÔNG mô hình register, nên không dùng
-// ⟦before⟧=⟦after⟧. Bất biến đúng đắn = BISIMULATION-ĐỔI-TÊN (THEORY §A7): chương
-// trình gán-register bisimilar chương trình temp ⟺ hai temp SỐNG ĐỒNG THỜI luôn ở
-// vị trí KHÁC nhau (không đè giá trị đang sống). Ta chứng cơ học BẤT BIẾN GIAO THOA:
-//   ∀ cạnh (u,v) ∈ interference-graph, color[u] ≠ color[v]  (spill = slot riêng, không đè).
+// Correctness here DIFFERS from the four passes above: interp does NOT model
+// registers, so ⟦before⟧=⟦after⟧ cannot be used. The correctness invariant is
+// RENAMING BISIMULATION (THEORY §A7): the register-assigned program is bisimilar to
+// the temporary program ⟺ two SIMULTANEOUSLY LIVE temporaries always occupy DIFFERENT
+// locations (a live value is never overwritten). We check the INTERFERENCE INVARIANT
+// mechanically:
+//   ∀ edge (u,v) ∈ interference-graph, color[u] ≠ color[v]  (a spill = its own slot, never overwritten).
 //
-// Chuỗi định lý: liveness (dataflow monotone, Kleene fixpoint) → interference graph
-// (u giao v ⟺ cùng sống tại một def) → coloring (simplify degree<k / spill) → verify.
+// Chain of theorems: liveness (monotone dataflow, Kleene fixpoint) → interference
+// graph (u interferes with v ⟺ both live at some def) → coloring (simplify degree<k / spill) → verify.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Liveness flow-SENSITIVE (backward dataflow, THEORY §B3 fixpoint trên lattice 2^Tmp).
+/// Flow-SENSITIVE liveness (backward dataflow, THEORY §B3 fixpoint over the lattice 2^Tmp).
 pub struct Liveness {
     pub live_in: Vec<Vec<bool>>,
     pub live_out: Vec<Vec<bool>>,
@@ -427,7 +438,7 @@ fn successors(f: &IrFunc) -> Vec<Vec<u32>> {
 pub fn liveness(f: &IrFunc) -> Liveness {
     let nb = f.blocks.len();
     let nt = f.temps.len();
-    // gen (use trước def trong block) + kill (def trong block)
+    // gen (use before def within a block) + kill (def within a block)
     let mut useb = vec![vec![false; nt]; nb];
     let mut defb = vec![vec![false; nt]; nb];
     let mut buf = Vec::new();
@@ -484,20 +495,20 @@ pub fn liveness(f: &IrFunc) -> Liveness {
             }
         }
         if !changed {
-            break; // fixpoint (Kleene): không set nào lớn lên nữa
+            break; // fixpoint (Kleene): no set grows any further
         }
     }
     Liveness { live_in, live_out }
 }
 
-/// Đồ thị giao thoa: u—v ⟺ u,v cùng sống tại một điểm định nghĩa (không thể chung register).
+/// Interference graph: u—v ⟺ u,v are both live at some definition point (they cannot share a register).
 pub fn interference(f: &IrFunc, lv: &Liveness) -> Vec<HashSet<Tmp>> {
     let nt = f.temps.len();
     let mut adj: Vec<HashSet<Tmp>> = vec![HashSet::new(); nt];
     let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         let mut live = lv.live_out[bi].clone();
-        // toán hạng của terminator sống ở đuôi block
+        // the terminator's operands are live at the block's tail
         buf.clear();
         term_uses(&b.term, &mut buf);
         for &u in &buf {
@@ -523,7 +534,7 @@ pub fn interference(f: &IrFunc, lv: &Liveness) -> Vec<HashSet<Tmp>> {
     adj
 }
 
-/// Kết quả tô màu: color[t]=Some(r) → register r; None → spill (slot stack riêng).
+/// Coloring result: color[t]=Some(r) → register r; None → spill (its own stack slot).
 pub struct Alloc {
     pub color: Vec<Option<u32>>,
     pub spilled: Vec<Tmp>,
@@ -535,8 +546,8 @@ pub fn color(adj: &[HashSet<Tmp>], k: u32) -> Alloc {
     let mut removed = vec![false; nt];
     let mut degree: Vec<usize> = adj.iter().map(|s| s.len()).collect();
     let mut stack: Vec<Tmp> = Vec::new();
-    // SIMPLIFY: đẩy node degree<k lên stack (chắc tô được); hết → chọn max-degree làm
-    // potential-spill (Briggs: có thể vẫn tô được ở select).
+    // SIMPLIFY: push a degree<k node onto the stack (certainly colorable); when none
+    // remain → pick the max-degree node as a potential-spill (Briggs: it may still be colorable at select).
     for _ in 0..nt {
         let low = (0..nt).find(|&v| !removed[v] && degree[v] < k as usize);
         let v = match low {
@@ -554,7 +565,7 @@ pub fn color(adj: &[HashSet<Tmp>], k: u32) -> Alloc {
             }
         }
     }
-    // SELECT: pop, gán màu nhỏ nhất khác hàng xóm; hết màu → spill thật (None).
+    // SELECT: pop, assign the smallest color that differs from all neighbors; out of colors → an actual spill (None).
     let mut colr = vec![None; nt];
     let mut spilled = Vec::new();
     while let Some(v) = stack.pop() {
@@ -573,14 +584,14 @@ pub fn color(adj: &[HashSet<Tmp>], k: u32) -> Alloc {
     Alloc { color: colr, spilled, k }
 }
 
-/// CHỨNG cơ học bất biến giao thoa: cạnh nào cũng khác màu. Đây là "P-verify" của
-/// lời-giải NP — regalloc có thể heuristic, nhưng tính đúng thì kiểm được rẻ.
+/// Mechanically CHECK the interference invariant: every edge is differently colored.
+/// This is the "P-verify" of the NP solution — regalloc may be heuristic, but its correctness is cheap to check.
 pub fn verify_coloring(adj: &[HashSet<Tmp>], al: &Alloc) -> Result<(), String> {
     for u in 0..adj.len() {
         if let Some(cu) = al.color[u] {
             for &v in &adj[u] {
                 if al.color[v as usize] == Some(cu) {
-                    return Err(format!("giao thoa (t{u},t{v}) cùng register {cu}"));
+                    return Err(format!("interference (t{u},t{v}) share register {cu}"));
                 }
             }
         }
@@ -589,12 +600,14 @@ pub fn verify_coloring(adj: &[HashSet<Tmp>], al: &Alloc) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ORCHESTRATOR — pipeline IR→IR (passes 1-4) tới FIXPOINT. Mỗi pass bảo toàn ⟦·⟧
-// (đã chứng riêng), nên hợp thành cũng bảo toàn ⟦·⟧ (đóng dưới phép hợp). Lặp vì pass
-// này mở cơ hội cho pass kia (copy-prop→const-fold gấp hằng; CSE→copy-prop→DCE dọn).
-// Chốt vòng lặp bằng "không rewrite nào nữa" (hội tụ) + trần cứng chống loạn.
-// (Regalloc KHÔNG ở đây: nó sinh assignment cho BACKEND tiêu thụ, không phải IR→IR;
-//  backend hiện spill-per-node chưa dùng — sẽ nối khi flip default sang IR, Bước B.)
+// ORCHESTRATOR — the IR→IR pipeline (passes 1-4) run to a FIXPOINT. Each pass
+// preserves ⟦·⟧ (proved individually), so their composition preserves ⟦·⟧ too (closed
+// under composition). Iterate because one pass opens opportunities for another
+// (copy-prop→const-fold folds constants; CSE→copy-prop→DCE cleans up). The loop
+// terminates on "no more rewrites" (convergence) + a hard cap against runaway.
+// (Regalloc is NOT here: it produces an assignment for the BACKEND to consume, not an
+//  IR→IR transform; the backend's current spill-per-node does not yet use it — it will
+//  be wired in when the default is flipped to IR, Step B.)
 // ─────────────────────────────────────────────────────────────────────────────
 pub fn optimize(tt: &TyTab, f: &mut IrFunc) {
     for _ in 0..32 {
@@ -604,7 +617,7 @@ pub fn optimize(tt: &TyTab, f: &mut IrFunc) {
         n += cse(f);
         n += dce(f);
         if n == 0 {
-            break; // fixpoint: không lệnh nào đổi nữa
+            break; // fixpoint: no instruction changes any further
         }
     }
 }
@@ -623,7 +636,7 @@ mod tests {
         ir.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Load(..))).count()
     }
 
-    // Pass 1 fold toán hạng-hằng, equiv giữ, kết quả = Copy(Imm đã tính).
+    // Pass 1 folds constant operands, equiv holds, result = Copy(the computed Imm).
     #[test]
     fn cf_folds_const_bin() {
         let tt = TyTab::new();
@@ -640,14 +653,14 @@ mod tests {
         )];
         let mut after = before.clone();
         let n = const_fold(&tt, &mut after[0]);
-        assert!(n >= 1, "phải fold ≥1");
+        assert!(n >= 1, "must fold ≥1");
         verify(&after[0]).unwrap();
-        equiv(&tt, &before, &after, "f").expect("const-fold phải bảo toàn ⟦·⟧");
+        equiv(&tt, &before, &after, "f").expect("const-fold must preserve ⟦·⟧");
         assert!(matches!(after[0].blocks[0].insts[0], Inst::Copy(0, _, Val::Imm(42))));
         assert_eq!(interp(&tt, &after, "f", &[]).unwrap(), 42);
     }
 
-    // const-branch: Br(Imm 0) → Jmp(else); interp đi đúng nhánh.
+    // const-branch: Br(Imm 0) → Jmp(else); interp takes the correct branch.
     #[test]
     fn cf_const_branch() {
         let tt = TyTab::new();
@@ -668,12 +681,12 @@ mod tests {
         assert!(n >= 1);
         assert!(matches!(after[0].blocks[0].term, Term::Jmp(2)));
         verify(&after[0]).unwrap();
-        equiv(&tt, &before, &after, "h").expect("const-branch phải bảo toàn ⟦·⟧");
+        equiv(&tt, &before, &after, "h").expect("const-branch must preserve ⟦·⟧");
         assert_eq!(interp(&tt, &after, "h", &[]).unwrap(), 20);
     }
 
-    // Trên code THẬT (parser đã fold sẵn hằng nguồn ⟹ pass phần lớn no-op) — bất
-    // biến then chốt: dù làm ít hay nhiều, const-fold KHÔNG BAO GIỜ đổi ⟦·⟧.
+    // On REAL code (the parser already folds source constants ⟹ the pass is largely a
+    // no-op) — the key invariant: whether it does little or much, const-fold NEVER changes ⟦·⟧.
     #[test]
     fn cf_preserves_real() {
         for (nm, src, entry) in [
@@ -693,21 +706,21 @@ mod tests {
         }
     }
 
-    // DCE xoá biểu-thức-lệnh chết (`a*b;`) + toán hạng của nó, equiv giữ nguyên.
+    // DCE removes a dead expression-statement (`a*b;`) + its operands, equiv preserved.
     #[test]
     fn dce_removes_dead() {
         let (ast, ir) = compile("dce1", "int g(int a,int b){a*b; return a+b;}");
         let mut opt = ir.clone();
         let removed: u32 = opt.iter_mut().map(dce).sum();
-        assert!(removed >= 1, "phải xoá ≥1 lệnh chết");
+        assert!(removed >= 1, "must remove ≥1 dead instruction");
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
         }
-        equiv(&ast.tt, &ir, &opt, "g").expect("DCE phải bảo toàn ⟦·⟧");
+        equiv(&ast.tt, &ir, &opt, "g").expect("DCE must preserve ⟦·⟧");
     }
 
-    // DCE KHÔNG được xoá Call dù kết quả không dùng (side-effect). Chứng cấu trúc:
-    // số Call giữ nguyên; + equiv.
+    // DCE must NOT remove a Call even if its result is unused (side effect). Structural
+    // proof: the Call count is unchanged; + equiv.
     #[test]
     fn dce_keeps_call() {
         let (ast, ir) = compile("dce2", "int side(int x){return x;} int k(int a){side(a); return a+1;}");
@@ -717,12 +730,12 @@ mod tests {
             dce(f);
         }
         let calls_after: usize = opt.iter().map(count_calls).sum();
-        assert_eq!(calls_before, calls_after, "DCE KHÔNG được xoá Call");
+        assert_eq!(calls_before, calls_after, "DCE must NOT remove a Call");
         assert!(calls_after >= 1);
         for f in &opt {
             verify(f).unwrap();
         }
-        equiv(&ast.tt, &ir, &opt, "k").expect("DCE (giữ call) phải bảo toàn ⟦·⟧");
+        equiv(&ast.tt, &ir, &opt, "k").expect("DCE (keeping the call) must preserve ⟦·⟧");
         assert_eq!(interp(&ast.tt, &opt, "k", &[41]).unwrap(), 42);
     }
 
@@ -764,12 +777,12 @@ mod tests {
         )];
         let mut opt = before.clone();
         let n = copy_prop(&mut opt[0]);
-        assert!(n >= 1, "phải propagate ≥1 use");
+        assert!(n >= 1, "must propagate ≥1 use");
         verify(&opt[0]).unwrap();
-        equiv(&tt, &before, &opt, "f").expect("copy-prop bảo toàn ⟦·⟧");
-        // giờ Bin có toán hạng hằng → const-fold gấp thành 8
+        equiv(&tt, &before, &opt, "f").expect("copy-prop preserves ⟦·⟧");
+        // now the Bin has constant operands → const-fold collapses it to 8
         const_fold(&tt, &mut opt[0]);
-        equiv(&tt, &before, &opt, "f").expect("cascade bảo toàn ⟦·⟧");
+        equiv(&tt, &before, &opt, "f").expect("the cascade preserves ⟦·⟧");
         assert_eq!(interp(&tt, &opt, "f", &[0, 0]).unwrap(), 8);
     }
 
@@ -777,7 +790,7 @@ mod tests {
     fn cp_preserves_real() {
         for (nm, src, entry) in [
             ("a", "int g(int a,int b){int x=a;int y=x+b;return y*x;}", "g"),
-            // Cond ⟹ temp `res` ĐA-ĐỊNH-NGHĨA: copy-prop KHÔNG được thay nó.
+            // Cond ⟹ the temporary `res` is MULTI-DEF: copy-prop must NOT substitute it.
             ("b", "int c(int a){int r=a>0?1:2;return r+a;}", "c"),
             ("d", "int t(int a,int b){int p=a+b;int q=p;return p*q;}", "t"),
         ] {
@@ -793,7 +806,7 @@ mod tests {
         }
     }
 
-    // CSE số học: hai Bin(Add,t0,t1) giống hệt → lệnh sau thành Copy(t2). interp giữ.
+    // Arithmetic CSE: two identical Bin(Add,t0,t1) → the later becomes Copy(t2). interp preserved.
     #[test]
     fn cse_arith() {
         let tt = TyTab::new();
@@ -808,7 +821,7 @@ mod tests {
                     Inst::Copy(0, INT, Val::Imm(4)),
                     Inst::Copy(1, INT, Val::Imm(5)),
                     Inst::Bin(2, Op::Add, INT, Val::Tmp(0), Val::Tmp(1)),
-                    Inst::Bin(3, Op::Add, INT, Val::Tmp(1), Val::Tmp(0)), // giao hoán → cùng khoá
+                    Inst::Bin(3, Op::Add, INT, Val::Tmp(1), Val::Tmp(0)), // commutative → same key
                     Inst::Bin(4, Op::Mul, INT, Val::Tmp(2), Val::Tmp(3)),
                 ],
                 term: Term::Ret(Some(Val::Tmp(4))),
@@ -816,15 +829,15 @@ mod tests {
         )];
         let mut after = before.clone();
         let n = cse(&mut after[0]);
-        assert!(n >= 1, "phải CSE ≥1");
+        assert!(n >= 1, "must CSE ≥1");
         assert!(matches!(after[0].blocks[0].insts[3], Inst::Copy(3, _, Val::Tmp(2))));
         verify(&after[0]).unwrap();
-        equiv(&tt, &before, &after, "f").expect("CSE bảo toàn ⟦·⟧");
+        equiv(&tt, &before, &after, "f").expect("CSE preserves ⟦·⟧");
         assert_eq!(interp(&tt, &after, "f", &[]).unwrap(), 81);
     }
 
-    // Load-CSE qua pipeline (cse;copy_prop)²;dce: `s+s` load s HAI lần liền nhau,
-    // không ghi-mem xen giữa → gộp còn 1 load. equiv giữ, số Load GIẢM.
+    // Load-CSE through the pipeline (cse;copy_prop)²;dce: `s+s` loads s TWICE in a row
+    // with no memory write between → merged into 1 load. equiv preserved, the Load count DECREASES.
     #[test]
     fn cse_load_pipeline() {
         let (ast, ir) = compile("csel", "int f(int a){int s=a*a; return s+s;}");
@@ -840,12 +853,12 @@ mod tests {
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
         }
-        equiv(&ast.tt, &ir, &opt, "f").expect("load-CSE bảo toàn ⟦·⟧");
-        assert!(count_loads(&opt) < loads0, "load-CSE phải giảm số Load ({loads0}→{})", count_loads(&opt));
+        equiv(&ast.tt, &ir, &opt, "f").expect("load-CSE preserves ⟦·⟧");
+        assert!(count_loads(&opt) < loads0, "load-CSE must reduce the Load count ({loads0}→{})", count_loads(&opt));
     }
 
-    // An toàn ALIASING: đọc p, GHI p, đọc p lại — load-CSE KHÔNG được gộp qua store.
-    // equiv là trọng tài cơ học (nếu gộp sai, giá trị lệch → bắt).
+    // ALIASING safety: read p, WRITE p, read p again — load-CSE must NOT merge across
+    // the store. equiv is the mechanical referee (a wrong merge shifts the value → caught).
     #[test]
     fn cse_preserves_real() {
         for (nm, src, entry) in [
@@ -868,7 +881,7 @@ mod tests {
         }
     }
 
-    // Hai temp cùng sống tại một def PHẢI giao thoa (cạnh trong đồ thị).
+    // Two temporaries live at the same def MUST interfere (an edge in the graph).
     fn two_live() -> IrFunc {
         mk(
             "f",
@@ -880,7 +893,7 @@ mod tests {
                 insts: vec![
                     Inst::Copy(0, INT, Val::Imm(1)),
                     Inst::Copy(1, INT, Val::Imm(2)),
-                    Inst::Bin(2, Op::Add, INT, Val::Tmp(0), Val::Tmp(1)), // t0,t1 cùng sống
+                    Inst::Bin(2, Op::Add, INT, Val::Tmp(0), Val::Tmp(1)), // t0,t1 both live
                 ],
                 term: Term::Ret(Some(Val::Tmp(2))),
             }],
@@ -891,12 +904,12 @@ mod tests {
     fn interference_known() {
         let f = two_live();
         let adj = interference(&f, &liveness(&f));
-        assert!(adj[0].contains(&1) && adj[1].contains(&0), "t0,t1 phải giao thoa");
-        // t2 không cùng sống với t0/t1 (chúng chết khi t2 sinh) → không giao thoa
+        assert!(adj[0].contains(&1) && adj[1].contains(&0), "t0,t1 must interfere");
+        // t2 is not live together with t0/t1 (they die when t2 is born) → no interference
         assert!(!adj[2].contains(&0) && !adj[2].contains(&1));
     }
 
-    // Coloring hợp lệ trên code THẬT (K=8 dư): bất biến giao thoa giữ.
+    // Valid coloring on REAL code (K=8, ample): the interference invariant holds.
     #[test]
     fn reg_alloc_valid() {
         for (nm, src) in [
@@ -913,23 +926,24 @@ mod tests {
         }
     }
 
-    // K=1 (một register) + hai temp giao thoa ⟹ BẮT BUỘC spill; coloring vẫn HỢP LỆ
-    // (spill = slot riêng, không tính vào bất biến register).
+    // K=1 (one register) + two interfering temporaries ⟹ a spill is FORCED; the
+    // coloring is still VALID (a spill = its own slot, not counted in the register invariant).
     #[test]
     fn reg_alloc_spill() {
         let f = two_live();
         let adj = interference(&f, &liveness(&f));
         let al = color(&adj, 1);
-        assert!(!al.spilled.is_empty(), "K=1 phải ép spill ≥1 temp");
-        verify_coloring(&adj, &al).expect("coloring (có spill) vẫn phải hợp lệ");
+        assert!(!al.spilled.is_empty(), "K=1 must force a spill of ≥1 temp");
+        verify_coloring(&adj, &al).expect("the coloring (with a spill) must still be valid");
     }
 
     fn count_insts(ir: &[IrFunc]) -> usize {
         ir.iter().flat_map(|f| &f.blocks).map(|b| b.insts.len()).sum()
     }
 
-    // ORCHESTRATOR: pipeline hội tụ, BẢO TOÀN ⟦·⟧ trên corpus rộng (gồm loop, cond,
-    // con trỏ, struct, đệ quy). Đây là ir-gate của toàn pipeline (thay full-suite lúc dev).
+    // ORCHESTRATOR: the pipeline converges and PRESERVES ⟦·⟧ over a broad corpus
+    // (including loop, cond, pointer, struct, recursion). This is the ir-gate of the
+    // whole pipeline (replacing the full suite during development).
     #[test]
     fn optimize_preserves_corpus() {
         let cases: &[(&str, &str, &str, &[i64])] = &[
@@ -952,14 +966,14 @@ mod tests {
                 verify(f).unwrap_or_else(|e| panic!("verify {nm}/{}: {e}", f.name));
             }
             equiv(&ast.tt, &ir, &opt, entry).unwrap_or_else(|e| panic!("{nm}: {e}"));
-            // pipeline phải cho CÙNG kết quả interp như trước (sanity)
+            // the pipeline must give the SAME interp result as before (sanity)
             let r0 = interp(&ast.tt, &ir, entry, args).unwrap();
             let r1 = interp(&ast.tt, &opt, entry, args).unwrap();
-            assert_eq!(r0, r1, "{nm}: interp lệch sau optimize");
+            assert_eq!(r0, r1, "{nm}: interp diverges after optimize");
         }
     }
 
-    // Pipeline THỰC SỰ tối ưu (không phải no-op): cfold + CSE giảm số lệnh.
+    // The pipeline ACTUALLY optimizes (not a no-op): cfold + CSE reduce the instruction count.
     #[test]
     fn optimize_reduces() {
         let (ast, ir) = compile("red", "int f(int a,int b){int s=a+b;int t=a+b;return s*t+s*t;}");
@@ -969,99 +983,110 @@ mod tests {
             optimize(&ast.tt, f);
         }
         equiv(&ast.tt, &ir, &opt, "f").unwrap();
-        assert!(count_insts(&opt) < before, "pipeline phải giảm lệnh ({before}→{})", count_insts(&opt));
+        assert!(count_insts(&opt) < before, "the pipeline must reduce instructions ({before}→{})", count_insts(&opt));
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    // ĐỊNH LÝ EXECUTABLE (NẤC-1) — commuting-square fold↔runtime nâng từ alg.sh
-    // lên tầng REFERENCE SEMANTICS. alg.sh chứng giao hoán ở tầng SOURCE (2 binary
-    // sinh bởi cc/zcc); ở đây chứng ngay trên IR bằng interp (ngữ nghĩa ⟦·⟧), zero-
-    // dep, in-process — KHÔNG cần cc, KHÔNG chờ end-to-end.
+    // EXECUTABLE THEOREM — the fold-vs-runtime commuting square, lifted from
+    // alg.sh to the REFERENCE SEMANTICS. alg.sh establishes commutation at the
+    // SOURCE level (two binaries produced by the system compiler and by zcc);
+    // here we establish it directly on the IR via interp (the denotation ⟦·⟧),
+    // in-process and dependency-free — no system compiler, no end-to-end wait.
     //
-    // PHÁT BIỂU (SEMANTICS.md §5, IR.md §3c):
-    //   ∀ e ∈ 𝔼_struct (không gian biểu thức sinh có cấu trúc, vét cạn shape × op),
+    // STATEMENT (SEMANTICS.md §5, IR.md §3c):
+    //   ∀ e ∈ 𝔼_struct (the generated structural expression space, exhausting
+    //                    shape × operator),
     //   ∀ P ∈ {const_fold, copy_prop, cse, dce, optimize},
-    //   ∀ input i ∈ battery(arity) mà ⟦lower(e)⟧(i) xác định (không UB/exotic):
+    //   ∀ input i ∈ battery(arity) with ⟦lower(e)⟧(i) defined (no UB / exotic):
     //          ⟦ P(lower(e)) ⟧(i)  =  ⟦ lower(e) ⟧(i).
-    // Tức MỌI pass GIAO HOÁN với ngữ nghĩa tham chiếu trên toàn không gian sinh.
-    // Đây là hình thức translation-validation vét-cạn-cấu-trúc (Rice chặn phổ quát
-    // → ràng vào lớp shape hữu hạn, decidable) — KHÔNG phải proof; là ĐO cơ học.
+    // That is, every pass commutes with the reference semantics over the whole
+    // generated space. This is a form of structurally-exhaustive translation
+    // validation (Rice's theorem blocks the universal case, so we restrict to a
+    // finite, decidable class of shapes) — not a proof, but a mechanical check.
     // ═════════════════════════════════════════════════════════════════════════
 
-    // Sinh 𝔼_struct: mỗi (op1,op2,op3) ∈ POOL³ tô vào MỘT template giàu đủ kích mọi
-    // pass CÙNG LÚC (dup subexpr→CSE, copy-chain→copy-prop, dead-stmt→DCE, const→fold).
-    // POOL toàn phép TỔNG trên ℤ/2^n (interp total) ⟹ commuting square nội tại KHÔNG
-    // có UB-skip trên nhánh này: mọi điểm so được (non-vacuous mạnh). Template thứ 2
-    // (div/mod) chứng nhánh "fold TỪ CHỐI UB" cũng giao hoán (interp Err→skip đối xứng).
+    // POOL holds the total binary operators over ℤ/2^n (interp is total on them),
+    // so the internal commuting square has no UB skips on the arithmetic families:
+    // every point is comparable (strongly non-vacuous). The div/mod family adds
+    // the branch where the folder DECLINES undefined behavior, which still commutes
+    // (interp returns Err and the equivalence check skips it, symmetrically).
     const POOL: [&str; 6] = ["+", "-", "*", "&", "|", "^"];
 
     fn gen_rich(o1: &str, o2: &str, o3: &str) -> String {
-        // x,y = subexpr TRÙNG (a o1 b) → CSE gộp; z dùng x (copy/use); dead-stmt
-        // (a o3 c) → DCE xoá; k = hằng (3 o1 4) → const-fold; return trộn tất cả.
+        // x, y are duplicate subexpressions (a o1 b) → CSE merges them; z uses x
+        // (copy/use); the statement (a o3 c) is dead → DCE removes it; k is a
+        // constant (3 o1 4) → constant folding; the return mixes all of them.
         format!(
             "int f(int a,int b,int c){{int x=a{o1}b;int y=a{o1}b;int z=x{o2}c;a{o3}c;int k=3{o1}4;return (x{o2}y){o3}(z{o1}k);}}"
         )
     }
     fn gen_divmod(o1: &str, o2: &str) -> String {
-        // Nhánh có / % : phần lớn input xác định, biên (b=0 …) → interp Err → equiv
-        // skip ĐỐI XỨNG (before Err ⟹ input ngoài không gian). Chứng const-fold KHÔNG
-        // fold div0 thành hằng (giữ lệnh) VẪN giao hoán với runtime.
+        // The / % branch: most inputs are defined, but boundary cases (b = 0, …)
+        // make interp return Err, so the equivalence check skips them symmetrically
+        // (a pre-image Err means the input is outside the modeled space). This
+        // shows that the constant folder, by NOT folding division by zero into a
+        // constant (it keeps the instruction), still commutes with the runtime.
         format!("int f(int a,int b,int c){{int x=a{o1}b;int y=a{o1}b;return (x{o2}c){o1}(y{o2}a);}}")
     }
     fn gen_shift(o1: &str, sh: &str) -> String {
-        // Shift với RHS mask nhỏ (b&3 ∈ [0,3]) → luôn xác định (né UB shift-tràn); dup
-        // (a sh s) → CSE; hằng (1 sh 2) → fold. Chứng Shl/Shr (>> xét dấu) giao hoán.
+        // Shift with a small masked right operand (b & 3 ∈ [0, 3]) is always
+        // defined (avoiding shift-out-of-range UB); the duplicate (a sh s) → CSE;
+        // the constant (1 sh 2) → fold. Exercises Shl / Shr (arithmetic >>).
         format!("int f(int a,int b){{int s=b&3;int x=a{sh}s;int y=a{sh}s;int k=1{sh}2;return (x{o1}y){o1}k;}}")
     }
     fn gen_ptr(o1: &str, o2: &str) -> String {
-        // Hai con trỏ tới local; Store XEN GIỮA hai Load → kích memory-kill của CSE
-        // (pr84169 thu nhỏ). Lea/Load/Store/μ — chứng pass tôn trọng mô hình bộ nhớ.
+        // Two pointers to locals, with a Store BETWEEN two Loads → exercises the
+        // CSE memory-kill (a reduced GCC PR84169). Lea / Load / Store / μ: shows
+        // that the passes respect the memory model.
         format!("int f(int a,int b){{int x=a;int y=b;int*p=&x;int*q=&y;*p=*p{o1}*q;*q=*q{o2}a;return *p{o1}*q;}}")
     }
     fn gen_loop(o1: &str, o2: &str) -> String {
-        // Vòng lặp trip≤7 (b&7) → interp LUÔN dừng (non-vacuous); back-edge (Br/Jmp) +
-        // copy-prop/CSE/DCE trong thân + qua biên block. Chứng pass giao hoán trên CFG.
+        // A loop with trip count ≤ 7 (b & 7) → interp always terminates
+        // (non-vacuous); a back-edge (Br / Jmp) plus copy-prop / CSE / DCE within
+        // the body and across the block boundary. Shows commutation on a CFG.
         format!("int f(int a,int b){{int s=a;int i;for(i=0;i<(b&7);i=i+1){{s=s{o1}i;s=s{o2}a;}}return s{o1}b;}}")
     }
 
-    // 𝔼_struct = hợp năm HỌ, mỗi họ vét cạn op trên một SHAPE riêng (straight-line
-    // arith, div/mod-UB, shift, con-trỏ/bộ-nhớ, vòng-lặp/CFG). Bao phủ cả bốn pass
-    // CORE + mọi loại Inst (Bin/Un/Copy/Load/Store/Lea/Cast) + cả hai loại Term.
+    // 𝔼_struct is the union of five families, each exhausting the operator set over
+    // a distinct SHAPE (straight-line arithmetic, div/mod UB, shift, pointer/memory,
+    // loop/CFG). Together they cover all four CORE passes, every kind of Inst
+    // (Bin/Un/Copy/Load/Store/Lea/Cast), and both kinds of Term.
     fn e_struct() -> Vec<String> {
         let mut s = Vec::new();
         for o1 in POOL {
             for o2 in POOL {
                 for o3 in POOL {
-                    s.push(gen_rich(o1, o2, o3)); // họ A: arith straight-line (6³=216)
+                    s.push(gen_rich(o1, o2, o3)); // family A: straight-line arithmetic (6³ = 216)
                 }
             }
         }
         for o2 in POOL {
             for o1 in ["/", "%"] {
-                s.push(gen_divmod(o1, o2)); // họ B: div/mod UB-skip (6×2=12)
+                s.push(gen_divmod(o1, o2)); // family B: div/mod UB skip (6×2 = 12)
             }
         }
         for o1 in POOL {
             for sh in ["<<", ">>"] {
-                s.push(gen_shift(o1, sh)); // họ C: shift (6×2=12)
+                s.push(gen_shift(o1, sh)); // family C: shift (6×2 = 12)
             }
         }
         for o1 in POOL {
             for o2 in POOL {
-                s.push(gen_ptr(o1, o2)); // họ D: con trỏ/bộ nhớ (6²=36)
+                s.push(gen_ptr(o1, o2)); // family D: pointer/memory (6² = 36)
             }
         }
         for o1 in POOL {
             for o2 in POOL {
-                s.push(gen_loop(o1, o2)); // họ E: vòng lặp/CFG (6²=36)
+                s.push(gen_loop(o1, o2)); // family E: loop/CFG (6² = 36)
             }
         }
-        s // 216+12+12+36+36 = 312 biểu thức
+        s // 216 + 12 + 12 + 36 + 36 = 312 expressions
     }
 
-    // Mỗi pass là một mũi tên trong commuting square. Chạy TỪNG pass RIÊNG (cô lập lỗi)
-    // + `optimize` (hợp thành tới fixpoint) — nếu hợp thành giao hoán mà một pass lẻ
-    // không, ta bắt được pass phạm tội.
+    // Each pass is one arrow of the commuting square. We run each pass INDIVIDUALLY
+    // (to isolate a fault) as well as `optimize` (their composition to a fixpoint):
+    // if the composition commutes but an individual pass does not, we catch the
+    // offending pass.
     fn all_passes(tt: &TyTab, f: &mut IrFunc, which: u8) {
         match which {
             0 => { const_fold(tt, f); }
@@ -1075,10 +1100,11 @@ mod tests {
 
     #[test]
     fn commuting_square_structural_exhaustion() {
-        // Evidence trail cơ học (luật input-sạch): đếm (expr, pass) đã CHỨNG giao hoán
-        // + số expr sinh. Verdict xanh CHỈ hợp lệ khi kèm số này = sàn — cấm "pass rỗng".
+        // Mechanical evidence trail: count the (expression, pass) squares proven to
+        // commute, and the number of expressions generated. A green verdict is valid
+        // only when these counts match the expected floor — no vacuous "passing" run.
         let srcs = e_struct();
-        let mut squares = 0u32; // số ô commuting-square (expr × pass) đã đóng
+        let mut squares = 0u32; // commuting squares (expression × pass) closed
         for src in &srcs {
             let (ast, ir) = compile("csq", src);
             for f in &ir {
@@ -1090,47 +1116,52 @@ mod tests {
                     all_passes(&ast.tt, f, which);
                 }
                 for f in &opt {
-                    verify(f).unwrap_or_else(|e| panic!("verify(sau pass {which}) {src}: {e}"));
+                    verify(f).unwrap_or_else(|e| panic!("verify (after pass {which}) {src}: {e}"));
                 }
                 equiv(&ast.tt, &ir, &opt, "f")
-                    .unwrap_or_else(|e| panic!("commuting square VỠ [pass {which}] {src}: {e}"));
+                    .unwrap_or_else(|e| panic!("commuting square BROKEN [pass {which}] {src}: {e}"));
                 squares += 1;
             }
         }
         let exprs = srcs.len() as u32;
-        // Sàn chứng: 216+12+12+36+36 = 312 expr × 5 pass = 1560 ô.
-        assert_eq!(exprs, 312, "không gian sinh phải đúng cỡ (216+12+12+36+36)");
-        assert_eq!(squares, 1560, "phải đóng đủ 312×5 ô commuting-square");
-        eprintln!("ĐỊNH LÝ commuting-square: {exprs} biểu thức 𝔼_struct (5 họ shape) × 5 pass = {squares} ô đóng xanh");
+        // Floor: 216 + 12 + 12 + 36 + 36 = 312 expressions × 5 passes = 1560 squares.
+        assert_eq!(exprs, 312, "generated space must have the expected size (216+12+12+36+36)");
+        assert_eq!(squares, 1560, "must close all 312×5 commuting squares");
+        eprintln!("commuting-square theorem: {exprs} expressions in 𝔼_struct (5 shape families) × 5 passes = {squares} squares closed");
     }
 
-    // Tự-chứng ĐỊNH LÝ (luật input-sạch: chứng chính công cụ chứng). Nếu HARNESS trên
-    // "xanh giả" — equiv bỏ sót đột biến — thì mọi verdict vô giá trị. Đột biến MỘT pass
-    // (cse gộp SAI qua ghi-mem: bỏ memory-kill) PHẢI bị commuting-square bắt ở ≥1 expr.
+    // Self-proof of the theorem (validate the tool that does the validating): if the
+    // harness above were "falsely green" — the equivalence check missing a mutation —
+    // every verdict would be worthless. A single-pass mutation (CSE merging wrongly
+    // across a memory write, i.e. dropping the memory-kill) MUST be caught by the
+    // commuting square on at least one expression.
     #[test]
     fn commuting_square_selfproof() {
-        // Biểu thức có Store xen giữa hai Load cùng địa chỉ: nếu CSE gộp bừa (không
-        // memory-kill) → miscompile. equiv PHẢI bắt. Đây là pr84169 thu nhỏ.
+        // An expression with a Store between two Loads of the same address: if CSE
+        // merged blindly (no memory-kill), it would miscompile, and the equivalence
+        // check MUST catch it. This is a reduced GCC PR84169.
         let (ast, ir) = compile("csqsp", "int f(int a){int p=a;int q=p;p=p+1;return p+q;}");
-        // CSE thật (đúng) phải giao hoán:
+        // Correct CSE must commute:
         let mut ok = ir.clone();
         for f in ok.iter_mut() {
             cse(f);
             copy_prop(f);
             dce(f);
         }
-        equiv(&ast.tt, &ir, &ok, "f").expect("CSE ĐÚNG phải giao hoán");
-        // Đột biến: ép hai Load KHÁC địa chỉ thành CÙNG khoá bằng cách viết bậy —
-        // thay một Store thành Copy (mất ghi-mem) rồi CSE → giá trị lệch. Dựng thủ công:
-        // ir sau khi bỏ Store sẽ đọc p CŨ ⟹ khác runtime ⟹ equiv bắt.
+        equiv(&ast.tt, &ir, &ok, "f").expect("correct CSE must commute");
+        // Mutation: remove a memory write by replacing a Store with a Copy, so the
+        // later read observes the OLD value and the result diverges from the runtime.
+        // Built by hand: after dropping the Store, the IR reads the old p, differing
+        // from the runtime, so the equivalence check catches it.
         let mut bad = ir.clone();
         let mut killed = false;
         'o: for f in bad.iter_mut() {
             for b in f.blocks.iter_mut() {
                 for i in b.insts.iter_mut() {
                     if let Inst::Store(ty, _addr, val) = i {
-                        // Store(*addr=val) → Copy(dst chết, val): xoá tác dụng ghi-mem.
-                        // dùng temp 0 làm bãi rác (đã def) → well-formed nhưng ngữ nghĩa hỏng.
+                        // Store(*addr = val) → Copy(dead dst, val): removes the memory
+                        // write. Reusing temp 0 as a scratch sink (already defined)
+                        // keeps the IR well-formed but semantically broken.
                         *i = Inst::Copy(0, *ty, *val);
                         killed = true;
                         break 'o;
@@ -1138,10 +1169,10 @@ mod tests {
                 }
             }
         }
-        assert!(killed, "phải có Store để đột biến");
+        assert!(killed, "there must be a Store to mutate");
         assert!(
             equiv(&ast.tt, &ir, &bad, "f").is_err(),
-            "đột biến xoá-Store PHẢI bị commuting-square bắt (nếu không, harness mù)"
+            "the Store-removal mutation MUST be caught by the commuting square (else the harness is blind)"
         );
     }
 }

@@ -1,19 +1,21 @@
-// EXT — nơi tập trung logic extension "có thịt" theo luật decouple (CLAUDE.md):
-// core (parser/codegen) chỉ được gọi VÀO đây; cắt file này + các touchpoint đánh
-// dấu EXT(...) trong core là còn lại compiler C89 thuần. Touchpoint nhỏ (1-3
-// dòng) vẫn nằm tại chỗ với marker, chỉ logic đủ dày mới dọn về đây.
+// EXT — the home for substantial extension logic under the decoupling rule
+// (CLAUDE.md): the core (parser/codegen) may only call INTO here; removing this
+// file plus the touchpoints marked EXT(...) in the core leaves a pure C89
+// compiler. Small touchpoints (1-3 lines) stay in place with a marker; only logic
+// of sufficient bulk is moved here.
 use crate::ast::SyncOp;
 
-// EXT(gcc): bảng builtin atomic __sync_* (M12) → (op, số arg đúng).
-// Danh sách rút từ nhu cầu thật trên aarch64: nginx (bool_compare_and_swap,
-// fetch_and_add, synchronize), redis atomicvar.h path HAVE_ATOMIC
+// EXT(gcc): the __sync_* atomic builtin table → (op, correct arg count).
+// The list is drawn from real needs on aarch64: nginx (bool_compare_and_swap,
+// fetch_and_add, synchronize), redis atomicvar.h HAVE_ATOMIC path
 // (add_and_fetch, sub_and_fetch, fetch_and_add, bool_compare_and_swap),
-// postgres s_lock (lock_test_and_set, lock_release); val_compare_and_swap và
-// fetch_and_sub thêm vì cùng khuôn codegen, coi như miễn phí.
-// EXT(clang): họ operator __has_* trong #if (M13 — TargetConditionals.h,
-// arm/_types.h gọi TRƯỚC khi cdefs.h kịp fallback-define). __has_include xử lý
-// riêng (phải tra file thật); các tên này "defined" sẵn và luôn eval 0 —
-// "không có feature" là câu trả lời an toàn vì SDK luôn có nhánh fallback.
+// postgres s_lock (lock_test_and_set, lock_release); val_compare_and_swap and
+// fetch_and_sub are added because they share the codegen mold, essentially free.
+// EXT(clang): the __has_* operator family in #if (M13 — TargetConditionals.h,
+// arm/_types.h calls them BEFORE cdefs.h can fallback-define them). __has_include
+// is handled separately (it must look up a real file); these names are already
+// "defined" and always evaluate to 0 — "no such feature" is the safe answer
+// because the SDK always has a fallback branch.
 pub fn has_operator_zero(name: &str) -> bool {
     matches!(
         name,
@@ -21,11 +23,12 @@ pub fn has_operator_zero(name: &str) -> bool {
     )
 }
 
-// EXT(gcc): họ __atomic_* kiểu C11 (hdr_histogram + redis atomicvar đòi ở M14)
-// — arg memorder BỎ QUA vì zcc luôn phát seq_cst; map thành macro xuống
-// __sync_* (statement-expr + __typeof__ có sẵn). Lưu ý load = fetch_add(p,0)
-// nên KHÔNG dùng được trên trang read-only. fetch_or/and/xor chỉ jemalloc đòi
-// (build MALLOC=libc không đụng) — chưa làm.
+// EXT(gcc): the C11-style __atomic_* family (required by hdr_histogram + redis
+// atomicvar at M14) — the memorder argument is IGNORED because zcc always emits
+// seq_cst; mapped as macros down to __sync_* (statement-expr + __typeof__ are
+// available). Note that a load = fetch_add(p,0), so it CANNOT be used on a
+// read-only page. fetch_or/and/xor are required only by jemalloc (a MALLOC=libc
+// build does not touch them) — not yet implemented.
 pub const ATOMIC_MACROS: &[(&str, &[&str], &str)] = &[
     (
         "__atomic_load_n",
@@ -71,11 +74,12 @@ pub const ATOMIC_MACROS: &[(&str, &[&str], &str)] = &[
             __zcc_cur == __zcc_old ? 1 : (*(e) = __zcc_cur, 0); })",
     ),
 ];
-// EXT(gcc): builtin bit-manipulation redis đòi (util.h clz, endianconv bswap64,
-// keymeta popcount, hyperloglog ctzll) — statement-expr thuần, không cần codegen
-// riêng; ngữ nghĩa -O0 nên tốc độ không phải mục tiêu. Tên biến tạm phải khác
-// nhau giữa các macro vì bswap64 expand lồng bswap32 (arg nằm TRONG block con:
-// trùng tên là tự tham chiếu). clz/ctz với x=0: UB, giống GCC.
+// EXT(gcc): bit-manipulation builtins required by redis (util.h clz, endianconv
+// bswap64, keymeta popcount, hyperloglog ctzll) — pure statement-expr, no
+// dedicated codegen needed; with -O0 semantics, speed is not a goal. The
+// temporary variable names must differ between macros because bswap64 expands a
+// nested bswap32 (the arg lives INSIDE the inner block: a name clash would be
+// self-referential). clz/ctz with x=0: UB, as in GCC.
 pub const BIT_MACROS: &[(&str, &[&str], &str)] = &[
     (
         "__builtin_bswap16",
@@ -135,8 +139,9 @@ pub const BIT_MACROS: &[(&str, &[&str], &str)] = &[
     ),
 ];
 
-// EXT(gcc): __ATOMIC_RELAXED..__ATOMIC_SEQ_CST = 0..5 (giá trị như GCC); sự TỒN TẠI của
-// __ATOMIC_SEQ_CST là cái hdr_atomic.h dò để chọn path __atomic
+// EXT(gcc): __ATOMIC_RELAXED..__ATOMIC_SEQ_CST = 0..5 (values as in GCC); the
+// EXISTENCE of __ATOMIC_SEQ_CST is what hdr_atomic.h probes to select the
+// __atomic path
 pub const ATOMIC_ORDERS: &[&str] = &[
     "__ATOMIC_RELAXED",
     "__ATOMIC_CONSUME",
@@ -146,14 +151,15 @@ pub const ATOMIC_ORDERS: &[&str] = &[
     "__ATOMIC_SEQ_CST",
 ];
 
-// EXT(gcc): __builtin_{add,sub,mul}_overflow — ngữ nghĩa ℤ (spec GCC): tính
-// a∘b trong số nguyên vô hạn, *res = giá trị cắt về kiểu *res, trả 1 nếu KHÔNG
-// biểu diễn được. Nhúng mỗi toán hạng ≤64-bit thành two's-complement 128-bit
-// {hi,lo} theo dấu RIÊNG của nó ⇒ phép toán 128-bit uniform (add=adds/adc,
-// sub=subs/sbc, mul=mul/umulh/madd — bỏ term ah*bh vì ở 2^128) ⇒ test biểu
-// diễn được = đơn ánh ℤ→Tr. Toàn cset, KHÔNG nhánh. AArch64 thuần register,
-// dùng chung darwin+ELF (cùng ISA). Backend đặt sẵn: x0=al, x1=bl, x9=&res;
-// scratch x10..x15. op 0=+ 1=- 2=*; a/b_sg = toán hạng signed; r_sg,rw = *res.
+// EXT(gcc): __builtin_{add,sub,mul}_overflow — ℤ semantics (GCC spec): compute
+// a∘b over the infinite integers, *res = the value truncated to the type of *res,
+// return 1 if it is NOT representable. Each ≤64-bit operand is embedded as a
+// 128-bit two's-complement {hi,lo} according to ITS OWN signedness ⇒ a uniform
+// 128-bit operation (add=adds/adc, sub=subs/sbc, mul=mul/umulh/madd — the ah*bh
+// term is dropped as it lives at 2^128) ⇒ the representability test is the
+// injectivity of ℤ→Tr. All cset, NO branches. Pure-register AArch64, shared by
+// darwin+ELF (same ISA). The backend pre-places: x0=al, x1=bl, x9=&res;
+// scratch x10..x15. op 0=+ 1=- 2=*; a/b_sg = operand is signed; r_sg,rw = *res.
 pub fn overflow_emit(s: &mut String, op: u8, a_sg: bool, b_sg: bool, r_sg: bool, rw: u32) {
     use std::fmt::Write as _;
     let ext = |s: &mut String, hi: &str, lo: &str, sg: bool| {
@@ -182,17 +188,17 @@ pub fn overflow_emit(s: &mut String, op: u8, a_sg: bool, b_sg: bool, r_sg: bool,
             2 => "strh w12, [x9]",
             _ => "strb w12, [x9]",
         }
-    ); // *res = rw byte thấp
+    ); // *res = the low rw bytes
     let wb = rw * 8;
     if !r_sg {
-        // unsigned: biểu diễn được ⟺ rh==0 ∧ (rl>>wb)==0
+        // unsigned: representable ⟺ rh==0 ∧ (rl>>wb)==0
         _ = writeln!(s, "\tmov x14, x13");
         if wb < 64 {
             _ = writeln!(s, "\torr x14, x14, x12, lsr #{wb}");
         }
         _ = writeln!(s, "\tcmp x14, #0\n\tcset x0, ne");
     } else {
-        // signed: ⟺ sign-extend(rl, wb) == {rh,rl}
+        // signed: representable ⟺ sign-extend(rl, wb) == {rh,rl}
         _ = if wb < 64 {
             writeln!(s, "\tsbfx x14, x12, #0, #{wb}")
         } else {
@@ -205,15 +211,17 @@ pub fn overflow_emit(s: &mut String, op: u8, a_sg: bool, b_sg: bool, r_sg: bool,
     }
 }
 
-// EXT(gcc): `__builtin_<f>` mà <f> là hàm thư viện C thật (abort, memcpy, printf…)
-// → GCC đổ về symbol libc; zcc strip prefix rồi gọi thẳng. DANH SÁCH TRẮNG bắt
-// buộc (default-deny): builtin nào KHÔNG có ở đây = intrinsic thuần compiler
-// (clrsb, parity, frame_address, apply, va_arg_pack, mul_overflow_p…) — strip
-// sẽ đẻ call tới symbol KHÔNG tồn tại → as/ld nghẹn (silent-miscompile). Luật
-// 2-fact: builtin lạ phải REJECT SẠCH, không được âm thầm hoá libc-call. Danh
-// sách = hàm thư viện C89/C99 + POSIX/GNU-string mà corpus THẬT đụng (test-first).
+// EXT(gcc): `__builtin_<f>` where <f> is a real C library function (abort, memcpy,
+// printf…) → GCC lowers it to the libc symbol; zcc strips the prefix and calls it
+// directly. A mandatory ALLOWLIST (default-deny): any builtin NOT here is a pure
+// compiler intrinsic (clrsb, parity, frame_address, apply, va_arg_pack,
+// mul_overflow_p…) — stripping it would emit a call to a NON-existent symbol →
+// as/ld chokes (a silent miscompile). Under the 2-fact rule, an unknown builtin
+// must be REJECTED CLEANLY, never silently turned into a libc call. The list =
+// the C89/C99 library functions + POSIX/GNU-string functions the REAL corpus
+// touches (test-first).
 pub fn builtin_is_libc(f: &str) -> bool {
-    // fortified `__builtin___memcpy_chk` → strip còn `__memcpy_chk` (symbol musl thật)
+    // fortified `__builtin___memcpy_chk` → strips to `__memcpy_chk` (a real musl symbol)
     if let Some(core) = f.strip_prefix("__").and_then(|x| x.strip_suffix("_chk")) {
         return builtin_is_libc(core);
     }
@@ -236,7 +244,7 @@ pub fn builtin_is_libc(f: &str) -> bool {
         | "_Exit" | "atexit" | "abs" | "labs" | "llabs" | "imaxabs" | "atoi"
         | "atol" | "atoll" | "atof" | "qsort" | "bsearch" | "getenv"
         | "strtol" | "strtoul" | "strtoll" | "strtoull" | "strtod"
-        // math.h (libm — driver link -lm)
+        // math.h (libm — the driver links -lm)
         | "fabs" | "fabsf" | "fabsl" | "sqrt" | "sqrtf" | "sqrtl"
         | "copysign" | "copysignf" | "copysignl" | "fmax" | "fmin" | "fmod"
         | "floor" | "ceil" | "round" | "trunc" | "pow" | "exp" | "log"

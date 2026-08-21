@@ -1,19 +1,20 @@
 #!/bin/sh
-# gate.sh — T2 (SOP v3): dispatcher gate theo VÙNG SRC vừa sửa.
-# Chỉ chạy gate sở hữu vùng, không chạy gate không liên quan.
-# Dùng: tests/gate.sh <vùng> [vùng...]   |   tests/gate.sh all
-# Vùng (khớp bảng gate-map trong SOP):
+# gate.sh — dispatcher that selects a gate by the SRC AREA just modified.
+# Runs only the gate owning that area, not unrelated gates.
+# Usage: tests/gate.sh <area> [area...]   |   tests/gate.sh all
+# Areas (matching the gate-map table):
 #   lex | cpp | decl | layout | uac | abi | decay | ext | cases | all
-# Ghi chú interface thật: shape.sh chạy TRỌN 3 lớp lex/decl/layout một phát
-# (không nhận arg) — gọi vùng nào trong 3 lớp đó đều nổ shape.sh nguyên con,
-# vẫn đơn vị phút. Gate ELF trong box: chạy qua probe.sh với ZCC env.
+# Note on the actual interface: shape.sh runs ALL 3 layers lex/decl/layout in one
+# shot (it takes no arg) — invoking any of those 3 areas fires the whole of
+# shape.sh, still on the order of minutes. ELF gate in the box: run via probe.sh
+# with the ZCC env.
 set -u
 D=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 2; }
 rc=0
 run_gate() {
     echo "== GATE: $*"
-    ( cd "$D/.." && sh "$@" ) || { rc=1; echo "== GATE ĐỎ: $*"; }
+    ( cd "$D/.." && sh "$@" ) || { rc=1; echo "== GATE RED: $*"; }
 }
 for v in "$@"; do
     case $v in
@@ -26,8 +27,8 @@ for v in "$@"; do
         cases)                       run_gate tests/run.sh cases ;;
         all) for g in tests/shape.sh tests/cpp.sh tests/alg.sh tests/abi.sh tests/decay.sh; do run_gate $g; done
              run_gate tests/run.sh cases; run_gate tests/run.sh ext ;;
-        *) echo "gate.sh: vùng lạ '$v' (xem bảng trong header)"; rc=2 ;;
+        *) echo "gate.sh: unknown area '$v' (see the table in the header)"; rc=2 ;;
     esac
 done
-[ $rc -eq 0 ] && echo "T2 XANH: mọi gate được gọi đều pass"
+[ $rc -eq 0 ] && echo "GREEN: every invoked gate passed"
 exit $rc
