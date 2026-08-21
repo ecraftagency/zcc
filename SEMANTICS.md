@@ -235,6 +235,26 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > (Bin/Un/Cast/Lea-Local); Loads keep block-local `cse` (cross-block load reuse needs
 > memory-availability analysis, omitted). Content: **`⟦f⟧ = ⟦gvn(f)⟧`** for f in SSA
 > form, gated by `equiv`.
+>
+> **`cfg_simplify` (Phase A, `opt::cfg_simplify`, structural CFG cleanup).** Two graph
+> rewrites that touch NO instruction's value: (1) a block `S` whose sole predecessor `P`
+> ends in `Jmp(S)` is spliced into `P` (append `S`'s instructions, adopt `S`'s
+> terminator) — `P` then `S` was already the exact execution order, with no edge entering
+> or leaving between them; (2) a block unreachable from the entry is deleted and the
+> survivors renumbered. `interp` never visits an unreachable block and executes a spliced
+> pair identically, so the executed instruction SEQUENCE is invariant — content
+> **`⟦f⟧ = ⟦cfg_simplify(f)⟧`**, gated by `equiv`. Guarded by `cfg_complete` (a computed
+> goto leaves the CFG edges unmodeled). It exists to collapse the straight lines and
+> orphaned blocks `sccp` exposes; φ-arms naming a merged/removed predecessor are renamed
+> or pruned to keep the IR well-formed.
+>
+> **register coalescing (Phase A, biased coloring in `opt::color_abi`/`abi_alloc`).** NOT
+> a `⟦·⟧` rewrite — it changes only the register ASSIGNMENT, not the IR. A non-interfering
+> move pair (`Copy` dst/src, disjoint live ranges) is biased toward the SAME color, so the
+> copy lowers to a self-move the peephole elides. The bias chooses only among colors
+> already free and legal for the temp, so the coloring stays valid and the correctness
+> theorem is unchanged — the same interference-invariant rename-bisimulation as Stage 5b
+> (`verify_abi`). No node-merge ⟹ k-colorability is never worsened ⟹ no spill risk.
 
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,

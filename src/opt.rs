@@ -566,11 +566,21 @@ pub struct ClassBudget {
 /// Chaitin simplify/select over ONE register class (`in_class` selects its temps;
 /// interference edges to out-of-class temps are ignored — the two files are disjoint).
 /// A `crossing` temp may only take a callee-saved color. Result: per-temp color, None = spill.
+///
+/// `bias` carries CONSERVATIVE register coalescing (Phase A): `bias[v]` lists the temps
+/// move-related to v (a non-interfering `Copy` partner). At SELECT, v prefers a color
+/// already held by such a partner, so the copy lowers to a same-register `mov` the
+/// peephole elides. This is coalescing WITHOUT node-merge — it only picks among the
+/// colors already free & legal for v, so it can never worsen k-colorability and NEVER
+/// changes the coloring's validity: the interference invariant (hence the ⟦·⟧-preserving
+/// rename-bisimulation) is identical with or without the bias. Correctness therefore
+/// rests on the SAME `verify_abi` theorem as Stage 5b — no new proof obligation.
 pub fn color_abi(
     adj: &[HashSet<Tmp>],
     in_class: &[bool],
     b: &ClassBudget,
     crossing: &[bool],
+    bias: &[Vec<Tmp>],
 ) -> Vec<Option<u32>> {
     let nt = adj.len();
     let k = b.k as usize;
@@ -617,7 +627,16 @@ pub fn color_abi(
             }
         }
         let lo = if crossing[v as usize] { b.ncaller } else { 0 };
-        colr[v as usize] = (lo..b.k).find(|&c| !used[c as usize]);
+        let free = |c: u32| c >= lo && c < b.k && !used[c as usize];
+        // biased coalescing: prefer a free, in-range color already held by a same-class
+        // move partner (the copy becomes a self-move). Falls back to the smallest free
+        // color — so the result is always a valid coloring regardless of the bias.
+        let biased = bias[v as usize]
+            .iter()
+            .filter(|&&p| in_class[p as usize])
+            .filter_map(|&p| colr[p as usize])
+            .find(|&c| free(c));
+        colr[v as usize] = biased.or_else(|| (lo..b.k).find(|&c| free(c)));
     }
     colr
 }
@@ -668,10 +687,25 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget) -> 
             }
         }
     }
+    // Conservative coalescing candidates: a Copy whose dst/src are distinct temps that
+    // do NOT interfere (their live ranges are disjoint) can share a register. Same class
+    // by construction (a Copy preserves type); the per-class select filters anyway.
+    let mut move_adj: Vec<Vec<Tmp>> = vec![Vec::new(); nt];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Copy(d, _, Val::Tmp(s)) = i
+                && d != s
+                && !adj[*d as usize].contains(s)
+            {
+                move_adj[*d as usize].push(*s);
+                move_adj[*s as usize].push(*d);
+            }
+        }
+    }
     let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
     let gp_in: Vec<bool> = is_fp.iter().map(|&b| !b).collect();
-    let gc = color_abi(&adj, &gp_in, gp, &crossing);
-    let fc = color_abi(&adj, &is_fp, fp, &crossing);
+    let gc = color_abi(&adj, &gp_in, gp, &crossing, &move_adj);
+    let fc = color_abi(&adj, &is_fp, fp, &crossing, &move_adj);
     for t in 0..nt {
         home[t] = if is_fp[t] { fc[t] } else { gc[t] }.map(|c| (is_fp[t], c));
     }
@@ -1657,6 +1691,129 @@ pub fn gvn(f: &mut IrFunc) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CFG SIMPLIFICATION (Phase A) — structural cleanup that removes JUMPS and BLOCKS
+// without touching any instruction's value. Two ⟦·⟧-trivial rewrites:
+//   (1) straight-line MERGE — a block S whose SOLE predecessor P ends in Jmp(S)
+//       (so P's only successor is S) is spliced into P: append S's instructions,
+//       adopt S's terminator. No edge enters or leaves between P and S, so the
+//       executed instruction SEQUENCE (P then S) is identical ⟹ ⟦·⟧ unchanged.
+//       S's successors' φ-arms that name S are renamed to P (P now owns that edge).
+//       A φ in S would need a single arm (S has one pred) — Braun never builds one,
+//       but if present it degenerates to a Copy of that arm.
+//   (2) UNREACHABLE elimination — a block never reached from the entry is deleted
+//       and the survivors renumbered (BlockId = index); interp never visits it ⟹
+//       ⟦·⟧ unchanged. Dead φ-arms naming a removed predecessor are dropped.
+// SCCP folds Br(const)→Jmp, orphaning the not-taken block; (2) removes it and (1)
+// then collapses the resulting straight line. Guarded by `cfg_complete` (computed-goto
+// edges are unmodeled → reachability/predecessors incomplete). Returns the count of
+// structural rewrites (a change-metric for the optimize_ssa fixpoint). MEASURED by
+// `equiv`, never trusted. Side I (algorithm: CFG graph rewrite preserving the
+// walk); no spec-constant involved.
+// ─────────────────────────────────────────────────────────────────────────────
+fn rename_phi_pred(b: &mut Block, from: BlockId, to: BlockId) {
+    for i in b.insts.iter_mut() {
+        if let Inst::Phi(_, _, arms) = i {
+            for (p, _) in arms.iter_mut() {
+                if *p == from {
+                    *p = to;
+                }
+            }
+        }
+    }
+}
+
+fn remap_term(t: &mut Term, map: &[u32]) {
+    match t {
+        Term::Jmp(a) => *a = map[*a as usize],
+        Term::Br(_, a, b) => {
+            *a = map[*a as usize];
+            *b = map[*b as usize];
+        }
+        Term::Ret(_) | Term::Unreachable => {}
+    }
+}
+
+pub fn cfg_simplify(f: &mut IrFunc) -> u32 {
+    if !cfg_complete(f) {
+        return 0; // computed goto: the CFG is incomplete → merge/reachability unsound
+    }
+    let mut changed = 0u32;
+    // (1) straight-line merges to a fixpoint (recompute predecessors each step).
+    loop {
+        let preds = predecessors(f);
+        let mut pair = None;
+        for p in 0..f.blocks.len() as BlockId {
+            if let Term::Jmp(s) = f.blocks[p as usize].term
+                && s != 0 // never merge the entry away
+                && s != p // not a self-loop
+                && preds[s as usize].len() == 1
+            {
+                pair = Some((p, s)); // s's sole predecessor is p
+                break;
+            }
+        }
+        let (p, s) = match pair {
+            Some(x) => x,
+            None => break,
+        };
+        let mut succs = Vec::new();
+        term_targets(&f.blocks[s as usize].term, &mut succs);
+        for t in succs {
+            if t != s {
+                rename_phi_pred(&mut f.blocks[t as usize], s, p);
+            }
+        }
+        let sb = std::mem::replace(
+            &mut f.blocks[s as usize],
+            Block { insts: Vec::new(), term: Term::Unreachable },
+        );
+        for inst in sb.insts {
+            match inst {
+                Inst::Phi(d, ty, arms) => {
+                    let v = arms.iter().find(|(pp, _)| *pp == p).map(|(_, v)| *v).unwrap_or(Val::Imm(0));
+                    f.blocks[p as usize].insts.push(Inst::Copy(d, ty, v));
+                }
+                other => f.blocks[p as usize].insts.push(other),
+            }
+        }
+        f.blocks[p as usize].term = sb.term;
+        changed += 1; // s is now an isolated Unreachable block; step (2) deletes it
+    }
+    // (2) unreachable-block elimination + renumber.
+    let reach = reachable_blocks(f);
+    if reach.iter().any(|&r| !r) {
+        let mut map = vec![0u32; f.blocks.len()];
+        let mut next = 0u32;
+        for (b, &r) in reach.iter().enumerate() {
+            if r {
+                map[b] = next;
+                next += 1;
+            }
+        }
+        let old = std::mem::take(&mut f.blocks);
+        for (b, mut blk) in old.into_iter().enumerate() {
+            if !reach[b] {
+                continue; // deleted (already counted as a merge, or genuinely dead)
+            }
+            remap_term(&mut blk.term, &map);
+            for i in blk.insts.iter_mut() {
+                if let Inst::Phi(_, _, arms) = i {
+                    arms.retain(|(pp, _)| reach[*pp as usize]);
+                    for (pp, _) in arms.iter_mut() {
+                        *pp = map[*pp as usize];
+                    }
+                }
+            }
+            f.blocks.push(blk);
+        }
+        for (_, b) in f.labels.iter_mut() {
+            *b = map[*b as usize];
+        }
+    }
+    changed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
 // point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
 // return to executable (φ-free) IR and do a final non-SSA cleanup.
@@ -1679,6 +1836,7 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc) {
         n += gvn(f); // global redundant-expression elimination (dominator-based)
         n += cse(f); // block-local load reuse (GVN skips memory)
         n += dce(f); // reclaim the temps the above passes deadened (incl. φ)
+        n += cfg_simplify(f); // collapse the straight lines / dead blocks SCCP exposed
         if n == 0 {
             break; // fixpoint
         }
@@ -2001,6 +2159,43 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{nm}/{}: {e}", f.name));
             }
         }
+    }
+
+    // Phase A — conservative register COALESCING (biased coloring). Its correctness is
+    // the SAME theorem as Stage 5b: the bias only chooses among already-free, already-legal
+    // colors, so the coloring stays valid ⟹ rename-bisimulation ⟹ ⟦·⟧ preserved — proven
+    // by `verify_abi` (which now runs WITH the bias in `abi_alloc_valid`). This test proves
+    // the pass is NON-VACUOUS: a non-interfering `Copy` pair (the φ-destruction edge copies
+    // out_of_ssa emits) actually ends up in the SAME register, so the copy lowers to a
+    // self-move the peephole elides.
+    #[test]
+    fn coalesce_shares_register_for_moves() {
+        // The fib swap loop: out_of_ssa emits edge copies for a,b,i — the coalescing targets.
+        let (ast, ir) = compile(
+            "coal",
+            "int f(int n){int a=0,b=1,i=0;while(i<n){int t=a+b;a=b;b=t;i=i+1;}return a;}",
+        );
+        let mut f = ir[0].clone();
+        to_ssa(&ast.tt, &mut f);
+        out_of_ssa(&mut f); // emits the Copy insts coalescing bites on
+        verify(&f).unwrap();
+        let (gp, fp) = (gp_budget(), fp_budget());
+        let home = abi_alloc(&ast.tt, &f, &gp, &fp);
+        verify_abi(&ast.tt, &f, &home, &gp, &fp).expect("biased coloring must still be valid");
+        let mut move_pairs = 0u32;
+        let mut coalesced = 0u32;
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Copy(d, _, Val::Tmp(s)) = i {
+                    move_pairs += 1;
+                    if home[*d as usize].is_some() && home[*d as usize] == home[*s as usize] {
+                        coalesced += 1; // shares a register ⟹ self-move ⟹ elidable
+                    }
+                }
+            }
+        }
+        assert!(move_pairs >= 1, "out_of_ssa must have produced edge copies to coalesce");
+        assert!(coalesced >= 1, "a non-interfering move pair MUST be coalesced ({coalesced}/{move_pairs})");
     }
 
     // TEETH for call-clobber: with ZERO callee-saved colors (k==ncaller), a value LIVE
@@ -2882,6 +3077,112 @@ mod tests {
         equiv(&ast.tt, &ssa, &opt, "f").expect("dominance-respecting GVN: ⟦to_ssa(f)⟧=⟦gvn(·)⟧");
         assert_eq!(interp(&ast.tt, &opt, "f", &[2, 1]).unwrap(), 9); // a>0: s=3 → 9
         assert_eq!(interp(&ast.tt, &opt, "f", &[-1, 2]).unwrap(), 2); // a≤0: s=1 → 1+1=2
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // CFG-SIMPLIFICATION — Phase A. THEOREM ⟦f⟧ = ⟦cfg_simplify(f)⟧ (a structural
+    // rewrite of the CFG that preserves the executed instruction sequence). Proven
+    // over 𝔼_struct in the SSA context (where merges/dead blocks actually arise), and
+    // on the SCCP-then-simplify path where it does real work.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn cfg_simplify_semantics_preserved() {
+        // ∀ e ∈ 𝔼_struct: to_ssa ▸ cfg_simplify commutes with ⟦·⟧, stays well-formed,
+        // and never introduces a φ. Anti-vacuous: the branch/loop families give blocks
+        // to merge/prune.
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        let mut shrank = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("cfgs", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+            }
+            let blocks_before: usize = ssa.iter().map(|f| f.blocks.len()).sum();
+            let mut opt = ssa.clone();
+            for f in opt.iter_mut() {
+                cfg_simplify(f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify cfg_simplify {src}: {e}"));
+            }
+            equiv(&ast.tt, &ssa, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦cfg_simplify(·)⟧ for {src}: {e}"));
+            let blocks_after: usize = opt.iter().map(|f| f.blocks.len()).sum();
+            if blocks_after < blocks_before {
+                shrank += 1;
+            }
+            proven += 1;
+        }
+        assert_eq!(proven, 312, "must prove cfg_simplify over the whole generated space");
+        assert!(shrank >= 36, "the branch/loop shapes must yield mergeable blocks (anti-vacuous), got {shrank}");
+        eprintln!("cfg_simplify theorem: {proven} exprs proven ⟦to_ssa(f)⟧=⟦cfg_simplify(·)⟧; {shrank} shrank");
+    }
+
+    // TEETH: SCCP folds a constant branch to Jmp, orphaning the not-taken block; then
+    // cfg_simplify must PRUNE it and MERGE the straight line — and the result must still
+    // compute the same value. If cfg_simplify silently did nothing, `shrank` above and
+    // this block-count drop would both be zero.
+    #[test]
+    fn cfg_simplify_prunes_dead_branch() {
+        // `c` is a runtime-opaque local the frontend does NOT fold, but SCCP promotes it
+        // to Const(1) and rewrites the branch → Jmp, orphaning the else block.
+        let (ast, ir) =
+            compile("cfgd", "int f(int a){int c=1;int r;if(c)r=a+1;else r=a-1;return r+r;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+            sccp(&ast.tt, f); // fold the constant branch → Jmp, orphaning the else block
+        }
+        let blocks_before: usize = ssa.iter().map(|f| f.blocks.len()).sum();
+        let mut opt = ssa.clone();
+        let mut n = 0u32;
+        for f in opt.iter_mut() {
+            n += cfg_simplify(f);
+        }
+        for f in &opt {
+            verify(f).unwrap();
+        }
+        assert!(n > 0, "cfg_simplify must fire after the constant branch is folded");
+        let blocks_after: usize = opt.iter().map(|f| f.blocks.len()).sum();
+        assert!(blocks_after < blocks_before, "dead block + straight line collapse ({blocks_before}→{blocks_after})");
+        equiv(&ast.tt, &ssa, &opt, "f").expect("dead-branch prune: ⟦sccp∘to_ssa(f)⟧=⟦cfg_simplify(·)⟧");
+        assert_eq!(interp(&ast.tt, &opt, "f", &[10]).unwrap(), 22); // (10+1)*2
+    }
+
+    // Self-proof (clean-input law): the gate has TEETH. Corrupt a merged instruction's
+    // value and equiv MUST catch it — proving the battery actually exercises the
+    // spliced code, not a vacuous pass.
+    #[test]
+    fn cfg_simplify_gate_has_teeth() {
+        let (ast, ir) =
+            compile("cfgt", "int f(int a){int s=0;int i;for(i=0;i<a;i=i+1)s=s+i;return s;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        let mut opt = ssa.clone();
+        cfg_simplify(&mut opt);
+        verify(&opt).unwrap();
+        let base = vec![ssa];
+        equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("identity: cfg_simplify preserves ⟦·⟧");
+        // Mutate one Add→Sub in the simplified function; equiv must diverge.
+        let mut bad = opt.clone();
+        let mut mutated = false;
+        'o: for b in bad.blocks.iter_mut() {
+            for i in b.insts.iter_mut() {
+                if let Inst::Bin(_, op @ Op::Add, ..) = i {
+                    *op = Op::Sub;
+                    mutated = true;
+                    break 'o;
+                }
+            }
+        }
+        assert!(mutated, "there must be an Add to mutate in the merged body");
+        assert!(
+            equiv(&ast.tt, &base, &vec![bad], "f").is_err(),
+            "an Add→Sub mutation in the merged code MUST be caught (else the gate is blind)"
+        );
     }
 
     // ═════════════════════════════════════════════════════════════════════════
