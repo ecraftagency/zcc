@@ -167,6 +167,10 @@ fn is_pure(i: &Inst) -> bool {
     matches!(
         i,
         Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Lea(..) | Inst::Cast(..) | Inst::Load(..)
+        // φ is side-effect-free (it only selects a value): a φ whose dst is unused is
+        // dead and may be removed — the `!used[d]` guard protects any LIVE φ. Straight
+        // lowering emits no φ, so this only affects the SSA pipeline (SCCP-deadened φ).
+        | Inst::Phi(..)
     )
 }
 
@@ -1472,6 +1476,37 @@ pub fn gvn(f: &mut IrFunc) -> u32 {
     n
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
+// point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
+// return to executable (φ-free) IR and do a final non-SSA cleanup.
+//
+//   optimize_ssa = to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce)* ▸ out_of_ssa ▸ optimize
+//
+// Each stage is an INDIVIDUALLY-PROVEN semantics-preserving rewrite (⟦·⟧-invariant,
+// gated by `equiv`); the COMPOSITE is therefore semantics-preserving, and this is
+// re-checked end-to-end by `optimize_ssa_preserves` — composition of commuting squares
+// is a commuting square, but we MEASURE it anyway (never trust by reasoning). This is
+// the artifact Stage 5 wires into the backend behind an optimization flag.
+// ─────────────────────────────────────────────────────────────────────────────
+pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc) {
+    to_ssa(tt, f);
+    for _ in 0..32 {
+        let mut n = 0;
+        n += sccp(tt, f); // conditional constants + dead-branch pruning (through φ)
+        n += const_fold(tt, f); // fold newly-constant operands
+        n += copy_prop(f); // collapse copies so GVN's operand value-numbers are canonical
+        n += gvn(f); // global redundant-expression elimination (dominator-based)
+        n += cse(f); // block-local load reuse (GVN skips memory)
+        n += dce(f); // reclaim the temps the above passes deadened (incl. φ)
+        if n == 0 {
+            break; // fixpoint
+        }
+    }
+    out_of_ssa(f); // φ → edge copies (swap/critical-edge safe) → executable IR
+    optimize(tt, f); // the proven non-SSA cleanup (folds the φ-destruction copies)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2535,5 +2570,68 @@ mod tests {
         equiv(&ast.tt, &ssa, &opt, "f").expect("dominance-respecting GVN: ⟦to_ssa(f)⟧=⟦gvn(·)⟧");
         assert_eq!(interp(&ast.tt, &opt, "f", &[2, 1]).unwrap(), 9); // a>0: s=3 → 9
         assert_eq!(interp(&ast.tt, &opt, "f", &[-1, 2]).unwrap(), 2); // a≤0: s=1 → 1+1=2
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // THE SSA PIPELINE — the composite QBE-level optimizer. THEOREM ⟦f⟧=⟦optimize_ssa(f)⟧.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn optimize_ssa_preserves() {
+        // ∀ e ∈ 𝔼_struct: the WHOLE pipeline commutes with ⟦·⟧, is well-formed, and the
+        // result is φ-free (backend-consumable). This is the end-to-end gate that Stage 5
+        // wiring relies on. Also cross-checked against the plain interp value.
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("pipe", src);
+            let mut opt = ir.clone();
+            for f in opt.iter_mut() {
+                optimize_ssa(&ast.tt, f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify optimize_ssa {src}: {e}"));
+            }
+            assert_eq!(count_phis(&opt), 0, "optimize_ssa must return φ-free IR for {src}");
+            equiv(&ast.tt, &ir, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦f⟧ ≠ ⟦optimize_ssa(f)⟧ for {src}: {e}"));
+            proven += 1;
+        }
+        assert_eq!(proven, 312, "must prove the SSA pipeline over the whole generated space");
+        eprintln!("optimize_ssa theorem: {proven} exprs proven ⟦f⟧=⟦optimize_ssa(f)⟧, φ-free");
+    }
+
+    #[test]
+    fn optimize_ssa_preserves_corpus_and_reduces() {
+        // Real programs (loop, cond, pointer, struct-ish, recursion): value-correct AND
+        // the pipeline actually shrinks the code (non-vacuous). Compared vs the plain
+        // interp result for a hard sanity check.
+        let cases: &[(&str, &str, &[i64], i64)] = &[
+            ("arith", "int f(int a,int b){int x=a+b;int y=a+b;return x*y+x*y;}", &[3, 4], 98),
+            ("loop", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1)s=s+i*i;return s;}", &[5], 30),
+            ("cond", "int f(int a){int t=1;int r;if(t)r=a*a;else r=0;return r+1;}", &[6], 37),
+            ("fib", "int f(int n){int a=0,b=1,i=0;while(i<n){int t=a+b;a=b;b=t;i=i+1;}return a;}", &[10], 55),
+            ("rec", "int f(int n){if(n<=1)return 1;return n*f(n-1);}", &[5], 120),
+            ("cfold", "int f(int a){int k=2*3+4;int m=k*2;return a+m;}", &[7], 27),
+        ];
+        for &(nm, src, args, want) in cases {
+            let (ast, ir) = compile(nm, src);
+            let before = count_insts(&ir);
+            let mut opt = ir.clone();
+            for f in opt.iter_mut() {
+                optimize_ssa(&ast.tt, f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify {nm}: {e}"));
+            }
+            assert_eq!(count_phis(&opt), 0, "{nm}: φ-free");
+            equiv(&ast.tt, &ir, &opt, "f").unwrap_or_else(|e| panic!("{nm}: {e}"));
+            assert_eq!(interp(&ast.tt, &opt, "f", args).unwrap(), want, "{nm}: wrong value");
+            assert_eq!(interp(&ast.tt, &ir, "f", args).unwrap(), want, "{nm}: baseline wrong (test bug)");
+            // At least one case must demonstrably shrink (the arith/cfold ones do).
+            if matches!(nm, "arith" | "cfold") {
+                assert!(count_insts(&opt) < before, "{nm}: pipeline must reduce ({before}→{})", count_insts(&opt));
+            }
+        }
     }
 }

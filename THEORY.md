@@ -157,6 +157,15 @@ target file (Side II); everything else is Side I.
 const-fold = rewrite-soundness · DCE = liveness · copy-prop = dominance + Leibniz ·
 CSE = value-numbering · regalloc = rename-bisimulation.
 
+**The SSA pipeline `opt::optimize_ssa` (the QBE-level projection under CbC) `[ssa-qbe fork]`:**
+`to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce)* ▸ out_of_ssa ▸ optimize`.
+Each stage is an individually-proven ⟦·⟧-invariant rewrite ⟹ the composite is too;
+re-MEASURED end-to-end by `optimize_ssa_preserves` (312 exprs × equiv, φ-free result)
++ `optimize_ssa_preserves_corpus_and_reduces` (value-correct + shrinks). The artifact
+Stage 5 wires into the backend behind an optimization flag. Deliberately OMITTED (QBE
+"most of the win, a fraction of the complexity", and the harder-to-prove): LICM,
+cross-loop GVN, and other loop restructuring.
+
 ### A8. Testing & proof methodology `[IN USE]`
 Differential testing · Metamorphic (commuting-square) · Property/boundary-value ·
 Structural exhaustion · UB filtering · 2-fact (PASS|NOT-IMPL|FAIL, gate = 0 FAIL) ·
