@@ -1361,6 +1361,117 @@ pub fn sccp(tt: &TyTab, f: &mut IrFunc) -> u32 {
     n
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GVN — Global Value Numbering (dominator-based, Simpson/Briggs). An SSA pass: the
+// global generalization of block-local `cse`. Two PURE instructions with the same
+// (op, type, operand value-numbers) compute the same value — and in SSA a temporary
+// has ONE definition, so its value is invariant along any path. Thus a redundant
+// computation whose value was already produced in a DOMINATING block can be replaced
+// by a Copy of that earlier temp (the dominating def is available on every path here).
+//
+// SOUND ONLY on SSA form (non-SSA reassignment would make same-operand-temp ≠ same-value)
+// — runs after `to_ssa`. Restricted to pure arithmetic (Bin/Un/Cast/Lea-Local); Loads
+// stay with block-local `cse` (cross-block load reuse needs memory-availability analysis,
+// deliberately omitted — the QBE "fraction of the complexity" ethos). Operand value-numbers
+// are the SSA temp ids themselves (single-def); run `copy_prop` first to collapse copies.
+//
+// THEOREM (CbC): `⟦f⟧ = ⟦gvn(f)⟧` for f in SSA form, MEASURED by `equiv`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Blocks reachable from the entry (a forward DFS over successors).
+fn reachable_blocks(f: &IrFunc) -> Vec<bool> {
+    let succ = successors(f);
+    let mut seen = vec![false; f.blocks.len()];
+    if f.blocks.is_empty() {
+        return seen;
+    }
+    seen[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(b) = stack.pop() {
+        for &s in &succ[b] {
+            if !seen[s as usize] {
+                seen[s as usize] = true;
+                stack.push(s as usize);
+            }
+        }
+    }
+    seen
+}
+
+/// Dominator SETS by the classic iterative data-flow fixpoint (Allen–Cocke):
+/// dom(b) = {b} ∪ (⋂ dom(p) over reachable predecessors p); dom(entry) = {entry}.
+/// `db ∈ dom(b)` ⟺ db dominates b (every path from entry to b passes through db).
+fn dominators(f: &IrFunc) -> Vec<HashSet<BlockId>> {
+    let nb = f.blocks.len();
+    let preds = predecessors(f);
+    let reach = reachable_blocks(f);
+    let allr: HashSet<BlockId> = (0..nb as BlockId).filter(|&b| reach[b as usize]).collect();
+    let mut dom = vec![allr; nb];
+    if nb > 0 {
+        dom[0] = HashSet::from([0]);
+    }
+    let order: Vec<BlockId> =
+        rpo(f).into_iter().filter(|&b| reach[b as usize] && b != 0).collect();
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let rp: Vec<BlockId> =
+                preds[b as usize].iter().copied().filter(|&p| reach[p as usize]).collect();
+            let mut newd = match rp.split_first() {
+                Some((first, rest)) => {
+                    let mut acc = dom[*first as usize].clone();
+                    for &p in rest {
+                        acc = acc.intersection(&dom[p as usize]).copied().collect();
+                    }
+                    acc
+                }
+                None => HashSet::new(),
+            };
+            newd.insert(b);
+            if newd != dom[b as usize] {
+                dom[b as usize] = newd;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    dom
+}
+
+pub fn gvn(f: &mut IrFunc) -> u32 {
+    let dom = dominators(f);
+    let reach = reachable_blocks(f);
+    let order: Vec<BlockId> = rpo(f).into_iter().filter(|&b| reach[b as usize]).collect();
+    // value-number key → (representative temp, its defining block).
+    let mut table: HashMap<(u16, u32, (u8, i64), (u8, i64)), (Tmp, BlockId)> = HashMap::new();
+    let mut n = 0u32;
+    for b in order {
+        for i in f.blocks[b as usize].insts.iter_mut() {
+            let (key, d, ty) = match i {
+                Inst::Bin(d, op, ty, a, bb) => (bin_key(*op, *ty, a, bb), *d, *ty),
+                Inst::Un(d, op, ty, a) => ((100u16 + *op as u16, *ty, enc(a), (9, 0)), *d, *ty),
+                Inst::Cast(d, from, to, a) => ((200u16, *to, enc(a), (9, *from as i64)), *d, *to),
+                Inst::Lea(d, Place::Local(off)) => ((300u16, 0u32, (3, *off as i64), (9, 0)), *d, ULONG),
+                _ => continue,
+            };
+            match table.get(&key) {
+                // reuse only when the earlier def DOMINATES here (available on every path).
+                Some(&(prev, db)) if dom[b as usize].contains(&db) => {
+                    *i = Inst::Copy(d, ty, Val::Tmp(prev));
+                    n += 1;
+                }
+                Some(_) => {} // same value but incomparable block → cannot safely reuse
+                None => {
+                    table.insert(key, (d, b));
+                }
+            }
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2313,5 +2424,116 @@ mod tests {
         }
         assert!(mutated, "SCCP must have produced a constant to corrupt");
         assert!(equiv(&ast.tt, &ssa, &bad, "f").is_err(), "a corrupted SCCP constant MUST be caught");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GVN — global value numbering (dominator-based). THEOREM ⟦to_ssa(f)⟧=⟦gvn(·)⟧.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn count_copies(ir: &[IrFunc]) -> usize {
+        ir.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Copy(..))).count()
+    }
+
+    #[test]
+    fn gvn_semantics_preserved() {
+        // ∀ e ∈ 𝔼_struct: GVN on SSA form commutes with ⟦·⟧, well-formed. copy_prop
+        // first (so operand value-numbers are canonical). Anti-vacuous: GVN must fire.
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        let mut fired = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("gvn", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+                copy_prop(f);
+            }
+            let mut opt = ssa.clone();
+            let mut changes = 0u32;
+            for f in opt.iter_mut() {
+                changes += gvn(f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify gvn {src}: {e}"));
+            }
+            equiv(&ast.tt, &ssa, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦gvn(·)⟧ for {src}: {e}"));
+            proven += 1;
+            if changes > 0 {
+                fired += 1;
+            }
+        }
+        assert_eq!(proven, 312, "must prove gvn over the whole generated space");
+        assert!(fired >= 36, "GVN must actually eliminate redundancy (anti-vacuous), got {fired}");
+        eprintln!("gvn theorem: {proven} exprs proven ⟦to_ssa(f)⟧=⟦gvn(·)⟧; {fired} fired");
+    }
+
+    // The GVN-SPECIFIC win over block-local cse: a redundant computation in a block
+    // DOMINATED by an earlier one is eliminated ACROSS the block boundary. Here `s*s` is
+    // computed at entry (u) and again in the then-block; entry dominates then ⟹ GVN
+    // replaces the second with a copy of u. (`s` is a promoted SSA temp — one value.)
+    #[test]
+    fn gvn_eliminates_across_dominating_block() {
+        let (ast, ir) =
+            compile("gvnd", "int f(int a,int b){int s=a+b;int u=s*s;if(a>b){return s*s+u;}return u;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+            copy_prop(f);
+        }
+        let muls_before: usize = ssa
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Bin(_, Op::Mul, ..)))
+            .count();
+        let mut opt = ssa.clone();
+        let mut n = 0u32;
+        for f in opt.iter_mut() {
+            n += gvn(f);
+        }
+        for f in &opt {
+            verify(f).unwrap();
+        }
+        assert!(n > 0, "GVN must fire on the cross-block redundant s*s");
+        let muls_after: usize = opt
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Bin(_, Op::Mul, ..)))
+            .count();
+        assert!(muls_after < muls_before, "the redundant multiply must be gone ({muls_before}→{muls_after})");
+        assert!(count_copies(&opt) > count_copies(&ssa), "a redundant op becomes a Copy");
+        equiv(&ast.tt, &ssa, &opt, "f").expect("cross-block GVN: ⟦to_ssa(f)⟧=⟦gvn(·)⟧");
+        // s=a+b, u=s*s; a>b → (s*s)+u = 2u; else u. Concrete:
+        assert_eq!(interp(&ast.tt, &opt, "f", &[3, 1]).unwrap(), 32); // s=4,u=16,a>b→32
+        assert_eq!(interp(&ast.tt, &opt, "f", &[1, 3]).unwrap(), 16); // s=4,u=16,a≤b→16
+    }
+
+    // Soundness guard for the DOMINANCE condition: a value computed in a block that does
+    // NOT dominate the use must NOT be reused. Two branches each compute s*s; neither
+    // dominates the other, so GVN must leave both (a wrong GVN would merge them and, via
+    // equiv over both edges, diverge). This proves the dominance test carries weight.
+    #[test]
+    fn gvn_respects_dominance() {
+        let (ast, ir) =
+            compile("gvndom", "int f(int a,int b){int s=a+b;int t;if(a>0)t=s*s;else t=s*s+1;return t;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+            copy_prop(f);
+        }
+        let mut opt = ssa.clone();
+        for f in opt.iter_mut() {
+            gvn(f);
+        }
+        for f in &opt {
+            verify(f).unwrap();
+        }
+        // Both branch multiplies survive (incomparable blocks) — equiv confirms no
+        // unsound merge slipped through regardless.
+        equiv(&ast.tt, &ssa, &opt, "f").expect("dominance-respecting GVN: ⟦to_ssa(f)⟧=⟦gvn(·)⟧");
+        assert_eq!(interp(&ast.tt, &opt, "f", &[2, 1]).unwrap(), 9); // a>0: s=3 → 9
+        assert_eq!(interp(&ast.tt, &opt, "f", &[-1, 2]).unwrap(), 2); // a≤0: s=1 → 1+1=2
     }
 }

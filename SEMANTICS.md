@@ -175,6 +175,17 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > the instruction). It carries no new denotation — its content is **`⟦f⟧ = ⟦sccp(f)⟧`**,
 > gated by `equiv`. Uses of a `Const` temp become `Imm`; a constant `Br` becomes `Jmp`
 > (a later DCE reclaims the pruned block).
+>
+> **`gvn` (Stage 4, `opt::gvn`, dominator-based value numbering).** The SSA-global
+> generalization of block-local `cse` (§ Pass 4). A pure `(op, τ, operand-value-numbers)`
+> is a value number; in SSA a temp has ONE definition, so its value is invariant along
+> any path — hence two instructions with the same value number compute the same value.
+> A redundant one is replaced by a `Copy` of the earlier temp ONLY when that temp's
+> defining block DOMINATES the use (`dominators`, the Allen–Cocke iterative fixpoint),
+> so the value is available on every path reaching here. Restricted to arithmetic
+> (Bin/Un/Cast/Lea-Local); Loads keep block-local `cse` (cross-block load reuse needs
+> memory-availability analysis, omitted). Content: **`⟦f⟧ = ⟦gvn(f)⟧`** for f in SSA
+> form, gated by `equiv`.
 
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
