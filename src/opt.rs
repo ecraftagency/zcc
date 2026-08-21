@@ -1172,6 +1172,195 @@ pub fn out_of_ssa(f: &mut IrFunc) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SCCP — Sparse Conditional Constant Propagation (Wegman & Zadeck, TOPLAS 1991).
+// An SSA pass (runs AFTER to_ssa, BEFORE out_of_ssa). Strictly stronger than
+// const_fold + copy_prop: it folds a value that is constant on every REACHABLE path
+// (through φ-joins), simultaneously discovering which CFG edges are dead — a branch
+// on a proven constant makes one successor unreachable, which can in turn prove more
+// φ constant. The two facts (reachability × constant lattice) reinforce each other in
+// one fixpoint; running const-prop and dead-branch-elimination separately would miss it.
+//
+// LATTICE (per SSA temp): Top ⊒ Const(c) ⊒ Bot. Top = "not yet known" (optimistic),
+// Const = one integer value on all reachable paths, Bot = "overdefined" (varies /
+// unknown). SSA gives each temp a SINGLE definition, so a temp's lattice value is just
+// the (monotone) evaluation of that one instruction — no cross-definition meet needed;
+// only φ MEETS its reachable arms. Monotone descent (Top→Const→Bot, reachable grows) ⟹
+// the round-robin fixpoint converges.
+//
+// THEOREM (CbC): `⟦f⟧ = ⟦sccp(f)⟧`. FAITHFUL by construction — the transfer function
+// evaluates constants with the SAME `eval_bin/eval_cast/canon` interp uses, and DECLINES
+// div/rem-by-0 (eval_bin→Err ⟹ Bot, keeping the instruction), matching interp's UB.
+// Floats stay Bot (interp models f64; the backend uses hardware regs — as in const_fold).
+// MEASURED by `equiv`, never trusted.
+// ─────────────────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq)]
+enum Lat {
+    Top,
+    Const(i64),
+    Bot,
+}
+
+/// The meet (greatest lower bound) of two lattice points — used to combine a φ's
+/// reachable arms and to lower a temp monotonically.
+fn lat_meet(a: Lat, b: Lat) -> Lat {
+    match (a, b) {
+        (Lat::Top, x) | (x, Lat::Top) => x,
+        (Lat::Const(x), Lat::Const(y)) if x == y => Lat::Const(x),
+        _ => Lat::Bot,
+    }
+}
+
+pub fn sccp(tt: &TyTab, f: &mut IrFunc) -> u32 {
+    let nt = f.temps.len();
+    let nb = f.blocks.len();
+    // Float temps are never folded (rounding / hardware register); seed them Bot.
+    let mut lat: Vec<Lat> =
+        (0..nt).map(|t| if tt.is_float(f.temps[t]) { Lat::Bot } else { Lat::Top }).collect();
+    let mut reach_b = vec![false; nb];
+    let mut reach_e: HashSet<(BlockId, BlockId)> = HashSet::new();
+    if nb > 0 {
+        reach_b[0] = true;
+    }
+
+    // The value of an operand under the current lattice (an immediate is a constant;
+    // a float immediate cannot be integer-folded → Bot).
+    let vlat = |lat: &[Lat], v: &Val| -> Lat {
+        match v {
+            Val::Imm(x) => Lat::Const(*x),
+            Val::Tmp(t) => lat[*t as usize],
+            Val::FImm(_) => Lat::Bot,
+        }
+    };
+    // The lattice value PRODUCED by one instruction (its transfer function). A φ meets
+    // its arms whose predecessor edge is currently reachable; anything not integer-
+    // foldable (Load/Call/Lea/exotic, a float result) is Bot.
+    let transfer = |lat: &[Lat], reach_e: &HashSet<(BlockId, BlockId)>, b: BlockId, i: &Inst| -> Lat {
+        match i {
+            Inst::Copy(_, ty, a) => match vlat(lat, a) {
+                Lat::Const(x) => Lat::Const(canon(tt, *ty, x)),
+                o => o,
+            },
+            Inst::Bin(_, op, ty, a, bb) => match (vlat(lat, a), vlat(lat, bb)) {
+                (Lat::Bot, _) | (_, Lat::Bot) => Lat::Bot,
+                (Lat::Const(x), Lat::Const(y)) => match eval_bin(tt, *op, *ty, x, y) {
+                    Ok(v) => Lat::Const(v),
+                    Err(_) => Lat::Bot, // div/rem by 0 → keep the instruction (UB), do not fold
+                },
+                _ => Lat::Top, // an operand still unknown (optimistic)
+            },
+            Inst::Un(_, op, ty, a) => match vlat(lat, a) {
+                Lat::Const(x) => {
+                    let r = match op {
+                        Un::Neg => canon(tt, *ty, x.wrapping_neg()),
+                        Un::BNot => canon(tt, *ty, !x),
+                    };
+                    Lat::Const(r)
+                }
+                o => o,
+            },
+            Inst::Cast(_, from, to, a) => {
+                if tt.is_float(*from) || tt.is_float(*to) {
+                    Lat::Bot // i↔f folding deferred (like float arithmetic)
+                } else {
+                    match vlat(lat, a) {
+                        Lat::Const(x) => Lat::Const(eval_cast(tt, *from, *to, x)),
+                        o => o,
+                    }
+                }
+            }
+            Inst::Phi(_, ty, arms) => {
+                let mut m = Lat::Top;
+                for (pb, v) in arms {
+                    if reach_e.contains(&(*pb, b)) {
+                        let a = match vlat(lat, v) {
+                            Lat::Const(x) => Lat::Const(canon(tt, *ty, x)),
+                            o => o,
+                        };
+                        m = lat_meet(m, a);
+                    }
+                }
+                m
+            }
+            _ => Lat::Bot, // Load/Call/Lea/Alloca/exotic define an unknown value
+        }
+    };
+
+    loop {
+        let mut changed = false;
+        let mark = |reach_b: &mut Vec<bool>, reach_e: &mut HashSet<(BlockId, BlockId)>, from: BlockId, to: BlockId, ch: &mut bool| {
+            if reach_e.insert((from, to)) {
+                *ch = true;
+            }
+            if !reach_b[to as usize] {
+                reach_b[to as usize] = true;
+                *ch = true;
+            }
+        };
+        for b in 0..nb {
+            if !reach_b[b] {
+                continue;
+            }
+            for i in &f.blocks[b].insts {
+                if let Some(d) = inst_def(i) {
+                    let nv = transfer(&lat, &reach_e, b as BlockId, i);
+                    let m = lat_meet(lat[d as usize], nv);
+                    if m != lat[d as usize] {
+                        lat[d as usize] = m;
+                        changed = true;
+                    }
+                }
+            }
+            match &f.blocks[b].term {
+                Term::Jmp(t) => mark(&mut reach_b, &mut reach_e, b as BlockId, *t, &mut changed),
+                Term::Br(c, t, e) => match vlat(&lat, c) {
+                    Lat::Const(0) => mark(&mut reach_b, &mut reach_e, b as BlockId, *e, &mut changed),
+                    Lat::Const(_) => mark(&mut reach_b, &mut reach_e, b as BlockId, *t, &mut changed),
+                    Lat::Bot => {
+                        mark(&mut reach_b, &mut reach_e, b as BlockId, *t, &mut changed);
+                        mark(&mut reach_b, &mut reach_e, b as BlockId, *e, &mut changed);
+                    }
+                    Lat::Top => {} // condition still undetermined — no edge yet (optimistic)
+                },
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // ── Apply. Every temp proven Const(c) has that value on all reachable paths
+    // (SSA single-def + monotone lattice) → substitute Imm(c) for its uses. A branch
+    // on a now-constant condition collapses to a Jmp (dead successor pruned; a later
+    // DCE reclaims the unreachable block).
+    let mut n = 0u32;
+    let subst = |x: &mut Val| {
+        if let Val::Tmp(t) = x {
+            if let Lat::Const(c) = lat[*t as usize] {
+                *x = Val::Imm(c);
+            }
+        }
+    };
+    for b in f.blocks.iter_mut() {
+        for i in b.insts.iter_mut() {
+            each_use_mut(i, |x| {
+                let before = matches!(x, Val::Tmp(_));
+                subst(x);
+                if before && matches!(x, Val::Imm(_)) {
+                    n += 1;
+                }
+            });
+        }
+        each_use_term_mut(&mut b.term, &subst);
+        if let Term::Br(Val::Imm(c), t, e) = &b.term {
+            b.term = Term::Jmp(if *c != 0 { *t } else { *e });
+            n += 1;
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2008,5 +2197,121 @@ mod tests {
             };
         }
         assert_eq!((reg[0], reg[1]), (20, 10), "seq_pcopy must realize the parallel swap");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STAGE 4 — SCCP (Wegman–Zadeck). THEOREM ⟦to_ssa(f)⟧ = ⟦sccp(to_ssa(f))⟧.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn sccp_semantics_preserved() {
+        // ∀ e ∈ 𝔼_struct: SCCP on SSA form commutes with ⟦·⟧, and is well-formed.
+        // Anti-vacuous: SCCP must actually fold on a healthy fraction (the constant
+        // sub-expression `3 o 4` in gen_rich, dead-branch prunes, …).
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        let mut folded = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("sccp", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+            }
+            let mut opt = ssa.clone();
+            let mut changes = 0u32;
+            for f in opt.iter_mut() {
+                changes += sccp(&ast.tt, f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify sccp {src}: {e}"));
+            }
+            equiv(&ast.tt, &ssa, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦sccp(to_ssa(f))⟧ for {src}: {e}"));
+            proven += 1;
+            if changes > 0 {
+                folded += 1;
+            }
+        }
+        assert_eq!(proven, 312, "must prove sccp over the whole generated space");
+        assert!(folded >= 36, "SCCP must actually fold on a healthy fraction (anti-vacuous), got {folded}");
+        eprintln!("sccp theorem: {proven} exprs proven ⟦to_ssa(f)⟧=⟦sccp(·)⟧; {folded} folded");
+    }
+
+    // The SCCP-SPECIFIC win over const_fold+copy_prop: a branch on a proven constant
+    // makes one arm UNREACHABLE, so a φ that merges (reachable-const, dead) collapses to
+    // the constant. Plain const-fold cannot do this (it has no reachability). Here `b`
+    // is constant 1 ⟹ the else is dead ⟹ c is provably 10 ⟹ the whole function is const.
+    #[test]
+    fn sccp_folds_through_reachability() {
+        let (ast, ir) = compile("sccpr", "int f(int a){int b=1;int c;if(b)c=10;else c=a;return c;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        let mut opt = ssa.clone();
+        for f in opt.iter_mut() {
+            sccp(&ast.tt, f);
+        }
+        for f in &opt {
+            verify(f).unwrap();
+        }
+        equiv(&ast.tt, &ssa, &opt, "f").expect("reachability fold: ⟦to_ssa(f)⟧=⟦sccp(·)⟧");
+        // The dead-branch condition collapsed → no Br survives in f (the else is pruned).
+        let ff = opt.iter().find(|f| f.name == "f").unwrap();
+        assert!(
+            ff.blocks.iter().all(|b| !matches!(b.term, Term::Br(..))),
+            "SCCP must resolve the constant branch to a Jmp"
+        );
+        // c is provably 10 regardless of a.
+        for a in [-3, 0, 7, 1000] {
+            assert_eq!(interp(&ast.tt, &opt, "f", &[a]).unwrap(), 10, "f({a}) must fold to 10");
+        }
+    }
+
+    // Self-proof (clean-input law): the gate must catch a WRONG SCCP result. Corrupt one
+    // constant that SCCP produced; equiv must reject. If green, every sccp verdict above
+    // is worthless.
+    #[test]
+    fn sccp_gate_has_teeth() {
+        let (ast, ir) = compile("sccpt", "int f(int a){int b=2*3+4;return a+b;}");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        let mut opt = ssa.clone();
+        for f in opt.iter_mut() {
+            sccp(&ast.tt, f);
+            dce(f); // strip the now-dead pre-fold arithmetic so the surviving Imm is LIVE
+        }
+        equiv(&ast.tt, &ssa, &opt, "f").expect("correct sccp must commute");
+        // Corrupt a folded immediate (b was 10) and confirm the gate bites.
+        let mut bad = opt.clone();
+        let mut mutated = false;
+        'o: for f in bad.iter_mut().filter(|f| f.name == "f") {
+            for blk in f.blocks.iter_mut() {
+                each_use_term_mut(&mut blk.term, |x| {
+                    if let Val::Imm(c) = x {
+                        *x = Val::Imm(*c + 1);
+                        mutated = true;
+                    }
+                });
+                for i in blk.insts.iter_mut() {
+                    each_use_mut(i, |x| {
+                        if let Val::Imm(c) = x {
+                            *x = Val::Imm(*c + 1);
+                            mutated = true;
+                        }
+                    });
+                    if mutated {
+                        break 'o;
+                    }
+                }
+                if mutated {
+                    break 'o;
+                }
+            }
+        }
+        assert!(mutated, "SCCP must have produced a constant to corrupt");
+        assert!(equiv(&ast.tt, &ssa, &bad, "f").is_err(), "a corrupted SCCP constant MUST be caught");
     }
 }

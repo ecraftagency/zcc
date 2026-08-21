@@ -164,6 +164,17 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > breaks a residual cycle by saving one value to a fresh temp. Its whole content is
 > the theorem **`⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧`**, gated by `equiv`. The
 > result is φ-free (backend-consumable) but no longer single-assignment.
+>
+> **`sccp` (Stage 4, `opt::sccp`, Wegman–Zadeck).** An SSA pass (between `to_ssa` and
+> `out_of_ssa`). A per-temp lattice `⊤ ⊒ Const(c) ⊒ ⊥` and a CFG-reachability set are
+> raised together in one monotone fixpoint: a temp is `Const(c)` only if it is `c` on
+> every REACHABLE path, and a `Br` on a proven constant marks only the taken edge
+> reachable — so a φ merging (reachable-const, dead-arm) collapses to the constant,
+> which plain const-folding cannot see. The transfer function reuses interp's own
+> `eval_bin/eval_cast/canon` (faithfulness) and declines div/rem-by-0 (→ `⊥`, keeping
+> the instruction). It carries no new denotation — its content is **`⟦f⟧ = ⟦sccp(f)⟧`**,
+> gated by `equiv`. Uses of a `Const` temp become `Imm`; a constant `Br` becomes `Jmp`
+> (a later DCE reclaims the pruned block).
 
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
