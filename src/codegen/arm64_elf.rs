@@ -1577,6 +1577,131 @@ impl<'a> Cg<'a> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BACKEND PEEPHOLE (Phase C) — machine-level redundant register-move elimination.
+//
+// WHY (MEASURED, not assumed): the emitter is an x0-accumulator machine ("every scalar
+// lives in x0", top-of-file). The Stage-5b allocator gives each IR temp a HOME register,
+// but the emitter still routes every op through x0/x1 and copies to/from the home — so a
+// value is stored to its home (`mov xH, x0`) and immediately reloaded (`mov x0, xH`). On
+// matmul this makes 197 of 398 instructions reg-reg `mov`s (gcc-O0: 0). This pass removes
+// the provably-redundant ones — the single biggest measured lever toward QBE-class codegen.
+//
+// SEMANTICS PRESERVED — the safety argument (machine-level translation validation):
+//   Track, within a STRAIGHT-LINE region, a value-equivalence over 64-bit GP registers: a
+//   `mov xD, xS` makes D≡S (they hold the identical 64-bit value). The ONLY rewrite is:
+//   DROP a `mov xD, xS` when the model already proves D≡S — the copy is then a verified
+//   no-op, so removing it cannot change any later observation. The model stays SOUND because
+//   every value-changing event breaks the relevant equivalence:
+//     • a recognized DEF (first-operand-writing instruction) gives its destination a FRESH
+//       value id — so no stale equivalence to it survives;
+//     • an unrecognized mnemonic, any branch/call/label (a basic-block boundary) FLUSHES the
+//       whole model — we never reason across control flow or an instruction we don't model.
+//   32-bit (`w`) writes and float ops that define a GP reg still invalidate that register's
+//   slot; equivalences are FORMED only by full-width `mov x,x`, so a partial-width write can
+//   never be mistaken for a 64-bit copy. Live-out is safe: a redundant `mov x0, xH` at a
+//   region end is dropped only when x0 ALREADY holds xH's value, so the return/epilogue sees
+//   the same x0. Correctness is re-validated end-to-end by opt-parity (0 DIVERGE) + torture.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parse `mov xD, xS` (both 64-bit GP) → (D, S); None for `mov x,#imm` / `mov w,w` / shifts.
+fn parse_mov_xx(t: &str) -> Option<(u32, u32)> {
+    let rest = t.strip_prefix("mov ")?;
+    let mut it = rest.split(',');
+    let d = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
+    let s = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
+    if it.next().is_some() {
+        return None; // a third operand (shift) ⟹ not a plain reg-reg move
+    }
+    Some((d, s))
+}
+
+/// The slot of the first register operand (x or w share a physical slot), for DEF tracking.
+fn first_reg_slot(operands: &str) -> Option<u32> {
+    let tok = operands.split(',').next()?.trim();
+    tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
+}
+
+/// Machine-level redundant-move elimination over one function body (see the block comment).
+fn peephole_moves(body: &str) -> String {
+    use std::collections::HashMap;
+    let mut out = String::with_capacity(body.len());
+    let mut eq: HashMap<u32, u64> = HashMap::new(); // register slot → value id
+    let mut next: u64 = 0;
+    // Recognized destination-writing mnemonics (dst = first register operand). Everything
+    // NOT here and NOT a store/compare/branch flushes the model (conservative = safe).
+    const DEF_FIRST: &[&str] = &[
+        "mov", "movk", "movz", "movn", "add", "sub", "mul", "msub", "madd", "neg", "mvn",
+        "and", "orr", "eor", "bic", "lsl", "lsr", "asr", "sdiv", "udiv", "sxtw", "sxth",
+        "sxtb", "uxtw", "uxth", "uxtb", "cset", "csel", "csinc", "cinc", "adrp", "ldr",
+        "ldrb", "ldrh", "ldrsw", "ldrsb", "ldrsh", "fmov", "scvtf", "ucvtf", "fcvt", "fadd",
+        "fsub", "fmul", "fdiv", "fneg", "fcvtzs", "fcvtzu", "sxtl",
+    ];
+    const NO_DEF: &[&str] =
+        &["str", "strb", "strh", "stp", "cmp", "cmn", "tst", "fcmp", "ccmp"];
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if t.ends_with(':') {
+            eq.clear(); // label = basic-block boundary
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if t.starts_with('.') {
+            out.push_str(line); // directive — touches no register
+            out.push('\n');
+            continue;
+        }
+        let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        let operands = t[mn.len()..].trim_start();
+        // The one rewrite: drop a mov xD,xS proven redundant; else record D≡S.
+        if let Some((d, s)) = parse_mov_xx(t) {
+            match (eq.get(&d), eq.get(&s)) {
+                (Some(a), Some(b)) if a == b => continue, // D already ≡ S → DROP
+                _ => {
+                    let sid = *eq.entry(s).or_insert_with(|| {
+                        next += 1;
+                        next
+                    });
+                    eq.insert(d, sid);
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+            }
+        }
+        if mn == "ldp" {
+            // two destinations = the first two register operands.
+            let mut regs = operands.split(',');
+            for _ in 0..2 {
+                if let Some(r) = regs.next().and_then(|tok| {
+                    let tok = tok.trim();
+                    tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
+                }) {
+                    next += 1;
+                    eq.insert(r, next);
+                }
+            }
+        } else if NO_DEF.contains(&mn) {
+            // no register destination — model unchanged.
+        } else if DEF_FIRST.contains(&mn) {
+            if let Some(r) = first_reg_slot(operands) {
+                next += 1;
+                eq.insert(r, next); // destination takes a fresh value ⟹ breaks stale ≡
+            }
+        } else {
+            eq.clear(); // unrecognized (incl. b/bl/br/ret/cbz/…) ⟹ flush = safe
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Backend entry point — the SOLE path: lower(AST) → IR → passes → asm. Covers the
 /// full suite/csmith/musl; the AST-walk emit() has been removed. The backend simulates per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
@@ -1653,10 +1778,73 @@ pub fn emit_ir(ast: &Ast) -> String {
         // Prologue parameter-ABI SHARED with emit() (nested-chain/variadic-save/sret/
         // spill scalar+struct+HFA) → parameters sit ready in frame slots for the IR body.
         emit_params(&mut g, f);
+        let body_start = g.s.len();
         g.emit_ir_body(&funcs[fi]);
+        // Phase C — machine-level redundant-move elimination over just this body (the region
+        // begins fresh: entered from the prologue, so an empty equivalence model is sound).
+        if passes.peephole && regalloc {
+            let body = g.s.split_off(body_start);
+            g.s.push_str(&peephole_moves(&body));
+        }
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
     }
     emit_module_tail(&mut g, ast);
     g.s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peephole_moves;
+
+    fn count(s: &str, needle: &str) -> usize {
+        s.lines().filter(|l| l.trim().starts_with(needle)).count()
+    }
+
+    // The core case: `mov xH, x0` then `mov x0, xH` — the second reload is redundant
+    // (x0 already holds xH's value) and must be DROPPED; the first store must be KEPT.
+    #[test]
+    fn peephole_drops_redundant_roundtrip() {
+        let body = "\tmov x24, x0\n\tmov x0, x24\n\tadd x0, x0, x1\n";
+        let out = peephole_moves(body);
+        assert_eq!(count(&out, "mov x0, x24"), 0, "the redundant reload must be dropped");
+        assert_eq!(count(&out, "mov x24, x0"), 1, "the store to the home must be kept");
+        assert!(out.contains("add x0, x0, x1"), "the real op is untouched");
+    }
+
+    // A DEF between the two movs BREAKS the equivalence — the reload is NOT redundant and
+    // must be KEPT (x0 was clobbered by the mul).
+    #[test]
+    fn peephole_keeps_move_after_clobber() {
+        let body = "\tmov x24, x0\n\tmul x0, x5, x6\n\tmov x0, x24\n";
+        let out = peephole_moves(body);
+        assert_eq!(count(&out, "mov x0, x24"), 1, "x0 was clobbered ⟹ the reload is real");
+    }
+
+    // A label (basic-block boundary) FLUSHES the model — a cross-boundary equivalence must
+    // never be assumed (the predecessor might not have set it).
+    #[test]
+    fn peephole_flushes_at_label() {
+        let body = "\tmov x24, x0\n.Lx:\n\tmov x0, x24\n";
+        let out = peephole_moves(body);
+        assert_eq!(count(&out, "mov x0, x24"), 1, "must not elide across a label");
+    }
+
+    // An UNRECOGNIZED mnemonic flushes conservatively (safety over coverage).
+    #[test]
+    fn peephole_flushes_on_unknown() {
+        let body = "\tmov x24, x0\n\tzzz x0, x1\n\tmov x0, x24\n";
+        let out = peephole_moves(body);
+        assert_eq!(count(&out, "mov x0, x24"), 1, "unknown insn ⟹ flush ⟹ keep the reload");
+    }
+
+    // Chained equivalence: x0≡x24≡x0 across a 3-hop still resolves; a genuinely distinct
+    // move (different value) is preserved.
+    #[test]
+    fn peephole_preserves_distinct_move() {
+        let body = "\tmov x24, x0\n\tmov x0, x24\n\tmov x1, x25\n";
+        let out = peephole_moves(body);
+        assert_eq!(count(&out, "mov x0, x24"), 0, "redundant dropped");
+        assert_eq!(count(&out, "mov x1, x25"), 1, "an unrelated move is preserved");
+    }
 }

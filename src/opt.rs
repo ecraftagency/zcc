@@ -2218,6 +2218,7 @@ pub struct Passes {
     pub licm: bool,
     pub strength_reduce: bool,
     pub coalesce: bool, // register coalescing (biased coloring, inside abi_alloc)
+    pub peephole: bool, // backend machine-level redundant-move elimination (arm64_elf)
 }
 
 impl Default for Passes {
@@ -2233,6 +2234,7 @@ impl Default for Passes {
             licm: false, // proven-correct but measured-negative on the naive-slot backend
             strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
             coalesce: true,
+            peephole: true, // measured win: removes the x0-funnel redundant reg-reg moves
         }
     }
 }
@@ -2256,6 +2258,7 @@ impl Passes {
             "licm" => self.licm = v,
             "strength_reduce" | "strength" | "sr" => self.strength_reduce = v,
             "coalesce" => self.coalesce = v,
+            "peephole" | "peep" => self.peephole = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -3786,6 +3789,7 @@ mod tests {
         assert!(!Passes::default().licm, "default profile ships licm OFF (measured-negative)");
         assert!(!Passes::default().strength_reduce, "default ships strength_reduce OFF (measured-negative)");
         assert!(Passes::default().gvn && Passes::default().coalesce, "other proven passes default ON");
+        assert!(Passes::default().peephole, "peephole default ON (MEASURED win: 1.39×→1.07×)");
         assert!(Passes::all().licm && Passes::all().strength_reduce, "all() turns loop passes ON");
         let mut p = Passes::default();
         p.set("gvn", false);

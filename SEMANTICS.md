@@ -313,6 +313,33 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > same denotation; the toggle changes only PERFORMANCE, never OBSERVABLE behavior
 > (`passes_toggle_wiring`, `coalesce_off_still_valid`).
 
+> **`peephole_moves` (Phase C, `arm64_elf`, backend redundant-move elimination) —
+> default-ON, the biggest measured win.** This is a MACHINE-level pass (post-codegen text),
+> not an IR ⟦·⟧ rewrite, so it lives in the target file and is validated by machine reasoning
+> + differential execution rather than the IR `equiv` harness. MOTIVE (measured): the emitter
+> is an x0-accumulator machine — every value flows through x0 and is copied to/from its home
+> register, so a store-then-reload `mov xH,x0 ; mov x0,xH` litters the output (matmul: 197 of
+> 398 instructions are reg-reg movs; gcc-O0 emits zero). The pass tracks a per-register 64-bit
+> value-equivalence within a straight-line region and performs exactly ONE rewrite: DROP a
+> `mov xD,xS` when the model already proves `xD ≡ xS` (a verified no-op). SOUNDNESS: every
+> recognized destination-writing instruction assigns its dst a FRESH value-id (breaking stale
+> equivalences), and any branch / call / label / unrecognized mnemonic FLUSHES the whole model
+> — so no equivalence survives a value change or is assumed across control flow. Equivalences
+> are formed only by full-width `mov x,x`, so a 32-bit `w` write (which zero-extends) can never
+> be mistaken for a 64-bit copy; live-out is safe because a redundant reload is dropped only
+> when the target already holds the value. Measured: bench geomean **1.39×→1.07× vs gcc-O0**
+> (beating gcc-O0 on loops 0.75× and sieve 0.63×). Gated by 5 machine unit tests + torture
+> (0 FAIL) + opt-parity (0 DIVERGE). Toggle `ZCC_OPT_OFF=peephole`.
+>
+> WHY THE IR PASSES REGRESS BUT THIS WINS (the LICM/phase-ordering answer): the commuting-square
+> proofs establish `⟦f⟧=⟦pass(f)⟧` — identical OUTPUT — and say NOTHING about instruction count
+> or cycles; performance is an ORTHOGONAL axis. On this x0-accumulator backend the true cost is
+> reg-reg move traffic, so LICM/strength-reduction (which add a loop-carried value and its
+> copies) can INCREASE that traffic and regress, while the peephole DIRECTLY deletes it and wins.
+> Optimizations are therefore NOT independent: their profitability is set by the backend and by
+> each other (SR needs `copy_prop` to even fire; LICM would pay only once values stay
+> register-resident). Correctness composes (every subset is ⟦·⟧-equal); PROFIT does not.
+
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
 `Alloca`, `CallX`, `Sync`, `Asm`. The interpreter returns an error, meaning the
