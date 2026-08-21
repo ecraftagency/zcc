@@ -103,6 +103,10 @@ pub enum Inst {
     // GNU computed-goto "goto *e": br qua giá trị. Kết thúc khối theo runtime (block
     // IR sau nó là dead — như Opaque cũ). Impure, KHÔNG dst.
     GotoPtr(Val),
+    // C99 6.7.5.2 VLA / __builtin_alloca: dst = con trỏ tới `size` byte cấp trên
+    // stack (sub sp, làm tròn 16). Impure (đổi sp) → không DCE/CSE dù dst chết;
+    // epilogue `mov sp,x29` thu hồi, reset_sp_base tại label depth-0 (goto-lùi).
+    Alloca(Tmp, Val), // dst = &vùng cấp; operand = số byte
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -166,7 +170,8 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::LabelAddr(d, ..)
         | Inst::VaArg(d, ..)
         | Inst::Overflow(d, ..)
-        | Inst::VaArea(d, ..) => Some(*d),
+        | Inst::VaArea(d, ..)
+        | Inst::Alloca(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::Opaque(d, ..) => *d,
         Inst::Store(..)
         | Inst::Memcpy(..)
@@ -195,7 +200,11 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
         }
-        Inst::Zero(a, _) | Inst::VaStart(a) | Inst::VaArg(_, a, _, _) | Inst::GotoPtr(a) => v(a),
+        Inst::Zero(a, _)
+        | Inst::VaStart(a)
+        | Inst::VaArg(_, a, _, _)
+        | Inst::GotoPtr(a)
+        | Inst::Alloca(_, a) => v(a),
         Inst::Overflow(_, _, _, _, _, a, b, rp) => {
             v(a);
             v(b);
@@ -627,6 +636,12 @@ impl<'a> Lower<'a> {
                 let off = *off;
                 let d = self.t(ty);
                 self.push(Inst::VaArea(d, off));
+                Val::Tmp(d)
+            }
+            Node::Alloca(e) => {
+                let sz = self.lower_expr(*e);
+                let d = self.t(ty);
+                self.push(Inst::Alloca(d, sz));
                 Val::Tmp(d)
             }
             // GNU statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
@@ -1177,8 +1192,9 @@ pub(crate) mod tests {
                     | Inst::VaArg(..)
                     | Inst::Overflow(..)
                     | Inst::VaArea(..)
-                    | Inst::GotoPtr(..) => {
-                        return Err("interp: exotic (symbol/va/overflow/goto — hàm không thuần)".into())
+                    | Inst::GotoPtr(..)
+                    | Inst::Alloca(..) => {
+                        return Err("interp: exotic (symbol/va/overflow/goto/alloca — hàm không thuần)".into())
                     }
                 }
             }

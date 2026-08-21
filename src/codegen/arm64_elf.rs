@@ -1938,6 +1938,12 @@ impl<'a> Cg<'a> {
                 self.ld_val(*a, "x0");
                 self.s += "\tbr x0\n";
             }
+            Inst::Alloca(d, size) => {
+                self.ld_val(*size, "x0"); // số byte
+                self.s += "\tadd x0, x0, #15\n\tand x0, x0, #0xfffffffffffffff0\n\tsub sp, sp, x0\n\tmov x0, sp\n";
+                self.vla_live += 1; // VLA sống scope hiện tại (dealloc reset_sp_base tại label)
+                self.tmp_store(*d, "x0");
+            }
         }
     }
 

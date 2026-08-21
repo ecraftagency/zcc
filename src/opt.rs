@@ -32,7 +32,11 @@ fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
             g(a);
             g(b);
         }
-        Inst::Zero(a, _) | Inst::VaStart(a) | Inst::VaArg(_, a, _, _) | Inst::GotoPtr(a) => g(a),
+        Inst::Zero(a, _)
+        | Inst::VaStart(a)
+        | Inst::VaArg(_, a, _, _)
+        | Inst::GotoPtr(a)
+        | Inst::Alloca(_, a) => g(a),
         Inst::Overflow(_, _, _, _, _, a, b, rp) => {
             g(a);
             g(b);
