@@ -1,6 +1,6 @@
 int printf(const char *fmt, ...);
 int garr[5] = {10, 20, 30};
-char gs[] = "global chuoi";
+char gs[] = "global string";
 char gs2[20] = "ngan";
 double gd[3] = {1.5, 2.5};
 int gm[2][3] = {{1, 2, 3}, {4, 5, 6}};
@@ -10,7 +10,7 @@ char *names[3] = {"mot", "hai", "ba"};
 int main(void) {
     int a[5] = {1, 2, 3};
     int b[] = {9, 8, 7, 6};
-    char s[] = "xin chao";
+    char s[] = "hello";
     char s2[12] = "hi";
     int m[2][3] = {{1, 2, 3}, {4, 5, 6}};
     struct pt p = {40, 2};

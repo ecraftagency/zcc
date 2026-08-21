@@ -1,11 +1,11 @@
 #define A 2
 #if A == 1
-#error nhanh sai khong duoc vao day
-int x = khong parse duoc dau
+#error wrong branch must not be taken here
+int x = unparseable if reached
 #elif A == 2
 #define R 10
 #else
-int y = cung khong parse duoc
+int y = also unparseable
 #endif
 #ifdef A
 #define R2 5
@@ -15,7 +15,7 @@ int y = cung khong parse duoc
 #endif
 #undef A
 #ifdef A
-int z = da undef roi ma
+int z = A is undefined now
 #endif
 #if defined(R) && !defined Q
 #define R4 26

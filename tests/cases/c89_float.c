@@ -26,7 +26,7 @@ int main() {
     printf("%f\n", d);
     printf("%d\n", 1.5 > 1.0);
     printf("%f\n", -d);
-    /* K&R 1.2: bảng Fahrenheit-Celsius */
+    /* K&R 1.2: Fahrenheit-Celsius table */
     for (i = 0; i <= 300; i += 100)
         printf("%3d %6.1f\n", i, (5.0 / 9.0) * (i - 32));
     return 0;

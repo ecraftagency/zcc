@@ -18,7 +18,7 @@ int main(void) {
     int i, j;
     a = 1; b = 2; p = &a; arr[0] = 5;
     r = 3; au = 4;
-    msg = "hang so";
+    msg = "constant";
     big = 5;
     printf("%d %d %d %d %d %d %lu %s\n", a, b, *p, arr[0], r, au, big, msg);
     bump(); bump();

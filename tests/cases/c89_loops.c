@@ -1,5 +1,5 @@
 int printf(char *fmt, ...);
-/* K&R 3.5-3.6: itoa + reverse bằng do-while */
+/* K&R 3.5-3.6: itoa + reverse implemented with do-while */
 int strlen_(char *s) {
     int n;
     for (n = 0; s[n] != '\0'; n++)

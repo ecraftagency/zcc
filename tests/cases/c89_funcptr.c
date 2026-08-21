@@ -4,7 +4,7 @@ int sub(int a, int b) { return a - b; }
 int apply(int (*op)(int, int), int x, int y) { return op(x, y); }
 long lret(void) { return 123456789012L; }
 char cret(void) { return 'z'; }
-char *sret(void) { return "chuoi"; }
+char *sret(void) { return "string"; }
 void nothing(void) { return; }
 static int hidden(int x) { return x * 2; }
 int main(void) {

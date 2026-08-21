@@ -1,4 +1,4 @@
-/* K&R 5.7-5.8: mang 2 chieu day_of_year/month_day, con tro vao hang */
+/* K&R 5.7-5.8: 2D array day_of_year/month_day, pointer into a row */
 #include <stdio.h>
 static char daytab[2][13] = {
     {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},

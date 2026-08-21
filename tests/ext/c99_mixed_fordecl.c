@@ -1,4 +1,4 @@
-/* EXT(c99): mixed declarations + declaration trong for-init */
+/* EXT(c99): mixed declarations + declaration in for-init */
 #include <stdio.h>
 int main(void) {
     printf("start\n");

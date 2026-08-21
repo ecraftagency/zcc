@@ -1,4 +1,4 @@
-/* K&R 7.3: minprintf — variadic + va_arg theo format */
+/* K&R 7.3: minprintf — variadic + va_arg per format */
 #include <stdio.h>
 #include <stdarg.h>
 void minprintf(char *fmt, ...) {
@@ -32,7 +32,7 @@ void minprintf(char *fmt, ...) {
     va_end(ap);
 }
 int main(void) {
-    minprintf("chao %s, %d tuoi, cao %f met\n", "Vu", 30, 1.75);
+    minprintf("hello %s, %d years old, %f m tall\n", "Ada", 30, 1.75);
     minprintf("100%% chac chan: %d %s %d\n", 1, "ne", -2);
     return 0;
 }

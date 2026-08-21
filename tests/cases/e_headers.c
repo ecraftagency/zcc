@@ -12,9 +12,9 @@ int main(void) {
     int *v;
     int arr[6];
     int i;
-    strcpy(buf, "xin ");
-    strcat(buf, "chao");
-    printf("%s %lu %d\n", buf, strlen(buf), strcmp(buf, "xin chao"));
+    strcpy(buf, "hello ");
+    strcat(buf, "world");
+    printf("%s %lu %d\n", buf, strlen(buf), strcmp(buf, "hello world"));
     sprintf(buf, "%d-%d", 40, 2);
     printf("%s | %d %ld\n", buf, atoi("123"), atol("-456"));
     printf("%d %d %d %c\n", isdigit('7'), isalpha('7'), isspace(' '), toupper('q'));

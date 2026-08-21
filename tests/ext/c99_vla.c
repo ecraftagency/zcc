@@ -1,5 +1,6 @@
-/* VLA local (C99) — zcc hạ xuống con trỏ + alloca; sizeof(vla) KHÔNG test
- * (zcc trả size con trỏ — sai spec có chủ đích, redis không đụng) */
+/* VLA local (C99) — zcc lowers to pointer + alloca; sizeof(vla) is NOT tested
+ * (zcc returns the pointer size — an intentional spec deviation, not exercised
+ * by the corpus) */
 #include <stdio.h>
 #include <string.h>
 
@@ -14,7 +15,7 @@ int sum_squares(int n) {
     return s + (int)strlen(buf);
 }
 
-/* VLA elem là struct, size từ tham số qua biểu thức */
+/* VLA element is a struct, size derived from a parameter via an expression */
 struct pt { int x, y; };
 int diag(int k) {
     struct pt m[k + 1];

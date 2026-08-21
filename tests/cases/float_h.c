@@ -1,5 +1,6 @@
-/* C89 2.2.4.2: float.h phải đủ bộ macro — thiếu cái nào thì #if user rơi
-   nhánh sai âm thầm (redis util.c double2ll — bug thật runtest bắt được) */
+/* C89 2.2.4.2: float.h must provide the full set of macros — if any is
+   missing, a user #if silently falls into the wrong branch (redis util.c
+   double2ll — a real bug caught by runtest). */
 #include <float.h>
 int printf(const char *, ...);
 int main(void)

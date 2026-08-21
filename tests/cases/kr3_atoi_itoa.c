@@ -1,4 +1,4 @@
-/* K&R 3.5-3.6 + ex3-4..3-6: atoi, itoa (chiu duoc INT_MIN), reverse */
+/* K&R 3.5-3.6 + ex3-4..3-6: atoi, itoa (handles INT_MIN), reverse */
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -42,7 +42,7 @@ int main(void) {
     printf("%s\n", buf);
     my_itoa(0, buf);
     printf("%s\n", buf);
-    strcpy(buf, "con meo");
+    strcpy(buf, "a cat");
     reverse(buf);
     printf("%s\n", buf);
     return 0;

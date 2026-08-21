@@ -1,4 +1,4 @@
-/* K&R 1.2/ex1-3,1-4: bang doi Fahrenheit-Celsius va nguoc lai, co header */
+/* K&R 1.2/ex1-3,1-4: Fahrenheit-Celsius conversion table and vice versa, with header */
 #include <stdio.h>
 #define LOWER 0
 #define UPPER 300

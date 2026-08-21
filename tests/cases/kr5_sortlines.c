@@ -1,4 +1,4 @@
-/* K&R 5.6: sap xep dong text — mang con tro char*, qsort tu viet, swap */
+/* K&R 5.6: sort lines of text — array of char* pointers, hand-written qsort, swap */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -52,6 +52,6 @@ int main(void) {
         for (i = 0; i < nlines; i++) printf("%s\n", lineptr[i]);
         return 0;
     }
-    printf("loi: input qua lon\n");
+    printf("error: input too large\n");
     return 1;
 }

@@ -1,4 +1,4 @@
-/* K&R 6.3: dem keyword — mang struct, binsearch tren struct, getword */
+/* K&R 6.3: count keywords — array of struct, binary search over struct, getword */
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>

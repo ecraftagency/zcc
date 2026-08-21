@@ -8,7 +8,7 @@ oracle-invalid	20020107-1	referee-reject: 20020107-1.c:20:3: error: implicit dec
 oracle-invalid	20020314-1	referee-reject: 20020314-1.c:14:7: error: implicit declaration of function 'alloca' [-Wimplicit-function-declaration]
 oracle-invalid	20020412-1	referee-reject: 20020412-1.c:30:19: error: unknown type name 'typeof'; did you mean '__typeof__'?
 oracle-invalid	20020819-1	referee-reject: 20020819-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	20021127-1	gcc-ext: UB redefine reserved `llabs` (C99 7.1.3); gcc+clang fold builtin bỏ def user, zcc gọi thật → abort
+oracle-invalid	20021127-1	gcc-ext: UB redefine reserved `llabs` (C99 7.1.3); gcc+clang fold builtin dropping the user definition, zcc calls the real one → abort
 oracle-invalid	20030222-1	referee-reject: 20030222-1.c:16:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
 oracle-invalid	20031211-2	referee-reject: 20031211-2.c:13:3: error: implicit declaration of function 'foo' [-Wimplicit-function-declaration]
 oracle-invalid	20040223-1	referee-reject: 20040223-1.c:9:5: error: implicit declaration of function 'abort' [-Wimplicit-function-declaration]
@@ -125,7 +125,7 @@ oracle-invalid	loop-2d	referee-reject: loop-2d.c:5:1: error: return type default
 oracle-invalid	loop-3	referee-reject: loop-3.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
 oracle-invalid	loop-3b	referee-reject: loop-3b.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
 oracle-invalid	loop-3c	referee-reject: loop-3c.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	medce-1	opt-dependent: referee DCE [link_error ], zcc -O0 giữ ref
+oracle-invalid	medce-1	opt-dependent: referee DCE [link_error ], zcc at -O0 keeps the reference
 oracle-invalid	memclr	referee-reject: memclr.c:45:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
 oracle-invalid	memcpy-a1	referee-reject: memcpy-ax.h:55:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
 oracle-invalid	memcpy-a2	referee-reject: memcpy-ax.h:55:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
@@ -208,110 +208,110 @@ oracle-invalid	unroll-1	referee-reject: collect2: error: ld returned 1 exit stat
 oracle-invalid	va-arg-22	referee-reject: va-arg-22.c:43:22: error: unknown type name 'typeof'; did you mean '__typeof__'?
 oracle-invalid	va-arg-7	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	va-arg-8	referee-reject: collect2: error: ld returned 1 exit status
-zcc-reject	20000822-1	20000822-1.c:15: nested function (GNU) không hỗ trợ
-zcc-reject	20010209-1	20010209-1.c:9: nested function (GNU) không hỗ trợ
-zcc-reject	20010605-1	20010605-1.c:6: nested function (GNU) không hỗ trợ
-zcc-reject	20020411-1	20020411-1.c:13: __builtin_conjf: builtin chưa hỗ trợ
-zcc-reject	20030501-1	20030501-1.c:11: nested function (GNU) không hỗ trợ
-zcc-reject	20040308-1	20040308-1.c:6: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	20040423-1	20040423-1.c:8: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	20040520-1	20040520-1.c:7: nested function (GNU) không hỗ trợ
-zcc-reject	20041124-1	20041124-1.c:4: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	20041201-1	20041201-1.c:3: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	20041218-2	20041218-2.c:5: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	20050121-1	20050121-1.c:33: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	20050316-1	20050316-1.c:7: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20050316-2	20050316-2.c:8: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20050316-3	20050316-3.c:4: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20050604-1	20050604-1.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20050607-1	20050607-1.c:5: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20060420-1	20060420-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	20070919-1	20070919-1.c:28: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	20090219-1	20090219-1.c:13: nested function (GNU) không hỗ trợ
-zcc-reject	20230630-2	20230630-2.c:13: __attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ
-zcc-reject	20230630-4	20230630-4.c:17: __attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ
-zcc-reject	920612-2	920612-2.c:11: nested function (GNU) không hỗ trợ
-zcc-reject	920721-4	920721-4.c:9: nested function (GNU) không hỗ trợ
-zcc-reject	931002-1	931002-1.c:15: nested function (GNU) không hỗ trợ
-zcc-reject	991014-1	991014-1.c:12: member 'buf' >4GB: object vượt giới hạn size u32 của zcc
-zcc-reject	align-3	align-3.c:13: __alignof__ của function (GNU function-alignment) chưa hỗ trợ
-zcc-reject	align-nest	align-nest.c:10: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	bf-pack-1	bf-pack-1.c:7: cần Punct(";"), gặp Some(Ident("__attribute__"))
-zcc-reject	built-in-setjmp	built-in-setjmp.c:13: __builtin_longjmp: builtin chưa hỗ trợ
-zcc-reject	builtin-bitops-1	builtin-bitops-1.c:189: __builtin_clrsb: builtin chưa hỗ trợ
-zcc-reject	complex-6	complex-6.c:42: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	frame-address	frame-address.c:21: __builtin_frame_address: builtin chưa hỗ trợ
-zcc-reject	nest-align-1	nest-align-1.c:26: nested function (GNU) không hỗ trợ
-zcc-reject	nest-stdar-1	nest-stdar-1.c:10: nested function (GNU) không hỗ trợ
-zcc-reject	nestfunc-1	nestfunc-1.c:20: nested function (GNU) không hỗ trợ
-zcc-reject	nestfunc-2	nestfunc-2.c:17: nested function (GNU) không hỗ trợ
-zcc-reject	nestfunc-3	nestfunc-3.c:16: nested function (GNU) không hỗ trợ
-zcc-reject	nestfunc-5	nestfunc-5.c:11: nested function (GNU) không hỗ trợ
-zcc-reject	nestfunc-6	nestfunc-6.c:15: nested function (GNU) không hỗ trợ
-zcc-reject	nestfunc-7	nestfunc-7.c:16: nested function (GNU) không hỗ trợ
-zcc-reject	packed-aligned	packed-aligned.c:3: cần kiểu tham số
-zcc-reject	pr103405	pr103405.c:25: nested function (GNU) không hỗ trợ
-zcc-reject	pr104604	pr104604.c:7: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	pr105613	pr105613.c:4: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr105984	pr105984.c:8: __builtin_mul_overflow_p: builtin chưa hỗ trợ
-zcc-reject	pr108292	pr108292.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr109040	pr109040.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr110817-1	pr110817-1.c:1: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr110817-2	pr110817-2.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr110817-3	pr110817-3.c:1: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr123625	pr123625.c:24: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr123625-2	pr123625-2.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr123753	pr123753.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr123978	pr123978.c:5: cần tên trong declarator, gặp Some(Punct("["))
-zcc-reject	pr124358	pr124358.c:3: cần tên trong declarator, gặp Some(Punct("["))
-zcc-reject	pr125291	pr125291.c:9: cần tên trong declarator, gặp Some(Punct("["))
-zcc-reject	pr126405	pr126405.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr126405-2	pr126405-2.c:7: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr126405-3	pr126405-3.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr19449	pr19449.c:6: __builtin_choose_expr: builtin chưa hỗ trợ
-zcc-reject	pr22061-3	pr22061-3.c:7: nested function (GNU) không hỗ trợ
-zcc-reject	pr22061-4	pr22061-4.c:7: nested function (GNU) không hỗ trợ
-zcc-reject	pr23135	pr23135.c:16: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr24135	pr24135.c:11: nested function (GNU) không hỗ trợ
-zcc-reject	pr38151	pr38151.c:8: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	pr39120	pr39120.c:6: cần kiểu tham số
-zcc-reject	pr39228	pr39228.c:9: __builtin_isinff: builtin chưa hỗ trợ
-zcc-reject	pr41935	pr41935.c:9: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	pr42833	pr42833.c:1: cần Punct(";"), gặp Some(Ident("int8_t"))
-zcc-reject	pr47237	pr47237.c:16: __builtin_apply: builtin chưa hỗ trợ
-zcc-reject	pr51447	pr51447.c:22: nested function (GNU) không hỗ trợ
-zcc-reject	pr56837	pr56837.c:2: _Complex số nguyên (GNU ext ngoài C99 6.2.5): chưa hỗ trợ
-zcc-reject	pr60003	pr60003.c:11: __builtin_longjmp: builtin chưa hỗ trợ
-zcc-reject	pr60960	pr60960.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr64242	pr64242.c:5: cần kiểu tham số
-zcc-reject	pr65427	pr65427.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr68532	pr68532.c:5: cần kiểu tham số
-zcc-reject	pr70903	pr70903.c:1: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr71494	pr71494.c:10: nested function (GNU) không hỗ trợ
-zcc-reject	pr71626-1	pr71626-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr71626-2	pr71626-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr80692	pr80692.c:5: biến chưa khai báo: _Decimal64
-zcc-reject	pr81588	pr81588.c:6: asm: constraint "g" chưa hỗ trợ
-zcc-reject	pr82210	pr82210.c:8: VLA trong struct/union (GNU) chưa hỗ trợ
-zcc-reject	pr84521	pr84521.c:9: __builtin_longjmp: builtin chưa hỗ trợ
-zcc-reject	pr84748	pr84748.c:3: cần Punct(";"), gặp Some(Ident("u128"))
-zcc-reject	pr85169	pr85169.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr85331	pr85331.c:4: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr86659-1	pr86659-1.c:3: cần kiểu tham số
-zcc-reject	pr86659-2	pr86659-2.c:3: cần kiểu tham số
-zcc-reject	pr87623	pr87623.c:8: __attribute__((scalar_storage_order)): đảo byte-order (GNU) chưa hỗ trợ
-zcc-reject	pr92618	pr92618.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr93213	pr93213.c:8: cần Punct(";"), gặp Some(Ident("u128"))
-zcc-reject	pr94412	pr94412.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr94524-1	pr94524-1.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr94524-2	pr94524-2.c:3: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	pr94591	pr94591.c:1: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	scal-to-vec1	scal-to-vec1.c:34: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	scal-to-vec2	scal-to-vec2.c:35: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	scal-to-vec3	scal-to-vec3.c:20: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	simd-1	simd-1.c:10: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	simd-2	simd-2.c:9: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	simd-4	simd-4.c:6: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	simd-5	simd-5.c:5: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	simd-6	simd-6.c:4: __attribute__((vector_size)): kiểu vector SIMD (GNU) chưa hỗ trợ
-zcc-reject	va-arg-pack-1	va-arg-pack-1.c:125: __builtin_va_arg_pack: builtin chưa hỗ trợ
+zcc-reject	20000822-1	20000822-1.c:15: nested function (GNU): not supported
+zcc-reject	20010209-1	20010209-1.c:9: nested function (GNU): not supported
+zcc-reject	20010605-1	20010605-1.c:6: nested function (GNU): not supported
+zcc-reject	20020411-1	20020411-1.c:13: __builtin_conjf: builtin not yet supported
+zcc-reject	20030501-1	20030501-1.c:11: nested function (GNU): not supported
+zcc-reject	20040308-1	20040308-1.c:6: VLA in struct/union (GNU): not yet supported
+zcc-reject	20040423-1	20040423-1.c:8: VLA in struct/union (GNU): not yet supported
+zcc-reject	20040520-1	20040520-1.c:7: nested function (GNU): not supported
+zcc-reject	20041124-1	20041124-1.c:4: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	20041201-1	20041201-1.c:3: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	20041218-2	20041218-2.c:5: VLA in struct/union (GNU): not yet supported
+zcc-reject	20050121-1	20050121-1.c:33: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	20050316-1	20050316-1.c:7: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	20050316-2	20050316-2.c:8: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	20050316-3	20050316-3.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	20050604-1	20050604-1.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	20050607-1	20050607-1.c:5: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	20060420-1	20060420-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	20070919-1	20070919-1.c:28: VLA in struct/union (GNU): not yet supported
+zcc-reject	20090219-1	20090219-1.c:13: nested function (GNU): not supported
+zcc-reject	20230630-2	20230630-2.c:13: __attribute__((scalar_storage_order)): byte-order reversal (GNU): not yet supported
+zcc-reject	20230630-4	20230630-4.c:17: __attribute__((scalar_storage_order)): byte-order reversal (GNU): not yet supported
+zcc-reject	920612-2	920612-2.c:11: nested function (GNU): not supported
+zcc-reject	920721-4	920721-4.c:9: nested function (GNU): not supported
+zcc-reject	931002-1	931002-1.c:15: nested function (GNU): not supported
+zcc-reject	991014-1	991014-1.c:12: member 'buf' >4GB: object exceeds zcc's u32 size limit
+zcc-reject	align-3	align-3.c:13: __alignof__ of a function (GNU function-alignment): not yet supported
+zcc-reject	align-nest	align-nest.c:10: VLA in struct/union (GNU): not yet supported
+zcc-reject	bf-pack-1	bf-pack-1.c:7: expected Punct(";"), found Some(Ident("__attribute__"))
+zcc-reject	built-in-setjmp	built-in-setjmp.c:13: __builtin_longjmp: builtin not yet supported
+zcc-reject	builtin-bitops-1	builtin-bitops-1.c:189: __builtin_clrsb: builtin not yet supported
+zcc-reject	complex-6	complex-6.c:42: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	frame-address	frame-address.c:21: __builtin_frame_address: builtin not yet supported
+zcc-reject	nest-align-1	nest-align-1.c:26: nested function (GNU): not supported
+zcc-reject	nest-stdar-1	nest-stdar-1.c:10: nested function (GNU): not supported
+zcc-reject	nestfunc-1	nestfunc-1.c:20: nested function (GNU): not supported
+zcc-reject	nestfunc-2	nestfunc-2.c:17: nested function (GNU): not supported
+zcc-reject	nestfunc-3	nestfunc-3.c:16: nested function (GNU): not supported
+zcc-reject	nestfunc-5	nestfunc-5.c:11: nested function (GNU): not supported
+zcc-reject	nestfunc-6	nestfunc-6.c:15: nested function (GNU): not supported
+zcc-reject	nestfunc-7	nestfunc-7.c:16: nested function (GNU): not supported
+zcc-reject	packed-aligned	packed-aligned.c:3: expected parameter type
+zcc-reject	pr103405	pr103405.c:25: nested function (GNU): not supported
+zcc-reject	pr104604	pr104604.c:7: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	pr105613	pr105613.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr105984	pr105984.c:8: __builtin_mul_overflow_p: builtin not yet supported
+zcc-reject	pr108292	pr108292.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr109040	pr109040.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr110817-1	pr110817-1.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr110817-2	pr110817-2.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr110817-3	pr110817-3.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr123625	pr123625.c:24: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr123625-2	pr123625-2.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr123753	pr123753.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr123978	pr123978.c:5: expected name in declarator, found Some(Punct("["))
+zcc-reject	pr124358	pr124358.c:3: expected name in declarator, found Some(Punct("["))
+zcc-reject	pr125291	pr125291.c:9: expected name in declarator, found Some(Punct("["))
+zcc-reject	pr126405	pr126405.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr126405-2	pr126405-2.c:7: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr126405-3	pr126405-3.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr19449	pr19449.c:6: __builtin_choose_expr: builtin not yet supported
+zcc-reject	pr22061-3	pr22061-3.c:7: nested function (GNU): not supported
+zcc-reject	pr22061-4	pr22061-4.c:7: nested function (GNU): not supported
+zcc-reject	pr23135	pr23135.c:16: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr24135	pr24135.c:11: nested function (GNU): not supported
+zcc-reject	pr38151	pr38151.c:8: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	pr39120	pr39120.c:6: expected parameter type
+zcc-reject	pr39228	pr39228.c:9: __builtin_isinff: builtin not yet supported
+zcc-reject	pr41935	pr41935.c:9: VLA in struct/union (GNU): not yet supported
+zcc-reject	pr42833	pr42833.c:1: expected Punct(";"), found Some(Ident("int8_t"))
+zcc-reject	pr47237	pr47237.c:16: __builtin_apply: builtin not yet supported
+zcc-reject	pr51447	pr51447.c:22: nested function (GNU): not supported
+zcc-reject	pr56837	pr56837.c:2: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
+zcc-reject	pr60003	pr60003.c:11: __builtin_longjmp: builtin not yet supported
+zcc-reject	pr60960	pr60960.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr64242	pr64242.c:5: expected parameter type
+zcc-reject	pr65427	pr65427.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr68532	pr68532.c:5: expected parameter type
+zcc-reject	pr70903	pr70903.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr71494	pr71494.c:10: nested function (GNU): not supported
+zcc-reject	pr71626-1	pr71626-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr71626-2	pr71626-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr80692	pr80692.c:5: undeclared variable: _Decimal64
+zcc-reject	pr81588	pr81588.c:6: asm: constraint "g" not yet supported
+zcc-reject	pr82210	pr82210.c:8: VLA in struct/union (GNU): not yet supported
+zcc-reject	pr84521	pr84521.c:9: __builtin_longjmp: builtin not yet supported
+zcc-reject	pr84748	pr84748.c:3: expected Punct(";"), found Some(Ident("u128"))
+zcc-reject	pr85169	pr85169.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr85331	pr85331.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr86659-1	pr86659-1.c:3: expected parameter type
+zcc-reject	pr86659-2	pr86659-2.c:3: expected parameter type
+zcc-reject	pr87623	pr87623.c:8: __attribute__((scalar_storage_order)): byte-order reversal (GNU): not yet supported
+zcc-reject	pr92618	pr92618.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr93213	pr93213.c:8: expected Punct(";"), found Some(Ident("u128"))
+zcc-reject	pr94412	pr94412.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr94524-1	pr94524-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr94524-2	pr94524-2.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr94591	pr94591.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	scal-to-vec1	scal-to-vec1.c:34: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	scal-to-vec2	scal-to-vec2.c:35: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	scal-to-vec3	scal-to-vec3.c:20: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	simd-1	simd-1.c:10: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	simd-2	simd-2.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	simd-4	simd-4.c:6: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	simd-5	simd-5.c:5: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	simd-6	simd-6.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	va-arg-pack-1	va-arg-pack-1.c:125: __builtin_va_arg_pack: builtin not yet supported

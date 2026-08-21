@@ -1,4 +1,4 @@
-/* K&R 4.10: qsort de quy tren int + ex4-12 itoa de quy + static buffer */
+/* K&R 4.10: recursive qsort on int + ex4-12 recursive itoa + static buffer */
 #include <stdio.h>
 void swap(int v[], int i, int j) {
     int temp = v[i];

@@ -1,4 +1,4 @@
-/* EXT(gcc): __typeof__(expr | typename) làm type-specifier */
+/* EXT(gcc): __typeof__(expr | typename) as a type-specifier */
 #include <stdio.h>
 int g = 7;
 __typeof__(g) h = 9;

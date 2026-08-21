@@ -1,4 +1,4 @@
-/* K&R 1.5.4 + ex1-13: dem dong/tu/ky tu + histogram do dai tu */
+/* K&R 1.5.4 + ex1-13: count lines/words/characters + word-length histogram */
 #include <stdio.h>
 #define IN 1
 #define OUT 0

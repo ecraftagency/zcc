@@ -6,7 +6,7 @@ int sum(int n){
   for(i=0;i<n;i++) s+=a[i];
   return s;
 }
-int loopvla(int n){       /* VLA cấp lại mỗi vòng — goto-lùi phải reset sp */
+int loopvla(int n){       /* VLA reallocated each iteration — the backward branch must reset sp */
   int total=0, k;
   for(k=1;k<=n;k++){
     char buf[k*8];

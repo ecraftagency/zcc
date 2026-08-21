@@ -1,4 +1,4 @@
-/* GNU stmt-expr lồng, value = struct trả về (SRet) — regress seal-Block. */
+/* Nested GNU statement expression whose value is a returned struct (SRet) — regression for seal-Block. */
 struct A { unsigned int a, b, c; };
 extern void abort(void); extern void exit(int);
 struct A bar(void){ return (struct A){176,52,31}; }

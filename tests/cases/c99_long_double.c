@@ -16,7 +16,7 @@ double sumva(int n, ...) {
     va_end(ap);
     return s;
 }
-/* đúng pattern ld2string của redis (util.c) */
+/* the exact ld2string pattern from redis (util.c) */
 int ld2string(char *buf, size_t len, long double value) {
     size_t l = snprintf(buf, len, "%.17Lf", value);
     if (l == 0 || l >= len) return 0;
@@ -31,7 +31,7 @@ int main(void) {
     v += 200;                      /* INCRBYFLOAT 3000 + 200 */
     ld2string(buf, sizeof buf, v);
     printf("A %s\n", buf);
-    ld2string(buf, sizeof buf, strtold("0.00000000000000001", 0)); /* án gốc */
+    ld2string(buf, sizeof buf, strtold("0.00000000000000001", 0)); /* original failing case */
     printf("B %s\n", buf);
     printf("C %.6Lf %.6Lg\n", g, id(3.5L));
     printf("D %.3Lf\n", many(1.0L, 2, 3, 4, 5, 6, 7, 8, 9, 10));
@@ -41,6 +41,6 @@ int main(void) {
     { struct s { long double x; char c; }; printf("H %d\n", (int)sizeof(struct s)); }
     { long double m = -0.5L; printf("I %.2Lf %d %d\n", -m, m < 0.0L, m == m); }
     ld2string(buf, sizeof buf, 5.0e3L);
-    printf("J %s\n", buf);         /* literal L thẳng vào arith/format */
+    printf("J %s\n", buf);         /* an L literal fed directly into arithmetic/formatting */
     return 0;
 }

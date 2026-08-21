@@ -1,4 +1,4 @@
-/* EXT(c99): variadic macro chuẩn __VA_ARGS__ */
+/* EXT(c99): standard variadic macro __VA_ARGS__ */
 #include <stdio.h>
 #define LOG(fmt, ...) printf("[log] " fmt, __VA_ARGS__)
 int main(void) {

@@ -1,4 +1,4 @@
-/* EXT(c99): designated initializer cho struct và mảng */
+/* EXT(c99): designated initializer for struct and array */
 #include <stdio.h>
 struct pt { int x, y, z; };
 struct pt p = { .z = 9, .x = 3 };

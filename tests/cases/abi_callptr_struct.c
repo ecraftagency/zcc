@@ -5,8 +5,8 @@ int use(struct S s){ return s.a+s.b+s.c; }
 int main(void){
   struct S (*pmk)(int) = mk;
   int (*puse)(struct S) = use;
-  struct S s = pmk(10);               /* CallPtr trả struct */
-  int r = puse(s);                    /* CallPtr nhận struct */
+  struct S s = pmk(10);               /* CallPtr returns a struct */
+  int r = puse(s);                    /* CallPtr accepts a struct */
   printf("%d %d %d %d\n", s.a, s.b, s.c, r);
   return 0;
 }

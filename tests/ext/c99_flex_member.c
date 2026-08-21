@@ -1,4 +1,4 @@
-/* EXT(c99): flexible array member — sizeof struct không tính mảng đuôi */
+/* EXT(c99): flexible array member — sizeof struct does not count the trailing array */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

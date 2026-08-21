@@ -1,11 +1,11 @@
-/* Be mat asm musl doi: pin reg, tied "0", "w" FP, "Q" memory */
+/* The asm surface musl requires: pinned reg, tied "0", "w" FP, "Q" memory */
 int printf(const char *, ...);
 static long add_pin(long a, long b) {
 	register long x9 __asm__("x9") = a;
 	register long x10 __asm__("x10") = b;
 	register long x11 __asm__("x11");
 	__asm__ __volatile__("add %0, %1, %2" : "=r"(x11) : "r"(x9), "0"(x10));
-	/* "0"(x10): input buoc vao reg cua output 0 (x11) — add x11,x9,x11 */
+	/* "0"(x10): input tied to the reg of output 0 (x11) — add x11,x9,x11 */
 	return x11;
 }
 static double fabs_w(double x) {
@@ -19,8 +19,9 @@ static float fmaxf_w(float a, float b) {
 	return r;
 }
 static int ll_sc(volatile int *p, int v) {
-	/* LL/SC phai nam TRON mot template: o -O0 moi compiler (ke ca cc)
-	   deu chen store stack giua 2 asm -> xoa exclusive monitor -> livelock */
+	/* LL/SC must live ENTIRELY within one template: at -O0 every compiler
+	   (cc included) inserts a stack store between two asm blocks -> clears the
+	   exclusive monitor -> livelock */
 	int old, flag;
 	__asm__ __volatile__("1:\n"
 			     "ldaxr %w0, %2\n"

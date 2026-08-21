@@ -1,7 +1,7 @@
-/* Ho ham math *l (C99) tren model "long double = double" cua zcc — map ve ban
-   double trong math.h nhung. Regression cho bug redis BLPOP: ceill khong co
-   prototype -> implicit int -> doc x0 rac thay d0 -> timeout = 0 = block
-   vinh vien (fail deterministic unit/type/list, cc referee pass). */
+/* The math *l functions (C99) on zcc's "long double = double" model — mapped to
+   the plain double versions in math.h. Regression for the redis BLPOP bug:
+   ceill has no prototype -> implicit int -> reads garbage x0 instead of d0 ->
+   timeout = 0 = blocks forever (deterministic fail, cc referee passes). */
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
@@ -9,7 +9,7 @@
 int main(void) {
     long double v;
     long long tval;
-    /* tai hien nguyen van duong timeout cua redis timeout.c */
+    /* reproduces verbatim the timeout path of redis timeout.c */
     v = strtold("1", 0);
     v *= 1000.0;
     tval = (long long) ceill(v);

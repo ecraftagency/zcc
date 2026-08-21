@@ -1,4 +1,4 @@
-/* EXT(gcc): ", ## __VA_ARGS__" — xóa phẩy khi arg rỗng */
+/* EXT(gcc): ", ## __VA_ARGS__" — drop the comma when the arg is empty */
 #include <stdio.h>
 #define LOG(fmt, ...) printf(fmt, ##__VA_ARGS__)
 int main(void) {

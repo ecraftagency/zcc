@@ -14,7 +14,7 @@ int classify(int c) {
 }
 int main() {
     char *s; int i; int cnt[4]; int fell;
-    s = "gio 14 con  7\tvit\n";
+    s = "car 14 bus  7\tvan\n";
     for (i = 0; i < 4; i++) cnt[i] = 0;
     for (i = 0; s[i] != '\0'; i++)
         cnt[classify(s[i])]++;

@@ -1,15 +1,16 @@
-/* Bề mặt gcc/C99 mà build git đòi (2026-08-17) — regression:
-   __builtin_types_compatible_p fold hằng trong ARRAY_SIZE kiểu git
+/* The gcc/C99 surface that the git build requires — regression:
+   __builtin_types_compatible_p constant-folded inside a git-style ARRAY_SIZE
    (BUILD_ASSERT_OR_ZERO = sizeof(char[1-2*!(cond)])), __extension__
-   trước expr lẫn đầu statement (obstack.h), [restrict n] trong array
-   param (SDK _regex.h khi xưng C99), PRIuMAX/SCNuMAX (inttypes.h),
-   __STDC_VERSION__ >= 199901L (gate của git-compat-util.h). */
+   both before an expr and at the head of a statement (obstack.h),
+   [restrict n] in an array parameter (SDK _regex.h when claiming C99),
+   PRIuMAX/SCNuMAX (inttypes.h), __STDC_VERSION__ >= 199901L
+   (the gate in git-compat-util.h). */
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
 
 #if __STDC_VERSION__ - 0 < 199901L
-#error "phai xung C99"
+#error "must claim C99"
 #endif
 
 #define BUILD_ASSERT_OR_ZERO(cond) (sizeof(char [1 - 2*!(cond)]) - 1)
@@ -27,9 +28,9 @@ int main(void) {
 	uintmax_t big = 12345;
 	for (i = 0; i < ARRAY_SIZE(tbl); i++)
 		tbl[i] = (int) i;
-	/* __extension__ trước expr */
+	/* __extension__ before an expr */
 	i = __extension__ ({ int t = tbl[6]; t + 1; });
-	/* __extension__ đầu statement */
+	/* __extension__ at the head of a statement */
 	__extension__ ({ tbl[0] = 9; (void) 0; });
 	printf("n=%lu last+1=%lu first=%d\n", (unsigned long) ARRAY_SIZE(tbl),
 	       i, tbl[0]);

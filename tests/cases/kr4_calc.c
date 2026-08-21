@@ -1,4 +1,4 @@
-/* K&R 4.3: may tinh Ba Lan nguoc — getop/getch/ungetch/push/pop + atof */
+/* K&R 4.3: reverse Polish calculator — getop/getch/ungetch/push/pop + atof */
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -13,7 +13,7 @@ int bufp = 0;
 int getch(void) { return (bufp > 0) ? buf[--bufp] : getchar(); }
 void ungetch(int c) {
     if (bufp >= BUFSIZE)
-        printf("ungetch: qua nhieu ky tu\n");
+        printf("ungetch: too many characters\n");
     else
         buf[bufp++] = c;
 }
@@ -77,14 +77,14 @@ int main(void) {
             if (op2 != 0.0)
                 push(pop() / op2);
             else
-                printf("loi: chia 0\n");
+                printf("error: divide by 0\n");
             break;
         case '%':
             op2 = pop();
             if (op2 != 0.0)
                 push((double)((long)pop() % (long)op2));
             else
-                printf("loi: chia 0\n");
+                printf("error: divide by 0\n");
             break;
         case '\n':
             printf("\t%.8g\n", pop());

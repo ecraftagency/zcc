@@ -1,4 +1,4 @@
-/* K&R 6.5: dem tan suat tu bang cay nhi phan — malloc, struct tu tro, de quy */
+/* K&R 6.5: count word frequency with a binary tree — malloc, self-referential struct, recursion */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

@@ -1,4 +1,4 @@
-/* K&R 5.5 + ex5-3..5-5: ban con tro cua strcpy/strcat/strncpy/strend */
+/* K&R 5.5 + ex5-3..5-5: pointer versions of strcpy/strcat/strncpy/strend */
 #include <stdio.h>
 #include <string.h>
 void my_strcpy(char *s, char *t) {
@@ -24,11 +24,11 @@ int strend(char *s, char *t) {
 }
 int main(void) {
     char a[64], b[32];
-    my_strcpy(a, "xin ");
-    my_strcat(a, "chao ban");
+    my_strcpy(a, "hello ");
+    my_strcat(a, "world");
     printf("%s\n", a);
     my_strncpy(b, "1234567890", 4);
     printf("%s\n", b);
-    printf("%d %d %d\n", strend(a, "ban"), strend(a, "chao"), strend(a, a));
+    printf("%d %d %d\n", strend(a, "world"), strend(a, "hello"), strend(a, a));
     return 0;
 }

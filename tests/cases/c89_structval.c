@@ -1,5 +1,5 @@
 int printf(const char *fmt, ...);
-/* K&R ch6: struct by value qua hàm */
+/* K&R ch6: struct passed by value through functions */
 struct point { int x; int y; };
 struct rect { struct point p1; struct point p2; };
 struct point makepoint(int x, int y) {

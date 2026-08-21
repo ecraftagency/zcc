@@ -13,7 +13,7 @@ long summ(struct Mid m){ return m.a * m.b; }
 struct Small mksmall(int a, int b){ struct Small s; s.a=a; s.b=b; return s; }
 struct Big mkbig(long v){ struct Big b; b.a=v; b.b=v*2; b.c=v*3; return b; }
 struct HFAd mkhd(double v){ struct HFAd h; h.p=v; h.q=v+1; return h; }
-/* nhiều arg tràn reg + mix */
+/* many arguments overflowing registers, mixed types */
 long many(int a,int b,int c,int d,int e,int f,int g,int h,int i,int j){
   return a+b+c+d+e+f+g+h+i+j;
 }

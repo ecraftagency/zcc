@@ -1,6 +1,6 @@
-/* EXT(gcc): #warning — báo stderr rồi compile tiếp */
+/* EXT(gcc): #warning — reports to stderr then continues compiling */
 #include <stdio.h>
-#warning "canh bao thu nghiem"
+#warning "experimental warning"
 int main(void) {
     printf("ok\n");
     return 0;
