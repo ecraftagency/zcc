@@ -155,13 +155,14 @@ target file (Side II); everything else is Side I.
 | CFG simplification (Phase A — block merge + unreachable elimination) | straight-line splice (a block spliced into its sole predecessor) + dead-block deletion + renumber ⟹ the executed instruction SEQUENCE is unchanged ⟹ `⟦f⟧=⟦cfg_simplify(f)⟧` | **DONE (Phase A)** — `opt::cfg_simplify` (in the `optimize_ssa` fixpoint); `cfg_complete`-guarded; collapses the straight lines / dead blocks SCCP exposes (φ-arms renamed/pruned to the new numbering); proven by `cfg_simplify_semantics_preserved` (312 exprs × equiv, ≥36 shrink), `cfg_simplify_prunes_dead_branch` (SCCP→prune synergy), `cfg_simplify_gate_has_teeth` |
 | register COALESCING (Phase A — conservative biased coloring) | a non-interfering move pair (`Copy` dst/src) prefers the SAME color ⟹ the copy is a self-move (peephole-elidable); the bias picks only among already-free legal colors ⟹ the coloring stays valid ⟹ the SAME `verify_abi` interference invariant ⟹ `⟦·⟧` unchanged (no new proof obligation, no node-merge ⟹ k-colorability never worsened) | **DONE (Phase A)** — `opt::color_abi` `bias` arg fed by `abi_alloc`'s non-interfering `Copy` pairs; proven valid by `abi_alloc_valid` (now WITH bias) + non-vacuous by `coalesce_shares_register_for_moves` (a real edge-copy pair shares a register) |
 | LICM (Phase B — loop-invariant code motion) | a PURE, TRAP-FREE, SINGLE-DEF instruction whose operands are all defined outside the loop is hoisted to the loop PREHEADER (a dominating block on the sole entry edge): computed once, not n times; speculation is safe (pure+trap-free), def-before-use holds (preheader dominates the loop) ⟹ `⟦f⟧=⟦licm(f)⟧`. Fences: hoist only Bin(¬Div,¬Rem)/Un/Copy/Cast/Lea, NEVER Load; SINGLE-DEF-gated (zcc IR is only partial-SSA — freezing one def of a multi-def loop-condition temp would turn a finite loop infinite, a bug `equiv` is BLIND to since interp of an infinite loop → Err → skipped); `cfg_complete`-guarded | **DONE, TOGGLEABLE, default-OFF** — `opt::licm` + loop infra (`back_edges`/`natural_loop`/`ensure_preheader`). Proven ⟦·⟧-preserving (`licm_semantics_preserved` 312×equiv, `licm_hoists_invariant`, `licm_respects_variance`, `licm_multidef_condition_stays_finite` direct-interp regression, `licm_gate_has_teeth`) — but MEASURED to REGRESS the memory-bound naive-slot backend (matmul 2.44→2.70×): hoisting trades a cheap recompute for a reload. Kept wired behind `Passes.licm` (`ZCC_OPT_ON=licm`) for a future register-resident backend; ships OFF (only a MEASURED win is default-on) |
+| STRENGTH REDUCTION (Phase B.5 — induction-variable based) | a DERIVED IV `j = i·d` (d const) riding a BASIC IV `i₁=φ(i₀, i₂), i₂=i₁+c` (c const) is replaced by a parallel ACCUMULATOR φ `j₁=φ(i₀·d, j₂), j₂=j₁+c·d` and `j := j₁`. PROOF by induction on trip count: base j₁=i₀·d=i₁·d; step j₂=j₁+c·d=i₁·d+c·d=(i₁+c)·d=i₂·d ⟹ j₁=i₁·d always ⟹ `⟦f⟧=⟦sr(f)⟧`. Distribution exact in ℤ/2ⁿ (no overflow gap). Fences: INTEGER-only (float × non-distributive), CONST c,d (c·d folded), all SINGLE-DEF (partial-SSA — checked not assumed), REDUCIBLE single-latch (2-arm header φ), `cfg_complete`-guarded. ENABLING dep: needs `copy_prop` first (mem2reg leaves a copy between the φ and each IV use) — SR is NOT independent | **DONE, TOGGLEABLE, default-OFF** — `opt::strength_reduce`. Proven ⟦·⟧ (`strength_reduce_semantics_preserved` 312×equiv, `strength_reduce_fires` + accumulator-φ evidence, `strength_reduce_in_pipeline_terminates_correct`, `strength_reduce_gate_has_teeth`). The 312-space proof MISSED a nested-loop stale-defcnt panic (`loop-ivopts-1`) that the BOX torture caught — evidence that the commuting-square space ⊊ the real-program space; fixed (per-loop defcnt) + re-gated 0 FAIL / 0 DIVERGE. Same memory-bound backend ⟹ ships OFF behind `ZCC_OPT_ON=sr` |
 
 **5 passes → theorem (all DECIDABLE; no loop restructuring → outside Rice):**
 const-fold = rewrite-soundness · DCE = liveness · copy-prop = dominance + Leibniz ·
 CSE = value-numbering · regalloc = rename-bisimulation.
 
 **The SSA pipeline `opt::optimize_ssa` (the QBE-level projection under CbC) `[ssa-qbe fork]`:**
-`to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce ∘ cfg_simplify [∘ licm])* ▸ out_of_ssa ▸ optimize`
+`to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce ∘ cfg_simplify [∘ licm ∘ strength_reduce])* ▸ out_of_ssa ▸ optimize`
 (register coalescing runs later, inside `abi_alloc`, as a coloring bias; `licm` is
 default-OFF — see below). The active pass set is not hard-coded: `optimize_ssa` reads an
 `opt::Passes` record, so any element toggles via `ZCC_OPT_OFF=`/`ZCC_OPT_ON=` comma lists
@@ -171,11 +172,11 @@ to the same denotation; the toggle changes only PERFORMANCE (`passes_toggle_wiri
 Each stage is an individually-proven ⟦·⟧-invariant rewrite ⟹ the composite is too;
 re-MEASURED end-to-end by `optimize_ssa_preserves` (312 exprs × equiv, φ-free result)
 + `optimize_ssa_preserves_corpus_and_reduces` (value-correct + shrinks). The artifact
-Stage 5 wires into the backend behind an optimization flag. **LICM is IMPLEMENTED and
-PROVEN but ships OFF** (measured-negative on the naive-slot backend — see the LICM row);
-still OMITTED (QBE "most of the win, a fraction of the complexity", harder-to-prove, or
-measured no-pay on this backend): strength-reduction, cross-loop GVN, other loop
-restructuring.
+Stage 5 wires into the backend behind an optimization flag. **LICM and STRENGTH REDUCTION
+are IMPLEMENTED and PROVEN but ship OFF** (measured-negative on the naive-slot backend —
+see their rows); one env flag (`ZCC_OPT_ON=licm,sr`) from ON, latent for a register-resident
+backend. Still OMITTED (QBE "most of the win, a fraction of the complexity"): cross-loop
+GVN and other loop restructuring.
 
 ### A8. Testing & proof methodology `[IN USE]`
 Differential testing · Metamorphic (commuting-square) · Property/boundary-value ·

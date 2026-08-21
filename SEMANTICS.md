@@ -278,6 +278,31 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > register-resident backend where hoisting a loop-invariant into a callee-saved register
 > would pay.
 
+> **`strength_reduce` (Phase B.5, `opt::strength_reduce`, induction-variable reduction) —
+> TOGGLEABLE, default-OFF.** The textbook loop optimization: a per-iteration MULTIPLY by a
+> constant that rides an induction variable becomes an ADD accumulator. A BASIC induction
+> variable appears as an SSA header φ `i₁ = φ(preheader: i₀, latch: i₂)` with `i₂ = i₁ + c`
+> (c constant), so at the head of iteration k, `i₁ = i₀ + k·c`. A DERIVED IV `j = i₁·d`
+> (d constant) is reduced by introducing a parallel accumulator φ `j₁ = φ(preheader: i₀·d,
+> latch: j₂)` with `j₂ = j₁ + c·d`, and replacing `j := i₁·d` by `j := j₁`. Correctness is
+> an INDUCTION on the trip count: base `j₁ = i₀·d = i₁·d` (i₁=i₀ on entry); step assume
+> `j₁ = i₁·d`, then `j₂ = j₁ + c·d = i₁·d + c·d = (i₁+c)·d = i₂·d`, the next head value.
+> Hence `j₁ = i₁·d` at every head ⟹ every observation of j is unchanged ⟹
+> **`⟦f⟧ = ⟦strength_reduce(f)⟧`**. Distribution `(i₁+c)·d = i₁·d + c·d` holds EXACTLY in
+> ℤ/2ⁿ (two's-complement wrap), so no overflow/UB gap opens at the IR level. Fences:
+> INTEGER-only (float × is non-distributive), CONSTANT c and d (⟹ c·d folds at build), all
+> of i₁/i₂/j SINGLE-DEF (partial-SSA ⟹ checked, not assumed — recomputed PER back-edge so a
+> nested loop's fresh temps are counted), REDUCIBLE single-latch loops only (2-arm header φ),
+> `cfg_complete`-guarded. **ENABLING-PASS dependency:** mem2reg leaves a copy between the
+> header φ and each IV use (`t = copy(i₁); … t·d`), so SR only sees the derived IV AFTER
+> `copy_prop` collapses the copy — SR is NOT independent; copy_prop precedes it in the
+> fixpoint. Proven by `strength_reduce_semantics_preserved` (312×equiv),
+> `strength_reduce_fires`, `strength_reduce_in_pipeline_terminates_correct`,
+> `strength_reduce_gate_has_teeth`. NOTE (the space-gap lesson): the 312-case commuting-square
+> proof did NOT catch a nested-loop stale-`defcnt` panic — the BOX torture (`loop-ivopts-1`)
+> did; the generated proof space is a STRICT SUBSET of the real-program space, so the box gate
+> is not redundant with the unit proof. Same memory-bound backend ⟹ ships OFF (`ZCC_OPT_ON=sr`).
+
 > **Pass pipeline as an industrial toggle (`opt::Passes`).** `optimize_ssa` no longer
 > hard-codes its pass set; it reads a `Passes { sccp, const_fold, copy_prop, gvn, cse,
 > dce, cfg_simplify, licm, coalesce }` record. `Passes::default()` = every ⟦·⟧-preserving

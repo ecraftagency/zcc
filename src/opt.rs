@@ -2010,6 +2010,176 @@ pub fn licm(f: &mut IrFunc) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// STRENGTH REDUCTION (Phase B.5) — induction-variable based, default-OFF.
+//
+// THE CLASSIC OPTIMIZATION (Cocke–Kennedy; Aho §9.6): inside a loop, a MULTIPLY by a
+// constant that rides an induction variable is replaced by an ADD accumulator. The
+// canonical target is address arithmetic: `a + i*elemsize` in a matmul inner loop
+// recomputes a multiply every iteration; strength reduction turns it into one add per
+// step (the accumulator marches `elemsize` per iteration). This is *the* textbook loop
+// optimization — the pedagogical heart of Phase B.
+//
+// GOVERNING THEOREM (CbC): `⟦f⟧ = ⟦strength_reduce(f)⟧`, MEASURED by `equiv`. The proof
+// is an INDUCTION on the loop trip count. Let the loop carry a BASIC INDUCTION VARIABLE
+// (BIV) as an SSA header φ:
+//
+//        i₁ = φ(preheader: i₀, latch: i₂)        i₂ = i₁ + c        (c constant)
+//
+// so at the head of iteration k, i₁ = i₀ + k·c. A DERIVED induction variable is a body
+// expression j = i₁ · d (d constant). We introduce a parallel accumulator φ:
+//
+//        j₁ = φ(preheader: i₀·d, latch: j₂)      j₂ = j₁ + c·d
+//
+// and replace `j = i₁·d` with `j = j₁`. CLAIM: j₁ = i₁·d at the head of every iteration.
+//   • BASE (k=0): j₁ = i₀·d = i₁·d, since i₁ = i₀ on entry.  ✓
+//   • STEP: assume j₁ = i₁·d. After the latch, j₂ = j₁ + c·d = i₁·d + c·d = (i₁+c)·d =
+//     i₂·d, which becomes the next head value of both φ's.  ✓
+// Hence every observation of j is unchanged ⟹ ⟦·⟧ preserved. The constant c·d is folded
+// at build time. Distribution (i₁+c)·d = i₁·d + c·d holds EXACTLY in ℤ/2ⁿ (two's-complement
+// wrapping), so no overflow/UB gap opens at the IR level — the reduction is faithful to
+// the fixed-width integer semantics interp implements.
+//
+// SAFETY FENCES (why the hypotheses actually hold on this partial-SSA IR):
+//   • INTEGER only — float × does not distribute exactly (non-associative), so `tt.is_float`
+//     types are skipped for both the BIV step and the derived multiply.
+//   • CONSTANT step c and CONSTANT multiplier d ⟹ c·d is a compile-time constant; no
+//     invariant-multiply needs inserting, keeping the inserted latch op a pure ADD.
+//   • SINGLE-DEF everywhere (i₁, i₂, j) — SSA guarantees it for promoted temps, but this IR
+//     is only PARTIAL SSA, so it is CHECKED, never assumed (same discipline as LICM).
+//   • REDUCIBLE single-latch loop — the header φ must have exactly two arms (one external,
+//     one from the unique back-edge tail); multi-latch / irreducible loops are skipped.
+//   • `cfg_complete`-guarded (computed goto ⟹ unsound dominance).
+//
+// MEASURED, not asserted: like LICM, on the memory-bound naive-slot backend the new φ adds
+// spill slots and edge copies that can outweigh the mul→add saving — so this ships behind
+// the `Passes` toggle, default-OFF, and its value here is the PROOF and the teaching, with
+// the perf win latent for a register-resident backend.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Match `Bin(_, _, _, a, b)` operands as (Tmp(want), Imm k) in either order → k.
+fn tmp_times_imm(a: &Val, b: &Val, want: Tmp) -> Option<i64> {
+    match (a, b) {
+        (Val::Tmp(t), Val::Imm(k)) | (Val::Imm(k), Val::Tmp(t)) if *t == want => Some(*k),
+        _ => None,
+    }
+}
+
+pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc) -> u32 {
+    if !cfg_complete(f) {
+        return 0; // computed goto ⟹ dominance/back-edges unsound (as LICM/GVN/SCCP)
+    }
+    let dom = dominators(f);
+    let backs = back_edges(f, &dom);
+    let mut changed = 0u32;
+    for &(tail, header) in &backs {
+        // REDUCIBLE single-latch only: a unique back-edge into `header` ⟹ the header φ has
+        // exactly one latch arm, so the accumulator φ we build is well-formed.
+        if backs.iter().filter(|(_, h)| *h == header).count() != 1 {
+            continue;
+        }
+        // Def-counts are recomputed PER back-edge, against the CURRENT function: a previous
+        // loop's rewrite may have appended fresh temps (jbase/jnext/jphi), so a stale snapshot
+        // would both under-size the array (a nested-loop panic) and miss the new single-defs.
+        let mut defcnt = vec![0u32; f.temps.len()];
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Some(d) = inst_def(i) {
+                    defcnt[d as usize] += 1;
+                }
+            }
+        }
+        let body = natural_loop(f, tail, header);
+        // 1. BASIC INDUCTION VARIABLES from the header φ region: i₁ = φ(ext: i₀, tail: i₂)
+        //    with i₂ = i₁ + c (constant c), integer, all single-def.
+        let mut bivs: Vec<(Tmp, TypeId, Val, i64)> = Vec::new(); // (i₁, ty, i₀, step c)
+        for inst in &f.blocks[header as usize].insts {
+            let Inst::Phi(i1, ty, arms) = inst else { continue };
+            if tt.is_float(*ty) || arms.len() != 2 || defcnt[*i1 as usize] != 1 {
+                continue;
+            }
+            let latch = arms.iter().find(|(p, _)| *p == tail);
+            let ext = arms.iter().find(|(p, _)| *p != tail);
+            let (Some((_, Val::Tmp(i2))), Some((_, i0))) = (latch, ext) else { continue };
+            if defcnt[*i2 as usize] != 1 {
+                continue;
+            }
+            // find i₂'s definition inside the body: Bin(i₂, Add, ty, i₁, Imm c) (either order).
+            let mut step = None;
+            for &bid in &body {
+                for di in &f.blocks[bid as usize].insts {
+                    if let Inst::Bin(d, Op::Add, dty, a, b) = di {
+                        if *d == *i2 && *dty == *ty {
+                            step = tmp_times_imm(a, b, *i1);
+                        }
+                    }
+                }
+            }
+            if let Some(c) = step {
+                bivs.push((*i1, *ty, *i0, c));
+            }
+        }
+        if bivs.is_empty() {
+            continue;
+        }
+        // 2. DERIVED IVs: Bin(j, Mul, ty, i₁, Imm d) in the body, j single-def, integer.
+        let mut derived: Vec<(BlockId, Tmp, TypeId, Val, i64, i64)> = Vec::new(); // (blk, j, ty, i₀, c, d)
+        for &bid in &body {
+            for inst in &f.blocks[bid as usize].insts {
+                let Inst::Bin(j, Op::Mul, ty, a, b) = inst else { continue };
+                if tt.is_float(*ty) || defcnt[*j as usize] != 1 {
+                    continue;
+                }
+                for &(i1, bty, i0, c) in &bivs {
+                    if bty == *ty {
+                        if let Some(d) = tmp_times_imm(a, b, i1) {
+                            derived.push((bid, *j, *ty, i0, c, d));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if derived.is_empty() {
+            continue;
+        }
+        // 3. Materialize the preheader ONLY now (no empty preheaders). It may rename the
+        //    header φ's external arm predecessor to `ph` (the value i₀ is unchanged).
+        let ph = match ensure_preheader(f, header, &body) {
+            Some(p) => p,
+            None => continue,
+        };
+        // 4. Rewrite each derived IV into an accumulator φ.
+        for (bid, j, ty, i0, c, d) in derived {
+            let jbase = f.temps.len() as Tmp; // j₀ = i₀·d, computed ONCE in the preheader
+            f.temps.push(ty);
+            f.blocks[ph as usize].insts.push(Inst::Bin(jbase, Op::Mul, ty, i0, Val::Imm(d)));
+            let jnext = f.temps.len() as Tmp; // j₂ = j₁ + c·d, at the latch
+            f.temps.push(ty);
+            let jphi = f.temps.len() as Tmp; // j₁ = φ(ph: j₀, tail: j₂), the accumulator
+            f.temps.push(ty);
+            let pos = f.blocks[header as usize]
+                .insts
+                .iter()
+                .position(|i| !matches!(i, Inst::Phi(..)))
+                .unwrap_or(0);
+            f.blocks[header as usize].insts.insert(
+                pos,
+                Inst::Phi(jphi, ty, vec![(ph, Val::Tmp(jbase)), (tail, Val::Tmp(jnext))]),
+            );
+            let step = c.wrapping_mul(d); // c·d folded now (interp canon's to `ty` width)
+            f.blocks[tail as usize].insts.push(Inst::Bin(jnext, Op::Add, ty, Val::Tmp(jphi), Val::Imm(step)));
+            // Replace the derived multiply `j = i₁·d` with `j = j₁`. Indices shifted (φ
+            // insert / latch append), so RE-LOCATE by j's unique (single-def) defining site.
+            if let Some(cur) = f.blocks[bid as usize].insts.iter().position(|i| inst_def(i) == Some(j)) {
+                f.blocks[bid as usize].insts[cur] = Inst::Copy(j, ty, Val::Tmp(jphi));
+            }
+            changed += 1;
+        }
+    }
+    changed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
 // point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
 // return to executable (φ-free) IR and do a final non-SSA cleanup.
@@ -2046,6 +2216,7 @@ pub struct Passes {
     pub dce: bool,
     pub cfg_simplify: bool,
     pub licm: bool,
+    pub strength_reduce: bool,
     pub coalesce: bool, // register coalescing (biased coloring, inside abi_alloc)
 }
 
@@ -2060,6 +2231,7 @@ impl Default for Passes {
             dce: true,
             cfg_simplify: true,
             licm: false, // proven-correct but measured-negative on the naive-slot backend
+            strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
             coalesce: true,
         }
     }
@@ -2070,7 +2242,7 @@ impl Passes {
     /// at runtime the same effect is `ZCC_OPT_ON=licm` over the default profile.
     #[cfg(test)]
     pub fn all() -> Self {
-        Passes { licm: true, ..Passes::default() }
+        Passes { licm: true, strength_reduce: true, ..Passes::default() }
     }
     fn set(&mut self, name: &str, v: bool) {
         match name {
@@ -2082,6 +2254,7 @@ impl Passes {
             "dce" => self.dce = v,
             "cfg_simplify" | "cfg" => self.cfg_simplify = v,
             "licm" => self.licm = v,
+            "strength_reduce" | "strength" | "sr" => self.strength_reduce = v,
             "coalesce" => self.coalesce = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
@@ -2130,6 +2303,9 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
         }
         if p.licm {
             n += licm(f); // hoist loop-invariant pure arithmetic to the preheader
+        }
+        if p.strength_reduce {
+            n += strength_reduce(tt, f); // i·d in a loop → add-accumulator φ (mul → add)
         }
         if n == 0 {
             break; // fixpoint
@@ -3608,12 +3784,14 @@ mod tests {
     #[test]
     fn passes_toggle_wiring() {
         assert!(!Passes::default().licm, "default profile ships licm OFF (measured-negative)");
+        assert!(!Passes::default().strength_reduce, "default ships strength_reduce OFF (measured-negative)");
         assert!(Passes::default().gvn && Passes::default().coalesce, "other proven passes default ON");
-        assert!(Passes::all().licm, "all() turns licm ON");
+        assert!(Passes::all().licm && Passes::all().strength_reduce, "all() turns loop passes ON");
         let mut p = Passes::default();
         p.set("gvn", false);
         p.set("licm", true);
-        assert!(!p.gvn && p.licm, "set() flips individual elements independently");
+        p.set("sr", true); // alias for strength_reduce
+        assert!(!p.gvn && p.licm && p.strength_reduce, "set() flips individual elements independently");
         p.set("nonexistent", false); // unknown name ignored (forward-compatible)
     }
 
@@ -3660,6 +3838,128 @@ mod tests {
         assert!(
             equiv(&ast.tt, &base, &vec![bad], "f").is_err(),
             "a Mul→Add mutation of the hoisted invariant MUST be caught (else the gate is blind)"
+        );
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // STRENGTH REDUCTION (Phase B.5) — ⟦f⟧=⟦strength_reduce(f)⟧, the IV-accumulator theorem.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    fn phi_count(f: &IrFunc) -> usize {
+        f.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Phi(..))).count()
+    }
+
+    // Commuting square over the whole generated structural space: to_ssa ▸ strength_reduce
+    // preserves ⟦·⟧ and stays well-formed for every e ∈ 𝔼_struct. Anti-vacuous below.
+    #[test]
+    fn strength_reduce_semantics_preserved() {
+        let srcs = e_struct();
+        let mut proven = 0u32;
+        for src in &srcs {
+            let (ast, ir) = compile("sr", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+            }
+            let mut opt = ssa.clone();
+            for f in opt.iter_mut() {
+                strength_reduce(&ast.tt, f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify sr {src}: {e}"));
+            }
+            equiv(&ast.tt, &ssa, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦strength_reduce(·)⟧ for {src}: {e}"));
+            proven += 1;
+        }
+        assert_eq!(proven, 312, "must prove strength_reduce over the whole generated space");
+        eprintln!("strength_reduce theorem: {proven} exprs proven ⟦to_ssa(f)⟧=⟦sr(·)⟧");
+    }
+
+    // NON-VACUOUS + the matmul motivation: `s = s + i*7` in a loop. `i` is a basic induction
+    // variable (header φ, i=i+1), so `i*7` is a DERIVED IV — strength reduction replaces the
+    // per-iteration MULTIPLY with an add-accumulator φ (one extra φ, the multiply leaves the
+    // loop as a copy). Value preserved; the accumulator φ is the structural evidence it fired.
+    //
+    // ENABLING-PASS DEPENDENCY (phase ordering): mem2reg leaves a COPY between the header φ and
+    // each use of the induction variable (`t9 = copy(i₁); t10 = t9·7`), so SR sees the multiply
+    // riding a copy, NOT the φ directly. `copy_prop` must run FIRST to collapse the copy — only
+    // then is the derived IV visible. SR is therefore NOT independent: copy_prop ENABLES it. In
+    // the real pipeline copy_prop precedes SR in the fixpoint; the test reproduces that order.
+    #[test]
+    fn strength_reduce_fires() {
+        let (ast, ir) =
+            compile("srf", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){s=s+i*7;}return s;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        copy_prop(&mut ssa); // ENABLING pass — collapse the mem2reg copies onto the φ
+        let phis_before = phi_count(&ssa);
+        let mut opt = ssa.clone();
+        let n = strength_reduce(&ast.tt, &mut opt);
+        verify(&opt).unwrap();
+        assert!(n > 0, "strength_reduce must fire on i*7 (a derived induction variable)");
+        assert!(
+            phi_count(&opt) > phis_before,
+            "the reduction introduces an accumulator φ (mul → add march)"
+        );
+        let base = vec![ssa];
+        equiv(&ast.tt, &base, &vec![opt.clone()], "f")
+            .expect("strength reduction: ⟦to_ssa(f)⟧=⟦sr(·)⟧");
+        // f(4) = Σ_{i=0}^{3} i*7 = 7*(0+1+2+3) = 42.
+        assert_eq!(interp(&ast.tt, &vec![opt.clone()], "f", &[4]).unwrap(), 42);
+        assert_eq!(interp(&ast.tt, &vec![opt], "f", &[0]).unwrap(), 0);
+    }
+
+    // Full-pipeline soundness: strength_reduce inside optimize_ssa (Passes::all) must produce
+    // a φ-free, verifying, value-correct function — the accumulator φ is destroyed by out_of_ssa.
+    #[test]
+    fn strength_reduce_in_pipeline_terminates_correct() {
+        let (ast, ir) =
+            compile("srp", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){s=s+i*3;}return s;}");
+        let mut opt = ir.clone();
+        for f in opt.iter_mut() {
+            optimize_ssa(&ast.tt, f, &Passes::all());
+        }
+        for f in &opt {
+            verify(f).unwrap_or_else(|e| panic!("verify: {e}"));
+            assert_eq!(phi_count(f), 0, "out_of_ssa must destroy the accumulator φ");
+        }
+        // f(5) = 3*(0+1+2+3+4) = 30.
+        assert_eq!(interp(&ast.tt, &opt, "f", &[5]).unwrap(), 30);
+    }
+
+    // Self-proof (clean-input law): the gate has TEETH. Corrupt the accumulator step and equiv
+    // MUST catch it — proving the inserted march is genuinely exercised, not dead.
+    #[test]
+    fn strength_reduce_gate_has_teeth() {
+        let (ast, ir) =
+            compile("srt", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){s=s+i*7;}return s;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        copy_prop(&mut ssa); // ENABLING pass (see strength_reduce_fires)
+        let mut opt = ssa.clone();
+        assert!(strength_reduce(&ast.tt, &mut opt) > 0, "must fire (precondition for teeth)");
+        verify(&opt).unwrap();
+        let base = vec![ssa];
+        equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("identity: sr preserves ⟦·⟧");
+        // After SR the ONLY remaining Mul is the base `i₀·d` SR inserted in the preheader (the
+        // body multiply became a copy of the accumulator φ). Corrupt it Mul→Add; equiv must
+        // diverge, proving SR's inserted base computation is genuinely exercised.
+        let mut bad = opt.clone();
+        let mut mutated = false;
+        'o: for b in bad.blocks.iter_mut() {
+            for i in b.insts.iter_mut() {
+                if let Inst::Bin(_, op @ Op::Mul, ..) = i {
+                    *op = Op::Add;
+                    mutated = true;
+                    break 'o;
+                }
+            }
+        }
+        assert!(mutated, "there must be an inserted base Mul to corrupt");
+        assert!(
+            equiv(&ast.tt, &base, &vec![bad], "f").is_err(),
+            "a Mul→Add corruption of the inserted base i₀·d MUST be caught (else the gate is blind)"
         );
     }
 
