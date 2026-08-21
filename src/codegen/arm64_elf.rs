@@ -1645,6 +1645,20 @@ fn sym(n: &str) -> String {
 // (load/store/cast_op/ext/imm/lea_local). Đuôi exotic: Opaque bridge re-emit
 // subtree AST cũ. Đường này sẽ THAY đường AST khi phủ hết suite (rồi xoá AST-walk).
 // ═══════════════════════════════════════════════════════════════════════════
+// Slot AAPCS cho ir_call_abi (bản độc lập của Slot cục bộ trong self.call — sẽ là
+// bản DUY NHẤT khi Stage D xoá AST-walk). G=x-reg, F=v-reg float(4B cần fcvt),
+// S=scalar→stack, St=struct→GPR(2 reg?), StS=struct→stack, H=HFA→v-reg, Q=ldouble q.
+#[derive(Clone, Copy)]
+enum ASlot {
+    G(u32),
+    F(u32, bool),
+    S(u32, u32, bool),
+    St(u32, bool),
+    StS(u32, u32),
+    H(u32, u32, bool),
+    Q(u32),
+}
+
 impl<'a> Cg<'a> {
     fn ir_toff(&self, i: Tmp) -> u32 {
         self.ir_tbase + 8 + i * 8
@@ -1827,6 +1841,194 @@ impl<'a> Cg<'a> {
         }
     }
 
+    // Call ABI-đầy-đủ trên IR: PORT nguyên cấu trúc self.call (push/pop stack, AAPCS
+    // C.1–C.11) — chỉ thay `self.expr(arg)` bằng `ld_val(val, "x0")` vì operand đã
+    // materialize thành Val (temp x29-relative). Val struct = ĐỊA CHỈ (khớp expr).
+    // ret struct: gom v-reg(HFA)/x0:x1(≤16B)/x8-sret(>16B) về local[sret_off], x0=&local.
+    fn ir_call_abi(
+        &mut self,
+        dst: &Option<Tmp>,
+        callee: &Callee,
+        args: &[(Val, TypeId)],
+        ret: TypeId,
+        sret_off: u32,
+    ) {
+        let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
+        let (mut gp, mut fp, mut off) = (0u32, 0u32, 0u32);
+        let mut plan = Vec::with_capacity(args.len());
+        for &(_, t) in args {
+            if matches!(self.a.tt.tys[t as usize], Ty::Struct(_)) {
+                let sz = self.a.tt.size(t);
+                let hfa = self.a.tt.hfa(t);
+                if let Some((dbl, n)) = hfa {
+                    if fp + n <= 8 {
+                        plan.push(ASlot::H(fp, n, dbl));
+                        fp += n;
+                        continue;
+                    }
+                    fp = 8; // AAPCS C.3
+                }
+                let need = if sz > 8 { 2 } else { 1 };
+                if hfa.is_none() && gp + need <= 8 {
+                    plan.push(ASlot::St(gp, sz > 8));
+                    gp += need;
+                } else {
+                    let o = alup(off, 8);
+                    plan.push(ASlot::StS(o, sz));
+                    off = o + sz.div_ceil(8) * 8;
+                    if hfa.is_none() {
+                        gp = 8; // C.11 (HFA tràn C.3 KHÔNG khóa NGRN)
+                    }
+                }
+                continue;
+            }
+            let fl = self.a.tt.is_float(t);
+            let szt = self.a.tt.size(t);
+            if fl && szt == 16 {
+                if fp < 8 {
+                    plan.push(ASlot::Q(fp));
+                    fp += 1;
+                } else {
+                    let o = alup(off, 16);
+                    plan.push(ASlot::S(o, 16, true));
+                    off = o + 16;
+                }
+            } else if fl && fp < 8 {
+                plan.push(ASlot::F(fp, szt == 4));
+                fp += 1;
+            } else if !fl && gp < 8 {
+                plan.push(ASlot::G(gp));
+                gp += 1;
+            } else {
+                let o = alup(off, 8);
+                plan.push(ASlot::S(o, szt, fl));
+                off = o + 8;
+            }
+        }
+        let pad = (off + 15) & !15;
+        if pad > 0 {
+            self.sp_adjust("sub", pad);
+        }
+        for (&(val, _), &sl) in args.iter().zip(&plan) {
+            match sl {
+                ASlot::S(o, sz, fl) => {
+                    self.ld_val(val, "x0");
+                    if fl && sz == 16 {
+                        _ = writeln!(self.s, "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #{o}]");
+                    } else if fl && sz == 4 {
+                        _ = writeln!(self.s, "\tfmov d7, x0\n\tfcvt s7, d7\n\tstr s7, [sp, #{o}]");
+                    } else {
+                        _ = match sz {
+                            1 => writeln!(self.s, "\tstrb w0, [sp, #{o}]"),
+                            2 => writeln!(self.s, "\tstrh w0, [sp, #{o}]"),
+                            4 => writeln!(self.s, "\tstr w0, [sp, #{o}]"),
+                            _ => writeln!(self.s, "\tstr x0, [sp, #{o}]"),
+                        };
+                    }
+                }
+                ASlot::StS(o, sz) => {
+                    self.ld_val(val, "x0"); // x0 = địa chỉ struct
+                    let mut k = 0;
+                    while k < sz {
+                        _ = writeln!(self.s, "\tldr x8, [x0, #{k}]\n\tstr x8, [sp, #{}]", o + k);
+                        k += 8;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Callee::Ptr(p) = callee {
+            self.ld_val(*p, "x0");
+            self.s += "\tstr x0, [sp, #-16]!\n";
+        }
+        let regargs: Vec<(Val, ASlot)> = args
+            .iter()
+            .zip(&plan)
+            .filter(|(_, sl)| !matches!(sl, ASlot::S(..) | ASlot::StS(..)))
+            .map(|(&(v, _), &sl)| (v, sl))
+            .collect();
+        for &(val, sl) in &regargs {
+            self.ld_val(val, "x0"); // struct: x0 = địa chỉ
+            if matches!(sl, ASlot::Q(_)) {
+                self.s += "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
+            } else {
+                self.s += "\tstr x0, [sp, #-16]!\n";
+            }
+        }
+        for &(_, sl) in regargs.iter().rev() {
+            match sl {
+                ASlot::G(i) => _ = writeln!(self.s, "\tldr x{i}, [sp], #16"),
+                ASlot::F(i, f32_) => {
+                    _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tfmov d{i}, x9");
+                    if f32_ {
+                        _ = writeln!(self.s, "\tfcvt s{i}, d{i}");
+                    }
+                }
+                ASlot::St(i, two) => {
+                    _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tldr x{i}, [x9]");
+                    if two {
+                        _ = writeln!(self.s, "\tldr x{}, [x9, #8]", i + 1);
+                    }
+                }
+                ASlot::H(f0, n, dbl) => {
+                    self.s += "\tldr x9, [sp], #16\n";
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(self.s, "\tldr d{}, [x9, #{}]", f0 + j, 8 * j);
+                        } else {
+                            _ = writeln!(self.s, "\tldr s{}, [x9, #{}]", f0 + j, 4 * j);
+                        }
+                    }
+                }
+                ASlot::Q(i) => _ = writeln!(self.s, "\tldr q{i}, [sp], #16"),
+                ASlot::S(..) | ASlot::StS(..) => unreachable!(),
+            }
+        }
+        // ret struct >16B: callee ghi thẳng qua x8 (đặt SAU pop reg, không bị đè)
+        let ret_struct = matches!(self.a.tt.tys[ret as usize], Ty::Struct(_));
+        if ret_struct && self.a.tt.size(ret) > 16 && self.a.tt.hfa(ret).is_none() {
+            self.lea_local("x8", sret_off);
+        }
+        match callee {
+            Callee::Sym(n) => _ = writeln!(self.s, "\tbl {}", sym(n)),
+            Callee::Ptr(_) => self.s += "\tldr x9, [sp], #16\n\tblr x9\n",
+        }
+        if pad > 0 {
+            self.sp_adjust("add", pad);
+        }
+        // canonical hóa / gom kết quả
+        match self.a.tt.tys[ret as usize] {
+            Ty::Void => {}
+            Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
+            Ty::Double => self.s += "\tfmov x0, d0\n",
+            Ty::LDouble => self.s += "\tbl __trunctfdf2\n\tfmov x0, d0\n",
+            Ty::Struct(_) => {
+                let sz = self.a.tt.size(ret);
+                if let Some((dbl, n)) = self.a.tt.hfa(ret) {
+                    self.lea_local("x9", sret_off);
+                    for j in 0..n {
+                        if dbl {
+                            _ = writeln!(self.s, "\tstr d{j}, [x9, #{}]", 8 * j);
+                        } else {
+                            _ = writeln!(self.s, "\tstr s{j}, [x9, #{}]", 4 * j);
+                        }
+                    }
+                } else if sz <= 16 {
+                    self.lea_local("x9", sret_off);
+                    self.s += "\tstr x0, [x9]\n";
+                    if sz > 8 {
+                        self.s += "\tstr x1, [x9, #8]\n";
+                    }
+                }
+                self.lea_local("x0", sret_off); // giá trị = &local
+            }
+            _ => self.ext(ret),
+        }
+        if let Some(d) = dst {
+            self.tmp_store(*d, "x0");
+        }
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Copy(d, _ty, a) => {
@@ -1889,6 +2091,9 @@ impl<'a> Cg<'a> {
                 self.tmp_store(*d, "x0");
             }
             Inst::Call(dst, callee, args, _nfix) => self.ir_call(dst, callee, args),
+            Inst::CallX(dst, callee, args, ret, sret) => {
+                self.ir_call_abi(dst, callee, args, *ret, *sret)
+            }
             Inst::Opaque(dst, node) => {
                 // BRIDGE tạm: re-emit subtree AST cũ (kết quả x0), nạp vào temp.
                 match dst {

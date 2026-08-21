@@ -107,6 +107,11 @@ pub enum Inst {
     // stack (sub sp, làm tròn 16). Impure (đổi sp) → không DCE/CSE dù dst chết;
     // epilogue `mov sp,x29` thu hồi, reset_sp_base tại label depth-0 (goto-lùi).
     Alloca(Tmp, Val), // dst = &vùng cấp; operand = số byte
+    // Call ABI-đầy-đủ (composite arg/ret, tràn reg, float≠8B, long double) — automaton
+    // AAPCS64 C.1–C.11. Operand mang KIỂU từng arg (Val = giá trị scalar / ĐỊA CHỈ
+    // struct, khớp lower_expr). ret = kiểu trả; sret = local slot khi ret là struct
+    // (dst = &slot). Scalar-thuần vẫn đi Inst::Call (nhanh). Impure.
+    CallX(Option<Tmp>, Callee, Vec<(Val, TypeId)>, TypeId, u32), // dst?, callee, (val,ty)*, ret, sret-off
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -172,7 +177,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
         | Inst::Alloca(d, ..) => Some(*d),
-        Inst::Call(d, ..) | Inst::Opaque(d, ..) => *d,
+        Inst::Call(d, ..) | Inst::Opaque(d, ..) | Inst::CallX(d, ..) => *d,
         Inst::Store(..)
         | Inst::Memcpy(..)
         | Inst::Zero(..)
@@ -220,6 +225,14 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
                 v(p)
             }
             for a in args {
+                v(a)
+            }
+        }
+        Inst::CallX(_, c, args, _, _) => {
+            if let Callee::Ptr(p) = c {
+                v(p)
+            }
+            for (a, _) in args {
                 v(a)
             }
         }
@@ -555,13 +568,15 @@ impl<'a> Lower<'a> {
                 Val::Tmp(old)
             }
             // Call thuần-scalar → Inst::Call (IR sạch). Có composite arg/ret (struct
-            // by-value, HFA, >16B) → ABI-automaton C.1–C.11 phức tạp: bridge nguyên
-            // call sang self.call (một chỗ giữ ABI, không nhân đôi).
+            // by-value, HFA, >16B, float≠8B, tràn reg) → ABI-automaton C.1–C.11 →
+            // Inst::CallX (operand mang KIỂU, emitter port self.call). ret struct đã
+            // được parser bọc SRet nên nhánh này ty luôn scalar/void.
             Node::Call(name, args, nfix) => {
                 let (name, nfix) = (name.clone(), *nfix);
                 let args = args.clone();
                 if self.call_composite(&args, ty) {
-                    return self.bridge_val(n, ty);
+                    let cargs = self.lower_call_args(&args);
+                    return self.emit_callx(Callee::Sym(name), cargs, ty);
                 }
                 let av: Vec<Val> = args.iter().map(|&x| self.lower_expr(x)).collect();
                 if ty == VOID {
@@ -577,7 +592,9 @@ impl<'a> Lower<'a> {
                 let (e, nfix) = (*e, *nfix);
                 let args = args.clone();
                 if self.call_composite(&args, ty) {
-                    return self.bridge_val(n, ty);
+                    let p = self.lower_expr(e);
+                    let cargs = self.lower_call_args(&args);
+                    return self.emit_callx(Callee::Ptr(p), cargs, ty);
                 }
                 let p = self.lower_expr(e);
                 let av: Vec<Val> = args.iter().map(|&x| self.lower_expr(x)).collect();
@@ -589,6 +606,24 @@ impl<'a> Lower<'a> {
                     self.push(Inst::Call(Some(t), Callee::Ptr(p), av, nfix));
                     Val::Tmp(t)
                 }
+            }
+            // Call trả struct (parser bọc SRet(call, off, sz)): ABI đầy đủ + gom kết
+            // quả (v-reg HFA / x0:x1 ≤16B / x8-sret >16B) về local[off]; giá trị = &local.
+            Node::SRet(call, off, _sz) => {
+                let (call, off) = (*call, *off);
+                let (pe, name, cargs_nodes) = match &a.nodes[call as usize] {
+                    Node::Call(nm, ar, _) => (None, Some(nm.clone()), ar.clone()),
+                    Node::CallPtr(e, ar, _) => (Some(*e), None, ar.clone()),
+                    _ => unreachable!("SRet bọc non-call"),
+                };
+                let callee = match name {
+                    Some(nm) => Callee::Sym(nm),
+                    None => Callee::Ptr(self.lower_expr(pe.unwrap())),
+                };
+                let cargs = self.lower_call_args(&cargs_nodes);
+                let d = self.t(ULONG); // địa chỉ struct-result (&local[off])
+                self.push(Inst::CallX(Some(d), callee, cargs, ty, off));
+                Val::Tmp(d)
             }
             // exotic đã có Inst typed (operand-free) → hạ thẳng, không qua Opaque.
             Node::FunAddr(name) => {
@@ -670,8 +705,26 @@ impl<'a> Lower<'a> {
                     self.lower_expr(last)
                 }
             }
-            // đuôi exotic (Sync/Asm/Alloca/SRet/composite-Call/…) → bridge
+            // đuôi exotic (Sync/Asm/…) → bridge
             _ => self.bridge_val(n, ty),
+        }
+    }
+
+    /// Lower từng arg → (Val, kiểu). Val = giá trị scalar / ĐỊA CHỈ struct (khớp
+    /// self.expr): emitter ABI đọc kiểu để phân slot, đọc Val để nạp thanh ghi/stack.
+    fn lower_call_args(&mut self, args: &[NodeId]) -> Vec<(Val, TypeId)> {
+        args.iter().map(|&x| (self.lower_expr(x), self.a.types[x as usize])).collect()
+    }
+
+    /// Push CallX (composite, ret scalar/void) và trả Val kết quả.
+    fn emit_callx(&mut self, callee: Callee, cargs: Vec<(Val, TypeId)>, ty: TypeId) -> Val {
+        if ty == VOID {
+            self.push(Inst::CallX(None, callee, cargs, VOID, 0));
+            Val::Imm(0)
+        } else {
+            let d = self.t(ty);
+            self.push(Inst::CallX(Some(d), callee, cargs, ty, 0));
+            Val::Tmp(d)
         }
     }
 
@@ -1193,8 +1246,9 @@ pub(crate) mod tests {
                     | Inst::Overflow(..)
                     | Inst::VaArea(..)
                     | Inst::GotoPtr(..)
-                    | Inst::Alloca(..) => {
-                        return Err("interp: exotic (symbol/va/overflow/goto/alloca — hàm không thuần)".into())
+                    | Inst::Alloca(..)
+                    | Inst::CallX(..) => {
+                        return Err("interp: exotic (symbol/va/overflow/goto/alloca/callX — hàm không thuần)".into())
                     }
                 }
             }
