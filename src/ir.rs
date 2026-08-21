@@ -88,7 +88,7 @@ pub enum Inst {
     // dst = &hàm (GOT nếu extern, adrp/add nếu static). Địa chỉ hằng-symbol,
     // KHÔNG toán hạng Val. Giữ impure (như Opaque) → không DCE/CSE → asm bất biến.
     FunAddr(Tmp, String),   // dst = địa chỉ hàm `name`
-    LabelAddr(Tmp, String), // dst = &&label (GNU computed-goto) trong hàm hiện tại
+    LabelAddr(Tmp, String), // EXT(gcc): dst = &&label (computed-goto) trong hàm hiện tại
     // memset(addr, 0, sz): zero-init struct/array (C99 6.7.8). Void, side-effect
     // ghi bộ nhớ → impure như Store, KHÔNG dst.
     Zero(Val, u32), // *(addr .. addr+sz) = 0
@@ -100,7 +100,7 @@ pub enum Inst {
     // op = mã u8; ta/tb = kiểu toán hạng (dấu), rt = kiểu *(rp) (dấu+rộng). Impure.
     Overflow(Tmp, u8, TypeId, TypeId, TypeId, Val, Val, Val), // dst,op,ta,tb,rt,a,b,rp
     VaArea(Tmp, u32), // builtin __va_area__: dst = x29 + off (đầu vùng arg vô danh)
-    // GNU computed-goto "goto *e": br qua giá trị. Kết thúc khối theo runtime (block
+    // EXT(gcc): computed-goto "goto *e": br qua giá trị. Kết thúc khối theo runtime (block
     // IR sau nó là dead — như Opaque cũ). Impure, KHÔNG dst.
     GotoPtr(Val),
     // C99 6.7.5.2 VLA / __builtin_alloca: dst = con trỏ tới `size` byte cấp trên
@@ -144,7 +144,6 @@ pub enum Term {
     Jmp(BlockId),                          // nhảy vô điều kiện
     Br(Val, BlockId, BlockId),             // cond ≠ 0 → then, ngược lại → els
     Ret(Option<Val>),                      // trả (void nếu None)
-    Switch(Val, Vec<(i64, BlockId)>, BlockId), // val khớp case → block, còn lại default
     Unreachable,                           // sau noreturn / chốt fallthrough không tới
 }
 
@@ -281,7 +280,6 @@ pub(crate) fn term_uses(t: &Term, out: &mut Vec<Tmp>) {
     };
     match t {
         Term::Br(c, ..) => v(c),
-        Term::Switch(c, ..) => v(c),
         Term::Ret(Some(r)) => v(r),
         Term::Jmp(_) | Term::Ret(None) | Term::Unreachable => {}
     }
@@ -294,12 +292,6 @@ pub(crate) fn term_targets(t: &Term, out: &mut Vec<BlockId>) {
         Term::Br(_, a, b) => {
             out.push(*a);
             out.push(*b);
-        }
-        Term::Switch(_, cases, def) => {
-            for (_, b) in cases {
-                out.push(*b)
-            }
-            out.push(*def);
         }
         Term::Ret(_) | Term::Unreachable => {}
     }
@@ -757,7 +749,7 @@ impl<'a> Lower<'a> {
                 self.push(Inst::Asm(tpl, irops));
                 Val::Imm(0) // asm expr = void
             }
-            // GNU statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
+            // EXT(gcc): statement-expression `({ s1; …; last })` ở vị trí biểu thức: chạy
             // tuần tự các stmt (side-effect qua lower_stmt), giá trị = giá trị của
             // stmt CUỐI nếu nó là expr-statement (C99-EXT gcc), ngược lại void.
             // KHÔNG cần Inst mới — stmt-expr chỉ là "statements + 1 value" trong IR.
@@ -1324,11 +1316,6 @@ pub(crate) mod tests {
                 Term::Jmp(t) => cur = *t as usize,
                 Term::Br(c, t, e) => cur = if fetch(&reg, c) != 0 { *t } else { *e } as usize,
                 Term::Ret(v) => return Ok(v.map(|v| fetch(&reg, &v)).unwrap_or(0)),
-                Term::Switch(v, cases, def) => {
-                    let x = fetch(&reg, v);
-                    cur = cases.iter().find(|(k, _)| *k == x).map(|(_, b)| *b).unwrap_or(*def)
-                        as usize;
-                }
                 Term::Unreachable => return Err("interp: chạm Unreachable".into()),
             }
         }

@@ -54,7 +54,10 @@ fn preprocess_pt(
     incs: &[String],
 ) -> Result<(Vec<PTok>, Vec<String>), String> {
     let mut macros = Macros::new();
-    // predefine target arm64 ELF Linux (LP64 little-endian)
+    // EXT(gcc): bảng predefined macro (target arm64 ELF Linux, LP64 little-endian) —
+    // __LP64__/__aarch64__/__CHAR_BIT__/__SIZEOF_*/__*_TYPE__/__builtin_* là gcc-predefined,
+    // KHÔNG ISO; chỉ __STDC__/__STDC_VERSION__ trong bảng là ISO (6.10.8). Phép-cắt: bỏ
+    // bảng này → còn C89 thuần (không TU nào thấy macro gcc → fallback path chuẩn).
     let ones = [
         "__STDC__", "__LP64__", "__arm64__", "__aarch64__",
         "__linux__",
@@ -579,7 +582,7 @@ fn process(
                 }
             }
             "pragma" => {
-                // #pragma push_macro("x") / pop_macro("x") — clang/gcc extension
+                // EXT(gcc): #pragma push_macro("x") / pop_macro("x")
                 if let (Some(Tok::Ident(p)), Some(Tok::Str(b, _))) =
                     (d.get(1).map(|t| &t.tok), d.get(3).map(|t| &t.tok))
                 {

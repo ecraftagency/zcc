@@ -102,7 +102,7 @@ impl TyTab {
     }
     pub fn size(&self, t: TypeId) -> u32 {
         match self.tys[t as usize] {
-            Ty::Void => 1, // cho void* arith kiểu GNU; sizeof(void) C89 vốn không hợp lệ
+            Ty::Void => 1, // EXT(gcc): void* arith; sizeof(void) C89 vốn không hợp lệ
             Ty::Char | Ty::UChar | Ty::Bool => 1,
             Ty::Short | Ty::UShort => 2,
             Ty::Int | Ty::UInt | Ty::Float => 4,
@@ -255,8 +255,8 @@ pub enum Node {
     Break,
     Continue,
     Goto(String),
-    GotoPtr(NodeId),   // GNU "goto *e" — br qua giá trị
-    LabelAddr(String), // GNU "&&label" — địa chỉ label trong hàm hiện tại
+    GotoPtr(NodeId),   // EXT(gcc): "goto *e" — br qua giá trị
+    LabelAddr(String), // EXT(gcc): "&&label" — địa chỉ label trong hàm hiện tại
     Label(String, NodeId),
     Block(Vec<NodeId>),
     Call(String, Vec<NodeId>, u32), // gọi thẳng theo tên; nreg = số arg đầu "đặt tên"
@@ -305,7 +305,7 @@ pub enum GInit {
     Num(i64), // với kiểu float: đây là BIT PATTERN (f32/f64 theo size)
     Str(u32),
     Addr(String, i64), // symbol + offset byte: int *p = &g.m; (prefix \x01 = tên đủ, không thêm _)
-    Diff(String, String), // hiệu 2 symbol: &&a - &&b (GNU, static jump table)
+    Diff(String, String), // EXT(gcc): hiệu 2 symbol &&a - &&b (static jump table)
     StrOff(u32, i64),  // địa chỉ vào giữa string literal: "abc" + 1, &"X"[0]
     Bytes(Vec<u8>),    // char arr[] = "..." (đã pad đủ size)
     List(Vec<(u32, u32, GInit)>), // initializer phẳng hóa: (offset, size, item)

@@ -41,7 +41,6 @@ struct Cg<'a> {
     fframe: u32,
     fvariadic: bool,
     fhasvla: bool,
-    vla_live: u32, // số VLA lexical đang sống (scope hiện tại) khi walk
     // đường IR (migrate): base offset vùng temp-slot (= frame; temp i tại
     // x29 − (ir_tbase + 8 + i*8)); ir_temps = bảng kiểu temp hàm hiện tại.
     ir_tbase: u32,
@@ -613,7 +612,7 @@ impl Cg<'_> {
         self.s += "\tstrb wzr, [x0], #1\n\tsubs x2, x2, #1\n";
         _ = writeln!(self.s, "\tb.ne L{n}");
     }
-    // &&label (GNU computed-goto) → x0. Nhãn cục bộ trong hàm hiện tại.
+    // EXT(gcc): &&label (computed-goto) → x0. Nhãn cục bộ trong hàm hiện tại.
     fn emit_labeladdr(&mut self, name: &str) {
         _ = writeln!(
             self.s,
@@ -1401,7 +1400,6 @@ impl<'a> Cg<'a> {
             Inst::Alloca(d, size) => {
                 self.ld_val(*size, "x0"); // số byte
                 self.s += "\tadd x0, x0, #15\n\tand x0, x0, #0xfffffffffffffff0\n\tsub sp, sp, x0\n\tmov x0, sp\n";
-                self.vla_live += 1; // VLA sống scope hiện tại (dealloc reset_sp_base tại label)
                 self.tmp_store(*d, "x0");
             }
         }
@@ -1424,14 +1422,6 @@ impl<'a> Cg<'a> {
                     None => self.s += "\tmov x0, #0\n",
                 }
                 self.s += EPILOGUE;
-            }
-            Term::Switch(v, cases, def) => {
-                self.ld_val(*v, "x0");
-                for (k, b) in cases {
-                    self.imm("x1", *k);
-                    _ = writeln!(self.s, "\tcmp x0, x1\n\tb.eq {}", self.ir_label(*b));
-                }
-                _ = writeln!(self.s, "\tb {}", self.ir_label(*def));
             }
             // rơi khỏi hàm không được: chốt bằng default (giống blanket đường AST)
             Term::Unreachable => self.s += "\tmov x0, #0\n\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n",
@@ -1496,7 +1486,6 @@ pub fn emit_ir(ast: &Ast) -> String {
         fframe: 0,
         fvariadic: false,
         fhasvla: false,
-        vla_live: 0,
         ir_tbase: 0,
         ir_temps: Vec::new(),
         ir_tspill: 0,
@@ -1512,7 +1501,6 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.fframe = f.frame;
         g.fvariadic = f.variadic;
         g.fhasvla = f.has_vla;
-        g.vla_live = 0;
         if !f.is_static {
             _ = writeln!(g.s, ".globl {}", f.name);
             if f.is_inline || f.is_weak {

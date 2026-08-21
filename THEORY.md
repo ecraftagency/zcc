@@ -105,7 +105,7 @@ mọi hằng layout/ABI sống trong TyTab + file target (vế II); phần còn 
 | Basic block | chuỗi thẳng + đúng 1 terminator | `ir.rs` (`Block`) |
 | Terminator = automaton trên BlockId | Jmp/Br/Ret/Switch/Unreachable | `ir.rs` (`Term`) |
 | Virtual registers / temps (SSA-free) | temp có kiểu Γ | `ir.rs` (`temps`) |
-| CORE vs OPAQUE two-tier | CORE opt đụng được; OPAQUE bridge 1-1 asm | `ir.rs` (`Inst`) |
+| CORE vs EXOTIC-typed two-tier | CORE (Bin/Un/Copy/Load/Lea/Cast) opt đụng được; EXOTIC-typed (Call/Store/Overflow/Va*/Sync/Asm…) impure, không DCE/CSE (Inst::Opaque đã XÓA) | `ir.rs` (`Inst`) |
 | Well-formedness verifier | ref-integrity+def-coverage+entry | `ir.rs` (`verify`) |
 | SSA + φ-node *(mở khi cần)* | mỗi temp gán 1 lần | *[chưa]* |
 
@@ -204,15 +204,17 @@ không "tối ưu tuyệt đối"; nhưng *đúng-màu* verify được trong P)
 | `<limits.h>` (INT_MAX, CHAR_BIT=8…) | 5.2.4.2.1 | header + TyTab size |
 | UAC bảng chuyển | 6.3.1.8 | `common_ty` |
 | escape/trigraph, số literal suffix | 6.4.4 | `lexer.rs` |
+| source/exec char set = UTF-8 multibyte (decode-table RFC 3629: mask `0x1f/0x0f/0x07/0x3f`, shift 6) | 5.1.1.2 + 6.4.5 | `lexer.rs` `utf8_cp` |
 | `%`,`/` truncation-toward-zero; overflow signed = UB | 6.5.5 | codegen + UB-filter |
-| char = **signed** (lựa chọn impl, khóa) | 6.2.5 | TyTab |
+| char = **unsigned** (AAPCS64 aarch64 default, khóa) | 6.2.5 + AAPCS64 | TyTab (`char`→UCHAR) |
 
 ### II-2. Memory model — kích thước & alignment (LP64, khóa)
 | kiểu | size | align | nguồn |
 |---|---|---|---|
 | char/short/int/long/long long | 1/2/4/8/8 | =size | LP64 (System V AArch64) |
 | pointer | 8 | 8 | LP64 |
-| float/double/long double | 4/8/8 | =size | (long double=double: lựa-chọn có sổ) |
+| float/double | 4/8 | =size | LP64 |
+| long double | **16** | **16** | binary128 memory/ABI (AAPCS64); *số học* làm như double (float.h `LDBL_MANT_DIG=53`), libgcc `__extenddftf2`/`__trunctfdf2` ở biên — lựa-chọn có sổ |
 | struct/union | Σ có padding | max field, aggregate ≥ **8** cho `data_align` | AAPCS64 §5.1 |
 | bitfield | packing theo storage-unit | — | 6.7.2.1 + ABI |
 
@@ -255,9 +257,12 @@ branch offset ±128MB), condition codes (eq/ne/lt…), addressing modes (`[base,
 | món | trạng thái | marker |
 |---|---|---|
 | stmt-expr `({...})`, `__extension__` | DÙNG | `EXT(gcc)` |
-| `__attribute__((aligned/packed))` | DÙNG (reject phần còn lại) | `EXT(gcc)` |
+| `__attribute__((aligned/packed/weak/alias/transparent_union))` | DÙNG | `EXT(gcc)` |
+| `__attribute__((mode(QI/HI/SI/DI/word/SF/DF/TF)))` → remap width | DÙNG (bảng machmode Vế-II; TI/XF reject) | `EXT(gcc)` `parser.rs apply_mode` |
 | `__builtin_*` (whitelist), `typeof`, `__GNUC__=4`, `types_compatible_p` | DÙNG chọn lọc | `EXT(gcc)` |
-| `vector_size`, `scalar_storage_order`, `mode`, nested-func, extended-asm | **REJECT sạch** → NOT-IMPL | `EXT(gcc)` |
+| labels-as-values (`&&label`, `goto *e`), stmt-expr, range `case lo…hi`/`[lo…hi]`, elvis `?:` | DÙNG | `EXT(gcc)` |
+| extended-asm (template + constraint hẹp, musl-critical) | DÙNG subset | `EXT(gcc)` |
+| `vector_size`, `scalar_storage_order`, nested-func, `mode(TI/XF)` | **REJECT sạch** → NOT-IMPL | `EXT(gcc)` |
 
 Nơi sống: **`src/ext.rs`** + điểm chạm đánh `EXT(...)`. Kiểm chứng bằng phép cắt:
 bỏ ext.rs + nhánh marker → phần còn lại pass nguyên suite C89 (`grep 'EXT(' src/` phủ 100%).

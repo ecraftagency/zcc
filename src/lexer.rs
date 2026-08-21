@@ -139,7 +139,7 @@ fn number(b: &[u8], i: &mut usize) -> Result<Tok, String> {
     // hằng số toàn ASCII → dựng &str từ subrange byte cho parse/from_str_radix
     let sv = move |x: usize, y: usize| std::str::from_utf8(&b[x..y]).unwrap();
     if b[s..].starts_with(b"0b") || b[s..].starts_with(b"0B") {
-        // GNU: hằng nhị phân 0b1010
+        // EXT(gcc): hằng nhị phân 0b1010
         *i += 2;
         let d = *i;
         while matches!(b.get(*i), Some(b'0' | b'1')) {

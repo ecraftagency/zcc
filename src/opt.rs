@@ -81,7 +81,7 @@ fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
 }
 fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
     match t {
-        Term::Br(c, ..) | Term::Switch(c, ..) => g(c),
+        Term::Br(c, ..) => g(c),
         Term::Ret(Some(r)) => g(r),
         _ => {}
     }
@@ -98,7 +98,7 @@ fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
 //   • CHỈ integer immediate. Float (FImm) HOÃN: interp mô hình f64, fold f32 có thể
 //     lệch rounding so với backend s-reg → giữ nguyên lệnh, để hardware quyết định.
 //   • Div/Rem cho 0 → eval_bin trả Err → KHÔNG fold (giữ lệnh, giữ hành vi UB của target).
-//   • const-branch: Br(Imm c)→Jmp, Switch(Imm v)→Jmp (mở đường DCE xoá block chết sau này).
+//   • const-branch: Br(Imm c)→Jmp (mở đường DCE xoá block chết sau này).
 // KHÔNG propagate hằng qua temp (đó là copy_prop, pass 3) — pass này chỉ fold toán hạng-hằng-sẵn.
 // ─────────────────────────────────────────────────────────────────────────────
 pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
@@ -129,10 +129,6 @@ pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
         }
         let newterm: Option<Term> = match &blk.term {
             Term::Br(Val::Imm(c), t, e) => Some(Term::Jmp(if *c != 0 { *t } else { *e })),
-            Term::Switch(Val::Imm(v), cases, def) => {
-                let tgt = cases.iter().find(|(k, _)| *k == *v).map(|(_, b)| *b).unwrap_or(*def);
-                Some(Term::Jmp(tgt))
-            }
             _ => None,
         };
         if let Some(t) = newterm {

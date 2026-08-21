@@ -135,7 +135,7 @@ pub const BIT_MACROS: &[(&str, &[&str], &str)] = &[
     ),
 ];
 
-// __ATOMIC_RELAXED..__ATOMIC_SEQ_CST = 0..5 (giá trị như GCC); sự TỒN TẠI của
+// EXT(gcc): __ATOMIC_RELAXED..__ATOMIC_SEQ_CST = 0..5 (giá trị như GCC); sự TỒN TẠI của
 // __ATOMIC_SEQ_CST là cái hdr_atomic.h dò để chọn path __atomic
 pub const ATOMIC_ORDERS: &[&str] = &[
     "__ATOMIC_RELAXED",

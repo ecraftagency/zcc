@@ -46,7 +46,7 @@ enum Init {
 enum Desig {
     No,
     Idx(u32),
-    Rng(u32, u32), // GNU [lo ... hi]
+    Rng(u32, u32), // EXT(gcc): [lo ... hi] range designator
     Mem(String),
 }
 // leaf sau khi đổ phẳng initializer: expr hoặc chuỗi byte (string vào mảng char)
@@ -1904,7 +1904,7 @@ impl P<'_> {
             return Ok(self.push(Node::Asm(tpl, ops), INT));
         }
         if self.eat_kw("__label__") {
-            // GNU local label declaration — no-op: label cùng hàm resolve qua Goto
+            // EXT(gcc): __label__ local label — no-op: label cùng hàm resolve qua Goto
             // thường; non-local goto (nested func) đã bỏ nên không track gì thêm.
             loop {
                 self.pos += 1;
@@ -2034,7 +2034,7 @@ impl P<'_> {
             Ok(self.push(Node::Continue, INT))
         } else if self.eat_kw("goto") {
             if self.eat(&Tok::Punct("*")) {
-                // GNU computed goto
+                // EXT(gcc): computed goto "goto *e"
                 let e = self.expr()?;
                 self.expect(Tok::Punct(";"))?;
                 return Ok(self.push(Node::GotoPtr(e), INT));
@@ -2357,7 +2357,7 @@ impl P<'_> {
                             break;
                         }
                     }
-                    // GNU cổ: "a : 'A'" ≡ ".a = 'A'" (đầu phần tử, không nhầm ?:)
+                    // EXT(gcc) cổ: "a : 'A'" ≡ ".a = 'A'" (đầu phần tử, không nhầm ?:)
                     if steps.is_empty()
                         && let (Some(Tok::Ident(n)), Some(Tok::Punct(":"))) =
                             (self.toks.get(self.pos), self.toks.get(self.pos + 1))
@@ -2797,7 +2797,7 @@ impl P<'_> {
                 // symbol khớp quy ước label của codegen (không gạch dưới đầu)
                 return Ok(GInit::Addr(format!("\x01lg_{}.{}", self.fname, n), 0));
             }
-            // &&a - &&b: hiệu 2 label (GNU jump table tĩnh); ptr-diff void*
+            // EXT(gcc): &&a - &&b hiệu 2 label (jump table tĩnh); ptr-diff void*
             // bị mkbin bọc "/1" nên phải bóc
             Node::Bin("/" | "-", ..) => {
                 if let Some((a, b)) = self.label_diff(e) {
@@ -2862,7 +2862,7 @@ impl P<'_> {
             match item {
                 FlatItem::E(e) => {
                     if self.tt.size(mt) == 0 {
-                        continue; // empty struct (GNU): không có data
+                        continue; // EXT(gcc): empty struct — không có data
                     }
                     // aggregate = compound literal ẩn (GVar static) → trải init nó vào đây
                     if matches!(self.tt.tys[mt as usize], Ty::Struct(_) | Ty::Array(..)) {
@@ -2956,7 +2956,7 @@ impl P<'_> {
             return Ok(c);
         }
         let c = self.truthy(c)?;
-        // GNU elvis "a ?: b": vế giữa = chính cond, KHÔNG eval lại (codegen nhận
+        // EXT(gcc): elvis "a ?: b" — vế giữa = chính cond, KHÔNG eval lại (codegen nhận
         // diện tb==cond để giữ x0)
         if self.eat(&Tok::Punct(":")) {
             let e = self.cond_expr()?;
@@ -3192,7 +3192,7 @@ impl P<'_> {
             };
             Ok(self.push(Node::Deref(e), t))
         } else if self.eat(&Tok::Punct("&&")) {
-            // GNU "&&label": && ở vị trí prefix không thể là logical-and
+            // EXT(gcc): "&&label" — && ở vị trí prefix không thể là logical-and
             let n = self.ident()?;
             let t = self.tt.ptr_to(VOID);
             Ok(self.push(Node::LabelAddr(n), t))
@@ -3473,7 +3473,7 @@ impl P<'_> {
         // (obstack.h của git: __extension__ ({ ... }))
         while self.eat_kw("__extension__") {}
         if self.eat(&Tok::Punct("(")) {
-            // GNU statement expression ({ ...; expr; }): giá trị = stmt cuối
+            // EXT(gcc): statement expression ({ ...; expr; }) — giá trị = stmt cuối
             if self.peek("{") {
                 self.pos += 1;
                 let scope = self.locals.len();
@@ -3597,6 +3597,7 @@ impl P<'_> {
                 };
                 return Ok(self.push(Node::VaArg(ap, ty, tmp), ty));
             }
+            // __func__ = C99 6.4.2.2; EXT(gcc): __FUNCTION__/__PRETTY_FUNCTION__ bí danh
             if n == "__func__" || n == "__FUNCTION__" || n == "__PRETTY_FUNCTION__" {
                 let bytes = self.fname.clone().into_bytes();
                 let ln = bytes.len() as u32;
@@ -3618,8 +3619,8 @@ impl P<'_> {
                 return Ok(self.push(Node::Num(v), INT));
             }
             if n == "__builtin_classify_type" {
-                // hằng class của kiểu arg (không eval): int=1 ptr=5 real=8
-                // struct=12 union=13 — đủ cho torture
+                // EXT(gcc): hằng class của kiểu arg (không eval), mã theo gcc/typeclass.h:
+                // void=0 int=1 ptr=5 real=8 struct=12 union=13 — đủ cho torture
                 self.expect(Tok::Punct("("))?;
                 let mark = self.nodes.len();
                 let e = self.expr()?;
