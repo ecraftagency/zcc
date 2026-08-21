@@ -113,7 +113,7 @@ target file (Side II); everything else is Side I.
 | Virtual registers / temps (SSA-free) | a temporary carries a type from Γ | `ir.rs` (`temps`) |
 | CORE vs. EXOTIC-typed two-tier | CORE (Bin/Un/Copy/Load/Lea/Cast) is reachable by passes; EXOTIC-typed (Call/Store/Overflow/Va*/Sync/Asm…) is impure, no DCE/CSE (Inst::Opaque has been REMOVED) | `ir.rs` (`Inst`) |
 | Well-formedness verifier | reference integrity + def coverage + entry | `ir.rs` (`verify`) |
-| SSA + φ-node *(opened when needed)* | each temp assigned once | *[not yet]* |
+| SSA + φ-node `[ssa-qbe fork: repr+interp DONE (Stage 1)]` | single-assignment temps; a φ at a join carries the value of the predecessor edge actually taken | `ir.rs` (`Inst::Phi`, interp φ-select via `prev`, verifier φ-arm V1); proven by `phi_diamond`/`phi_loop` |
 
 ### A7. Optimization — proving each pass `[IN USE: IR→IR proven]` (each pass provable, in place of a LOC ceiling)
 
@@ -141,6 +141,16 @@ target file (Side II); everything else is Side I.
 | Liveness / reaching-defs / available-expr | basis of DCE/copy-prop/CSE |
 | Dominance / dom-tree (Lengauer–Tarjan) | A dom B; basis of copy-prop, SSA |
 | Graph coloring / interference (Chaitin–Briggs) | regalloc = coloring |
+
+**SSA pipeline `[ssa-qbe fork]` — theorem ladder (each stage a commuting square; QBE is a *projection*, CbC is supreme):**
+
+| stage | theorem (proof obligation) | status |
+|---|---|---|
+| φ-node semantics | interp selects the arm of the taken predecessor edge (denotational ⟦φ⟧) | **DONE (Stage 1)** — `phi_diamond`/`phi_loop` |
+| SSA construction (Braun 2013, on-the-fly, no dominance frontier) | `⟦f⟧ = ⟦to_ssa(f)⟧` (semantics-preserving promotion of non-address-taken locals) | PLANNED (Stage 2) |
+| out-of-SSA / φ-destruction (parallel-copy, swap/lost-copy handled) | `⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧` | PLANNED (Stage 3) |
+| SCCP (Wegman–Zadeck sparse conditional constant prop) | lattice ⊤/const/⊥ over CFG-reachability; `⟦f⟧=⟦sccp(f)⟧` | PLANNED (Stage 4) |
+| wired register allocation (consume Chaitin coloring in the backend) | interference-invariant bisimulation + `⟦·⟧` unchanged | PLANNED (Stage 5) |
 
 **5 passes → theorem (all DECIDABLE; no loop restructuring → outside Rice):**
 const-fold = rewrite-soundness · DCE = liveness · copy-prop = dominance + Leibniz ·

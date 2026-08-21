@@ -133,6 +133,14 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 | `Lea(d, Local off)` | `ρ[d ↦ frame − off]`   (`Global` / `Str` ↦ ⊥) |
 | `Cast(d,σ,τ,a)` | `ρ[d ↦ ⟦cast⟧_{σ→τ}(⟨a⟩ρ)]` |
 | `Call(Some d, Sym g, ā, _)` | `ρ[d ↦ canon_{τd}( ⟦g⟧(⟨ā⟩ρ) )]`   (recursive big-step; `Ptr` / depth > 500 ↦ ⊥) |
+| `Phi(d,τ,[(bᵢ,vᵢ)])` `[ssa-qbe]` | `ρ[d ↦ canon_τ(⟨v_k⟩ρ)]` where `b_k = π` (the predecessor edge just taken); no arm for `π`, or `π` undefined at entry ↦ ⊥ |
+
+> **φ and the predecessor π.** The φ-node (SSA form, present only between `to_ssa`
+> and `out_of_ssa`) extends Σ with an auxiliary `π ∈ BlockId ⊎ {⊥}` — the block
+> the current edge came from — threaded by §4b (each `goto` sets `π :=` the block
+> being left). φ-nodes are *parallel* at a join, but SSA freshness (a φ dst is a
+> new temp never named by a sibling φ arm) makes left-to-right evaluation over `ρ`
+> faithful. This is the `Inst::Phi` arm of `interp` and the `prev` variable.
 
 **Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
 `LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
@@ -145,11 +153,12 @@ only CORE, so only ⟦·⟧ over CORE is needed to establish that a pass commute
 ## 4b. Terminator semantics ⟦Term⟧ : Σ → (BlockId ⊎ Halt)  (mirrors `match term`)
 
 ```
-⟦Jmp b⟧          =  goto b
-⟦Br c b_t b_e⟧   =  goto (⟨c⟩ρ ≠ 0 ? b_t : b_e)
+⟦Jmp b⟧          =  goto b   (π := this block)
+⟦Br c b_t b_e⟧   =  goto (⟨c⟩ρ ≠ 0 ? b_t : b_e)   (π := this block)
 ⟦Ret v?⟧         =  Halt(⟨v⟩ρ)    (Halt(0) when None)
 ⟦Unreachable⟧    =  ⊥             (reaching it means malformed IR, or genuinely unreachable dead code)
 ```
+`π` (the predecessor block) is set by every taken edge and read only by `Phi` (§4).
 
 ## 4c. Function big-step ⟦Func⟧ : 𝕍* → 𝕍 ∪ {⊥}
 
