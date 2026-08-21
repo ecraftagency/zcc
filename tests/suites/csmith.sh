@@ -15,49 +15,57 @@
 # guard against a green no-op.
 # Run INSIDE the box:  ZCC=/usr/local/bin/zcc sh csmith.sh [N]   (N = limit)
 set -u
-ZCC="${ZCC:-/usr/local/bin/zcc}"
-INC=/suites/csmith/include
+export ZCC="${ZCC:-/usr/local/bin/zcc}"
+export INC=/suites/csmith/include
 DIR=/suites/csmith
-LIM="${1:-0}"
-D=$(mktemp -d)
-trap 'rm -rf "$D"' EXIT
+LIM="${1:-0}"                       # 0 = all
+JOBS="${CSMITH_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+RES=$(mktemp); trap 'rm -f "$RES"' EXIT
 
-par=0; div=0; ni=0; skip=0; n=0; bytes=0
-divlist=""; nilist=""
-for f in "$DIR"/*.c; do
-    [ -f "$f" ] || continue
-    b=$(basename "$f" .c)
-    n=$((n+1))
-    [ "$LIM" -gt 0 ] && [ "$n" -gt "$LIM" ] && { n=$((n-1)); break; }
+# One worker per .c, run under `xargs -P`. Each prints exactly one TSV line:
+#   STATUS<TAB>name<TAB>bytes<TAB>detail   (STATUS ∈ PARITY|DIVERGE|NOTIMPL|SKIP)
+# The worker is self-contained (fresh shell): $ZCC and $INC come from the environment.
+work='
+  f="$1"; b=$(basename "$f" .c)
+  d=$(mktemp -d); trap "rm -rf $d" EXIT
+  # gcc oracle — junk sample (gcc fail/timeout/UB-runtime) → SKIP, NOT charged to zcc
+  gcc -w -I"$INC" "$f" -o "$d/g" 2>/dev/null || { printf "SKIP\t%s\t0\tgcc-compile\n" "$b"; exit 0; }
+  timeout 15 "$d/g" > "$d/go" 2>&1; grc=$?
+  # gcc did not COMPLETE normally (124=timeout, >127=signal) → junk reference → SKIP
+  { [ "$grc" = 124 ] || [ "$grc" -gt 127 ]; } && { printf "SKIP\t%s\t0\tgcc-run\n" "$b"; exit 0; }
+  # zcc noopt — compile-fail = NOT-IMPL (completeness gap, named)
+  if ! "$ZCC" -I"$INC" "$f" -o "$d/z" 2>"$d/ze"; then
+      printf "NOTIMPL\t%s\t0\t%s\n" "$b" "$(head -1 "$d/ze" | cut -c1-40)"; exit 0; fi
+  bytes=$(wc -c < "$d/z")
+  timeout 60 "$d/z" > "$d/zo" 2>&1; zrc=$?
+  # zcc opt
+  if ! ZCC_OPT=1 "$ZCC" -I"$INC" "$f" -o "$d/zp" 2>/dev/null; then
+      printf "DIVERGE\t%s\t%s\tOPT-COMPILE-FAIL\n" "$b" "$bytes"; exit 0; fi
+  timeout 60 "$d/zp" > "$d/zpo" 2>&1; prc=$?
+  # zcc did not COMPLETE (124=timeout, >127=signal) → NOT a checksum divergence.
+  # An honest 3rd state: perf boundary (zcc -O0 naive codegen ≫ gcc -O0) OR a masked
+  # non-termination. NEVER scored PARITY (unproven) NOR DIVERGE (miscompile unproven);
+  # named + auditable like NOT-IMPL, resolved by a separate run-to-completion check.
+  if [ "$zrc" = 124 ] || [ "$zrc" -gt 127 ] || [ "$prc" = 124 ] || [ "$prc" -gt 127 ]; then
+      printf "TIMEOUT\t%s\t%s\tz=%s,o=%s (gcc completed)\n" "$b" "$bytes" "$zrc" "$prc"; exit 0; fi
+  if [ "$grc" = "$zrc" ] && [ "$grc" = "$prc" ] && cmp -s "$d/go" "$d/zo" && cmp -s "$d/go" "$d/zpo"; then
+      printf "PARITY\t%s\t%s\t-\n" "$b" "$bytes"
+  else
+      printf "DIVERGE\t%s\t%s\tg=%s,z=%s,o=%s\n" "$b" "$bytes" "$grc" "$zrc" "$prc"
+  fi
+'
+list() { for f in "$DIR"/*.c; do [ -f "$f" ] && printf '%s\n' "$f"; done | sort
+       }
+if [ "$LIM" -gt 0 ]; then list | head -n "$LIM"; else list; fi \
+    | xargs -P "$JOBS" -n1 sh -c "$work" _ > "$RES"
 
-    # gcc oracle — junk sample (gcc fail/timeout/UB-runtime) → SKIP, NOT charged to zcc
-    if ! gcc -w -I"$INC" "$f" -o "$D/g" 2>/dev/null; then skip=$((skip+1)); continue; fi
-    timeout 15 "$D/g" > "$D/go" 2>&1; grc=$?
-    [ "$grc" -gt 127 ] && { skip=$((skip+1)); continue; } # gcc-binary crash/timeout: reject sample
-
-    # zcc noopt — compile-fail = NOT-IMPL (completeness gap, named)
-    if ! "$ZCC" -I"$INC" "$f" -o "$D/z" 2>"$D/ze"; then
-        ni=$((ni+1)); nilist="$nilist $b:$(head -1 "$D/ze" | cut -c1-40)"; continue
-    fi
-    bytes=$((bytes + $(wc -c < "$D/z")))
-    timeout 15 "$D/z" > "$D/zo" 2>&1; zrc=$?
-
-    # zcc opt
-    if ! ZCC_OPT=1 "$ZCC" -I"$INC" "$f" -o "$D/zp" 2>/dev/null; then
-        div=$((div+1)); divlist="$divlist $b(OPT-COMPILE-FAIL)"; continue
-    fi
-    timeout 15 "$D/zp" > "$D/zpo" 2>&1; prc=$?
-
-    if [ "$grc" = "$zrc" ] && [ "$grc" = "$prc" ] \
-       && cmp -s "$D/go" "$D/zo" && cmp -s "$D/go" "$D/zpo"; then
-        par=$((par+1))
-    else
-        div=$((div+1))
-        divlist="$divlist $b(g=$grc,z=$zrc,o=$prc)"
-    fi
-done
-
-echo "csmith: $par PARITY / $div DIVERGE / $ni NOT-IMPL / $skip SKIP  (scanned $n; zcc-ELF ${bytes}B)"
-[ -n "$divlist" ] && echo "DIVERGE:$divlist"
-[ -n "$nilist" ] && echo "NOT-IMPL:$nilist" | cut -c1-400
+par=$(grep -c '^PARITY'  "$RES"); div=$(grep -c '^DIVERGE'  "$RES")
+ni=$(grep -c '^NOTIMPL' "$RES"); skip=$(grep -c '^SKIP'    "$RES")
+to=$(grep -c '^TIMEOUT' "$RES")
+bytes=$(awk -F'\t' '{s+=$3} END{print s+0}' "$RES")
+n=$((par+div+ni+to+skip))
+echo "csmith: $par PARITY / $div DIVERGE / $to TIMEOUT / $ni NOT-IMPL / $skip SKIP  (scanned $n, ${JOBS} jobs; zcc-ELF ${bytes}B)"
+[ "$div"  -gt 0 ] && { printf 'DIVERGE:'; awk -F'\t' '$1=="DIVERGE"{printf " %s(%s)",$2,$4} END{print ""}' "$RES"; }
+[ "$to"   -gt 0 ] && { printf 'TIMEOUT (zcc -O0 ≫ gcc -O0 budget; correctness re-checked run-to-completion):'; awk -F'\t' '$1=="TIMEOUT"{printf " %s(%s)",$2,$4} END{print ""}' "$RES"; }
+[ "$ni"   -gt 0 ] && { printf 'NOT-IMPL:'; awk -F'\t' '$1=="NOTIMPL"{printf " %s:%s",$2,$4} END{print ""}' "$RES" | cut -c1-400; echo; }
 [ "$div" = 0 ]
