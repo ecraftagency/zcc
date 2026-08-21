@@ -601,6 +601,49 @@ impl Cg<'_> {
         }
         Some(2)
     }
+    // Tier-1 #3 — multiply-add fusion. Recognize `Add(Mul(x,y), c)` (commutative: the mul
+    // may be either add operand) where the Mul feeds ONLY that Add (`use_count==1`), both
+    // integer and the SAME width, and emit one `madd xD, xX, xY, xC` = c + x·y — deleting
+    // the separate `mul`.
+    //   insts[i]   = Bin(m, Mul, ctm, x, y)
+    //   insts[i+1] = Bin(d, Add, ctd, {m,c} | {c,m}),  size(ctm)==size(ctd), use_count[m]==1
+    // `⟦·⟧` preserved by a ℤ/2ⁿ argument: the original truncates the product to n bits
+    // (`mul;ext`) before adding, madd keeps the full 64-bit product — but the FINAL `ext_r`
+    // to width n makes them equal, since `(c + trunc_n(x·y)) ≡ (c + x·y) (mod 2ⁿ)` (addition
+    // commutes with mod; the low n bits, all `ext_r` observes, are identical). Signedness is
+    // irrelevant to `mul`'s low bits. Scratch x0/x1/x2 for spilled/imm operands (never homes).
+    fn try_fuse_madd(&mut self, insts: &[Inst], i: usize) -> Option<usize> {
+        let Inst::Bin(m, Op::Mul, ctm, mx, my) = &insts[i] else {
+            return None;
+        };
+        if !self.a.tt.is_integer(*ctm) {
+            return None;
+        }
+        let Some(Inst::Bin(d, Op::Add, ctd, aa, bb)) = insts.get(i + 1) else {
+            return None;
+        };
+        if !self.a.tt.is_integer(*ctd) || self.a.tt.size(*ctm) != self.a.tt.size(*ctd) {
+            return None;
+        }
+        let addend = match (aa, bb) {
+            (Val::Tmp(t), _) if t == m => *bb,
+            (_, Val::Tmp(t)) if t == m => *aa,
+            _ => return None,
+        };
+        if self.use_count.get(*m as usize).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let rx = self.src_gp(*mx, 0);
+        let ry = self.src_gp(*my, 1);
+        let ra = self.src_gp(addend, 2);
+        let rd = self.gp_home(*d).unwrap_or(0);
+        _ = writeln!(self.s, "\tmadd x{rd}, x{rx}, x{ry}, x{ra}");
+        self.ext_r(rd, *ctd);
+        if self.gp_home(*d).is_none() {
+            self.tmp_store(*d, "x0");
+        }
+        Some(2)
+    }
     // store x{reg} → [x1] per type
     fn store(&mut self, reg: u32, t: TypeId) {
         match self.a.tt.tys[t as usize] {
@@ -1771,7 +1814,10 @@ impl<'a> Cg<'a> {
             }
             let mut ii = 0;
             while ii < blk.insts.len() {
-                if let Some(n) = self.try_fuse_addr(&blk.insts, ii) {
+                if let Some(n) = self
+                    .try_fuse_addr(&blk.insts, ii)
+                    .or_else(|| self.try_fuse_madd(&blk.insts, ii))
+                {
                     ii += n;
                     continue;
                 }
