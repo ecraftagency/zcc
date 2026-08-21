@@ -1157,16 +1157,21 @@ pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Interp — ngữ nghĩa DENOTATIONAL ⟦·⟧ của IR CORE (IR.md §3b). Đây là HÀM NGHĨA:
-// định nghĩa "IR này TÍNH RA gì", làm ground-truth cho commuting-square oracle
-// (pass đúng ⟺ giao hoán với interp). test-side (#[cfg(test)]) — KHÔNG vào binary
-// release, KHÔNG tính trần 10k; nó là proof-checker, không phải logic compiler.
+// Interp — REFERENCE SEMANTICS ⟦·⟧ của IR CORE (NẤC-1). Đây là HÀM NGHĨA hình thức
+// hoá: định nghĩa "IR này TÍNH RA gì", làm ground-truth cho commuting-square oracle
+// (pass đúng ⟺ giao hoán với interp). **Định nghĩa toán học đầy đủ mỗi Inst +
+// định lý commuting-square: `SEMANTICS.md`** (spec map 1-1 với code dưới đây; mọi
+// arm `match inst`/`match term` = một rule §4/§4b, mọi hàm nghĩa nguyên tử §3).
+// test-side (#[cfg(test)]) — KHÔNG vào binary release, KHÔNG tính trần 10k (IR.md
+// §7.1); là proof-checker, không phải logic compiler. Chưa machine-checked proof —
+// mechanized reference semantics ĐƯỢC KIỂM bằng vét-cạn-cấu-trúc (nền cho nấc-2/3).
 //
-// Mô hình máy (khớp hợp đồng "canonical register" ast.rs): mỗi temp giữ một giá
-// trị 64-bit canonical — int sign/zero-extend đúng kiểu, float = BIT PATTERN f64
-// (float nâng lên double). Bộ nhớ local = mảng byte cỡ `frame`; Lea(Local off) →
-// địa chỉ = off (index vào mảng). Global/Str/Opaque KHÔNG mô hình hoá → Err (hàm
-// chứa chúng là "không thuần", nằm ngoài không gian commuting-square CORE).
+// Trạng thái máy Σ = ⟨ρ, μ⟩ (SEMANTICS.md §2): ρ: Tmp→𝕍 register file (mỗi temp
+// một giá trị 64-bit canonical — int sign/zero-extend đúng kiểu, float = BIT
+// PATTERN f64, float nâng lên double); μ: [0,frame)→Byte bộ nhớ local phẳng
+// (little-endian LP64), Lea(Local off) → index = frame−off. Observable = giá trị
+// TRẢ. Global/Str/exotic KHÔNG mô hình hoá → Err = ⊥ (hàm "không thuần", NGOÀI
+// không gian CORE ⟹ commuting-square SKIP như UB).
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

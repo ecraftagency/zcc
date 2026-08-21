@@ -119,8 +119,8 @@ mọi hằng layout/ABI sống trong TyTab + file target (vế II); phần còn 
 > chạy sau cờ `ZCC_OPT` trên đường IR mặc định (đo box: torture opt≡noopt end-to-end).
 | khái niệm/định lý | mô tả |
 |---|---|
-| Denotational semantics ⟦·⟧:State→State | pass đúng ⟺ ⟦f⟧=⟦f'⟧ |
-| Operational semantics (small/big-step) | interp = hiện thực ⟦·⟧ |
+| Denotational semantics ⟦·⟧:State→State | pass đúng ⟺ ⟦f⟧=⟦f'⟧ — hình thức hoá: `SEMANTICS.md` §1-4 (NẤC-1) |
+| Operational semantics (small/big-step) | interp = hiện thực ⟦·⟧ (Σ=⟨ρ,μ⟩); định lý executable `SEMANTICS.md` §5 |
 | Translation validation (Pnueli/Necula) | validate MỖI LẦN chạy pass |
 | Bisimulation / simulation | khớp trạng thái edge-by-edge (regalloc) |
 | Symbolic execution | biến ký hiệu→term đóng; COMPLETE loop-free |
@@ -187,7 +187,7 @@ không "tối ưu tuyệt đối"; nhưng *đúng-màu* verify được trong P)
 | `decay` | dẫn xuất kiểu | type-derivation lattice |
 | `alg` | UAC + fold | join-semilattice + commuting-square fold↔runtime |
 | `abi` | ABI classify + link | finite automaton + cross-link cancellation |
-| `ir` *(`cargo test opt::`)* | IR + 5 pass | denotation preservation: equiv commuting-square (fold/DCE/copy/CSE) + interference-invariant (regalloc) |
+| `ir` *(`cargo test`)* | IR + 5 pass + ref-semantics | reference semantics ⟦·⟧ (`SEMANTICS.md`, NẤC-1) + ĐỊNH LÝ executable commuting-square vét-cạn 𝔼_struct (228 expr×5 pass=1140 ô) + interference-invariant (regalloc) |
 
 ---
 

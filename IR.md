@@ -112,7 +112,9 @@ Bất biến (reject nếu vỡ, không để trôi xuống asm rác):
 - **No dangling**: Temp/Block/global ref hợp lệ.
 
 ### 3b. Interp — reference evaluator (ground truth ngữ nghĩa)
-Chạy IR trực tiếp (không qua asm) → kết quả quan sát được. Dùng làm oracle NỘI TẠI:
+Chạy IR trực tiếp (không qua asm) → kết quả quan sát được. Dùng làm oracle NỘI TẠI.
+**Ngữ nghĩa hình thức hoá đầy đủ (NẤC-1): `SEMANTICS.md`** — trạng thái Σ=⟨ρ,μ⟩ +
+định nghĩa toán học ⟦·⟧ mỗi Inst/Term, map 1-1 với `ir.rs::tests::interp`:
 
 ### 3c. Commuting square — mỗi pass phải GIAO HOÁN với interp
 ```
@@ -124,6 +126,9 @@ Chạy IR trực tiếp (không qua asm) → kết quả quan sát được. Dù
 ```
 Pass đúng ⟺ giao hoán với interp. Đây là commuting-square fold↔runtime (đã có ở
 `alg.sh`) nâng lên tầng IR — bắt bug NGAY tại pass đẻ ra nó, không chờ end-to-end.
+**Nâng thành ĐỊNH LÝ EXECUTABLE (NẤC-1, xong):** `opt.rs::commuting_square_
+structural_exhaustion` vét cạn `𝔼_struct` (228 biểu thức × 5 pass = 1140 ô) chứng
+∀e giao hoán, + `commuting_square_selfproof` (anti-blindness). Phát biểu: SEMANTICS §5.
 
 ## 4. Lowering (nơi correctness sống)
 

@@ -971,4 +971,159 @@ mod tests {
         equiv(&ast.tt, &ir, &opt, "f").unwrap();
         assert!(count_insts(&opt) < before, "pipeline phải giảm lệnh ({before}→{})", count_insts(&opt));
     }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // ĐỊNH LÝ EXECUTABLE (NẤC-1) — commuting-square fold↔runtime nâng từ alg.sh
+    // lên tầng REFERENCE SEMANTICS. alg.sh chứng giao hoán ở tầng SOURCE (2 binary
+    // sinh bởi cc/zcc); ở đây chứng ngay trên IR bằng interp (ngữ nghĩa ⟦·⟧), zero-
+    // dep, in-process — KHÔNG cần cc, KHÔNG chờ end-to-end.
+    //
+    // PHÁT BIỂU (SEMANTICS.md §5, IR.md §3c):
+    //   ∀ e ∈ 𝔼_struct (không gian biểu thức sinh có cấu trúc, vét cạn shape × op),
+    //   ∀ P ∈ {const_fold, copy_prop, cse, dce, optimize},
+    //   ∀ input i ∈ battery(arity) mà ⟦lower(e)⟧(i) xác định (không UB/exotic):
+    //          ⟦ P(lower(e)) ⟧(i)  =  ⟦ lower(e) ⟧(i).
+    // Tức MỌI pass GIAO HOÁN với ngữ nghĩa tham chiếu trên toàn không gian sinh.
+    // Đây là hình thức translation-validation vét-cạn-cấu-trúc (Rice chặn phổ quát
+    // → ràng vào lớp shape hữu hạn, decidable) — KHÔNG phải proof; là ĐO cơ học.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Sinh 𝔼_struct: mỗi (op1,op2,op3) ∈ POOL³ tô vào MỘT template giàu đủ kích mọi
+    // pass CÙNG LÚC (dup subexpr→CSE, copy-chain→copy-prop, dead-stmt→DCE, const→fold).
+    // POOL toàn phép TỔNG trên ℤ/2^n (interp total) ⟹ commuting square nội tại KHÔNG
+    // có UB-skip trên nhánh này: mọi điểm so được (non-vacuous mạnh). Template thứ 2
+    // (div/mod) chứng nhánh "fold TỪ CHỐI UB" cũng giao hoán (interp Err→skip đối xứng).
+    const POOL: [&str; 6] = ["+", "-", "*", "&", "|", "^"];
+
+    fn gen_rich(o1: &str, o2: &str, o3: &str) -> String {
+        // x,y = subexpr TRÙNG (a o1 b) → CSE gộp; z dùng x (copy/use); dead-stmt
+        // (a o3 c) → DCE xoá; k = hằng (3 o1 4) → const-fold; return trộn tất cả.
+        format!(
+            "int f(int a,int b,int c){{int x=a{o1}b;int y=a{o1}b;int z=x{o2}c;a{o3}c;int k=3{o1}4;return (x{o2}y){o3}(z{o1}k);}}"
+        )
+    }
+    fn gen_divmod(o1: &str, o2: &str) -> String {
+        // Nhánh có / % : phần lớn input xác định, biên (b=0 …) → interp Err → equiv
+        // skip ĐỐI XỨNG (before Err ⟹ input ngoài không gian). Chứng const-fold KHÔNG
+        // fold div0 thành hằng (giữ lệnh) VẪN giao hoán với runtime.
+        format!("int f(int a,int b,int c){{int x=a{o1}b;int y=a{o1}b;return (x{o2}c){o1}(y{o2}a);}}")
+    }
+
+    // Mỗi pass là một mũi tên trong commuting square. Chạy TỪNG pass RIÊNG (cô lập lỗi)
+    // + `optimize` (hợp thành tới fixpoint) — nếu hợp thành giao hoán mà một pass lẻ
+    // không, ta bắt được pass phạm tội.
+    fn all_passes(tt: &TyTab, f: &mut IrFunc, which: u8) {
+        match which {
+            0 => { const_fold(tt, f); }
+            1 => { copy_prop(f); }
+            2 => { cse(f); }
+            3 => { dce(f); }
+            4 => optimize(tt, f),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn commuting_square_structural_exhaustion() {
+        // Evidence trail cơ học (luật input-sạch): đếm (expr, pass) đã CHỨNG giao hoán
+        // + số expr sinh. Verdict xanh CHỈ hợp lệ khi kèm số này > sàn — cấm "pass rỗng".
+        let mut exprs = 0u32; // số biểu thức 𝔼_struct sinh + lower + verify
+        let mut squares = 0u32; // số ô commuting-square (expr × pass) đã đóng
+
+        // ── Không gian 1: POOL³ × template giàu (6³ = 216 biểu thức, VÉT CẠN op-triple).
+        for o1 in POOL {
+            for o2 in POOL {
+                for o3 in POOL {
+                    let src = gen_rich(o1, o2, o3);
+                    let (ast, ir) = compile("csq", &src);
+                    for f in &ir {
+                        verify(f).unwrap_or_else(|e| panic!("verify {src}: {e}"));
+                    }
+                    exprs += 1;
+                    for which in 0u8..=4 {
+                        let mut opt = ir.clone();
+                        for f in opt.iter_mut() {
+                            all_passes(&ast.tt, f, which);
+                        }
+                        for f in &opt {
+                            verify(f).unwrap_or_else(|e| panic!("verify(sau pass {which}) {src}: {e}"));
+                        }
+                        equiv(&ast.tt, &ir, &opt, "f")
+                            .unwrap_or_else(|e| panic!("commuting square VỠ [pass {which}] {src}: {e}"));
+                        squares += 1;
+                    }
+                }
+            }
+        }
+
+        // ── Không gian 2: POOL² × template div/mod (nhánh UB-skip đối xứng + fold-từ-chối-div0).
+        for o2 in POOL {
+            for o1 in ["/", "%"] {
+                let src = gen_divmod(o1, o2);
+                let (ast, ir) = compile("csqd", &src);
+                for f in &ir {
+                    verify(f).unwrap_or_else(|e| panic!("verify {src}: {e}"));
+                }
+                exprs += 1;
+                for which in 0u8..=4 {
+                    let mut opt = ir.clone();
+                    for f in opt.iter_mut() {
+                        all_passes(&ast.tt, f, which);
+                    }
+                    for f in &opt {
+                        verify(f).unwrap_or_else(|e| panic!("verify(sau pass {which}) {src}: {e}"));
+                    }
+                    equiv(&ast.tt, &ir, &opt, "f")
+                        .unwrap_or_else(|e| panic!("commuting square VỠ [pass {which}] {src}: {e}"));
+                    squares += 1;
+                }
+            }
+        }
+
+        // Sàn chứng: 216 (POOL³) + 12 (POOL²×{/,%}) = 228 expr; × 5 pass = 1140 ô.
+        assert_eq!(exprs, 228, "không gian sinh phải đúng cỡ (216+12)");
+        assert_eq!(squares, 1140, "phải đóng đủ 228×5 ô commuting-square");
+        eprintln!("ĐỊNH LÝ commuting-square: {exprs} biểu thức 𝔼_struct × 5 pass = {squares} ô đóng xanh");
+    }
+
+    // Tự-chứng ĐỊNH LÝ (luật input-sạch: chứng chính công cụ chứng). Nếu HARNESS trên
+    // "xanh giả" — equiv bỏ sót đột biến — thì mọi verdict vô giá trị. Đột biến MỘT pass
+    // (cse gộp SAI qua ghi-mem: bỏ memory-kill) PHẢI bị commuting-square bắt ở ≥1 expr.
+    #[test]
+    fn commuting_square_selfproof() {
+        // Biểu thức có Store xen giữa hai Load cùng địa chỉ: nếu CSE gộp bừa (không
+        // memory-kill) → miscompile. equiv PHẢI bắt. Đây là pr84169 thu nhỏ.
+        let (ast, ir) = compile("csqsp", "int f(int a){int p=a;int q=p;p=p+1;return p+q;}");
+        // CSE thật (đúng) phải giao hoán:
+        let mut ok = ir.clone();
+        for f in ok.iter_mut() {
+            cse(f);
+            copy_prop(f);
+            dce(f);
+        }
+        equiv(&ast.tt, &ir, &ok, "f").expect("CSE ĐÚNG phải giao hoán");
+        // Đột biến: ép hai Load KHÁC địa chỉ thành CÙNG khoá bằng cách viết bậy —
+        // thay một Store thành Copy (mất ghi-mem) rồi CSE → giá trị lệch. Dựng thủ công:
+        // ir sau khi bỏ Store sẽ đọc p CŨ ⟹ khác runtime ⟹ equiv bắt.
+        let mut bad = ir.clone();
+        let mut killed = false;
+        'o: for f in bad.iter_mut() {
+            for b in f.blocks.iter_mut() {
+                for i in b.insts.iter_mut() {
+                    if let Inst::Store(ty, _addr, val) = i {
+                        // Store(*addr=val) → Copy(dst chết, val): xoá tác dụng ghi-mem.
+                        // dùng temp 0 làm bãi rác (đã def) → well-formed nhưng ngữ nghĩa hỏng.
+                        *i = Inst::Copy(0, *ty, *val);
+                        killed = true;
+                        break 'o;
+                    }
+                }
+            }
+        }
+        assert!(killed, "phải có Store để đột biến");
+        assert!(
+            equiv(&ast.tt, &ir, &bad, "f").is_err(),
+            "đột biến xoá-Store PHẢI bị commuting-square bắt (nếu không, harness mù)"
+        );
+    }
 }
