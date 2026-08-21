@@ -897,6 +897,93 @@ impl Cg<'_> {
             self.fname, name
         );
     }
+    // __builtin_*_overflow: x0=a, x1=b, x9=&res. Kết quả bool → x0. Dùng chung
+    // AST-walk (Node::Overflow) + IR (Inst::Overflow). ta/tb/rt = kiểu a/b/*rp.
+    fn emit_overflow(&mut self, op: u8, ta: TypeId, tb: TypeId, rt: TypeId) {
+        let a_sg = !self.a.tt.is_unsigned(ta);
+        let b_sg = !self.a.tt.is_unsigned(tb);
+        let (r_sg, rw) = (!self.a.tt.is_unsigned(rt), self.a.tt.size(rt));
+        crate::ext::overflow_emit(&mut self.s, op, a_sg, b_sg, r_sg, rw);
+    }
+    // va_start: x0 = &ap. Điền va_list AAPCS từ trạng thái prologue (va=gp,fp,stk,frame).
+    // Dùng chung AST-walk (Node::VaStart) + IR (Inst::VaStart).
+    fn emit_vastart(&mut self) {
+        let (gp, fp, stk, frame) = self.va;
+        self.imm("x9", (16 + stk) as i64);
+        self.s += "\tadd x9, x29, x9\n\tstr x9, [x0]\n"; // __stack
+        self.imm("x9", frame as i64);
+        self.s += "\tsub x9, x29, x9\n\tstr x9, [x0, #8]\n"; // __gr_top
+        self.s += "\tsub x9, x9, #64\n\tstr x9, [x0, #16]\n"; // __vr_top
+        _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #24]", (gp as i64 - 8) * 8);
+        _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #28]", (fp as i64 - 8) * 16);
+    }
+    // va_arg(*(&ap)→ ở x0, kiểu t, scratch-local tmp cho HFA gather) → kết quả x0.
+    // Dùng chung AST-walk (Node::VaArg) + IR (Inst::VaArg). Chi tiết AAPCS: xem cũ.
+    fn emit_vaarg(&mut self, t: TypeId, tmp: u32) {
+        let st = matches!(self.a.tt.tys[t as usize], Ty::Struct(_));
+        let sz = self.a.tt.size(t);
+        let fl = self.a.tt.is_float(t);
+        let hfa = if st { self.a.tt.hfa(t) } else { None };
+        let (offs, top, step) = if fl {
+            (28, 16, 16)
+        } else if let Some((_, n)) = hfa {
+            (28, 16, n * 16)
+        } else if st && sz <= 16 {
+            (24, 8, sz.div_ceil(8) * 8)
+        } else {
+            (24, 8, 8)
+        };
+        let ldbl = matches!(self.a.tt.tys[t as usize], Ty::LDouble);
+        let stk_step = if st && (sz <= 16 || hfa.is_some()) {
+            sz.div_ceil(8) * 8
+        } else if ldbl {
+            16
+        } else {
+            8
+        };
+        // pr92904 AAPCS: composite by-value KHÔNG split reg/stack — consume offs
+        // trước, chỉ đi reg khi offs MỚI ≤ 0; vắt qua 0 → rơi nguyên khối xuống stack.
+        let blk = st && (sz <= 16 || hfa.is_some());
+        let l = self.labels(2);
+        _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]");
+        if blk {
+            _ = writeln!(self.s, "\tadd w10, w9, #{step}\n\tstr w10, [x0, #{offs}]");
+            _ = writeln!(self.s, "\tcmp w10, #0\n\tb.le L{l}");
+        } else {
+            _ = writeln!(self.s, "\ttbnz w9, #31, L{l}");
+        }
+        self.s += "\tldr x10, [x0]\n";
+        if ldbl {
+            self.s += "\tadd x10, x10, #15\n\tand x10, x10, #0xfffffffffffffff0\n";
+        }
+        self.s += "\tadd x11, x10, #";
+        _ = writeln!(self.s, "{}\n\tstr x11, [x0]\n\tb L{}", stk_step, l + 1);
+        _ = writeln!(self.s, "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw");
+        if !blk {
+            _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
+        }
+        if let Some((dbl, n)) = hfa {
+            self.lea_local("x11", tmp);
+            for j in 0..n {
+                if dbl {
+                    _ = writeln!(self.s, "\tldr x12, [x10, #{}]", 16 * j);
+                    _ = writeln!(self.s, "\tstr x12, [x11, #{}]", 8 * j);
+                } else {
+                    _ = writeln!(self.s, "\tldr w12, [x10, #{}]", 16 * j);
+                    _ = writeln!(self.s, "\tstr w12, [x11, #{}]", 4 * j);
+                }
+            }
+            self.s += "\tmov x10, x11\n";
+        }
+        _ = writeln!(self.s, "L{}:\n\tmov x0, x10", l + 1);
+        if st {
+            if sz > 16 && hfa.is_none() {
+                self.s += "\tldr x0, [x0]\n"; // >16B: slot chứa CON TRỎ
+            } // struct: giá trị = địa chỉ (quy ước struct-expr của zcc)
+        } else {
+            self.load(t);
+        }
+    }
 
     fn expr(&mut self, id: NodeId) {
         let t = self.a.types[id as usize];
@@ -1016,109 +1103,13 @@ impl Cg<'_> {
             Node::VaArea(off) => _ = writeln!(self.s, "\tadd x0, x29, #{off}"),
             Node::VaStart(ap) => {
                 let ap = *ap;
-                // điền va_list AAPCS từ trạng thái prologue (va = gp,fp,stk,frame)
-                let (gp, fp, stk, frame) = self.va;
                 self.addr(ap); // x0 = &ap
-                self.imm("x9", (16 + stk) as i64);
-                self.s += "\tadd x9, x29, x9\n\tstr x9, [x0]\n"; // __stack
-                self.imm("x9", frame as i64);
-                self.s += "\tsub x9, x29, x9\n\tstr x9, [x0, #8]\n"; // __gr_top
-                self.s += "\tsub x9, x9, #64\n\tstr x9, [x0, #16]\n"; // __vr_top
-                _ = writeln!(
-                    self.s,
-                    "\tmov x9, #{}\n\tstr w9, [x0, #24]",
-                    (gp as i64 - 8) * 8
-                );
-                _ = writeln!(
-                    self.s,
-                    "\tmov x9, #{}\n\tstr w9, [x0, #28]",
-                    (fp as i64 - 8) * 16
-                );
+                self.emit_vastart();
             }
             Node::VaArg(ap, t, tmp) => {
                 let (ap, t, tmp) = (*ap, *t, *tmp);
-                // chọn vùng: offs âm → còn reg trong save area, ≥0 → stack caller.
-                // Scalar khớp chính xác AAPCS; HFA đi VR (C.3) — save area để mỗi
-                // member 1 q-slot 16B nên phải gather về scratch liên tục;
-                // composite thường ≤16 đi block GP, >16 gián tiếp qua con trỏ
-                // (HFA >16 KHÔNG gián tiếp — C.3 giữ by-value).
-                let st = matches!(self.a.tt.tys[t as usize], Ty::Struct(_));
-                let sz = self.a.tt.size(t);
-                let fl = self.a.tt.is_float(t);
-                let hfa = if st { self.a.tt.hfa(t) } else { None };
-                let (offs, top, step) = if fl {
-                    (28, 16, 16)
-                } else if let Some((_, n)) = hfa {
-                    (28, 16, n * 16)
-                } else if st && sz <= 16 {
-                    (24, 8, sz.div_ceil(8) * 8)
-                } else {
-                    (24, 8, 8)
-                };
-                // stack caller: mọi scalar slot 8 (kể cả double — 16 chỉ là bước
-                // VR save area), composite by-value theo size tròn 8, indirect = 1
-                // slot con trỏ; trên stack HFA nằm LIỀN như composite thường
-                let ldbl = matches!(self.a.tt.tys[t as usize], Ty::LDouble);
-                let stk_step = if st && (sz <= 16 || hfa.is_some()) {
-                    sz.div_ceil(8) * 8
-                } else if ldbl {
-                    16
-                } else {
-                    8
-                };
-                // pr92904, luật runtime AAPCS: composite by-value KHÔNG BAO GIỜ
-                // split reg/stack — consume offs trước (ghi lại luôn), chỉ đi reg
-                // khi offs MỚI ≤ 0; vắt qua 0 (vd gr_offs=-8, cần 16B) → rơi
-                // nguyên khối xuống stack, offs dương khóa mọi va_arg sau (khớp
-                // caller khóa NGRN/NSRN C.11/C.3). Over-alignment (aligned(16+))
-                // của composite bị BỎ QUA — gcc arm64 không round NGRN/stack
-                // (verify asm: named x3,x4 / anon x4,x5 / stack [sp,8]).
-                let blk = st && (sz <= 16 || hfa.is_some());
                 self.addr(ap); // x0 = &ap
-                let l = self.labels(2);
-                _ = writeln!(self.s, "\tldr w9, [x0, #{offs}]");
-                if blk {
-                    _ = writeln!(self.s, "\tadd w10, w9, #{step}\n\tstr w10, [x0, #{offs}]");
-                    _ = writeln!(self.s, "\tcmp w10, #0\n\tb.le L{l}");
-                } else {
-                    _ = writeln!(self.s, "\ttbnz w9, #31, L{l}");
-                }
-                self.s += "\tldr x10, [x0]\n";
-                if ldbl {
-                    // AAPCS va_arg quad: __stack round lên 16 trước khi đọc
-                    self.s += "\tadd x10, x10, #15\n\tand x10, x10, #0xfffffffffffffff0\n";
-                }
-                self.s += "\tadd x11, x10, #";
-                _ = writeln!(self.s, "{}\n\tstr x11, [x0]\n\tb L{}", stk_step, l + 1);
-                _ = writeln!(
-                    self.s,
-                    "L{l}:\n\tldr x10, [x0, #{top}]\n\tadd x10, x10, w9, sxtw"
-                );
-                if !blk {
-                    _ = writeln!(self.s, "\tadd w9, w9, #{step}\n\tstr w9, [x0, #{offs}]");
-                }
-                if let Some((dbl, n)) = hfa {
-                    // gather: member j ở [x10 + 16j] → scratch + j*esz
-                    self.lea_local("x11", tmp);
-                    for j in 0..n {
-                        if dbl {
-                            _ = writeln!(self.s, "\tldr x12, [x10, #{}]", 16 * j);
-                            _ = writeln!(self.s, "\tstr x12, [x11, #{}]", 8 * j);
-                        } else {
-                            _ = writeln!(self.s, "\tldr w12, [x10, #{}]", 16 * j);
-                            _ = writeln!(self.s, "\tstr w12, [x11, #{}]", 4 * j);
-                        }
-                    }
-                    self.s += "\tmov x10, x11\n";
-                }
-                _ = writeln!(self.s, "L{}:\n\tmov x0, x10", l + 1);
-                if st {
-                    if sz > 16 && hfa.is_none() {
-                        self.s += "\tldr x0, [x0]\n"; // >16B: slot chứa CON TRỎ
-                    } // struct: giá trị = địa chỉ (quy ước struct-expr của zcc)
-                } else {
-                    self.load(t);
-                }
+                self.emit_vaarg(t, tmp);
             }
             // EXT(gcc): inline asm subset — operand %k gán cứng x{9+k} (an toàn
             // vì -O0 không giữ giá trị sống trong thanh ghi qua statement);
@@ -1331,17 +1322,15 @@ impl Cg<'_> {
             // EXT(gcc): overflow builtin — eval 3 arg (x0=al, x1=bl, x9=&res), gọi ext
             Node::Overflow(op, a, b, rp) => {
                 let (op, a, b, rp) = (*op, *a, *b, *rp);
+                let (ta, tb) = (self.a.types[a as usize], self.a.types[b as usize]);
+                let rt = self.a.tt.pointee(self.a.types[rp as usize]).unwrap();
                 self.expr(a);
                 self.s += "\tstr x0, [sp, #-16]!\n";
                 self.expr(b);
                 self.s += "\tstr x0, [sp, #-16]!\n";
                 self.expr(rp);
                 self.s += "\tmov x9, x0\n\tldr x1, [sp], #16\n\tldr x0, [sp], #16\n";
-                let a_sg = !self.a.tt.is_unsigned(self.a.types[a as usize]);
-                let b_sg = !self.a.tt.is_unsigned(self.a.types[b as usize]);
-                let rt = self.a.tt.pointee(self.a.types[rp as usize]).unwrap();
-                let (r_sg, rw) = (!self.a.tt.is_unsigned(rt), self.a.tt.size(rt));
-                crate::ext::overflow_emit(&mut self.s, op, a_sg, b_sg, r_sg, rw);
+                self.emit_overflow(op, ta, tb, rt);
             }
             Node::Str(i) => {
                 _ = writeln!(
@@ -1921,6 +1910,25 @@ impl<'a> Cg<'a> {
             Inst::Zero(a, sz) => {
                 self.ld_val(*a, "x0"); // địa chỉ → x0
                 self.emit_zero(*sz);
+            }
+            Inst::VaStart(a) => {
+                self.ld_val(*a, "x0"); // &ap → x0
+                self.emit_vastart();
+            }
+            Inst::VaArg(d, a, t, tmp) => {
+                self.ld_val(*a, "x0"); // &ap → x0
+                self.emit_vaarg(*t, *tmp);
+                self.tmp_store(*d, "x0");
+            }
+            Inst::Overflow(d, op, ta, tb, rt, a, b, rp) => {
+                // a→x0, b→x1, rp→x9. tmp_load DÙNG x9 làm scratch địa chỉ → phải nạp
+                // rp vào x9 SAU CÙNG (nạp a/b trước sẽ đè x9, nhưng nạp rp cuối thì
+                // không gì đè nữa). Sai thứ tự = ghi kết quả sai địa chỉ (pr64006/68381…).
+                self.ld_val(*a, "x0");
+                self.ld_val(*b, "x1");
+                self.ld_val(*rp, "x9");
+                self.emit_overflow(*op, *ta, *tb, *rt);
+                self.tmp_store(*d, "x0");
             }
         }
     }

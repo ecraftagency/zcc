@@ -92,6 +92,13 @@ pub enum Inst {
     // memset(addr, 0, sz): zero-init struct/array (C99 6.7.8). Void, side-effect
     // ghi bộ nhớ → impure như Store, KHÔNG dst.
     Zero(Val, u32), // *(addr .. addr+sz) = 0
+    // Variadic AAPCS64 (C99 7.15). Operand = &va_list. VaStart void; VaArg trả 1 giá
+    // trị (struct = địa chỉ). Impure (đọc/ghi va_list + save-area).
+    VaStart(Val),                    // khởi tạo *(&ap) từ trạng thái prologue
+    VaArg(Tmp, Val, TypeId, u32),    // dst = va_arg(*(&ap), t); tmp = scratch-local (HFA gather)
+    // EXT(gcc) __builtin_*_overflow: dst = (a op b tràn?); ghi kết quả vào *(rp).
+    // op = mã u8; ta/tb = kiểu toán hạng (dấu), rt = kiểu *(rp) (dấu+rộng). Impure.
+    Overflow(Tmp, u8, TypeId, TypeId, TypeId, Val, Val, Val), // dst,op,ta,tb,rt,a,b,rp
     // ---- OPAQUE ----
     // Bọc một node AST exotic (va/atomic/asm/nested/SRet/Zero/…).
     // BRIDGE: backend IR→asm re-emit ĐÚNG subtree AST cũ (không tái hiện logic),
@@ -152,9 +159,11 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::Lea(d, ..)
         | Inst::Cast(d, ..)
         | Inst::FunAddr(d, ..)
-        | Inst::LabelAddr(d, ..) => Some(*d),
+        | Inst::LabelAddr(d, ..)
+        | Inst::VaArg(d, ..)
+        | Inst::Overflow(d, ..) => Some(*d),
         Inst::Call(d, ..) | Inst::Opaque(d, ..) => *d,
-        Inst::Store(..) | Inst::Memcpy(..) | Inst::Zero(..) => None,
+        Inst::Store(..) | Inst::Memcpy(..) | Inst::Zero(..) | Inst::VaStart(..) => None,
     }
 }
 
@@ -177,7 +186,12 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
             v(a);
             v(b);
         }
-        Inst::Zero(a, _) => v(a),
+        Inst::Zero(a, _) | Inst::VaStart(a) | Inst::VaArg(_, a, _, _) => v(a),
+        Inst::Overflow(_, _, _, _, _, a, b, rp) => {
+            v(a);
+            v(b);
+            v(rp);
+        }
         Inst::Lea(..) | Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
@@ -548,6 +562,29 @@ impl<'a> Lower<'a> {
                 let addr = self.lower_addr(l);
                 self.push(Inst::Zero(addr, sz));
                 Val::Imm(0) // void
+            }
+            Node::VaStart(ap) => {
+                let ap = *ap;
+                let addr = self.lower_addr(ap);
+                self.push(Inst::VaStart(addr));
+                Val::Imm(0) // void
+            }
+            Node::VaArg(ap, vt, tmp) => {
+                let (ap, vt, tmp) = (*ap, *vt, *tmp);
+                let addr = self.lower_addr(ap);
+                let d = self.t(ty);
+                self.push(Inst::VaArg(d, addr, vt, tmp));
+                Val::Tmp(d)
+            }
+            Node::Overflow(op, oa, ob, rp) => {
+                let (op, oa, ob, rp) = (*op, *oa, *ob, *rp);
+                let (ta, tb) = (a.types[oa as usize], a.types[ob as usize]);
+                let rt = a.tt.pointee(a.types[rp as usize]).unwrap();
+                let (va, vb) = (self.lower_expr(oa), self.lower_expr(ob));
+                let vrp = self.lower_expr(rp);
+                let d = self.t(ty);
+                self.push(Inst::Overflow(d, op, ta, tb, rt, va, vb, vrp));
+                Val::Tmp(d)
             }
             // đuôi exotic (VaArg/Sync/Overflow/Asm/Alloca/SRet/…) → bridge
             _ => self.bridge_val(n, ty),
@@ -1059,8 +1096,14 @@ pub(crate) mod tests {
                             reg[*d as usize] = canon(tt, f.temps[*d as usize], r);
                         }
                     }
-                    Inst::Opaque(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) | Inst::Zero(..) => {
-                        return Err("interp: symbol/label/memset (hàm không thuần)".into())
+                    Inst::Opaque(..)
+                    | Inst::FunAddr(..)
+                    | Inst::LabelAddr(..)
+                    | Inst::Zero(..)
+                    | Inst::VaStart(..)
+                    | Inst::VaArg(..)
+                    | Inst::Overflow(..) => {
+                        return Err("interp: exotic (symbol/va/overflow — hàm không thuần)".into())
                     }
                 }
             }
