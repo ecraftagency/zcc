@@ -57,6 +57,7 @@ pub(crate) fn each_use_mut(i: &mut Inst, mut g: impl FnMut(&mut Val)) {
         Inst::Lea(..)
         | Inst::FunAddr(..)
         | Inst::LabelAddr(..)
+        | Inst::Param(..)
         | Inst::VaArea(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
@@ -348,6 +349,7 @@ pub fn cse(f: &mut IrFunc) -> u32 {
             if !matches!(i,
                 Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Load(..) | Inst::Lea(..)
                 | Inst::Cast(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) | Inst::VaArea(..)
+                | Inst::Param(..)
             ) {
                 loads.clear(); // memory write (or unknown) → conservative memory-kill
             }
@@ -715,6 +717,7 @@ fn pure_mem(i: &Inst) -> bool {
             | Inst::FunAddr(..)
             | Inst::LabelAddr(..)
             | Inst::VaArea(..)
+            | Inst::Param(..)
             | Inst::Phi(..)
     )
 }
@@ -1467,20 +1470,43 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
     // body overrides normally; a param reassigned before first read leaves this Load dead
     // (DCE). Locals are NOT seeded — their own Store is the def.
     const ENTRY: BlockId = 0;
+    let off2idx: HashMap<u32, u32> =
+        f.params.iter().enumerate().map(|(i, &(off, _))| (off, i as u32)).collect();
     let mut seed_addr: HashSet<Tmp> = HashSet::new();
-    let mut seed_insts: Vec<Inst> = Vec::new();
+    // Two seed groups with a HARD ordering constraint. A GP Param reads an incoming argument
+    // register (x0–x7); an FP seed's Lea+Load uses x0/x9 as scratch. So EVERY GP Param must be
+    // delivered BEFORE any FP seed, else an FP seed clobbers an arg register a later Param
+    // still needs (20020413-1: `test(long double, int*)` — the val-seed's `mov x0,..` wiped
+    // eval's x0). GP Params are ordered by argument index so the x0-funnel of a spilled Param
+    // only ever clobbers an argument register already delivered.
+    let mut gp_params: Vec<(u32, Tmp)> = Vec::new(); // (arg index, temp)
+    let mut fp_seeds: Vec<Inst> = Vec::new();
     for (vi, &off) in promotable.iter().enumerate() {
         if !param_off.contains(&off) {
             continue;
         }
         let ty = s.var_ty[vi];
-        let a = s.new_temp(addr_ty[&off]);
         let pt = s.new_temp(ty);
-        seed_addr.insert(a);
-        seed_insts.push(Inst::Lea(a, Place::Local(off)));
-        seed_insts.push(Inst::Load(pt, ty, Val::Tmp(a)));
+        if tt.is_float(ty) {
+            // Step-1 path (FP): materialize the value from the ABI-spilled slot (emit_params
+            // still spills FP params; the seed Lea keeps the slot referenced). Delivering an
+            // FP arg into a v-home directly is left to a later step.
+            let a = s.new_temp(addr_ty[&off]);
+            seed_addr.insert(a);
+            fp_seeds.push(Inst::Lea(a, Place::Local(off)));
+            fp_seeds.push(Inst::Load(pt, ty, Val::Tmp(a)));
+        } else {
+            // Step-2 path (GP integer/pointer): deliver the incoming arg REGISTER directly
+            // into pt's home; emit_params skips the frame spill (the slot goes unreferenced
+            // — no Lea — which is exactly the backend's skip criterion). Kills str + reload.
+            gp_params.push((off2idx[&off], pt));
+        }
         s.write_var(vi, ENTRY, Val::Tmp(pt));
     }
+    gp_params.sort_unstable_by_key(|&(i, _)| i);
+    let mut seed_insts: Vec<Inst> =
+        gp_params.into_iter().map(|(i, pt)| Inst::Param(pt, i)).collect();
+    seed_insts.extend(fp_seeds);
     if !seed_insts.is_empty() {
         seed_insts.append(&mut f.blocks[ENTRY as usize].insts);
         f.blocks[ENTRY as usize].insts = seed_insts;
@@ -3317,6 +3343,7 @@ fn each_def_mut(i: &mut Inst, mut g: impl FnMut(&mut Tmp)) {
         | Inst::VaArg(d, ..)
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
+        | Inst::Param(d, ..)
         | Inst::Alloca(d, ..)
         | Inst::Select(d, ..)
         | Inst::Phi(d, ..) => g(d),

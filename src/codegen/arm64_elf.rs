@@ -195,6 +195,23 @@ struct Cg<'a> {
     // Block-layout (§6): true when the function is small enough that every intra-function
     // label is within cb(n)z's ±1MB imm19 reach ⟹ the 2-insn near branch form is safe.
     near_branch: bool,
+    // Step-2 param promotion: `param_loc[i]` = where the ABI delivers parameter i (arg
+    // register or caller-stack slot), set by emit_params' ABI walk; read by Inst::Param
+    // lowering to deliver the value into the temp's home. `param_ref` = the frame offsets
+    // still referenced by an IR `Lea(Local(off))` — a scalar param NOT in this set was
+    // promoted to Inst::Param (no slot), so emit_params SKIPS its spill.
+    param_loc: Vec<ParamLoc>,
+    param_ref: std::collections::HashSet<u32>,
+}
+
+// Where the AAPCS64 delivers a promoted scalar parameter (GP integer/pointer only; FP
+// params keep the frame-slot path). Gp(n) = argument register x{n}; Stack(off) = the
+// caller-frame slot at [x29,#off] (register-file overflow, the 9th+ GP argument).
+#[derive(Clone, Copy)]
+enum ParamLoc {
+    None,
+    Gp(u32),
+    Stack(u32),
 }
 
 
@@ -232,7 +249,7 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
     // locks gp=8 (C.11). This MUST match call() byte-for-byte.
     let alup = |o: u32, a: u32| (o + a - 1) & !(a - 1);
     let (mut gp, mut fp, mut boff) = (0u32, 0u32, 0u32);
-    for &(off, t) in &f.params {
+    for (idx, &(off, t)) in f.params.iter().enumerate() {
         // struct by value ≤16B: arrives in 1-2 consecutive GPRs (or on the stack)
         if let Some((dbl, n)) = ast.tt.hfa(t) {
             if fp + n <= 8 {
@@ -324,17 +341,20 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             }
             fp += 1;
         } else if !fl && gp < 8 {
-            if off <= 256 {
-                g.store_gp_fp(gp, off, t); // stur w/x{gp}, [x29,#-off] per width
-            } else {
-                g.lea_local("x9", off);
-                _ = match ast.tt.size(t) {
-                    1 => writeln!(g.s, "\tstrb w{gp}, [x9]"),
-                    2 => writeln!(g.s, "\tstrh w{gp}, [x9]"),
-                    4 => writeln!(g.s, "\tstr w{gp}, [x9]"),
-                    _ => writeln!(g.s, "\tstr x{gp}, [x9]"),
-                };
-            }
+            g.param_loc[idx] = ParamLoc::Gp(gp); // arg register (for a promoted Inst::Param)
+            if g.param_ref.contains(&off) {
+                if off <= 256 {
+                    g.store_gp_fp(gp, off, t); // stur w/x{gp}, [x29,#-off] per width
+                } else {
+                    g.lea_local("x9", off);
+                    _ = match ast.tt.size(t) {
+                        1 => writeln!(g.s, "\tstrb w{gp}, [x9]"),
+                        2 => writeln!(g.s, "\tstrh w{gp}, [x9]"),
+                        4 => writeln!(g.s, "\tstr w{gp}, [x9]"),
+                        _ => writeln!(g.s, "\tstr x{gp}, [x9]"),
+                    };
+                }
+            } // else: promoted → Inst::Param delivers x{gp} into the home; no spill.
             gp += 1;
         } else {
             // scalar on the caller's stack: rounded 8-byte slot at [x29 + 16 + boff]
@@ -351,17 +371,22 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
             let o = alup(boff, 8);
             boff = o + 8;
             let src = 16 + o;
-            g.lea_local("x9", off);
-            if fl && sz == 4 {
-                _ = writeln!(g.s, "\tldr s7, [x29, #{src}]\n\tstr s7, [x9]");
-            } else {
-                _ = match sz {
-                    1 => writeln!(g.s, "\tldrb w8, [x29, #{src}]\n\tstrb w8, [x9]"),
-                    2 => writeln!(g.s, "\tldrh w8, [x29, #{src}]\n\tstrh w8, [x9]"),
-                    4 => writeln!(g.s, "\tldr w8, [x29, #{src}]\n\tstr w8, [x9]"),
-                    _ => writeln!(g.s, "\tldr x8, [x29, #{src}]\n\tstr x8, [x9]"),
-                };
+            if !fl {
+                g.param_loc[idx] = ParamLoc::Stack(src); // caller slot (for a promoted Inst::Param)
             }
+            if g.param_ref.contains(&off) {
+                g.lea_local("x9", off);
+                if fl && sz == 4 {
+                    _ = writeln!(g.s, "\tldr s7, [x29, #{src}]\n\tstr s7, [x9]");
+                } else {
+                    _ = match sz {
+                        1 => writeln!(g.s, "\tldrb w8, [x29, #{src}]\n\tstrb w8, [x9]"),
+                        2 => writeln!(g.s, "\tldrh w8, [x29, #{src}]\n\tstrh w8, [x9]"),
+                        4 => writeln!(g.s, "\tldr w8, [x29, #{src}]\n\tstr w8, [x9]"),
+                        _ => writeln!(g.s, "\tldr x8, [x29, #{src}]\n\tstr x8, [x9]"),
+                    };
+                }
+            } // else: promoted → Inst::Param loads from [x29,#src] into the home; no spill.
         }
     }
     g.va = (gp.min(8), fp.min(8), boff, g.fframe);
@@ -2277,6 +2302,32 @@ impl<'a> Cg<'a> {
                 _ = writeln!(self.s, "\tadd x0, x29, #{off}");
                 self.tmp_store(*d, "x0");
             }
+            Inst::Param(d, i) => {
+                // Deliver a promoted GP parameter's incoming value into temp d's home. The
+                // value contract keeps every scalar canonical to its width in a 64-bit
+                // register (sxtw for int, etc.), so canonicalize via ext_rd/ext_r. When d has
+                // a REGISTER home, canonicalize the arg register STRAIGHT into the home (no x0
+                // funnel) — homes are x10–x15/x19–x28, always disjoint from the arg registers
+                // x0–x7, so there is never a read/write alias. A spilled d funnels through x0
+                // then tmp_store. Emitted at entry-top, before any arg-register clobber.
+                let ty = self.ir_temps[*d as usize];
+                let reg_home = matches!(self.talloc.get(*d as usize).copied().flatten(), Some((false, _)));
+                let dst = match self.talloc.get(*d as usize).copied().flatten() {
+                    Some((false, idx)) => self.gpp(idx),
+                    _ => 0, // spilled (or, defensively, an unexpected fp home) → via x0
+                };
+                match self.param_loc[*i as usize] {
+                    ParamLoc::Gp(n) => self.ext_rd(dst, n, ty), // x{dst} = canon(x{n})
+                    ParamLoc::Stack(off) => {
+                        _ = writeln!(self.s, "\tldr x{dst}, [x29, #{off}]");
+                        self.ext_r(dst, ty);
+                    }
+                    ParamLoc::None => unreachable!("Inst::Param for a non-scalar/absent param"),
+                }
+                if !reg_home {
+                    self.tmp_store(*d, "x0"); // spilled: land the x0-funneled value in its slot
+                }
+            }
             Inst::GotoPtr(a) => {
                 self.ld_val(*a, "x0");
                 self.s += "\tbr x0\n";
@@ -3430,6 +3481,8 @@ pub fn emit_ir(ast: &Ast) -> String {
         sp_at_base: true,
         fdynstack: false,
         near_branch: false,
+        param_loc: Vec::new(),
+        param_ref: std::collections::HashSet::new(),
     };
     for a in &ast.raw_asm {
         g.s += a;
@@ -3462,6 +3515,26 @@ pub fn emit_ir(ast: &Ast) -> String {
         );
         if g.fframe > 0 {
             g.sp_adjust("sub", g.fframe);
+        }
+        // Step-2 param promotion (regalloc only): a scalar param whose slot has NO IR
+        // Lea(Local(off)) was promoted to Inst::Param (to_ssa) — emit_params must SKIP its
+        // spill (Param delivers the arg register into the home instead). Build the referenced
+        // set from the IR; size param_loc (filled by emit_params' ABI walk). At -O0 (no
+        // regalloc) param_ref is left empty ⟹ every param spills, the pre-Step-2 behavior.
+        g.param_loc = vec![ParamLoc::None; f.params.len()];
+        g.param_ref.clear();
+        if g.regalloc {
+            for b in &funcs[fi].blocks {
+                for i in &b.insts {
+                    if let Inst::Lea(_, crate::ir::Place::Local(off)) = i {
+                        g.param_ref.insert(*off);
+                    }
+                }
+            }
+        } else {
+            // -O0: no Inst::Param is produced, so every param slot must be spilled. Seeding
+            // param_ref with all param offsets keeps emit_params on its unconditional path.
+            g.param_ref = f.params.iter().map(|&(off, _)| off).collect();
         }
         // Prologue parameter-ABI SHARED with emit() (nested-chain/variadic-save/sret/
         // spill scalar+struct+HFA) → parameters sit ready in frame slots for the IR body.

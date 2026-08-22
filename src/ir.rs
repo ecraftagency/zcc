@@ -122,6 +122,11 @@ pub enum Inst {
     // op = u8 code; ta/tb = operand types (signedness), rt = the type of *(rp) (signedness+width). Impure.
     Overflow(Tmp, u8, TypeId, TypeId, TypeId, Val, Val, Val), // dst,op,ta,tb,rt,a,b,rp
     VaArea(Tmp, u32), // builtin __va_area__: dst = x29 + off (start of the anonymous-argument area)
+    // A promoted PARAMETER's incoming value: dst = the ABI argument at index `i` into f.params
+    // (the value delivered in its arg register / caller-stack slot). Created ONLY by to_ssa
+    // when it promotes a full-width scalar param (mem2reg), replacing the frame slot. Pure
+    // (no memory effect); the backend lowers it to a canonicalizing `mov home, arg` at entry.
+    Param(Tmp, u32),
     // EXT(gcc): computed-goto "goto *e": branch through a value. Ends the block at
     // runtime (the IR block following it is dead). Impure, with NO dst.
     GotoPtr(Val),
@@ -219,6 +224,7 @@ pub(crate) fn inst_def(i: &Inst) -> Option<Tmp> {
         | Inst::VaArg(d, ..)
         | Inst::Overflow(d, ..)
         | Inst::VaArea(d, ..)
+        | Inst::Param(d, ..)
         | Inst::Alloca(d, ..)
         | Inst::Select(d, ..)
         | Inst::Phi(d, ..) => Some(*d),
@@ -276,6 +282,7 @@ pub(crate) fn inst_uses(i: &Inst, out: &mut Vec<Tmp>) {
         Inst::Lea(..)
         | Inst::FunAddr(..)
         | Inst::LabelAddr(..)
+        | Inst::Param(..)
         | Inst::VaArea(..) => {}
         Inst::Call(_, c, args, _) => {
             if let Callee::Ptr(p) = c {
@@ -1370,6 +1377,12 @@ pub(crate) mod tests {
                         reg[*d as usize] = r;
                     }
                     Inst::Copy(d, ty, a) => reg[*d as usize] = canon(tt, *ty, fetch(&reg, a)),
+                    Inst::Param(d, i) => {
+                        // The incoming argument at index i, canonicalized to the temp's type
+                        // (mirrors the seeding at the top: args → params, by position).
+                        reg[*d as usize] =
+                            canon(tt, f.temps[*d as usize], *args.get(*i as usize).unwrap_or(&0));
+                    }
                     Inst::Select(d, ty, c, a, b) => {
                         let chosen = if fetch(&reg, c) != 0 { fetch(&reg, a) } else { fetch(&reg, b) };
                         reg[*d as usize] = canon(tt, *ty, chosen);
