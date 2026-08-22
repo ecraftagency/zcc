@@ -355,6 +355,12 @@ pub struct Func {
     // goto leaving the VLA scope must deallocate; otherwise a VLA inside a goto
     // loop overflows the stack)
     pub has_vla: bool,
+    // C99 6.7.3: a `volatile` token appeared anywhere in THIS function's definition span
+    // (return type, params, or body). The IR drops the qualifier, so ⟦·⟧-preservation of the
+    // opt passes is proven only for volatile-free functions ⟹ a flagged function keeps the
+    // naive -O0 path while its volatile-free peers optimize (per-function opt gate). See
+    // `Ast::has_global_volatile` for the file-scope-object case that widens this to the whole TU.
+    pub has_volatile: bool,
 }
 
 // Sole target: AArch64 ELF (Linux). ABI-specific behavior (char signedness, va,
@@ -380,10 +386,11 @@ pub struct Ast {
     // EXT(gcc): a weak prototype/extern — the TU emits .weak so the undefined
     // reference is weak
     pub weak_decls: Vec<String>,
-    // C99 6.7.3: the TU contains volatile. The IR does not model volatile (the
-    // qualifier is dropped), so ⟦·⟧-preservation of the opt pass is only proven
-    // for volatile-free input → this flag disables the (default-on) optimizer, so
-    // a volatile function runs WITHIN the fragment the theorem covers. Sound by
-    // construction.
-    pub has_volatile: bool,
+    // C99 6.7.3, file-scope case: a `volatile` token appeared OUTSIDE every function-definition
+    // span — i.e. on a file-scope object/typedef/prototype. A volatile GLOBAL OBJECT can be
+    // accessed from a function whose own body carries no `volatile` token, so per-function
+    // gating is unsound in its presence → this flag falls back to disabling opt for the WHOLE
+    // TU (the safe direction). Clear ⟺ every volatile is confined inside some function, and
+    // then each function is gated independently by `Func::has_volatile`.
+    pub has_global_volatile: bool,
 }

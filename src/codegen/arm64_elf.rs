@@ -2554,6 +2554,95 @@ fn drop_redundant_moves(body: &str) -> String {
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// REDUNDANT-LOAD-AFTER-STORE elimination (store→load identity). [MEASURED lever:
+// sqlite3.c carries 166,019 adjacent `str xN,[sp,#m]; ldr xN,[sp,#m]` pairs = 52% of
+// ALL 319k loads — the value-contract materializes each temp to/from its frame slot per
+// use (O0 style), and the register allocator's spill code round-trips through the slot;
+// neither is visible to the IR-level load-elim (B2, §3), so they survive to the stream.
+// This is the machine-level case of a veteran-compiler pass: GCC `postreload-cse`/
+// `peephole2`, LLVM MachineCSE + store→load forwarding, QBE load.c.]
+//
+// THEOREM (store→load identity). State Σ=⟨ρ registers, μ memory⟩:
+//   ⟦str xN,[m]⟧ : μ' = μ[addr(m) ↦ ρ(xN)], ρ unchanged
+//   ⟦ldr xN,[m]⟧ : ρ' = ρ[xN ↦ μ(addr(m))], μ unchanged
+// When the two are ADJACENT (nothing executes between ⟹ ρ(xN), the base register of m,
+// and μ(addr(m)) are unperturbed), after `str` we have μ(addr(m)) = ρ(xN); then `ldr`
+// assigns ρ(xN) := μ(addr(m)) = ρ(xN) — the IDENTITY on ρ. So ⟦str;ldr⟧ = ⟦str⟧ and
+// deleting the `ldr` preserves ⟦·⟧. ∎  Full 64-bit `x` form only: a `w`-form reload
+// zero-extends into the high 32 bits, an OBSERVABLE change unless those bits are already
+// dead — that proof is not local, so `w` pairs are left untouched (there are none here).
+//
+// TWO HYPOTHESES OF THE THEOREM, both discharged by construction:
+//   (1) NON-VOLATILE m — a volatile access must not be elided (C11 6.7.3/7: both the store
+//       and the load are required observable side effects). The base is restricted to `[sp,`
+//       (frame slots): sp is never a user pointer, so a frame slot is a compiler-generated
+//       stack temp — never volatile, never aliased. (Measured: all 166,019 pairs are `[sp,`.)
+//   (2) ADJACENCY with no control entry — a LABEL between the pair is an entry point at which
+//       execution may reach the `ldr` WITHOUT having run the `str`, so μ(addr(m)) ≠ ρ(xN)
+//       there. A label FLUSHES the pending store. Blank/directive lines carry no execution
+//       and no entry, so the pair survives across them; any other instruction flushes (safe).
+// SOUND like the move passes: the ONLY rewrite is deleting a proven-identity load; every
+// value/memory-changing event drops the pending store. Re-validated by opt-parity (0 DIVERGE).
+
+/// Parse a 64-bit `ldr`/`str xN, [sp, #k]` frame-slot access → (is_load, N, mem-text).
+/// None for any other mnemonic, a `w`-form, a non-`[sp,` base, or writeback/index addressing.
+fn parse_frame_ldst(t: &str) -> Option<(bool, u32, &str)> {
+    let (mn, rest) = t.split_once(char::is_whitespace)?;
+    let is_load = match mn {
+        "ldr" => true,
+        "str" => false,
+        _ => return None,
+    };
+    let rest = rest.trim_start();
+    // writeback (`[sp,#k]!`) / post-index (`[sp],#k`) mutate sp — not a pure load/store.
+    if rest.contains('!') || rest.contains("],") {
+        return None;
+    }
+    let (reg, mem) = rest.split_once(',')?;
+    let n = reg.trim().strip_prefix('x')?.parse::<u32>().ok()?; // x-form (64-bit) only
+    let mem = mem.trim();
+    mem.starts_with("[sp,").then_some((is_load, n, mem))
+}
+
+/// Delete every `ldr xN,[sp,#m]` immediately preceded by `str xN,[sp,#m]` (store→load
+/// identity, see the block comment). Airtight and value-independent; the single largest
+/// measured reduction in the load stream.
+fn drop_redundant_loads(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut pending_store: Option<(u32, String)> = None; // (reg, mem) of the last store
+    for line in body.lines() {
+        let t = line.trim();
+        if t.ends_with(':') {
+            // label (incl. local `.L…:`) = control-flow entry ⟹ store→load identity breaks.
+            // Checked BEFORE the `.`-directive case, since local labels start with a dot.
+            pending_store = None;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if t.is_empty() || t.starts_with('.') {
+            out.push_str(line); // blank/directive: no execution, no control entry — keep pair
+            out.push('\n');
+            continue;
+        }
+        match parse_frame_ldst(t) {
+            Some((true, reg, mem)) => {
+                if pending_store.as_ref().is_some_and(|(sr, sm)| *sr == reg && sm == mem) {
+                    pending_store = None; // the redundant reload — DROP it (not emitted)
+                    continue;
+                }
+                pending_store = None; // a load that redefines xN: no store now pends
+            }
+            Some((false, reg, mem)) => pending_store = Some((reg, mem.to_string())),
+            None => pending_store = None, // any other instruction may touch mem/regs ⟹ flush
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Backend entry point — the SOLE path: lower(AST) → IR → passes → asm. Covers the
 /// full suite/csmith/musl; the AST-walk emit() has been removed. The backend simulates per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
@@ -2563,35 +2652,52 @@ pub fn emit_ir(ast: &Ast) -> String {
     // returning φ-free IR the naive-slot backend consumes unchanged. Every pass is proven
     // ⟦·⟧-preserving (opt.rs::tests, commuting-square); verify rejects broken IR.
     // Two guards, both MANDATORY (not A/B scaffolding):
-    //   (1) has_volatile — the IR does not model volatile (6.7.3), so ⟦·⟧-preservation is
-    //       proven only for volatile-free input; a volatile function keeps the naive -O0 path.
+    //   (1) volatile — the IR does not model volatile (6.7.3), so ⟦·⟧-preservation is proven
+    //       only for volatile-free code. Gated PER FUNCTION: `opt_ok[i]` is false when function
+    //       i's own definition span carries `volatile` (Func::has_volatile) — that one function
+    //       keeps the naive -O0 path while its volatile-free peers optimize. A file-scope
+    //       volatile object (Ast::has_global_volatile) may be reached from a function with no
+    //       `volatile` token, so it disables opt for the WHOLE TU (the safe fallback).
     //   (2) ZCC_O0 — the -O0 escape (debug + the bench baseline), the sole knob that turns
     //       the optimizer off. Default (unset) = full SSA optimization + regalloc.
-    let opt_on = !ast.has_volatile && std::env::var("ZCC_O0").is_err();
+    let zcc_o0 = std::env::var("ZCC_O0").is_ok();
+    // funcs[i] ↔ ast.funcs[i] by construction (ir::lower pushes one per AST func, in order).
+    let opt_ok: Vec<bool> = ast
+        .funcs
+        .iter()
+        .map(|f| !zcc_o0 && !ast.has_global_volatile && !f.has_volatile)
+        .collect();
     // Industrial toggleable pipeline: which passes run is read once from the environment
     // (ZCC_OPT_OFF / ZCC_OPT_ON over the default profile). `coalesce` is consumed later by
     // abi_alloc, so it is stashed on Cg.
     let passes = crate::opt::Passes::from_env();
-    if opt_on {
+    {
         // Tier-1 #5: whole-program inlining runs FIRST (it is interprocedural — it reads
         // the whole `funcs` set), on straight-lowered IR; the per-function SSA passes then
         // clean up the spliced copies + β-substitute across the inline (const-prop, DCE).
         if passes.inline {
-            // A variadic / VLA caller must not be inlined INTO: the callee frame is
-            // appended into its reg-save / dynamic-SP region (see opt::inline). funcs[i]
-            // ↔ ast.funcs[i] by construction (ir::lower pushes one per AST func, in order).
-            let caller_ok: Vec<bool> =
-                ast.funcs.iter().map(|f| !f.variadic && !f.has_vla).collect();
-            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok);
+            // A variadic / VLA caller must not be inlined INTO: the callee frame is appended
+            // into its reg-save / dynamic-SP region (see opt::inline). Both caller AND callee
+            // must be opt-eligible (a volatile function is never optimized, nor spliced into
+            // optimized code).
+            let caller_ok: Vec<bool> = ast
+                .funcs
+                .iter()
+                .enumerate()
+                .map(|(i, f)| opt_ok[i] && !f.variadic && !f.has_vla)
+                .collect();
+            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &opt_ok);
         }
-        for f in funcs.iter_mut() {
-            crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k);
-            debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
+        for (i, f) in funcs.iter_mut().enumerate() {
+            if opt_ok.get(i).copied().unwrap_or(false) {
+                crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k);
+                debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
+            }
         }
     }
-    // Stage 5b — ABI-aware regalloc runs whenever opt runs (φ-free, volatile-free IR);
-    // off ⟹ the naive all-spill memory model (the -O0 baseline).
-    let regalloc = opt_on;
+    // Stage 5b — ABI-aware regalloc runs per function whenever that function is optimized
+    // (φ-free, volatile-free IR); off ⟹ the naive all-spill memory model (the -O0 baseline).
+    // Set on `g` inside the emit loop from `opt_ok[fi]`.
     let mut g = Cg {
         s: String::from(".cfi_sections .eh_frame\n.text\n"),
         a: ast,
@@ -2606,7 +2712,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         ir_tbase: 0,
         ir_temps: Vec::new(),
         ir_tspill: 0,
-        regalloc,
+        regalloc: false, // set per function from opt_ok[fi] in the emit loop
         coalesce: passes.coalesce,
         talloc: Vec::new(),
         csave_gp: Vec::new(),
@@ -2620,6 +2726,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.s += "\n.text\n";
     }
     for (fi, f) in ast.funcs.iter().enumerate() {
+        g.regalloc = opt_ok[fi]; // per-function: optimized ⟺ volatile-free (C99 6.7.3)
         g.fname = f.name.clone();
         g.fret = f.ret;
         g.fsret = f.sret;
@@ -2651,18 +2758,20 @@ pub fn emit_ir(ast: &Ast) -> String {
         emit_params(&mut g, f);
         let body_start = g.s.len();
         g.emit_ir_body(&funcs[fi]);
-        // Phase C — machine-level redundant-move elimination over just this body (the region
-        // begins fresh: entered from the prologue, so an empty equivalence model is sound).
-        if regalloc && (passes.peephole || passes.ldst_pair) {
-            let mut body = g.s.split_off(body_start);
-            if passes.peephole {
-                body = peephole_moves(&body); // redundant/dead moves first…
-            }
-            if passes.ldst_pair {
-                body = pair_ldst(&body); // …then the exposed adjacent accesses → ldp/stp
-            }
-            g.s.push_str(&body);
+        // Phase C — machine-level cleanup over just this body (the region begins fresh:
+        // entered from the prologue, so an empty equivalence model is sound).
+        let mut body = g.s.split_off(body_start);
+        // Redundant-load-after-store (store→load identity) is airtight at ANY opt level —
+        // frame-slot only, so valid even on the -O0 volatile path (see block comment). Run it
+        // always, on the raw stream, before copy-prop can rename an address register.
+        body = drop_redundant_loads(&body);
+        if g.regalloc && passes.peephole {
+            body = peephole_moves(&body); // redundant/dead reg-moves…
         }
+        if g.regalloc && passes.ldst_pair {
+            body = pair_ldst(&body); // …then the exposed adjacent accesses → ldp/stp
+        }
+        g.s.push_str(&body);
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
     }
@@ -2759,6 +2868,73 @@ mod tests {
         let out = peephole_moves(body);
         assert_eq!(count(&out, "mov x0, x24"), 0, "redundant dropped");
         assert_eq!(count(&out, "mov x1, x25"), 1, "an unrelated move is preserved");
+    }
+
+    use super::drop_redundant_loads;
+
+    // CORE store→load identity: `str x0,[sp,#24]; ldr x0,[sp,#24]` adjacent ⟹ the ldr is
+    // the identity on x0 and must be DROPPED; the store is KEPT (a later block may reload it).
+    #[test]
+    fn redundant_load_after_store_dropped() {
+        let body = "\tstr x0, [sp, #24]\n\tldr x0, [sp, #24]\n\tadd x0, x0, x1\n";
+        let out = drop_redundant_loads(body);
+        assert_eq!(count(&out, "ldr x0, [sp, #24]"), 0, "the redundant reload is deleted");
+        assert_eq!(count(&out, "str x0, [sp, #24]"), 1, "the store is kept");
+        assert!(out.contains("add x0, x0, x1"), "the real op is untouched");
+    }
+
+    // A DIFFERENT destination register is a real move (store→load forward into x1), NOT the
+    // identity — it must be KEPT (we delete only the same-register no-op).
+    #[test]
+    fn redundant_load_diff_reg_kept() {
+        let out = drop_redundant_loads("\tstr x0, [sp, #24]\n\tldr x1, [sp, #24]\n");
+        assert_eq!(count(&out, "ldr x1, [sp, #24]"), 1, "load into a distinct reg is not a no-op");
+    }
+
+    // A DIFFERENT slot is a genuine load — KEPT.
+    #[test]
+    fn redundant_load_diff_slot_kept() {
+        let out = drop_redundant_loads("\tstr x0, [sp, #24]\n\tldr x0, [sp, #32]\n");
+        assert_eq!(count(&out, "ldr x0, [sp, #32]"), 1, "a different slot is a real load");
+    }
+
+    // Hypothesis (2): a LABEL between the pair is a control entry point ⟹ the load may run
+    // without the store ⟹ NOT redundant. Must be KEPT.
+    #[test]
+    fn redundant_load_flushed_at_label() {
+        let out = drop_redundant_loads("\tstr x0, [sp, #24]\n.Lx:\n\tldr x0, [sp, #24]\n");
+        assert_eq!(count(&out, "ldr x0, [sp, #24]"), 1, "must not elide across a label");
+    }
+
+    // Any intervening instruction (it may write memory or the register) FLUSHES the pending
+    // store ⟹ the reload is real. Must be KEPT.
+    #[test]
+    fn redundant_load_flushed_by_intervening_insn() {
+        let out = drop_redundant_loads("\tstr x0, [sp, #24]\n\tmul x0, x5, x6\n\tldr x0, [sp, #24]\n");
+        assert_eq!(count(&out, "ldr x0, [sp, #24]"), 1, "clobber between ⟹ the reload is real");
+    }
+
+    // Hypothesis (1): a NON-frame base (`[x9]`) may alias a VOLATILE object — the restriction
+    // to `[sp,` excludes it, so such a pair is left untouched.
+    #[test]
+    fn redundant_load_nonframe_base_kept() {
+        let out = drop_redundant_loads("\tstr x0, [x9]\n\tldr x0, [x9]\n");
+        assert_eq!(count(&out, "ldr x0, [x9]"), 1, "arbitrary-pointer pairs are never elided");
+    }
+
+    // A `w`-form reload zero-extends the high 32 bits (an observable change unless dead) ⟹ NOT
+    // the 64-bit identity. Left untouched (x-form only).
+    #[test]
+    fn redundant_load_wform_kept() {
+        let out = drop_redundant_loads("\tstr w0, [sp, #24]\n\tldr w0, [sp, #24]\n");
+        assert_eq!(count(&out, "ldr w0, [sp, #24]"), 1, "w-form reload is not the 64-bit identity");
+    }
+
+    // A blank/directive line carries no execution and no control entry ⟹ the pair survives it.
+    #[test]
+    fn redundant_load_survives_directive() {
+        let out = drop_redundant_loads("\tstr x0, [sp, #24]\n\t.p2align 3\n\tldr x0, [sp, #24]\n");
+        assert_eq!(count(&out, "ldr x0, [sp, #24]"), 0, "a directive does not break adjacency");
     }
 
     use super::drop_dead_moves;

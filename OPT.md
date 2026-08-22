@@ -151,6 +151,7 @@ Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simpli
 | **add/sub-imm12 peephole** (backend) | `mov #k;add`→`add #k`; matmul inner 12→9 insn; marginal on bench (3.44→3.40) but universal + pressure-free | **ON** |
 | **pointer_iv (SR + LFTR + dead-counter)** | FIRES on matmul (gcc's 7-insn form); **k=10 5.47× (spills), k=18 1.80×** ✅; equiv 102/102. Default-OFF: regresses at k=10, is FOUNDATION for the k-decouple (§4) | **OFF** |
 | **backend sp-relative addressing-fold** (local slot → `[sp,#pos]`) | **SIZE lever.** Folds `sub xN,x29,#off; ldr/str [xN]` → one `ldr/str [sp,#pos]` for every foldable local access (`Lea(Local)+Load/Store` fusion `try_fuse_local` + the `tmp_load/store` spill path). **sqlite3.c: 1.95M→1.05M insn (−46.3%), .text 7.89M→4.28M B (−45.8%), `sub` 728k→79k (−89%); gap-to-gcc 8.1×→4.4×.** Guarded: `!fhasvla && !fdynstack(alloca) && sp_at_base` (ir_call_abi/ir_asm clear it mid-marshalling) — same effective byte (`sp=x29−frame_total`), machine-translation-validated. Bench-perf FLAT (kernels are register-resident; the win is on memory-heavy real code + as/ld + compile-speed). | **ON** |
+| **redundant-load-after-store** (backend, store→load identity) | **SIZE lever, airtight at ANY opt level.** Deletes `ldr xN,[sp,#m]` immediately preceded by `str xN,[sp,#m]` — value-independent no-op (∵ adjacent ⟹ ρ(xN)=μ[m] already). Frame-slot (`[sp,`) only ⟹ never volatile/aliased ⟹ valid even on the -O0 path (runs UNCONDITIONALLY, before the regalloc-gated move peepholes). **sqlite3.c: ldr 319k→153k (−52%), total 1.05M→879k insn (−15.9%); gap-to-gcc 4.41×→3.71×.** 166,019 pairs = 52% of ALL loads = the value-contract's per-use spill/reload, invisible to IR-level B2 (§5). The veteran machine-level pass: gcc `postreload-cse`, LLVM MachineCSE + store→load forwarding, QBE `load.c`. | **ON** |
 
 **P1 note (levels are distinct):** copy-propagation is a **backend peephole on emitted `.s` text**
 (post-isel). It does NOT touch the SSA IR, so it does NOT change the SSA pressure the LICM guard
@@ -168,6 +169,38 @@ guarded-OFF passes (only an inert `gp_k` param threaded).
 speed-safe and shipped OFF; their lasting value is the **pressure-guard infrastructure** (measured
 `P`, `k−P` headroom) that any pressure-aware backend work reuses. That is the *foundation* leg of
 the gate. As standalone wins they are flat — so **no further investment in IR scalar opt**.
+
+### §3b — Per-function volatile gate (Law-2 Side-I fix) + the sqlite ceiling
+
+**The defect (whole-TU volatile gate).** The opt gate was `!ast.has_volatile` — a whole-TU token
+scan: a SINGLE `volatile` token *anywhere* forced the ENTIRE translation unit to -O0. The IR does
+not model volatile, so ⟦·⟧-preservation is proven only for volatile-free code — but the *faithful*
+scope of that constraint is **per function**, not per TU. Disabling opt for every function because
+one function (or a header typedef) mentions volatile is a convenience-truncation, a Law-2 Side-I
+defect (algorithm not faithfully realizing its side), exactly the §2b pattern one level up.
+
+**The fix (proven sound).** Optimize function `f` iff `f` is volatile-free — its *definition span*
+(return type + params + body) carries no `volatile` token (`Func::has_volatile`) — AND the TU has no
+file-scope volatile (`Ast::has_global_volatile`: a `volatile` token outside every function span).
+SOUNDNESS by scope: every volatile *access* needs a volatile-qualified type in scope at the access;
+that type's `volatile` token is EITHER in the accessing function's own span (→ that function stays
+O0) OR at file scope (→ `has_global_volatile` → whole-TU O0). No volatile access can hide in a
+function whose span AND file scope are both volatile-free. Inlining respects it too (a volatile
+callee is never spliced into optimized code — `callee_ok` in `opt::inline`). Measured on a mixed TU:
+`hot()` optimizes (0 spills, x19–x28 regalloc) while `vol()` (local volatile) stays O0. Gate green
+(torture 1378/0, opt-parity 1552/0, csmith 254/0 — csmith stresses volatile heavily).
+
+**The sqlite ceiling this exposes (the #1 remaining SIZE lever, ~5× the sp-fold).** Forcing opt ON
+over the volatile gate measures the ceiling: **sqlite3.c 1.05M → 548k insn (−47.6%), gap 4.4×→2.3×**
+(str 287k→23k −92%, ldr 319k→57k −82% — the spills collapse under regalloc). The per-function gate
+does NOT reach it: **musl's threading typedefs** (`pthread_mutex_t` &c. in `bits/alltypes.h`) carry
+`volatile` members at FILE scope ⟹ `has_global_volatile` ⟹ sqlite stays whole-TU O0. That is the
+*correct conservative* verdict (a volatile struct member COULD be accessed). Breaking it requires
+**type-aware volatile**: retain the qualifier in the type system, mark the Load/Store volatile at
+lowering from the accessed lvalue's type, and have passes skip only those — the veteran approach
+(LLVM volatile MemoryDef). Then never-accessed header typedefs stop poisoning the TU. This is a
+frontend change (Article-B boundary) = **the next size batch**, deferred here as its own careful
+work under the full csmith/yarpgen volatile gate.
 
 ---
 

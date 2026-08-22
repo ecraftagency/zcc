@@ -98,6 +98,11 @@ struct P<'a> {
     // re-parse in the prologue after setup_params (parameters are now locals). Drained on
     // entering a funcdef; cleared for a non-definition.
     param_vla_dims: Vec<(usize, usize)>,
+    // [tok_lo, tok_hi) token span of each function DEFINITION (return type + params + body),
+    // recorded in `program()`. Used to attribute each `volatile` token: inside a span ⟹ that
+    // function is O0; outside every span ⟹ file-scope ⟹ Ast::has_global_volatile. (Per-function
+    // opt gate, C99 6.7.3.)
+    fn_tok_spans: Vec<(usize, usize)>,
     // currently parsing a parameter list (counted because of nesting): a non-constant
     // parameter-array size (glibc regex.h `__pmatch[__nmatch]` — __nmatch is a PRIOR
     // parameter, not in scope) → skip the expr; the parameter decays to a pointer, so the
@@ -3805,6 +3810,10 @@ impl P<'_> {
         let mut funcs = Vec::new();
         let mut ranges: Vec<(u32, u32)> = Vec::new(); // body [n0,n1) per func
         while self.pos < self.toks.len() {
+            // Token span of THIS top-level item — the funcdef branch records it (see
+            // fn_tok_spans) so a `volatile` in the return type / params / body attributes to
+            // THIS function, and any `volatile` outside every span is file-scope.
+            let item_lo = self.pos;
             // EXT(gcc): global-level __asm__("...") → emitted verbatim (musl
             // crt_arch.h defines _start; MUST be caught before decl_specs because
             // skip_attrs would mistakenly consume it as an asm-label)
@@ -3910,6 +3919,12 @@ impl P<'_> {
                     // (C99 6.7.4p7) → a DCE candidate; codegen emits weak if non-static so that
                     // copies from multiple TUs can coalesce
                     let is_inline = inline_fn && !self.plain_decls.contains(&name);
+                    // C99 6.7.3: does a `volatile` token appear in THIS function's span
+                    // (return type + params + body)? [item_lo, self.pos) is that span (self.pos
+                    // now sits just past the body). If so, the function keeps the -O0 path.
+                    let has_volatile =
+                        self.toks[item_lo..self.pos].iter().any(is_volatile_tok);
+                    self.fn_tok_spans.push((item_lo, self.pos));
                     funcs.push(Func {
                         name,
                         params,
@@ -3922,6 +3937,7 @@ impl P<'_> {
                         variadic: sig.variadic,
                         sret,
                         has_vla: !self.vla_szs.is_empty(),
+                        has_volatile,
                     });
                     ranges.push((n0, n1));
                     continue;
@@ -4057,6 +4073,12 @@ fn n_hack(base: Option<&str>) -> &str {
     base.unwrap_or("")
 }
 
+// C99 6.7.3 — the `volatile` type-qualifier keyword in its accepted spellings (GNU
+// __volatile / __volatile__ included). Sole predicate behind the per-function opt gate.
+fn is_volatile_tok(t: &Tok) -> bool {
+    matches!(t, Tok::Ident(n) if matches!(n.as_str(), "volatile" | "__volatile" | "__volatile__"))
+}
+
 pub fn parse(
     toks: &[Tok],
     locs: &[(u32, u32)],
@@ -4090,6 +4112,7 @@ pub fn parse(
         vla_inner: Vec::new(),
         vm_typedef_sz: HashMap::new(),
         param_vla_dims: Vec::new(),
+        fn_tok_spans: Vec::new(),
         in_params: 0,
         reg_pins: HashMap::new(),
         vla_arrs: HashMap::new(),
@@ -4215,10 +4238,12 @@ pub fn parse(
         aliases: p.aliases,
         pic: false,
         weak_decls: p.weak_decls,
-        // C99 6.7.3: a single scan — any volatile token ⟹ disable optimization (sound-by-
-        // construction: the IR carries no volatile, so only volatile-free fragments are optimized).
-        has_volatile: p.toks.iter().any(|t| {
-            matches!(t, Tok::Ident(n) if matches!(n.as_str(), "volatile" | "__volatile" | "__volatile__"))
+        // File-scope volatile = a `volatile` token OUTSIDE every function-definition span. A
+        // volatile global object may be accessed from a function whose own body has no
+        // `volatile` token, so its presence forces the whole TU back to -O0 (the safe
+        // fallback). Empty ⟺ every volatile is confined inside a function ⟹ per-function gate.
+        has_global_volatile: p.toks.iter().enumerate().any(|(i, t)| {
+            is_volatile_tok(t) && !p.fn_tok_spans.iter().any(|&(lo, hi)| i >= lo && i < hi)
         }),
     })
 }

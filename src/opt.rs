@@ -3415,7 +3415,10 @@ fn splice(caller: &mut IrFunc, b: BlockId, k: usize, callee: &IrFunc) {
 /// variadic caller is exactly the AAPCS64 reg-save area and for a VLA caller confuses the
 /// dynamic-SP reset base — both need va/VLA-aware placement this pass does not do. Callee
 /// eligibility (scalar-only, no va/alloca/asm/…) is separately gated by `inline_ok`.
-pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool]) -> u32 {
+/// `caller_ok[ci]` gates who may be inlined INTO; `callee_ok[gi]` gates who may be inlined
+/// (splicing a volatile callee's body into an optimized caller would subject its volatile
+/// accesses to opt — C99 6.7.3 — so a volatile function is never a callee here).
+pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &[bool]) -> u32 {
     const LEAF_MAX: usize = 16; // a non-recursive callee this small is a pure win to inline
     const SELF_MAX: usize = 40; // a self-recursive callee: depth-1 unroll if this small
     let snapshot: Vec<IrFunc> = funcs.to_vec();
@@ -3433,6 +3436,9 @@ pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool]) -> u32 {
             for (k, inst) in funcs[ci].blocks[b].insts.iter().enumerate() {
                 if let Inst::Call(_, Callee::Sym(name), _, _) = inst {
                     let Some(&gi) = by_name.get(name.as_str()) else { continue };
+                    if !callee_ok.get(gi).copied().unwrap_or(true) {
+                        continue; // volatile callee — never spliced into optimized code
+                    }
                     let g = &snapshot[gi];
                     if !inline_ok(tt, g) {
                         continue;
@@ -6208,7 +6214,7 @@ mod tests {
         assert_eq!(count_sym_calls(&ir, "add"), 2, "baseline: two calls to add");
         let mut inl = ir.clone();
         let ok = vec![true; inl.len()];
-        inline(&ast.tt, &mut inl, &ok);
+        inline(&ast.tt, &mut inl, &ok, &ok);
         for g in &inl {
             verify(g).unwrap_or_else(|e| panic!("verify after inline: {e}"));
         }
@@ -6228,7 +6234,7 @@ mod tests {
         );
         let mut inl = ir.clone();
         let ok = vec![true; inl.len()];
-        inline(&ast.tt, &mut inl, &ok);
+        inline(&ast.tt, &mut inl, &ok, &ok);
         for g in &inl {
             verify(g).unwrap_or_else(|e| panic!("verify: {e}"));
         }
@@ -6258,7 +6264,7 @@ mod tests {
         assert_eq!(count_sym_calls(&ir, "fib"), 3, "2 inside fib + 1 in f");
         let mut inl = ir.clone();
         let ok = vec![true; inl.len()];
-        inline(&ast.tt, &mut inl, &ok);
+        inline(&ast.tt, &mut inl, &ok, &ok);
         for g in &inl {
             verify(g).unwrap_or_else(|e| panic!("verify after self-inline: {e}"));
         }
