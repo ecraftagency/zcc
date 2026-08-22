@@ -3438,7 +3438,7 @@ pub fn emit_ir(ast: &Ast) -> String {
                 .enumerate()
                 .map(|(i, f)| opt_ok[i] && !f.variadic && !f.has_vla)
                 .collect();
-            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &opt_ok);
+            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &opt_ok, &crate::opt::InlineCfg::from_env());
         }
         for (i, f) in funcs.iter_mut().enumerate() {
             if opt_ok.get(i).copied().unwrap_or(false) {
@@ -3453,6 +3453,37 @@ pub fn emit_ir(ast: &Ast) -> String {
             }
         }
     }
+    // Dead-function elimination — after inline, a static function whose every call site was
+    // spliced away (and whose address is not taken anywhere reachable) is unreferenced ⟹ its
+    // standalone body is dead code (gcc's remove-unused-static). Roots = exported (non-static)
+    // functions + every symbol NAMED by a global initializer (function-pointer tables — sqlite's
+    // vtab/opcode method arrays). Reachability follows Call/CallX/FunAddr edges to a fixpoint.
+    let dead: Vec<bool> = if passes.inline {
+        let mut root_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<&crate::ast::GInit> = ast.globals.iter().map(|g| &g.init).collect();
+        while let Some(init) = stack.pop() {
+            match init {
+                crate::ast::GInit::Addr(n, _) => {
+                    root_syms.insert(n.strip_prefix('\x01').unwrap_or(n).to_string());
+                    root_syms.insert(n.clone());
+                }
+                crate::ast::GInit::Diff(a, b) => {
+                    root_syms.insert(a.clone());
+                    root_syms.insert(b.clone());
+                }
+                crate::ast::GInit::List(items) => {
+                    for (_, _, sub) in items {
+                        stack.push(sub);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let is_static: Vec<bool> = ast.funcs.iter().map(|f| f.is_static).collect();
+        crate::opt::dead_static_fns(&funcs, &is_static, &root_syms)
+    } else {
+        vec![false; funcs.len()]
+    };
     // Stage 5b — ABI-aware regalloc runs per function whenever that function is optimized
     // (φ-free, volatile-free IR); off ⟹ the naive all-spill memory model (the -O0 baseline).
     // Set on `g` inside the emit loop from `opt_ok[fi]`.
@@ -3489,6 +3520,9 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.s += "\n.text\n";
     }
     for (fi, f) in ast.funcs.iter().enumerate() {
+        if dead.get(fi).copied().unwrap_or(false) {
+            continue; // dead-function elimination: unreferenced static, fully inlined away
+        }
         g.regalloc = opt_ok[fi]; // per-function: optimized ⟺ volatile-free (C99 6.7.3)
         g.fname = f.name.clone();
         g.fret = f.ret;

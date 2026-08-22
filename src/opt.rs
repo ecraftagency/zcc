@@ -1433,12 +1433,22 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
     }
     // The promotable set: scalar (int/float/pointer, per LP64 TyTab), has real
     // memory traffic, not escaped. A dense var index gives φ/currentDef arrays.
+    // A PARAMETER offset carries a second constraint: its DECLARED type (f.params) must
+    // itself be a GP/FP scalar. A composite param (e.g. `struct{ull a:16,b:32,c:16}` — 8B)
+    // is accessed through integer-typed bitfield RMW, so `ty_of[off]` is integer and would
+    // pass the traffic-type `scalar` test — but the ABI delivers it as a STRUCT (emit_params'
+    // struct arm, no param_loc), so promoting it to an Inst::Param would mismatch (param_loc
+    // None → the `unreachable!` at emit time, gcc 20081117-1). Gate param offsets on the
+    // declared type too.
+    let param_decl: HashMap<u32, TypeId> = f.params.iter().map(|&(o, t)| (o, t)).collect();
+    let is_scalar_ty = |ty: TypeId| {
+        tt.is_integer(ty) || tt.is_float(ty) || matches!(tt.tys[ty as usize], Ty::Ptr(_))
+    };
     let mut promotable: Vec<u32> = ty_of
         .iter()
         .filter_map(|(&off, &ty)| {
-            let scalar = tt.is_integer(ty)
-                || tt.is_float(ty)
-                || matches!(tt.tys[ty as usize], Ty::Ptr(_));
+            let scalar = is_scalar_ty(ty)
+                && param_decl.get(&off).map_or(true, |&pt| is_scalar_ty(pt));
             (!escaped.contains(&off) && has_mem.contains(&off) && scalar).then_some(off)
         })
         .collect();
@@ -3409,6 +3419,12 @@ fn scalar_ty(tt: &TyTab, ty: TypeId) -> bool {
 fn inline_ok(tt: &TyTab, callee: &IrFunc) -> bool {
     callee.labels.is_empty()
         && callee.params.iter().all(|&(_, pty)| scalar_ty(tt, pty))
+        // A SUB-WORD (u8/u16/…) param must not be inlined: the splice turns it into a spliced
+        // local written by Store(arg); to_ssa then promotes that local to a register, but the
+        // sub-word wrap-on-back-edge canonicalization (the pr81913 case) is proven only for a
+        // function's OWN sub-word params (to_ssa excludes them from promotion) — a spliced one
+        // is not in the caller's params list, so it would promote and mis-wrap. Reject here.
+        && callee.params.iter().all(|&(_, pty)| tt.size(pty) >= 4)
         && (callee.ret == VOID || scalar_ty(tt, callee.ret))
         && callee.blocks.iter().flat_map(|b| &b.insts).all(|i| {
             matches!(
@@ -3502,55 +3518,154 @@ fn splice(caller: &mut IrFunc, b: BlockId, k: usize, callee: &IrFunc) {
 /// `caller_ok[ci]` gates who may be inlined INTO; `callee_ok[gi]` gates who may be inlined
 /// (splicing a volatile callee's body into an optimized caller would subject its volatile
 /// accesses to opt — C99 6.7.3 — so a volatile function is never a callee here).
-pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &[bool]) -> u32 {
-    // Article-E convenience thresholds (NOT spec constants — these are policy, dated 2026-08).
-    // Inlining trades call-overhead (≈4 insns: arg-marshal + bl + ret-marshal) for a body copy;
-    // the win is net-positive only while the body is small. 16/40 are tuned-not-derived cutoffs
-    // (gcc's -O1 `max-inline-insns-single` is analogous and likewise a policy knob, ~70 there on
-    // a finer GIMPLE count). Both are guarded by opt-parity + torture, so a wrong value costs
-    // SIZE, never correctness; revisit if the sqlite/O1 size gap traces to inline over/under-fire.
-    const LEAF_MAX: usize = 16; // a non-recursive callee this small is a pure win to inline
-    const SELF_MAX: usize = 40; // a self-recursive callee: depth-1 unroll if this small
-    let snapshot: Vec<IrFunc> = funcs.to_vec();
-    let by_name: HashMap<&str, usize> =
-        snapshot.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+/// Inlining policy (thresholds). POLICY is separated from MECHANISM: the pass reads a cfg;
+/// the caller (emit_ir) supplies `from_env()`, tests supply `exercise_all()` to exize every
+/// edge. Article-E convenience thresholds (NOT spec constants — policy, dated 2026-08).
+#[derive(Clone, Copy)]
+pub struct InlineCfg {
+    pub leaf: usize,   // max body of a MULTI-call non-recursive callee to inline
+    pub self_: usize,  // max body of a self-recursive callee (depth-1 unroll per round)
+    pub single: usize, // max body of a SOLE-call-site callee (inline + DFE — pure win)
+    pub rounds: usize, // fixpoint rounds: a call chain A→B→C inlines one edge per round
+}
+impl InlineCfg {
+    // MEASURED on sqlite (the O1 size gap): the two edges behave OPPOSITELY for SIZE —
+    //  • SINGLE-call callees are a pure win — the body is not duplicated (one site), and DFE
+    //    then deletes the standalone copy, so inlining reclaims prologue+epilogue+bl+marshalling
+    //    for free. Inline these regardless of size (single large). ✓ −18k on sqlite.
+    //  • MULTI-call inlining currently REGRESSES size (each site duplicates the body, and the
+    //    copies carry the eager-sxtw int-value-contract bloat — ~21k sxtw on sqlite — that the
+    //    post-inline SSA cleanup cannot reclaim). So leaf defaults 0 (off). This flips to a net
+    //    win — as it is for gcc -O1 — once the int value contract stops re-extending after every
+    //    op (OPT.md: the sxtw lever); revisit leaf then.
+    // All guarded by opt-parity + torture, so a wrong value costs SIZE, never correctness.
+    pub fn from_env() -> Self {
+        let e = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        InlineCfg { leaf: e("ZCC_LEAF", 0), self_: e("ZCC_SELF", 0), single: e("ZCC_SINGLE", 400), rounds: e("ZCC_ROUNDS", 4) }
+    }
+    /// Test config — non-zero on every edge so the commuting-square tests exercise leaf,
+    /// self-recursive, and single-call inlining regardless of the shipped size policy.
+    #[cfg(test)]
+    pub fn exercise_all() -> Self {
+        InlineCfg { leaf: 40, self_: 40, single: 400, rounds: 4 }
+    }
+}
+
+pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &[bool], cfg: &InlineCfg) -> u32 {
+    let (leaf_max, self_max, single_max, max_rounds) = (cfg.leaf, cfg.self_, cfg.single, cfg.rounds);
     let mut total = 0u32;
-    for ci in 0..funcs.len() {
-        if !caller_ok.get(ci).copied().unwrap_or(true) {
-            continue;
-        }
-        let start_nc = funcs[ci].blocks.len();
-        // Original-block call sites eligible under the cost model, with their snapshot index.
-        let mut sites: Vec<(BlockId, usize, usize)> = Vec::new();
-        for b in 0..start_nc {
-            for (k, inst) in funcs[ci].blocks[b].insts.iter().enumerate() {
-                if let Inst::Call(_, Callee::Sym(name), _, _) = inst {
-                    let Some(&gi) = by_name.get(name.as_str()) else { continue };
-                    if !callee_ok.get(gi).copied().unwrap_or(true) {
-                        continue; // volatile callee — never spliced into optimized code
-                    }
-                    let g = &snapshot[gi];
-                    if !inline_ok(tt, g) {
-                        continue;
-                    }
-                    let n = inst_count(g);
-                    let ok = if gi == ci { n <= SELF_MAX } else { n <= LEAF_MAX };
-                    if ok {
-                        sites.push((b as BlockId, k, gi));
+    for _round in 0..max_rounds {
+        let snapshot: Vec<IrFunc> = funcs.to_vec();
+        let by_name: HashMap<&str, usize> =
+            snapshot.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+        // Global direct-call count per callee (on this round's state): a callee reached by
+        // exactly one Call site is a duplication-free inline (DFE reclaims its body).
+        let mut callcnt: Vec<u32> = vec![0; snapshot.len()];
+        for f in &snapshot {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Inst::Call(_, Callee::Sym(name), ..) = inst {
+                        if let Some(&gi) = by_name.get(name.as_str()) {
+                            callcnt[gi] += 1;
+                        }
                     }
                 }
             }
         }
-        // Per block, splice HIGHER indices first: lower call sites keep their (b,k)
-        // valid (split_off only detaches the tail above k), so the whole original
-        // worklist can be applied without recomputation.
-        sites.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        for (b, k, gi) in sites {
-            splice(&mut funcs[ci], b, k, &snapshot[gi]);
-            total += 1;
+        let mut round_splices = 0u32;
+        for ci in 0..funcs.len() {
+            if !caller_ok.get(ci).copied().unwrap_or(true) {
+                continue;
+            }
+            let start_nc = funcs[ci].blocks.len();
+            let mut sites: Vec<(BlockId, usize, usize)> = Vec::new();
+            for b in 0..start_nc {
+                for (k, inst) in funcs[ci].blocks[b].insts.iter().enumerate() {
+                    if let Inst::Call(_, Callee::Sym(name), _, _) = inst {
+                        let Some(&gi) = by_name.get(name.as_str()) else { continue };
+                        if !callee_ok.get(gi).copied().unwrap_or(true) {
+                            continue; // volatile callee — never spliced into optimized code
+                        }
+                        let g = &snapshot[gi];
+                        if !inline_ok(tt, g) {
+                            continue;
+                        }
+                        let n = inst_count(g);
+                        let ok = if gi == ci {
+                            n <= self_max
+                        } else if callcnt[gi] == 1 {
+                            n <= single_max // sole call site → inline + DFE, no duplication
+                        } else {
+                            n <= leaf_max
+                        };
+                        if ok {
+                            sites.push((b as BlockId, k, gi));
+                        }
+                    }
+                }
+            }
+            // Per block, splice HIGHER indices first: lower call sites keep their (b,k)
+            // valid (split_off only detaches the tail above k), so the whole original
+            // worklist can be applied without recomputation.
+            sites.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            for (b, k, gi) in sites {
+                splice(&mut funcs[ci], b, k, &snapshot[gi]);
+                total += 1;
+                round_splices += 1;
+            }
+        }
+        if round_splices == 0 {
+            break;
         }
     }
     total
+}
+
+/// Dead-function elimination (interprocedural, runs AFTER inline). A function with
+/// INTERNAL linkage (`is_static`) that no longer appears as a call target or has its
+/// address taken anywhere reachable is unreferenced ⟹ its standalone body is dead code
+/// and need not be emitted (this is exactly gcc's remove-unused-static, the other half
+/// of why -O1 emits fewer functions than we do). Reachability roots: every EXTERNALLY
+/// visible function (non-static — a translation unit outside can call it) plus every
+/// symbol NAMED by a global initializer (a function-pointer table — sqlite's vtab/opcode
+/// methods). From the roots we follow Call/CallX `Callee::Sym` and `FunAddr` edges to a
+/// fixpoint; any static function not reached is dead. Correctness: a deleted function is
+/// provably unreachable from any entry the linker can see, so ⟦program⟧ is unchanged.
+pub fn dead_static_fns(funcs: &[IrFunc], is_static: &[bool], root_syms: &HashSet<String>) -> Vec<bool> {
+    let idx: HashMap<&str, usize> =
+        funcs.iter().enumerate().map(|(i, f)| (f.name.as_str(), i)).collect();
+    let mut reach = vec![false; funcs.len()];
+    let mut work: Vec<usize> = Vec::new();
+    for (i, f) in funcs.iter().enumerate() {
+        if !is_static.get(i).copied().unwrap_or(true) || root_syms.contains(&f.name) {
+            if !reach[i] {
+                reach[i] = true;
+                work.push(i);
+            }
+        }
+    }
+    let mark = |name: &str, reach: &mut Vec<bool>, work: &mut Vec<usize>| {
+        if let Some(&j) = idx.get(name) {
+            if !reach[j] {
+                reach[j] = true;
+                work.push(j);
+            }
+        }
+    };
+    while let Some(i) = work.pop() {
+        for b in &funcs[i].blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Call(_, Callee::Sym(n), ..) | Inst::CallX(_, Callee::Sym(n), ..) => {
+                        mark(n, &mut reach, &mut work)
+                    }
+                    Inst::FunAddr(_, n) => mark(n, &mut reach, &mut work),
+                    _ => {}
+                }
+            }
+        }
+    }
+    (0..funcs.len()).map(|i| is_static.get(i).copied().unwrap_or(false) && !reach[i]).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6304,7 +6419,7 @@ mod tests {
         assert_eq!(count_sym_calls(&ir, "add"), 2, "baseline: two calls to add");
         let mut inl = ir.clone();
         let ok = vec![true; inl.len()];
-        inline(&ast.tt, &mut inl, &ok, &ok);
+        inline(&ast.tt, &mut inl, &ok, &ok, &InlineCfg::exercise_all());
         for g in &inl {
             verify(g).unwrap_or_else(|e| panic!("verify after inline: {e}"));
         }
@@ -6324,7 +6439,7 @@ mod tests {
         );
         let mut inl = ir.clone();
         let ok = vec![true; inl.len()];
-        inline(&ast.tt, &mut inl, &ok, &ok);
+        inline(&ast.tt, &mut inl, &ok, &ok, &InlineCfg::exercise_all());
         for g in &inl {
             verify(g).unwrap_or_else(|e| panic!("verify: {e}"));
         }
@@ -6354,7 +6469,7 @@ mod tests {
         assert_eq!(count_sym_calls(&ir, "fib"), 3, "2 inside fib + 1 in f");
         let mut inl = ir.clone();
         let ok = vec![true; inl.len()];
-        inline(&ast.tt, &mut inl, &ok, &ok);
+        inline(&ast.tt, &mut inl, &ok, &ok, &InlineCfg::exercise_all());
         for g in &inl {
             verify(g).unwrap_or_else(|e| panic!("verify after self-inline: {e}"));
         }
