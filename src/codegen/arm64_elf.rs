@@ -2036,12 +2036,18 @@ impl<'a> Cg<'a> {
             // full 64-bit selected operand; ext_r re-canonicalizes to the result width,
             // mirroring interp's canon(ty, chosen) exactly.
             Inst::Select(d, ty, c, a, b) => {
-                self.ld_val(*c, "x0");
-                self.ld_val(*a, "x1");
-                self.ld_val(*b, "x2");
-                self.s += "\tcmp x0, #0\n\tcsel x0, x1, x2, ne\n";
-                self.ext_r(0, *ty);
-                self.tmp_store(*d, "x0");
+                // Read cond/a/b from homes (scratch x0/x1/x2 only for spilled/imm), csel into
+                // d's home, ext in place — no x0 funnel (§residence). The loads before cmp are
+                // flag-neutral (mov/ldr/movz), so the compare's flags survive to the csel.
+                let rc = self.src_gp(*c, 0);
+                let ra = self.src_gp(*a, 1);
+                let rb = self.src_gp(*b, 2);
+                let rd = self.gp_home(*d).unwrap_or(0);
+                _ = writeln!(self.s, "\tcmp x{rc}, #0\n\tcsel x{rd}, x{ra}, x{rb}, ne");
+                self.ext_r(rd, *ty);
+                if self.gp_home(*d).is_none() {
+                    self.tmp_store(*d, "x0");
+                }
             }
             Inst::Bin(d, op, ty, a, b) => {
                 if self.a.tt.is_float(*ty) {
