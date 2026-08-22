@@ -100,6 +100,18 @@ struct Cg<'a> {
     // per function via the authoritative opt::each_use visitor. A temp used exactly once is
     // safe to fold-and-delete (its sole use is the Load whose address it computes).
     use_count: Vec<u32>,
+    // Backend addressing-fold: local slots normally address as `sub x9,x29,#off; [x9]`.
+    // When the frame is fixed (no VLA) AND sp sits at its base (not displaced by call-arg
+    // marshalling), the same slot is `[sp,#pos]` with pos = frame_total−off — one folded
+    // instruction, no scratch. `sp_at_base` tracks that second condition: ir_call_abi /
+    // ir_asm clear it while sp is pushed/subtracted, so a mid-marshalling load falls back
+    // to the always-correct x29-relative form. (fhasvla is the first condition.)
+    sp_at_base: bool,
+    // Set when the function contains an `Inst::Alloca` (__builtin_alloca). alloca does
+    // `sub sp,sp,xN` in the body and is NOT reclaimed until the epilogue — so sp leaves its
+    // base for the rest of the function, exactly like a VLA, yet the frontend does NOT set
+    // has_vla for a bare alloca (no vla_szs entry). The sp-fold must treat it like fhasvla.
+    fdynstack: bool,
 }
 
 
@@ -439,6 +451,28 @@ impl Cg<'_> {
             }
         }
     }
+    // The x29-relative slot at `x29 − off` re-expressed as a POSITIVE sp-relative offset,
+    // valid ONLY when (a) the frame is fixed — no VLA, so sp never leaves its base — and
+    // (b) sp is currently AT that base (not displaced by call-arg marshalling). Then
+    // sp = x29 − frame_total, so sp + (frame_total − off) = x29 − off: the identical byte
+    // (machine translation-validation of the fold). Returns Some(pos) only when pos fits an
+    // 8-byte-scaled ldr/str immediate (multiple of 8, 0..=32760 — covers every real frame);
+    // None ⟹ caller keeps the two-instruction lea_local form. Callers pass only 8-byte
+    // (x-form) slots, so the /8 scaling and the %8 test are exact.
+    fn sp_slot(&self, off: u32) -> Option<u32> {
+        self.sp_slot_sz(off, 8)
+    }
+    // Size-parametric form (for the local addressing-fold, whose access width is 1/2/4/8).
+    // pos must satisfy the ldr/str unsigned-scaled encoding: a multiple of the access size,
+    // 0..=size·4095. A misaligned or out-of-range local keeps the two-instruction lea form.
+    fn sp_slot_sz(&self, off: u32, sz: u32) -> Option<u32> {
+        if self.fhasvla || self.fdynstack || !self.sp_at_base {
+            return None;
+        }
+        let total = self.fframe + if self.fvariadic { 192 } else { 0 } + self.ir_tspill;
+        let pos = total.checked_sub(off)?;
+        (pos % sz == 0 && pos <= sz * 4095).then_some(pos)
+    }
     // reg = x29 - off (off may exceed imm12)
     fn lea_local(&mut self, reg: &str, off: u32) {
         if off <= 4095 {
@@ -559,6 +593,37 @@ impl Cg<'_> {
             Ty::Float | Ty::LDouble | Ty::Bitfield(..)
         )
     }
+    // Local addressing-fold (try_fuse_local): a simple-GP load/store whose frame slot folds
+    // straight into `[sp,#pos]`. Load form mirrors `load_gp`, store form mirrors the `_` arm
+    // of `store` (plain integer/pointer/Double — the widths that truncate on write). Bool /
+    // Float / LDouble / Bitfield stores need pre/post work (cmp-cset, fcvt, libcall, RMW) and
+    // are excluded, keeping the eager x1-addressed `store` path.
+    fn simple_gp_store_ty(&self, t: TypeId) -> bool {
+        !matches!(
+            self.a.tt.tys[t as usize],
+            Ty::Bool | Ty::Float | Ty::LDouble | Ty::Bitfield(..)
+        )
+    }
+    fn load_gp_sp(&mut self, rd: u32, pos: u32, t: TypeId) {
+        let u = self.a.tt.is_unsigned(t);
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tldrsb x{rd}, [sp, #{pos}]"),
+            (1, true) => writeln!(self.s, "\tldrb w{rd}, [sp, #{pos}]"),
+            (2, false) => writeln!(self.s, "\tldrsh x{rd}, [sp, #{pos}]"),
+            (2, true) => writeln!(self.s, "\tldrh w{rd}, [sp, #{pos}]"),
+            (4, false) => writeln!(self.s, "\tldrsw x{rd}, [sp, #{pos}]"),
+            (4, true) => writeln!(self.s, "\tldr w{rd}, [sp, #{pos}]"),
+            _ => writeln!(self.s, "\tldr x{rd}, [sp, #{pos}]"),
+        };
+    }
+    fn store_gp_sp(&mut self, rv: u32, pos: u32, t: TypeId) {
+        _ = match self.a.tt.size(t) {
+            1 => writeln!(self.s, "\tstrb w{rv}, [sp, #{pos}]"),
+            2 => writeln!(self.s, "\tstrh w{rv}, [sp, #{pos}]"),
+            4 => writeln!(self.s, "\tstr w{rv}, [sp, #{pos}]"),
+            _ => writeln!(self.s, "\tstr x{rv}, [sp, #{pos}]"),
+        };
+    }
     // Tier-1 #2 — register-offset load: x{rd} = *(x{rbase} + x{rindex}), width per t. The
     // ARM64 `[Xn, Xm]` addressing form adds the full 64-bit Xm; it exists for every ldr
     // variant used here (ldr/ldrb/ldrh/ldrsb/ldrsh/ldrsw). rd may alias rbase/rindex (base
@@ -656,6 +721,44 @@ impl Cg<'_> {
             self.tmp_store(*d, "x0");
         }
         Some(2)
+    }
+    // Tier-1 #2b — local addressing-mode fold. `Lea(t, Local(off))` whose SOLE use is the
+    // very next Load/Store folds the frame offset into the memory operand:
+    //   Lea(t, Local(off)) · Load(d, ty, t)   →  ldr* Rd, [sp,#pos]
+    //   Lea(t, Local(off)) · Store(ty, t, v)  →  str* Rv, [sp,#pos]
+    // deleting BOTH the `sub xN, x29, #off` address computation AND the address temp — the
+    // dominant instruction on every local access (sqlite: ~½ the stream). pos = sp_slot_sz
+    // re-bases x29−off to sp+pos: sp = x29 − frame_total ⟹ sp + (frame_total − off) = x29 −
+    // off, the IDENTICAL effective address (machine translation-validation; opt-parity 0
+    // DIVERGE confirms). Guards: `use_count[t]==1` (the Lea is dead after the fold), a
+    // simple-GP width (exotic loads/stores keep the funnel), and a foldable pos (else the
+    // eager lea form stays). Returns Some(2) on a fold, else None. Requires sp at its fixed
+    // base — sp_slot_sz refuses under VLA or mid-marshalling.
+    fn try_fuse_local(&mut self, insts: &[Inst], i: usize) -> Option<usize> {
+        let Inst::Lea(t, Place::Local(off)) = &insts[i] else {
+            return None;
+        };
+        if self.use_count.get(*t as usize).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        match insts.get(i + 1)? {
+            Inst::Load(d, lty, Val::Tmp(la)) if la == t && self.simple_gp_load_ty(*lty) => {
+                let pos = self.sp_slot_sz(*off, self.a.tt.size(*lty))?;
+                let rd = self.gp_home(*d).unwrap_or(0);
+                self.load_gp_sp(rd, pos, *lty);
+                if self.gp_home(*d).is_none() {
+                    self.tmp_store(*d, "x0");
+                }
+                Some(2)
+            }
+            Inst::Store(sty, Val::Tmp(la), v) if la == t && self.simple_gp_store_ty(*sty) => {
+                let pos = self.sp_slot_sz(*off, self.a.tt.size(*sty))?;
+                let rv = self.src_gp(*v, 0);
+                self.store_gp_sp(rv, pos, *sty);
+                Some(2)
+            }
+            _ => None,
+        }
     }
     // store x{reg} → [x1] per type
     fn store(&mut self, reg: u32, t: TypeId) {
@@ -933,8 +1036,12 @@ impl<'a> Cg<'a> {
             Some((true, idx)) => _ = writeln!(self.s, "\tfmov {reg}, d{}", fp_phys(idx)),
             Some((false, idx)) => _ = writeln!(self.s, "\tmov {reg}, x{}", gp_phys(idx)),
             None => {
-                self.lea_local("x9", self.ir_toff(i));
-                _ = writeln!(self.s, "\tldr {reg}, [x9]");
+                if let Some(pos) = self.sp_slot(self.ir_toff(i)) {
+                    _ = writeln!(self.s, "\tldr {reg}, [sp, #{pos}]");
+                } else {
+                    self.lea_local("x9", self.ir_toff(i));
+                    _ = writeln!(self.s, "\tldr {reg}, [x9]");
+                }
             }
         }
     }
@@ -943,8 +1050,12 @@ impl<'a> Cg<'a> {
             Some((true, idx)) => _ = writeln!(self.s, "\tfmov d{}, {reg}", fp_phys(idx)),
             Some((false, idx)) => _ = writeln!(self.s, "\tmov x{}, {reg}", gp_phys(idx)),
             None => {
-                self.lea_local("x9", self.ir_toff(i));
-                _ = writeln!(self.s, "\tstr {reg}, [x9]");
+                if let Some(pos) = self.sp_slot(self.ir_toff(i)) {
+                    _ = writeln!(self.s, "\tstr {reg}, [sp, #{pos}]");
+                } else {
+                    self.lea_local("x9", self.ir_toff(i));
+                    _ = writeln!(self.s, "\tstr {reg}, [x9]");
+                }
             }
         }
     }
@@ -1269,6 +1380,11 @@ impl<'a> Cg<'a> {
             }
         }
         let pad = (off + 15) & !15;
+        // sp is about to leave its base — the `sub sp,#pad` below and the per-arg
+        // `str x,[sp,#-16]!` pushes (which displace sp even when pad==0). Loads emitted
+        // during marshalling must use the x29-relative form, so disable the sp-fold here
+        // and re-enable it once sp is fully restored (after the `add sp,#pad` below).
+        self.sp_at_base = false;
         if pad > 0 {
             self.sp_adjust("sub", pad);
         }
@@ -1359,6 +1475,7 @@ impl<'a> Cg<'a> {
         if pad > 0 {
             self.sp_adjust("add", pad);
         }
+        self.sp_at_base = true; // sp restored to base; folding valid again
         // canonicalize / gather the result
         match self.a.tt.tys[ret as usize] {
             Ty::Void => {}
@@ -1476,6 +1593,9 @@ impl<'a> Cg<'a> {
     // EXT(gcc) inline asm on IR: a PORT of the body of self.expr(Node::Asm). Operands are
     // already materialized (op.inp = value/address; op.wb = writeback address) → replacing expr/addr with ld_val.
     fn ir_asm(&mut self, tpl: &str, ops: &[crate::ir::AsmIrOp]) {
+        // Operands are pushed/popped on the stack (phases below), so sp leaves its base for
+        // the duration — disable the sp-fold; the writeback pops restore sp before we return.
+        self.sp_at_base = false;
         // register assignment: pin > tied > pool (GP x9.., FP v16.. — caller-saved); mem uses the GP pool
         let (mut gp, mut vp) = (9u32, 16u32);
         let mut regs: Vec<u32> = Vec::with_capacity(ops.len());
@@ -1572,6 +1692,7 @@ impl<'a> Cg<'a> {
             self.s += "\tmov x1, x0\n\tldr x2, [sp], #16\n";
             self.store(2, ops[k].ty);
         }
+        self.sp_at_base = true; // all pushes popped; sp back at base
     }
 
     fn emit_inst(&mut self, i: &Inst) {
@@ -1820,6 +1941,13 @@ impl<'a> Cg<'a> {
             self.sp_adjust("sub", self.ir_tspill);
         }
         self.save_callee(true); // spill callee-saved regs into the frame-bottom slab
+        self.sp_at_base = true; // sp now at its fixed base (per-function reset; Cg is reused)
+        // alloca (like a VLA) displaces sp for the rest of the body but does NOT set has_vla
+        // → the sp-fold must be disabled for the whole function (see fdynstack).
+        self.fdynstack = irf
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Alloca(..))));
         // Tier-1 #2: function-wide temp READ counts (the authoritative opt::each_use visitor
         // over a clone — codegen is not hot). A single-use address temp is fold-and-deletable.
         self.use_count = vec![0u32; irf.temps.len()];
@@ -1856,6 +1984,7 @@ impl<'a> Cg<'a> {
                 if let Some(n) = self
                     .try_fuse_addr(&blk.insts, ii)
                     .or_else(|| self.try_fuse_madd(&blk.insts, ii))
+                    .or_else(|| self.try_fuse_local(&blk.insts, ii))
                 {
                     ii += n;
                     continue;
@@ -2483,6 +2612,8 @@ pub fn emit_ir(ast: &Ast) -> String {
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
         use_count: Vec::new(),
+        sp_at_base: true,
+        fdynstack: false,
     };
     for a in &ast.raw_asm {
         g.s += a;

@@ -150,6 +150,7 @@ Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simpli
 | #26 rematerialization (operand-free pure defs) | **flat** — nothing spills to relieve | **OFF** |
 | **add/sub-imm12 peephole** (backend) | `mov #k;add`→`add #k`; matmul inner 12→9 insn; marginal on bench (3.44→3.40) but universal + pressure-free | **ON** |
 | **pointer_iv (SR + LFTR + dead-counter)** | FIRES on matmul (gcc's 7-insn form); **k=10 5.47× (spills), k=18 1.80×** ✅; equiv 102/102. Default-OFF: regresses at k=10, is FOUNDATION for the k-decouple (§4) | **OFF** |
+| **backend sp-relative addressing-fold** (local slot → `[sp,#pos]`) | **SIZE lever.** Folds `sub xN,x29,#off; ldr/str [xN]` → one `ldr/str [sp,#pos]` for every foldable local access (`Lea(Local)+Load/Store` fusion `try_fuse_local` + the `tmp_load/store` spill path). **sqlite3.c: 1.95M→1.05M insn (−46.3%), .text 7.89M→4.28M B (−45.8%), `sub` 728k→79k (−89%); gap-to-gcc 8.1×→4.4×.** Guarded: `!fhasvla && !fdynstack(alloca) && sp_at_base` (ir_call_abi/ir_asm clear it mid-marshalling) — same effective byte (`sp=x29−frame_total`), machine-translation-validated. Bench-perf FLAT (kernels are register-resident; the win is on memory-heavy real code + as/ld + compile-speed). | **ON** |
 
 **P1 note (levels are distinct):** copy-propagation is a **backend peephole on emitted `.s` text**
 (post-isel). It does NOT touch the SSA IR, so it does NOT change the SSA pressure the LICM guard
