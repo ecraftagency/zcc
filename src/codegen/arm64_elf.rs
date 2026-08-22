@@ -584,12 +584,19 @@ impl Cg<'_> {
     // passes the destination's HOME register so the extension lands in place, no x0 detour.
     // Byte-identical to the old `ext` when r=0 (verified: same mnemonics, same order).
     fn ext_r(&mut self, r: u32, t: TypeId) {
+        self.ext_rd(r, r, t);
+    }
+    // Cast-and-relocate in one step: x{rd} = canon(x{ra}) per width `t`. The ARMv8 extend/
+    // extract forms all take a distinct source register (`sxtw x{rd}, w{ra}`), so an integer
+    // width-cast whose result is register-homed lands directly in the home with NO x0 funnel
+    // (kills both `mov x0,aHome` and `mov dHome,x0`). ext_r is the rd==ra special case.
+    fn ext_rd(&mut self, rd: u32, ra: u32, t: TypeId) {
         if matches!(self.a.tt.tys[t as usize], Ty::Bool) {
-            _ = writeln!(self.s, "\tcmp x{r}, #0\n\tcset x{r}, ne");
+            _ = writeln!(self.s, "\tcmp x{ra}, #0\n\tcset x{rd}, ne");
             return;
         }
         // Bitfield: truncate to w bits per the base's signedness — the value of (l.m = v)
-        // is v AFTER truncation (GCC torture 921016-1)
+        // is v AFTER truncation (GCC torture 921016-1). First shift reads ra→rd, then in-place.
         if let Ty::Bitfield(b, _, w) = self.a.tt.tys[t as usize] {
             let sh = 64 - w;
             let op = if self.a.tt.is_unsigned(b) {
@@ -597,19 +604,25 @@ impl Cg<'_> {
             } else {
                 "asr"
             };
-            _ = writeln!(self.s, "\tlsl x{r}, x{r}, #{sh}\n\t{op} x{r}, x{r}, #{sh}");
+            _ = writeln!(self.s, "\tlsl x{rd}, x{ra}, #{sh}\n\t{op} x{rd}, x{rd}, #{sh}");
             return;
         }
         let u = self.a.tt.is_unsigned(t);
-        _ = match (self.a.tt.size(t), u) {
-            (1, false) => writeln!(self.s, "\tsxtb x{r}, w{r}"),
-            (1, true) => writeln!(self.s, "\tuxtb w{r}, w{r}"), // writing w → upper 32 bits auto-zeroed
-            (2, false) => writeln!(self.s, "\tsxth x{r}, w{r}"),
-            (2, true) => writeln!(self.s, "\tuxth w{r}, w{r}"),
-            (4, false) => writeln!(self.s, "\tsxtw x{r}, w{r}"),
-            (4, true) => writeln!(self.s, "\tmov w{r}, w{r}"),
-            _ => return,
-        };
+        // 8-byte (and other) widths have no extend form: the value is already canonical, so a
+        // cast is a plain relocate — one `mov` only when rd≠ra (elided when they coincide).
+        match (self.a.tt.size(t), u) {
+            (1, false) => _ = writeln!(self.s, "\tsxtb x{rd}, w{ra}"),
+            (1, true) => _ = writeln!(self.s, "\tuxtb w{rd}, w{ra}"), // w-write auto-zeroes bits 32..63
+            (2, false) => _ = writeln!(self.s, "\tsxth x{rd}, w{ra}"),
+            (2, true) => _ = writeln!(self.s, "\tuxth w{rd}, w{ra}"),
+            (4, false) => _ = writeln!(self.s, "\tsxtw x{rd}, w{ra}"),
+            (4, true) => _ = writeln!(self.s, "\tmov w{rd}, w{ra}"),
+            _ => {
+                if rd != ra {
+                    _ = writeln!(self.s, "\tmov x{rd}, x{ra}");
+                }
+            }
+        }
     }
     fn load(&mut self, t: TypeId) {
         match self.a.tt.tys[t as usize] {
@@ -1516,14 +1529,24 @@ impl<'a> Cg<'a> {
             let rt = self.ir_temps[*d as usize];
             // Canonicalize the return value (matching the AST call): int → ext per width
             // (an extern callee returns w0 with garbage high bits), float → canonical f64.
-            match self.a.tt.tys[rt as usize] {
-                Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
-                Ty::Double => self.s += "\tfmov x0, d0\n",
-                Ty::LDouble => self.s += "\tbl __trunctfdf2\n\tfmov x0, d0\n",
-                Ty::Void | Ty::Struct(_) => {}
-                _ => self.ext(rt),
+            let ity = self.a.tt.tys[rt as usize];
+            if !self.a.tt.is_float(rt) && !matches!(ity, Ty::Void | Ty::Struct(_)) {
+                // integer result sits in x0 (ABI) → extend it straight into d's home, merging
+                // the canonicalization and the funnel `mov home,x0` into one extend (§residence).
+                let rd = self.gp_home(*d).unwrap_or(0);
+                self.ext_rd(rd, 0, rt);
+                if self.gp_home(*d).is_none() {
+                    self.tmp_store(*d, "x0");
+                }
+            } else {
+                match ity {
+                    Ty::Float => self.s += "\tfcvt d0, s0\n\tfmov x0, d0\n",
+                    Ty::Double => self.s += "\tfmov x0, d0\n",
+                    Ty::LDouble => self.s += "\tbl __trunctfdf2\n\tfmov x0, d0\n",
+                    _ => {} // Void | Struct: x0 holds the address / nothing
+                }
+                self.tmp_store(*d, "x0");
             }
-            self.tmp_store(*d, "x0");
         }
     }
 
@@ -2032,20 +2055,51 @@ impl<'a> Cg<'a> {
             }
             Inst::Lea(d, p) => {
                 match p {
-                    Place::Local(off) => self.lea_local("x0", *off),
-                    Place::Global(name, off) => self.lea_global_x0(name, *off),
-                    Place::Str(i) => _ = writeln!(
-                        self.s,
-                        "\tadrp x0, l_str{0}\n\tadd x0, x0, :lo12:l_str{0}",
-                        i
-                    ),
+                    // Local address = one `sub x{home},x29,#off` (or sp-fold) straight into the
+                    // home — no `mov home,x0` funnel (§residence). Global/Str hardcode x0 (adrp
+                    // + the x9 scratch in lea_global_x0), so they keep the funnel.
+                    Place::Local(off) => {
+                        let rd = self.gp_home(*d);
+                        let reg = rd.map(|r| format!("x{r}")).unwrap_or_else(|| "x0".into());
+                        self.lea_local(&reg, *off);
+                        if rd.is_none() {
+                            self.tmp_store(*d, "x0");
+                        }
+                    }
+                    Place::Global(name, off) => {
+                        self.lea_global_x0(name, *off);
+                        self.tmp_store(*d, "x0");
+                    }
+                    Place::Str(i) => {
+                        _ = writeln!(
+                            self.s,
+                            "\tadrp x0, l_str{0}\n\tadd x0, x0, :lo12:l_str{0}",
+                            i
+                        );
+                        self.tmp_store(*d, "x0");
+                    }
                 }
-                self.tmp_store(*d, "x0");
             }
             Inst::Cast(d, from, to, a) => {
-                self.ld_val(*a, "x0");
-                self.cast_op(*from, *to);
-                self.tmp_store(*d, "x0");
+                // Integer→integer width cast = a single extend/relocate: read a from its home,
+                // land canonically in d's home, no x0 funnel (§value-residence). Float casts and
+                // void/struct/array reinterprets keep the x0 funnel (d0-scratch conversions).
+                let tt = &self.a.tt;
+                let int_cast = !tt.is_float(*from)
+                    && !tt.is_float(*to)
+                    && !matches!(tt.tys[*to as usize], Ty::Void | Ty::Struct(_) | Ty::Array(..));
+                if int_cast {
+                    let ra = self.src_gp(*a, 0);
+                    let rd = self.gp_home(*d).unwrap_or(0);
+                    self.ext_rd(rd, ra, *to);
+                    if self.gp_home(*d).is_none() {
+                        self.tmp_store(*d, "x0");
+                    }
+                } else {
+                    self.ld_val(*a, "x0");
+                    self.cast_op(*from, *to);
+                    self.tmp_store(*d, "x0");
+                }
             }
             Inst::Call(dst, callee, args, _nfix) => self.ir_call(dst, callee, args),
             Inst::CallX(dst, callee, args, ret, sret) => {
