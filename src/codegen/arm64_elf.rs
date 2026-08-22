@@ -866,13 +866,15 @@ impl Cg<'_> {
             _ => None,
         }
     }
-    // store x{reg} → [x1] per type
+    // store x{reg} → [x1] per type. MUST NOT clobber x{reg}: the value may be a live home
+    // (compute-from-home path passes v's home register), so any transformation of the stored
+    // value uses a scratch (x9) rather than writing back into x{reg}.
     fn store(&mut self, reg: u32, t: TypeId) {
         match self.a.tt.tys[t as usize] {
             Ty::Bool => {
                 _ = writeln!(
                     self.s,
-                    "\tcmp x{reg}, #0\n\tcset x{reg}, ne\n\tstrb w{reg}, [x1]"
+                    "\tcmp x{reg}, #0\n\tcset w9, ne\n\tstrb w9, [x1]"
                 );
             }
             Ty::Float => {
@@ -1993,9 +1995,12 @@ impl<'a> Cg<'a> {
                 }
             }
             Inst::Store(ty, a, v) => {
-                self.ld_val(*v, "x0");
+                // Read the value from its home (no `mov x0,vHome` funnel) — store() is now
+                // clobber-free so passing a live home is safe. Address still funnels to x1
+                // (store hardcodes [x1]); loading it there cannot clobber a spilled v in x0.
+                let rv = self.src_gp(*v, 0);
                 self.ld_val(*a, "x1");
-                self.store(0, *ty);
+                self.store(rv, *ty);
             }
             Inst::Memcpy(d, s, sz) => {
                 self.ld_val(*s, "x0"); // src
