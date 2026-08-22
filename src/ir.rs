@@ -17,7 +17,7 @@
 //   - IrFunc = a finite control graph + the temporary type table (Γ: Tmp → TypeId).
 //
 // Baseline: IR only, optimization deferred. The pass layer is future work — see
-// IR.md §5. The interpreter/verifier is a proof-checker (test-side; it does not
+// OPT.md §7. The interpreter/verifier is a proof-checker (test-side; it does not
 // count against the 10k ceiling); the verifier lives here because it is light and
 // is an automaton that checks immediately after lowering.
 #![allow(dead_code)] // removed once lowering (step 2) + the backend IR→asm (step 3) consume it
@@ -73,7 +73,7 @@ pub enum Callee {
     Ptr(Val),    // indirect call through a function pointer
 }
 
-/// An IR instruction. Two CLASSES (see IR.md §2b):
+/// An IR instruction. Two CLASSES (see OPT.md §7):
 ///   CORE   — evaluable by interp, covered by the verifier, (in future) touched by passes.
 ///   OPAQUE — wraps an exotic construct (va/atomic/asm/…), lowered one-to-one to
 ///            the backend exactly as the old AST→asm path did; interp treats any
@@ -194,7 +194,7 @@ pub struct IrFunc {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Verifier — an automaton for well-formedness (IR.md §3a). Runs after lowering /
+// Verifier — an automaton for well-formedness (OPT.md §7). Runs after lowering /
 // after every pass; rejects malformed IR IMMEDIATELY rather than letting it drift
 // down into garbage asm. v1 (baseline) checks:
 //   (V1) ref-integrity: every Tmp id < |temps|, every target BlockId < |blocks|.
@@ -406,7 +406,7 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Lowering AST → IR (IR.md §4) — WHERE correctness lives. The classic -O0 model:
+// Lowering AST → IR (OPT.md §7) — WHERE correctness lives. The classic -O0 model:
 // every C variable lives in frame MEMORY (offsets already assigned by the parser);
 // temporaries hold only the intermediate value of an expression. lower_expr(n)
 // emits instructions and returns a Val holding the result; lower_addr(n) returns a
@@ -1252,7 +1252,7 @@ pub(crate) fn eval_cast(tt: &TyTab, from: TypeId, to: TypeId, v: i64) -> i64 {
 // one-to-one (each `match inst` / `match term` arm is a rule of §4 / §4b, each
 // atomic semantic function a definition of §3). This is test-side (#[cfg(test)]):
 // it is excluded from the release binary and does not count against the source
-// ceiling (IR.md §7.1); it is a proof-checker, not compiler logic. It is not a
+// ceiling (OPT.md §7); it is a proof-checker, not compiler logic. It is not a
 // machine-checked proof — it is a mechanized reference semantics, validated by
 // structural exhaustion (the foundation for the later verification stages).
 //

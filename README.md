@@ -71,8 +71,8 @@ per-pass machine-checked proofs) is on the roadmap — see `SEMANTICS.md` §6.
 
 - `THEORY.md` — the theoretical catalog: every feature mapped to a theorem.
 - `SEMANTICS.md` — the formal reference semantics ⟦·⟧ of the IR.
-- `IR.md` — the intermediate-representation design contract.
 - `MILESTONES.md` — development history and roadmap.
+- `OPT.md` `[ssa-qbe fork]` — the single optimization working-doc (IR contract · scoreboard · pipeline plan); transient, folds into the above at opt-end.
 
 ## Build
 

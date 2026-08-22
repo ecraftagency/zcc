@@ -7,7 +7,7 @@ use crate::ast::Ast;
 pub mod arm64_elf;
 
 // The SOLE path: lower(AST) → IR → passes → asm. The AST-walk emit() has been removed:
-// every C99 construct lowers to a typed Inst, and the backend simulates per-inst. See IR.md.
+// every C99 construct lowers to a typed Inst, and the backend simulates per-inst. See OPT.md §7.
 pub fn emit_ir(ast: &Ast) -> String {
     arm64_elf::emit_ir(ast)
 }

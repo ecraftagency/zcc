@@ -2,7 +2,7 @@
 
 zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external crates. Terminology stays English. This file is the constitution: the three laws, then the supporting articles — each an amendment with detail offloaded to its own document. Only the first three carry the word **law**; the rest are mechanisms.
 
-> **`[ssa-qbe fork]` override — this branch only; `main` (zcc-slim SEAL) keeps the body verbatim.** The two-fact model is literal: `[THEORY.md, SEMANTICS.md]` (Side I) ⊕ `[iso/os/arch/gnu specs]` (Side II) **is** the source of zcc; `src/*.rs` is its *compiled object*. This fork **is** the optimizer, so it suspends exactly two Side-II clauses of Article B — nothing else: "-O0 / no optimization pass" → SUSPENDED (the fork's purpose is `opt.rs` + `OPTIMIZATION-ROADMAP.md`; every pass ships under the CbC gate of Law 3); "10k LOC ceiling" → RAISED to ~15k (minimal-LOC as a *value* still binds). Laws 1–3, architecture, driver, extension, and the test gate remain in full force.
+> **`[ssa-qbe fork]` override — this branch only; `main` (zcc-slim SEAL) keeps the body verbatim.** The two-fact model is literal: `[THEORY.md, SEMANTICS.md]` (Side I) ⊕ `[iso/os/arch/gnu specs]` (Side II) **is** the source of zcc; `src/*.rs` is its *compiled object*. This fork **is** the optimizer, so it suspends exactly two Side-II clauses of Article B — nothing else: "-O0 / no optimization pass" → SUSPENDED (the fork's purpose is `opt.rs` + `OPT.md`; every pass ships under the CbC gate of Law 3); "10k LOC ceiling" → RAISED to ~15k (minimal-LOC as a *value* still binds). Laws 1–3, architecture, driver, extension, and the test gate remain in full force.
 
 ## Law 1 — the decomposition theorem (Law Zero; if only one is kept, keep this. Full text: `THEORY.md`)
 
@@ -74,5 +74,5 @@ AArch64-ELF (Linux) specifics — no leading `_`, `adrp`/`:got:`/TLS relocations
 - **`SEMANTICS.md`** — the reference operational semantics (the executable meaning behind `⟦·⟧`).
 - **`MILESTONES.md`** — milestone ladder, LOC budget, C99-remaining, debt ledger.
 - **`tests/README.md`** — test-asset register, full test-mechanism text, baseline + traps.
-- **`OPTIMIZATION-ROADMAP.md`** `[fork]` — the theorem-derived optimization catalog + per-pass proof obligations.
+- **`OPT.md`** `[fork]` — the single, transient optimization working-doc (scoreboard · one-theorem · done-ledger · next-gate · catalog · IR contract + opt.rs audit). Deleted at opt-end; durable facts cook into `THEORY.md`/`SEMANTICS.md`.
 - **`src/ext.rs` + `grep 'EXT(' src/`** — the entire current deviation surface.

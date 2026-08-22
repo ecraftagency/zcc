@@ -418,7 +418,7 @@ pub fn cse(f: &mut IrFunc) -> u32 {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // B1 — LIGHTWEIGHT ALIAS ANALYSIS (the memory oracle; the enabler for B2 load-elim).
-// [Side-I theorem — OPTIMIZATION-ROADMAP.md B1, ported from QBE `alias.c` but
+// [Side-I theorem — OPT.md §5 (B1), ported from QBE `alias.c` but
 //  re-derived as a theorem in zcc's IR, not transliterated.]
 //
 // THEOREM. Aliasing is a TOTAL DECIDABLE relation over a 4-point base lattice + an
@@ -651,7 +651,7 @@ pub(crate) fn alias_info(f: &IrFunc) -> AliasInfo {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // B2 — LOAD ELIMINATION / STORE→LOAD FORWARDING (gated by the B1 alias oracle).
-// [Side-I theorem — OPTIMIZATION-ROADMAP.md B2, ported from QBE `load.c`.]
+// [Side-I theorem — OPT.md §5 (B2), ported from QBE `load.c`.]
 //
 // THEOREM. Within a straight-line block, a `Load` from `a` (width sa) whose value is
 // already available in memory — because a preceding `Store` wrote a MUST-alias
@@ -2383,7 +2383,7 @@ pub fn licm(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
         // memory traffic ⟹ C_M strictly decreases. P is MEASURED (liveness); k is a Side-II ABI
         // constant — no tuned weight anywhere. (Residual: P is SSA-pressure, a proxy for the
         // post-φ-destruction allocator's pressure; the box A/B closes that gap before the
-        // default-ON flip — OPTIMIZATION-ROADMAP §"why proof-faster meets reality-slower".)
+        // default-ON flip — OPT.md §2 (why proof-faster meets reality-slower).)
         let lv = liveness(f);
         let headroom = gp_k.saturating_sub(loop_gp_pressure(tt, f, &lv, &body));
         if headroom == 0 {
@@ -4073,7 +4073,7 @@ mod tests {
     // here we establish it directly on the IR via interp (the denotation ⟦·⟧),
     // in-process and dependency-free — no system compiler, no end-to-end wait.
     //
-    // STATEMENT (SEMANTICS.md §5, IR.md §3c):
+    // STATEMENT (SEMANTICS.md §5, OPT.md §7):
     //   ∀ e ∈ 𝔼_struct (the generated structural expression space, exhausting
     //                    shape × operator),
     //   ∀ P ∈ {const_fold, copy_prop, cse, dce, optimize},

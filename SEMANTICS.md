@@ -17,7 +17,7 @@ arm of `ir.rs::tests::interp`, or onto one of the atomic semantic functions
 `ir.rs` and are shared with the constant folder — establishing *faithfulness*
 (the folder and the interpreter are one and the same denotation function).
 
-See also: `IR.md` §3b/§3c (the IR contract), `THEORY.md` §A7 (denotational
+See also: `OPT.md` §7 (the IR contract), `THEORY.md` §A7 (denotational
 semantics), and `tests/alg.sh` (the source-level fold-vs-runtime commuting
 square that this document lifts to the IR level).
 
@@ -358,7 +358,7 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 `Alloca`, `CallX`, `Sync`, `Asm`. The interpreter returns an error, meaning the
 input has reached a function containing an exotic instruction — an impure
 function — so the commuting square skips it (as it does for undefined behavior).
-This is the CORE / EXOTIC-typed partition of the IR (IR.md §2b): passes touch
+This is the CORE / EXOTIC-typed partition of the IR (OPT.md §7): passes touch
 only CORE, so only ⟦·⟧ over CORE is needed to establish that a pass commutes.
 
 ## 4b. Terminator semantics ⟦Term⟧ : Σ → (BlockId ⊎ Halt)  (mirrors `match term`)

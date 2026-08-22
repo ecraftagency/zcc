@@ -1953,7 +1953,7 @@ fn peephole_moves(body: &str) -> String {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // B4 — LOAD/STORE PAIR FORMATION (`ldp`/`stp`). [Side-I structural theorem —
-// OPTIMIZATION-ROADMAP.md B4 / Tier-5 #23.]
+// OPT.md §5 (B4) / §6 Tier-5 #23.]
 //
 // THEOREM. Two ADJACENT same-class accesses to `[base,#o]` and `[base,#o+sz]` (sz the
 // access width) have the SAME memory effect as one pair op `ldp/stp rA,rB,[base,#o]`
