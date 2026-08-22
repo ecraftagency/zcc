@@ -52,6 +52,31 @@ fn fp_phys(idx: u32) -> u32 {
 // Add/Sub with a small constant right operand → (mnemonic, magnitude) for the AArch64
 // imm12 form. Side-II: the imm12 field is an *unsigned* 0..4096; a negative Add becomes a
 // Sub and vice versa. Returns None when the operand is not an in-range immediate.
+// Relational Op → AArch64 condition suffix (unsigned picks lo/ls/hi/hs). None ⟹ not a
+// comparison. The mapping is identical to ir_bin_r/try_bin_imm's cset cond — the fused
+// compare-branch reuses it so `cmp;b.cc` carries the exact condition `cmp;cset;cbnz` did.
+fn rel_cond(op: Op, u: bool) -> Option<&'static str> {
+    Some(match (op, u) {
+        (Op::Eq, _) => "eq", (Op::Ne, _) => "ne",
+        (Op::Lt, true) => "lo", (Op::Lt, false) => "lt",
+        (Op::Le, true) => "ls", (Op::Le, false) => "le",
+        (Op::Gt, true) => "hi", (Op::Gt, false) => "gt",
+        (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
+        _ => return None,
+    })
+}
+
+// The negated condition (ARMv8 flips the cond field's low bit). Used when the THEN edge is
+// the fall-through, so we branch to ELSE on ¬cond. Total over rel_cond's range.
+fn inv_cond(cc: &str) -> &'static str {
+    match cc {
+        "eq" => "ne", "ne" => "eq",
+        "lt" => "ge", "ge" => "lt", "le" => "gt", "gt" => "le",
+        "lo" => "hs", "hs" => "lo", "ls" => "hi", "hi" => "ls",
+        _ => unreachable!(),
+    }
+}
+
 fn add_sub_imm12(op: Op, b: Val) -> Option<(&'static str, u64)> {
     let Val::Imm(k) = b else { return None };
     let mnem = match (op, k >= 0) {
@@ -2268,6 +2293,62 @@ impl<'a> Cg<'a> {
     // successor equal to `ft` falls through with no branch. Block-layout fall-through (§6):
     // the fall-through edge is 0 distance ⟹ any cb(n)z to the ADJACENT next label is always
     // in imm19 range; the far edge takes the ±128MB `b`. Control-flow identity, opt-parity.
+    // Compare-branch fusion detector. A block that ends in `Br(Tmp(c), then, els)` whose `c`
+    // is produced by the block's LAST instruction as an INTEGER relational compare, used
+    // NOWHERE else (use_count==1), is the `cmp;cset;cbnz;b` diamond gcc emits as `cmp;b.cc`.
+    // Returns the compare's (op, type, lhs, rhs) so emit_cbr can drop the cset and branch on
+    // the flags directly. THEOREM: `cset xD,cc` sets xD=(cc?1:0); `cbnz xD,L`/`cbz xD,L`
+    // branch on xD≠0/xD=0 ⟺ cc/¬cc; and xD is dead after (single use) ⟹ the boolean need
+    // never be materialized. Requiring the compare to be the LAST inst keeps its NZCV flags
+    // live to the branch (nothing emitted between the cmp and the b.cc).
+    fn cbr_relational(&self, blk: &crate::ir::Block) -> Option<(Op, TypeId, Val, Val)> {
+        let Term::Br(Val::Tmp(c), _, _) = &blk.term else { return None };
+        if let Some(Inst::Bin(d, op, ct, a, b)) = blk.insts.last()
+            && *d == *c
+            && self.use_count[*c as usize] == 1
+            && !self.a.tt.is_float(*ct)
+            && rel_cond(*op, self.a.tt.is_unsigned(*ct)).is_some()
+        {
+            return Some((*op, *ct, *a, *b));
+        }
+        None
+    }
+
+    // Emit a fused compare-and-branch (the cbr_relational case): the exact `cmp`/`cmn` operand
+    // lowering of the Bin relational path, then a conditional `b.cc` (no cset). Fall-through and
+    // huge-function (¬near_branch, imm19 ±1MB) handling mirror emit_term's Term::Br arm exactly,
+    // substituting b.cc for cbnz and b.¬cc for cbz.
+    fn emit_cbr(&mut self, op: Op, ct: TypeId, a: Val, b: Val, tb: u32, eb: u32, ft: Option<u32>) {
+        let u = self.a.tt.is_unsigned(ct);
+        let cc = rel_cond(op, u).unwrap();
+        let ra = self.src_gp(a, 0);
+        // b: fold small ±imm12 into cmp/cmn (byte-identical to try_bin_imm), else a register.
+        if let Val::Imm(k) = b
+            && (0..4096).contains(&k)
+        {
+            _ = writeln!(self.s, "\tcmp x{ra}, #{k}");
+        } else if let Val::Imm(k) = b
+            && (-4095..=0).contains(&k)
+        {
+            _ = writeln!(self.s, "\tcmn x{ra}, #{}", -k);
+        } else {
+            let rb = self.src_gp(b, 1);
+            _ = writeln!(self.s, "\tcmp x{ra}, x{rb}");
+        }
+        let (lt, le) = (self.ir_label(tb), self.ir_label(eb));
+        let ncc = inv_cond(cc);
+        if ft == Some(eb) {
+            _ = writeln!(self.s, "\tb.{cc} {lt}"); // else falls through: take THEN on cc
+        } else if ft == Some(tb) {
+            _ = writeln!(self.s, "\tb.{ncc} {le}"); // then falls through: take ELSE on ¬cc
+        } else if self.near_branch {
+            _ = writeln!(self.s, "\tb.{cc} {lt}\n\tb {le}");
+        } else {
+            let n = self.labels(1);
+            _ = writeln!(self.s, "\tb.{ncc} L{n}\n\tb {lt}\nL{n}:\n\tb {le}");
+        }
+    }
+
     fn emit_term(&mut self, t: &Term, ft: Option<u32>) {
         match t {
             Term::Jmp(b) => {
@@ -2435,22 +2516,34 @@ impl<'a> Cg<'a> {
             if is_label && self.fhasvla {
                 self.reset_sp_base();
             }
+            // Compare-branch fusion: when the terminator branches on the block's last
+            // instruction (a single-use relational), withhold that instruction from the body
+            // and fold cmp+cset+cbnz into one cmp+b.cc. The truncated slice also stops the
+            // addressing-fuse chain from reaching across into the withheld compare.
+            let cbr = self.cbr_relational(blk);
+            let body_len = blk.insts.len() - cbr.is_some() as usize;
+            let body = &blk.insts[..body_len];
             let mut ii = 0;
-            while ii < blk.insts.len() {
+            while ii < body_len {
                 if let Some(n) = self
-                    .try_fuse_addr(&blk.insts, ii)
-                    .or_else(|| self.try_fuse_store_addr(&blk.insts, ii))
-                    .or_else(|| self.try_fuse_madd(&blk.insts, ii))
-                    .or_else(|| self.try_fuse_local(&blk.insts, ii))
+                    .try_fuse_addr(body, ii)
+                    .or_else(|| self.try_fuse_store_addr(body, ii))
+                    .or_else(|| self.try_fuse_madd(body, ii))
+                    .or_else(|| self.try_fuse_local(body, ii))
                 {
                     ii += n;
                     continue;
                 }
-                self.emit_inst(&blk.insts[ii]);
+                self.emit_inst(&body[ii]);
                 ii += 1;
             }
             let ft = (bi + 1 < irf.blocks.len()).then_some(bi as u32 + 1);
-            self.emit_term(&blk.term, ft);
+            if let Some((op, ct, a, b)) = cbr {
+                let Term::Br(_, tb, eb) = &blk.term else { unreachable!() };
+                self.emit_cbr(op, ct, a, b, *tb, *eb, ft);
+            } else {
+                self.emit_term(&blk.term, ft);
+            }
         }
     }
 }
