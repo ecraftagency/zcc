@@ -1437,7 +1437,8 @@ impl<'a> Cg<'a> {
     // rd=ra=0,rb=1 it emits BYTE-IDENTICAL asm to `ir_bin` (the x0-funnel), so the -O0 path
     // (all temps spilled ⟹ rd=ra=0,rb=1) is unchanged; only the register-resident path skips
     // the copies. Correctness = ir_bin's (same mnemonic per Op); validated by opt-parity.
-    // x2 is a fixed scratch for rem's quotient (never a home: homes are x19–x28); msub reads
+    // x2 is a fixed scratch for rem's quotient (never a home: the home set is x10–x15 ∪ x19–x28,
+    // WIDE or NARROW — x2 lies outside both budgets); msub reads
     // all sources before writing rd, so rd may alias ra/rb (the allocator only coalesces when
     // the aliased source is dead here). No ext on the compare path (cset yields a clean 0/1).
     fn ir_bin_r(&mut self, op: Op, ct: TypeId, rd: u32, ra: u32, rb: u32) {
@@ -1585,18 +1586,23 @@ impl<'a> Cg<'a> {
     }
 
     fn ir_call(&mut self, dst: &Option<Tmp>, callee: &Callee, args: &[Val]) {
+        // INVARIANT (ir::call_composite, ir.rs): Inst::Call carries ONLY ≤8 GP + ≤8 FP
+        // SCALAR args — any register overflow (gp>8 / fp>8), composite (struct/HFA/>16B),
+        // or non-8B float is routed to Inst::CallX/ir_call_abi instead. So neither counter
+        // can reach 8 here; the debug_asserts pin that delegated precondition.
         let (mut gp, mut fp) = (0u32, 0u32);
         for &a in args {
-            if self.val_is_float(a) && fp < 8 {
+            if self.val_is_float(a) {
+                debug_assert!(fp < 8, "Inst::Call fp>8 — call_composite must route to CallX");
                 self.ld_val(a, "x9");
                 _ = writeln!(self.s, "\tfmov d{fp}, x9");
                 fp += 1;
-            } else if !self.val_is_float(a) && gp < 8 {
+            } else {
+                debug_assert!(gp < 8, "Inst::Call gp>8 — call_composite must route to CallX");
                 let r = format!("x{gp}");
                 self.ld_val(a, &r);
                 gp += 1;
             }
-            // TODO(expand): stack-overflow args (>8) + struct/HFA by value
         }
         match callee {
             Callee::Sym(name) => _ = writeln!(self.s, "\tbl {}", sym(name)),
@@ -2309,9 +2315,19 @@ impl<'a> Cg<'a> {
         // §3 keystone — pick the GP budget. WIDE (x10–x15 caller homes) is sound iff the body
         // never clobbers x10–x15 as fixed scratch, which by exhaustive enumeration means it
         // contains no Overflow / Sync / VaArg (the prologue struct-copy runs before any home is
-        // live; lea_local's large-offset path uses x16). Any such instruction ⟹ NARROW.
+        // live; lea_local's large-offset path uses x16), AND no mid-body inline soft-float `bl`.
+        // The latter: a long-double Load / Store lowers to `bl __trunctfdf2` / `bl __extenddftf2`
+        // (load()/store()), and a `bl` clobbers the entire caller-saved file INCLUDING x10–x15 —
+        // the same hazard as a Call, but opt::crossing marks call-crossing ONLY for Call/CallX,
+        // so an x10–x15 home live across a long-double Load/Store would be silently clobbered.
+        // Force NARROW. (long-double arithmetic is lowered to real Calls → already crossing; the
+        // long-double marshalling bls sit inside ir_call/ir_call_abi → crossing-confined; the Ret
+        // conversion is in the epilogue with no home live — none of those need the gate.)
+        let tt = &self.a.tt;
         let heavy = irf.blocks.iter().flat_map(|b| &b.insts).any(|i| {
             matches!(i, Inst::Overflow(..) | Inst::Sync(..) | Inst::VaArg(..))
+                || matches!(i, Inst::Load(_, ty, _) | Inst::Store(ty, _, _)
+                    if matches!(tt.tys[*ty as usize], Ty::LDouble))
         });
         self.gp_wide = self.regalloc && !heavy;
         let gpb = if self.gp_wide { &GP_BUDGET_WIDE } else { &GP_BUDGET };
