@@ -2667,6 +2667,146 @@ fn peephole_moves(body: &str) -> String {
     drop_dead_moves(&drop_redundant_moves(&propagate_copies(body)))
 }
 
+// The target `.L` label of a local branch, or None if the line is not one. Branches to a
+// local label: `b .L`, `b.<cc> .L`, `cbz/cbnz r, .L`, `tbz/tbnz r, #n, .L` — the label is
+// always the final operand. `bl`/`br`/`adr` are deliberately excluded (call / indirect /
+// address-of, handled by the caller's safety bail).
+fn branch_target(t: &str) -> Option<&str> {
+    let is_br = t.starts_with("b ")
+        || t.starts_with("b.")
+        || t.starts_with("cbz ")
+        || t.starts_with("cbnz ")
+        || t.starts_with("tbz ")
+        || t.starts_with("tbnz ");
+    if !is_br {
+        return None;
+    }
+    let last = t.rsplit(|c: char| c == ',' || c.is_whitespace()).next()?;
+    last.starts_with(".L").then_some(last)
+}
+
+/// Machine-level JUMP-THREADING (control-flow identity — the same translation-validation
+/// tier as drop_redundant_moves/loads: a pure output rewrite over provably-equal control
+/// flow). A block that is nothing but `b .Lt` is a pure forwarder; every branch to its
+/// label is retargeted to `.Lt` (chains collapse to a fixpoint), and a forwarder block that
+/// is then unreachable — no branch targets it AND control cannot fall into it (the preceding
+/// instruction is an unconditional `b`/`ret`) — is deleted. Runs AFTER peephole_moves, so a
+/// forwarder whose only content was a φ-destruction copy that coalesced to a dropped
+/// self-move is now visible as an empty `label: b` block (the case the IR-level pass cannot
+/// see, because coalescing is a backend fact). SAFETY: bails on any body that forms a label
+/// ADDRESS (computed goto / jump table — `br xN`, `adr/adrp … .L`, `.quad/.word .L`): there a
+/// label is reachable through data this text rewrite does not model.
+fn thread_asm_branches(body: &str) -> String {
+    use std::collections::{HashMap, HashSet};
+    let lines: Vec<&str> = body.lines().collect();
+    // Pass 0: forwarder map + safety scan. forwarder[L] = T for a block `L:` whose first
+    // instruction is `b .T`. Any `.L` reached other than as a branch target ⟹ bail.
+    let mut forwarder: HashMap<&str, &str> = HashMap::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let t = raw.trim();
+        if t.starts_with("br ") || t.starts_with("adr ") || t.starts_with("adrp ") && t.contains(".L") {
+            return body.to_string();
+        }
+        if (t.starts_with(".quad") || t.starts_with(".word") || t.starts_with(".xword")) && t.contains(".L") {
+            return body.to_string();
+        }
+        if let Some(lbl) = t.strip_suffix(':').filter(|s| s.starts_with(".L")) {
+            // first non-blank line after the label
+            let nxt = lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty());
+            if let Some(nt) = nxt
+                && let Some(rest) = nt.strip_prefix("b ")
+                && rest.trim().starts_with(".L")
+                && rest.trim() != lbl
+            // exclude a genuine empty self-loop `for(;;);` (`L: b L`) — it is NOT a
+            // forwarder; retargeting/deleting it would destroy the infinite loop.
+            {
+                forwarder.insert(lbl, rest.trim());
+            }
+        }
+    }
+    if forwarder.is_empty() {
+        return body.to_string();
+    }
+    // Resolve each forwarder to its chain's final target (cycle-guarded: a genuine empty
+    // self-loop `for(;;);` resolves to itself and is left intact).
+    let resolve = |start: &str| -> String {
+        let mut cur = start;
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(&next) = forwarder.get(cur) {
+            if next == cur || !seen.insert(cur) {
+                break;
+            }
+            cur = next;
+        }
+        cur.to_string()
+    };
+    // Pass 1: retarget every branch whose target is a forwarder to that chain's final label.
+    let mut retargeted: Vec<String> = Vec::with_capacity(lines.len());
+    for raw in &lines {
+        let t = raw.trim();
+        if let Some(tgt) = branch_target(t)
+            && forwarder.contains_key(tgt)
+        {
+            let fin = resolve(tgt);
+            if fin != tgt {
+                // replace only the trailing target token (labels are unique), keep leading tab.
+                let lead = &raw[..raw.len() - raw.trim_start().len()];
+                retargeted.push(format!("{lead}{}", t.strip_suffix(tgt).unwrap().to_string() + &fin));
+                continue;
+            }
+        }
+        retargeted.push((*raw).to_string());
+    }
+    // Which labels are STILL a branch target after retargeting. A forwarder that stays
+    // referenced — e.g. a member of a multi-block cycle (an infinite loop) where resolve()
+    // returns a cycle member, so its incoming branches were left in place — must NOT be
+    // deleted: dropping its `b` would fall a live predecessor into the wrong next block.
+    let mut referenced: HashSet<String> = HashSet::new();
+    for raw in &retargeted {
+        if let Some(tg) = branch_target(raw.trim()) {
+            referenced.insert(tg.to_string());
+        }
+    }
+    // Pass 2: delete a forwarder block (`L:` + its `b`) only when it is BOTH unreferenced by
+    // any surviving branch AND fall-through-unreachable (the previous instruction is an
+    // unconditional `b`/`ret`) — i.e. genuinely dead. Either condition alone is unsound.
+    let mut out = String::with_capacity(body.len());
+    let mut prev_unconditional = false; // last real instruction was `b …` / `ret`
+    let mut i = 0;
+    while i < retargeted.len() {
+        let raw = &retargeted[i];
+        let t = raw.trim();
+        if let Some(lbl) = t.strip_suffix(':').filter(|s| s.starts_with(".L"))
+            && forwarder.contains_key(lbl)
+            && !referenced.contains(lbl)
+            && prev_unconditional
+        {
+            // dead forwarder: skip the label and its single `b` (the next non-blank line).
+            let mut j = i + 1;
+            while j < retargeted.len() && retargeted[j].trim().is_empty() {
+                j += 1;
+            }
+            i = j + 1; // drop label..=the `b`
+            continue; // prev_unconditional stays true (we removed a `b`, still after one)
+        }
+        out.push_str(raw);
+        out.push('\n');
+        if let Some(lbl) = t.strip_suffix(':').filter(|s| s.starts_with(".L")) {
+            // A REFERENCED label is a branch target: control can arrive here and fall through
+            // into the next block, so that block is reachable regardless of the last insn.
+            // An unreferenced label is transparent (a fall-through can only reach it from the
+            // preceding instruction) and leaves prev_unconditional unchanged.
+            if referenced.contains(lbl) {
+                prev_unconditional = false;
+            }
+        } else if !t.is_empty() && !t.starts_with('.') {
+            prev_unconditional = t.starts_with("b ") || t == "ret" || t.starts_with("ret ");
+        }
+        i += 1;
+    }
+    out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MACHINE-LEVEL COPY PROPAGATION (Tier-A, pressure-FREE). [OPT.md §4 diagnostic:
 // the matmul inner k-loop carried 10/39 reg-reg `mov`s — the emitter's x0 funnel
@@ -3346,6 +3486,10 @@ pub fn emit_ir(ast: &Ast) -> String {
         if g.regalloc && passes.ldst_pair {
             body = pair_ldst(&body); // …then the exposed adjacent accesses → ldp/stp
         }
+        if g.regalloc && passes.peephole {
+            // collapse forwarder blocks left empty once their φ-copies coalesced away.
+            body = thread_asm_branches(&body);
+        }
         g.s.push_str(&body);
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
@@ -3436,6 +3580,55 @@ mod tests {
         let body = "\tmov x24, x0\n\tmul x0, x5, x6\n\tmov x0, x24\n";
         let out = peephole_moves(body);
         assert_eq!(count(&out, "mov x0, x24"), 1, "x0 was clobbered ⟹ the reload is real");
+    }
+
+    // Jump-threading: a chain of empty `b`-only forwarders collapses; every branch to the
+    // chain retargets to the final real block, and the dead forwarder blocks are removed.
+    #[test]
+    fn thread_collapses_forwarder_chain() {
+        let body = "\tcbz x0, .La\n\tret\n.La:\n\tb .Lb\n.Lb:\n\tb .Lc\n.Lc:\n\tmov x0, #1\n\tret\n";
+        let out = super::thread_asm_branches(body);
+        assert!(out.contains("cbz x0, .Lc"), "branch retargeted through the chain to the final block");
+        assert_eq!(count(&out, ".La:"), 0, "dead forwarder .La deleted");
+        assert_eq!(count(&out, ".Lb:"), 0, "dead forwarder .Lb deleted");
+        assert!(out.contains(".Lc:"), "the real target block is kept");
+        assert!(out.contains("mov x0, #1"), "real code untouched");
+    }
+
+    // A genuine empty self-loop (`for(;;);` → `L: b L`) is NOT a forwarder: it must survive.
+    #[test]
+    fn thread_preserves_self_loop() {
+        let body = "\tret\n.Lloop:\n\tb .Lloop\n";
+        let out = super::thread_asm_branches(body);
+        assert!(out.contains(".Lloop:") && out.contains("b .Lloop"), "the infinite loop is intact");
+    }
+
+    // A forwarder reached by FALL-THROUGH cannot be deleted (nothing could replace the
+    // fall-through edge without adding a branch) — retargeted-through but block kept.
+    #[test]
+    fn thread_keeps_fallthrough_forwarder() {
+        let body = "\tadd x0, x0, x1\n.Lf:\n\tb .Lg\n.Lg:\n\tret\n";
+        let out = super::thread_asm_branches(body);
+        assert!(out.contains(".Lf:"), "fall-through forwarder must be kept");
+    }
+
+    // REGRESSION (981019-1): a forwarder reached by fall-through THROUGH an intervening empty
+    // BUT branch-targeted label must be kept. `.Le` (referenced by `b .Le`) is empty and falls
+    // into `.Lf: b .Lx` — deleting .Lf would fall .Le's arrivals into the next block (a bug that
+    // rerouted a return path into `bl abort`). The referenced label resets fall-through-reach.
+    #[test]
+    fn thread_keeps_forwarder_after_referenced_empty_label() {
+        let body = "\tcbz x0, .Le\n\tb .Lx\n\tbl abort\n\tb .Ly\n.Le:\n.Lf:\n\tb .Lx\n.Lz:\n\tbl abort\n.Lx:\n\tret\n";
+        let out = super::thread_asm_branches(body);
+        assert!(out.contains(".Lf:") && out.contains("b .Lx"), ".Lf must survive: .Le falls into it");
+        assert!(out.contains(".Le:"), "the referenced empty label is kept");
+    }
+
+    // A body that forms a label ADDRESS (computed goto / jump table) is left untouched.
+    #[test]
+    fn thread_bails_on_computed_goto() {
+        let body = "\tbr x0\n.Lx:\n\tb .Ly\n.Ly:\n\tret\n";
+        assert_eq!(super::thread_asm_branches(body), body, "computed-goto body is not rewritten");
     }
 
     // A label (basic-block boundary) FLUSHES the model — a cross-boundary equivalence must
