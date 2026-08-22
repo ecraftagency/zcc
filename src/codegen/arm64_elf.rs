@@ -1355,7 +1355,12 @@ impl<'a> Cg<'a> {
     }
     // x0 = &global (+ off). Mirrors the GVar arm of addr(): local-exec TLS / GOT (extern
     // or -fPIC non-static) / adrp+:lo12: (local). Flags looked up in ast.globals by name.
-    fn lea_global_x0(&mut self, name: &str, off: i64) {
+    // x{reg} = &global (+ off). Mirrors the GVar arm of addr(): local-exec TLS / GOT (extern
+    // or -fPIC non-static) / adrp+:lo12: (local). `reg` is the destination home (§residence:
+    // adrp/mrs take ANY register, so a Lea of a global lands straight in the home — no
+    // `mov home,x0` funnel). x9 is the fixed large-off scratch (never a home ⟹ ≠ reg).
+    // Spilled dst passes reg=0 ⟹ byte-identical to the old x0 path (opt-parity all-spill).
+    fn lea_global(&mut self, reg: u32, name: &str, off: i64) {
         let (is_tls, is_got) = {
             let gl = self.a.globals.iter().find(|g| g.name.as_str() == name);
             (
@@ -1363,18 +1368,19 @@ impl<'a> Cg<'a> {
                 gl.is_some_and(|g| g.is_extern || (self.a.pic && !g.is_static)),
             )
         };
+        let r = format!("x{reg}");
         if is_tls {
-            _ = writeln!(self.s, "\tmrs x0, tpidr_el0\n\tadd x0, x0, #:tprel_hi12:{name}, lsl #12\n\tadd x0, x0, #:tprel_lo12_nc:{name}");
+            _ = writeln!(self.s, "\tmrs {r}, tpidr_el0\n\tadd {r}, {r}, #:tprel_hi12:{name}, lsl #12\n\tadd {r}, {r}, #:tprel_lo12_nc:{name}");
         } else if is_got {
-            _ = writeln!(self.s, "\tadrp x0, :got:{name}\n\tldr x0, [x0, :got_lo12:{name}]");
+            _ = writeln!(self.s, "\tadrp {r}, :got:{name}\n\tldr {r}, [{r}, :got_lo12:{name}]");
         } else {
-            _ = writeln!(self.s, "\tadrp x0, {name}\n\tadd x0, x0, :lo12:{name}");
+            _ = writeln!(self.s, "\tadrp {r}, {name}\n\tadd {r}, {r}, :lo12:{name}");
         }
         if off > 4095 {
             self.imm("x9", off);
-            self.s += "\tadd x0, x0, x9\n";
+            _ = writeln!(self.s, "\tadd {r}, {r}, x9");
         } else if off > 0 {
-            _ = writeln!(self.s, "\tadd x0, x0, #{off}");
+            _ = writeln!(self.s, "\tadd {r}, {r}, #{off}");
         }
     }
 
@@ -2150,9 +2156,10 @@ impl<'a> Cg<'a> {
             }
             Inst::Lea(d, p) => {
                 match p {
-                    // Local address = one `sub x{home},x29,#off` (or sp-fold) straight into the
-                    // home — no `mov home,x0` funnel (§residence). Global/Str hardcode x0 (adrp
-                    // + the x9 scratch in lea_global_x0), so they keep the funnel.
+                    // Address computed straight into the home — no `mov home,x0` funnel
+                    // (§residence): Local = one `sub home,x29,#off` (or sp-fold), Global/Str =
+                    // adrp+:lo12: into the home (adrp takes any register). Spilled dst (rd=None)
+                    // keeps the x0 path + tmp_store — byte-identical to the -O0 all-spill baseline.
                     Place::Local(off) => {
                         let rd = self.gp_home(*d);
                         let reg = rd.map(|r| format!("x{r}")).unwrap_or_else(|| "x0".into());
@@ -2162,16 +2169,23 @@ impl<'a> Cg<'a> {
                         }
                     }
                     Place::Global(name, off) => {
-                        self.lea_global_x0(name, *off);
-                        self.tmp_store(*d, "x0");
+                        let rd = self.gp_home(*d);
+                        self.lea_global(rd.unwrap_or(0), name, *off);
+                        if rd.is_none() {
+                            self.tmp_store(*d, "x0");
+                        }
                     }
                     Place::Str(i) => {
+                        let rd = self.gp_home(*d);
+                        let reg = rd.unwrap_or(0);
                         _ = writeln!(
                             self.s,
-                            "\tadrp x0, l_str{0}\n\tadd x0, x0, :lo12:l_str{0}",
+                            "\tadrp x{reg}, l_str{0}\n\tadd x{reg}, x{reg}, :lo12:l_str{0}",
                             i
                         );
-                        self.tmp_store(*d, "x0");
+                        if rd.is_none() {
+                            self.tmp_store(*d, "x0");
+                        }
                     }
                 }
             }
