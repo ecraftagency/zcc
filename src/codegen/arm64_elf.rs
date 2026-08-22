@@ -1945,10 +1945,234 @@ fn reg_uses(t: &str) -> (Vec<u32>, Vec<u32>, bool) {
     }
 }
 
-/// Machine-level redundant-move elimination over one function body (see the block comment).
-/// Chained with `drop_dead_moves` — redundant round-trips first, then dead stores.
+/// Machine-level move cleanup over one function body (see the block comment).
+/// COPY PROPAGATION first (funnel every read to its value's producer, so the x0-scratch
+/// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores.
 fn peephole_moves(body: &str) -> String {
-    drop_dead_moves(&drop_redundant_moves(body))
+    drop_dead_moves(&drop_redundant_moves(&propagate_copies(body)))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MACHINE-LEVEL COPY PROPAGATION (Tier-A, pressure-FREE). [OPT.md §4 diagnostic:
+// the matmul inner k-loop carried 10/39 reg-reg `mov`s — the emitter's x0 funnel
+// (`mov x0, xSRC; mov xDST, x0`; `<compute> x0; mov xDST, x0`). These are pure copies:
+// removing one LOWERS register pressure, so this is a WIN independent of the pressure
+// guard (§2). The funnel also inflated measured SSA pressure, which is what blocked LICM
+// from hoisting the invariant `adrp` (the §4 anomaly, cause (c)).]
+//
+// TRANSFORM. Within a straight-line region, maintain `home[r]` = the register that
+// canonically holds r's current value (the ROOT of its copy chain), formed ONLY by a
+// full-width `mov x,x`. REWRITE every READ operand `r` to `home[r]`. This funnels each read
+// back to the value's producer, so the intermediate scratch copies are read by nothing and
+// die (removed by `drop_dead_moves`). No line is deleted here — only read registers renamed
+// among provably-equal registers.
+//
+// SOUNDNESS (same model as drop_redundant_moves — machine translation validation):
+//   `home[r]=c` is established only when r and c provably hold the identical 64-bit value
+//   (a `mov x,x`), so substituting a read r→c cannot change any value. The model stays sound
+//   because every value-changing event severs the stale link:
+//     • a real DEF of register D (any first-operand write that is NOT a copy) makes D its own
+//       root AND severs every x with home[x]==D — those x still hold the OLD value at x, so
+//       their root becomes x, never the redefined D;
+//     • a `mov xD,xS` first severs D (its value is being replaced), then sets home[D]=root(S);
+//     • any label / branch / call / unknown mnemonic / writeback-addressing FLUSHES the model
+//       (we never reason across a boundary).
+//   A `w` (32-bit) read substitutes to the `w` form of the root: full-64 equality implies
+//   low-32 equality, so it is safe. Only x/w GP registers are tracked; sp/fp/vector operands
+//   never match the substitution scan. Re-validated end-to-end by opt-parity (0 DIVERGE) +
+//   torture — exactly the net that guards the existing peephole.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Substitute the single GP register in one operand token by its `home` root (letter and
+/// surrounding syntax — brackets, offset — preserved). Immediates, symbols, conditions, FP
+/// registers, and `sp` never match (no `x`/`w` + digits), so they pass through untouched.
+fn sub_reg_token(tok: &str, home: &std::collections::HashMap<u32, u32>) -> String {
+    // A relocation / symbol operand (`:lo12:x00`, `:got:`) can hold a C global whose name
+    // looks exactly like a register (`x00`) — NEVER a register, so never substitute it. The
+    // ':' marks it unambiguously; adrp's bare-symbol operand is skipped at the call site.
+    if tok.contains(':') {
+        return tok.to_string();
+    }
+    let b = tok.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        // a register starts with x/w NOT preceded by an alphanumeric (so the 'x' inside a
+        // symbol like ".Lx3" or "lo12" is never mistaken for a register).
+        if (c == b'x' || c == b'w') && (i == 0 || !b[i - 1].is_ascii_alphanumeric()) {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            // A real GP register is `x0`..`x30` — 1–2 digits, value ≤ 30, NO leading zero.
+            // A symbol like `x00` (leading zero) or `x40` (>30) fails this and is left alone.
+            let digits = &tok[i + 1..j];
+            let canonical = j > i + 1
+                && (j == b.len() || !b[j].is_ascii_alphanumeric())
+                && (digits.len() == 1 || !digits.starts_with('0'));
+            if canonical {
+                if let Ok(n) = digits.parse::<u32>() {
+                    if n <= 30 {
+                        let r = *home.get(&n).unwrap_or(&n);
+                        if r != n {
+                            return format!("{}{}{}{}", &tok[..i], c as char, r, &tok[j..]);
+                        }
+                        return tok.to_string();
+                    }
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    tok.to_string()
+}
+
+/// Copy-propagate read operands to their value's producer within each straight-line region.
+fn propagate_copies(body: &str) -> String {
+    use std::collections::HashMap;
+    let mut out = String::with_capacity(body.len());
+    let mut home: HashMap<u32, u32> = HashMap::new(); // reg → canonical root holding its value
+    // Sever register D: it is being (re)defined, so nothing may read the OLD value through it.
+    let sever = |home: &mut HashMap<u32, u32>, d: u32| {
+        home.retain(|_, v| *v != d); // copies of the old D value: root becomes themselves
+        home.remove(&d); // D is now its own root (holds the fresh value)
+    };
+    const NO_DEF: &[&str] =
+        &["str", "strb", "strh", "stp", "cmp", "cmn", "tst", "fcmp", "ccmp"];
+    const DEF_FIRST: &[&str] = &[
+        "mov", "movz", "movn", "add", "sub", "mul", "msub", "madd", "neg", "mvn", "and",
+        "orr", "eor", "bic", "lsl", "lsr", "asr", "sdiv", "udiv", "sxtw", "sxth", "sxtb",
+        "uxtw", "uxth", "uxtb", "cset", "csel", "csinc", "cinc", "adrp", "ldr", "ldrb",
+        "ldrh", "ldrsw", "ldrsb", "ldrsh", "fmov", "scvtf", "ucvtf", "fcvt", "fadd", "fsub",
+        "fmul", "fdiv", "fneg", "fcvtzs", "fcvtzu", "sxtl",
+    ];
+    // Boundary mnemonics that still READ a register before the region ends (fold the read,
+    // then flush). Plain b/bl/ret carry no GP read we propagate.
+    const READ_THEN_FLUSH: &[&str] = &["cbz", "cbnz", "tbz", "tbnz", "br", "blr"];
+    let gp = |tok: &str| -> Option<u32> {
+        let t = tok.trim().trim_start_matches('[').trim_end_matches(']');
+        t.strip_prefix('x').or_else(|| t.strip_prefix('w'))?.parse::<u32>().ok()
+    };
+    for line in body.lines() {
+        let t = line.trim();
+        // Label FIRST — an emitted label `.Lir_x:` both starts with '.' and ends with ':';
+        // it is a basic-block boundary and MUST flush before the directive fast-path.
+        if t.ends_with(':') {
+            home.clear(); // label = basic-block boundary
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if t.is_empty() || t.starts_with('.') {
+            out.push_str(line); // blank / directive — no register effect
+            out.push('\n');
+            continue;
+        }
+        // Writeback / pre-post-index mutates the base implicitly ⟹ boundary (never model it).
+        if t.contains('!') || t.contains("],") {
+            home.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        let operands = t[mn.len()..].trim_start();
+        let toks: Vec<&str> = operands.split(',').collect();
+        // Rewrite the chosen READ tokens; leave the destination position and update `home`.
+        let emit = |toks: &[String]| -> String { format!("\t{} {}", mn, toks.join(",")) };
+        let sub_all = |toks: &[&str], home: &HashMap<u32, u32>| -> Vec<String> {
+            toks.iter().map(|tk| sub_reg_token(tk, home)).collect()
+        };
+        if mn.starts_with("b.") || matches!(mn, "b" | "bl" | "ret") {
+            out.push_str(line);
+            out.push('\n');
+            home.clear();
+            continue;
+        }
+        if READ_THEN_FLUSH.contains(&mn) {
+            let nt = sub_all(&toks, &home); // the register operands are reads
+            out.push_str(&emit(&nt));
+            out.push('\n');
+            home.clear();
+            continue;
+        }
+        if NO_DEF.contains(&mn) {
+            let nt = sub_all(&toks, &home); // stores/compares: every operand is a read
+            out.push_str(&emit(&nt));
+            out.push('\n');
+            continue;
+        }
+        if mn == "ldp" {
+            // token[0], token[1] are destinations (leave); the rest are address reads.
+            let n = toks.len().min(2);
+            let mut nt: Vec<String> = toks[..n].iter().map(|s| s.to_string()).collect();
+            nt.extend(sub_all(&toks[n..], &home));
+            out.push_str(&emit(&nt));
+            out.push('\n');
+            for tk in &toks[..n] {
+                if let Some(d) = gp(tk) {
+                    sever(&mut home, d);
+                }
+            }
+            continue;
+        }
+        if mn == "movk" {
+            // token[0] is a read+write merge (leave it — substituting the accumulator dst is
+            // wrong); the rest are reads. The partial write severs the dst.
+            let mut nt = vec![toks[0].to_string()];
+            nt.extend(sub_all(&toks[1..], &home));
+            out.push_str(&emit(&nt));
+            out.push('\n');
+            if let Some(d) = gp(toks[0]) {
+                sever(&mut home, d);
+            }
+            continue;
+        }
+        if mn == "adrp" {
+            // `adrp xD, SYM` — the second operand is a BARE symbol (a global named `x5` would
+            // masquerade as a register); never substitute it. Just record the fresh dst.
+            out.push_str(line);
+            out.push('\n');
+            if let Some(d) = toks.first().and_then(|s| gp(s)) {
+                sever(&mut home, d);
+            }
+            continue;
+        }
+        if DEF_FIRST.contains(&mn) {
+            let dst = toks.first().and_then(|s| gp(s));
+            let mut nt = vec![toks[0].to_string()]; // destination stays
+            nt.extend(sub_all(&toks[1..], &home));
+            out.push_str(&emit(&nt));
+            out.push('\n');
+            // Update the model. A FULL-WIDTH `mov x,x` is a 64-bit COPY: D takes S's root.
+            // Any other GP write — including a narrow `mov w,w`, which zero-extends the low
+            // 32 bits and so produces a DIFFERENT 64-bit value (the bswap-1 truncation bug) —
+            // gives D a fresh value and records NO equivalence. `parse_mov_xx` accepts only
+            // `mov x,x`, exactly the copies drop_redundant_moves already trusts. A float/vector
+            // dst (gp() == None) touches no GP reg.
+            if let Some(d) = dst {
+                // Resolve S's root BEFORE severing D — sever may drop entries that point at D
+                // (e.g. `mov x0,x24` when x24 was itself a copy of x0), and we must read the
+                // root as it stood before this instruction. rs==d ⟹ the copy is redundant
+                // (D already holds its own value) ⟹ record nothing, keeping D its own root.
+                let rs = parse_mov_xx(t).map(|(_, s)| *home.get(&s).unwrap_or(&s));
+                sever(&mut home, d);
+                if let Some(rs) = rs {
+                    if rs != d {
+                        home.insert(d, rs);
+                    }
+                }
+            }
+            continue;
+        }
+        // Unknown mnemonic ⟹ boundary (never mis-model).
+        out.push_str(line);
+        out.push('\n');
+        home.clear();
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

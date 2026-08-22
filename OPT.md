@@ -8,32 +8,37 @@
 > **Decisions come from §1 (the scoreboard), never from §6 (the catalog).** The catalog is a
 > reference shelf; the scoreboard is the one measured surface. If a technique is not on the
 > path from §1's measured gap, it does not get built — no matter how good its textbook name.
+>
+> **THE TARGET IS gcc -O1 — and it is the STOPPING POINT (điểm dừng).** Not O2, not O3. No toy
+> compiler has matched gcc-O1; reaching parity is the finish line for this fork. The scoreboard
+> below is scored against O1; O0/O2 are context columns only. When the geomean-vs-O1 reaches
+> ~1.0 the optimizer is DONE — remaining O2/O3 distance is explicitly out of scope.
 
 ---
 
 ## §1 — Scoreboard: the one number (measured, `zcc-box` docker, ELF aarch64-musl)
 
-**The gap = inner-loop instruction count of hot kernels. Everything reduces to shrinking it.**
+**The finish line = gcc -O1 parity. The gap = the two loop-nest kernels; everything reduces to them.**
 
-Solid, measured (bench geomean vs referee):
+Ratio = zcc_time / gcc_time (**lower is faster; 1.0 = parity**). Measured bench, best-of-3:
 
-| kernel | vs gcc-**O0** | vs gcc-**O2** | where the O2 residual lives (measured category) |
-|---|---|---|---|
-| fib    | **1.05×** (par) | **3.44×** | call/return + O2 scheduling |
-| loops  | 0.37× | **1.08× (≈par!)** | already O2-class |
-| matmul | ~1.20× | **3.87×** | loop-nest memory + inner-loop address/index/move overhead |
-| sieve  | 0.48× | **3.60×** | loop-nest memory + SIMD |
-| **geomean** | **0.69×** | **2.68×** | — |
+| kernel | vs O0 | **vs gcc-O1 (TARGET)** | vs O2 | where the O1 gap lives (measured) |
+|---|---|---|---|---|
+| fib    | 1.05 | **1.05 — ✅ PARITY** | 3.43 | O1≈O0 here; only O2 scheduling beyond |
+| loops  | 0.35 | **1.06 — ✅ PARITY** | 1.04 | already O1/O2-class |
+| matmul | 1.09 | **3.44 — ❌ GAP** | 3.46 | loop-nest: invariant `adrp`/base + index `mul`s not hoisted/reduced |
+| sieve  | 0.43 | **2.60 — ❌ GAP** | 3.22 | loop-nest memory + index arithmetic |
+| **geomean** | ~0.64 | **~1.78× (target 1.0)** | ~2.7× | — |
 
-**Reading it:** vs O0 zcc is already ahead (0.69×). The real chase is the **2.68× vs O2**, and it
-is **NOT classical scalar passes** (those are flat — see §3) — it is **loop-nest memory + the
-backend's per-iteration overhead** (address recompute, index muls, x0-funnel moves).
+**Reading it:** **fib + loops already MATCH gcc-O1** (1.05, 1.06). The *entire* remaining O1 gap is
+**matmul (3.44×) + sieve (2.60×)** — both loop-nest memory kernels. Note **matmul O1 ≈ O2** (3.44 vs
+3.46): gcc lands the whole matmul win *at O1*, so O1 is a real, sufficient target here.
 
-**Leading hypothesis (NOT yet confirmed — the §4 diagnostic decides it):** matmul's inner k-loop
-carries ~2 `adrp` + index `mul`s + x0-funnel `mov`s **on top of** the `ldrsw;ldrsw;madd` core,
-where gcc-O2's inner loop is ~6 instructions. If those extras are hoistable/removable, backend
-isel is a direct win; if the inner loop is genuinely pressure-bound, they are not. **Measure
-before building** (§4).
+**CONFIRMED (§4, box-measured):** gcc-O1 beats matmul with **LICM (hoist the invariant `adrp`/base) +
+strength-reduction (index `mul` → pointer-increment IV)**. zcc's *existing* `licm`/`strength_reduce`
+passes are **INERT on matmul** — `ZCC_OPT_ON=licm,strength_reduce,remat` leaves the adrp count (7) and
+the runtime (230µs) UNCHANGED. So O1 is **not** "flip a flag": the loop passes must be *made to fire*
+on the matmul shape (the §4 work). This is the one remaining lever and it is on the §1 path.
 
 ---
 
@@ -70,7 +75,7 @@ faith. Law 3 in its purest form: proven at the earliest decidable layer, *confir
 ## §3 — Done ledger (one line each; measured effect; on/off)
 
 Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simplify · register-coalescing
-(biased) · backend peephole (redundant + dead-move elim).
+(biased) · backend peephole (**machine copy-propagation** + redundant + dead-move elim).
 
 | pass | measured effect | state |
 |---|---|---|
@@ -78,12 +83,21 @@ Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simpli
 | #2 addressing-mode fold | matmul 1.38→1.25× | ON |
 | #3 madd fusion | geomean 0.78→0.74× | ON |
 | #5 inlining (β-reduction, depth-1) | geomean 0.74→0.69×, **fib 1.38→1.05×** | ON |
+| **P1 machine copy-propagation** (Tier-A, backend) | matmul inner-loop 39→32 insn, reg-reg movs 10→1; **geomean-O0 0.69→0.64**; fib/loops confirmed at O1 parity. Pressure-FREE (removing a copy frees a register). | **ON** |
 | B1 lightweight alias (4-pt lattice, 1 RPO pass) | enabler for B2/B4; escape falls out free | ON |
 | B2 load-elim / store→load forwarding | flat on the 4 kernels (no hot store→reload) | ON |
 | B4 csel if-conversion + ldp/stp pairing | isolated win on branchy shape (csel×2, cond-branch 3→1, PAR w/ O0) | ON |
-| LICM (pressure-guarded) | **flat** — kernels register-resident, nothing to relocate | **OFF** |
-| strength-reduction (pressure-guarded) | **flat** — same reason | **OFF** |
+| LICM (pressure-guarded) | **INERT on matmul** — does NOT hoist the invariant adrp (§4); flat elsewhere | **OFF** |
+| strength-reduction (pressure-guarded) | **INERT on matmul** — does NOT reduce the index mul (§4) | **OFF** |
 | #26 rematerialization (operand-free pure defs) | **flat** — nothing spills to relieve | **OFF** |
+
+**P1 note (levels are distinct):** copy-propagation is a **backend peephole on emitted `.s` text**
+(post-isel). It does NOT touch the SSA IR, so it does NOT change the SSA pressure the LICM guard
+reads — P1 and the loop passes (§4) are at *different levels* and P1 does **not** unblock LICM. Its
+win is real where movs are on the critical path (call-heavy fib, loops); on matmul, whose bottleneck
+is address arithmetic not movs, it is small. Self-certified: machine translation-validation
+(opt-parity **1552 PARITY / 0 DIVERGE**) + torture **1378/0** + cargo **100/100**. The one subtle
+bug it had — treating a truncating `mov w,w` as a 64-bit copy — is fenced (`parse_mov_xx`, x-only).
 
 **Gates green, full stack default-ON:** cargo **96/96** · torture **1378/0** · opt-parity **1552/0
 PARITY** · csmith 300 = **254/0** (rest = skip). Default build output **byte-unchanged** by the
@@ -96,20 +110,34 @@ the gate. As standalone wins they are flat — so **no further investment in IR 
 
 ---
 
-## §4 — Next: the gate (WIN, or FOUNDATION for a big win — never flat-and-cutoff)
+## §4 — Next: close the O1 gap = make the loop passes fire on matmul + sieve
 
-**The only remaining lever is backend instruction-selection** (x0-funnel moves + index muls +
-inner-loop address recompute) — a **different category** from the flat IR scalar passes above, not
-a continuation of them. It is the one thing on the path from §1's measured 2.68× gap.
+**The whole remaining job is O1 parity on the two loop-nest kernels** (§1). P1 removed the x0-funnel
+(pressure-free win, done); backend isel is *not* the lever it was framed as — the matmul bottleneck
+is **address arithmetic** (invariant `adrp`/base recomputed + index `mul`s per iteration), which is
+**IR loop-optimization territory**, exactly what gcc-O1 does.
 
-**But it is unproven, and there is an open anomaly:** LICM ON does **not** hoist matmul's
-invariant inner-loop `adrp` (verified: `adrp` still inside the `.Lir_mm_7` region with LICM ON).
-Three undisambiguated causes: (a) pressure guard blocks it (inner-loop P≈10 ≥ k=10 → headroom 0);
-(b) genuine high pressure makes the hoist unprofitable; (c) the `Lea` isn't in hoistable single-def
-form. **This is exactly the gate:** run one cheap box diagnostic to decide *whether the inner-loop
-overhead is removable at all* — if yes, backend isel is a confirmed WIN; if no (pressure-bound), it
-is flat and must NOT be built. **Measure before writing a single pass.** Nothing enters the batch
-that cannot show, on the exact target shape, that it deletes inner-loop instructions.
+**CONFIRMED, box-measured (the §4 diagnostic, now run):** turning the existing loop passes ON
+(`ZCC_OPT_ON=licm,strength_reduce,remat`) changes matmul by **NOTHING** — adrp count stays 7, main
+insns 217→218, runtime 230µs→230µs, output identical. So the passes are **INERT on the matmul shape**,
+not merely OFF. The open causes narrow to **(a)** the SSA pressure guard reads `P ≥ k` in the inner
+loop and caps hoists at 0, and/or **(c)** the invariant address `Lea(A)`/`Lea(B)` and the affine index
+`k·8`, `k·1920` are not in the single-def form LICM/SR recognize. Cause **(b)** (genuinely pressure-
+bound) is *unlikely* — gcc-O1 keeps the same kernel register-resident, so the registers exist.
+
+**The gate for the O1 work (each step measured on the exact matmul/sieve shape, SSA-IR level):**
+1. **Instrument at the SSA level** (not `.s`): print the inner-loop `P` the LICM guard computes and
+   *why* it refuses — is headroom 0 (cause a), or is `Lea(A)` never marked loop-invariant (cause c)?
+2. If **(a)**: the guard is too conservative *because it counts pre-`out_of_ssa` pressure*; the fix is
+   a truer pressure estimate or letting the hoist proceed when the hoisted value REPLACES a per-iter
+   recompute (net-zero pressure — hoisting `Lea(A)` deletes the in-loop `adrp`, it does not add live
+   range beyond what the recompute already needed).
+3. If **(c)**: teach LICM to recognize `Lea(global)` as invariant and SR to reduce the affine index
+   `base + k·stride` to a pointer IV (`p += stride`) — the classic combo. This is the real O1 win.
+4. **STOP when geomean-vs-O1 ≈ 1.0.** O1 is the finish line (top-of-doc). Do not chase O2/O3.
+
+**Measure before writing a single pass.** Nothing enters the batch that cannot show, on matmul/sieve,
+that it deletes inner-loop instructions and moves the vs-O1 ratio toward 1.0.
 
 ---
 
