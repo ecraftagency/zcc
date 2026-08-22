@@ -1,0 +1,10 @@
+# Terraform state may contain resource metadata + is environment-specific — never commit.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+# Local variable files (your ssh_cidr etc.). The lock file .terraform.lock.hcl IS committed.
+*.tfvars
+!example.tfvars
+# Bug-trace capture pulled back from a paid run (DIVERGE sources + gate logs) — transient.
+fails-*/
