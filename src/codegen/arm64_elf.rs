@@ -94,6 +94,11 @@ struct Cg<'a> {
     regalloc: bool,
     coalesce: bool, // register-coalescing toggle (biased coloring in abi_alloc)
     talloc: Vec<AbiHome>,
+    // Compact spill-slot byte offset per temp: only SPILLED temps (talloc[t]==None) consume a
+    // stack slot, packed densely. A register-homed temp never calls ir_toff, so its entry is
+    // dead (0). This shrinks the frame from temps.len()*8 to num_spilled*8 — the frame bloat
+    // that pushed slot offsets past sp-scaling range into the dynamic `sub x?,x29,x10` form.
+    spill_off: Vec<u32>,
     csave_gp: Vec<u32>,
     csave_fp: Vec<u32>,
     // Tier-1 #2 (addressing-mode fold): function-wide READ count per temp, computed once
@@ -112,6 +117,9 @@ struct Cg<'a> {
     // base for the rest of the function, exactly like a VLA, yet the frontend does NOT set
     // has_vla for a bare alloca (no vla_szs entry). The sp-fold must treat it like fhasvla.
     fdynstack: bool,
+    // Block-layout (§6): true when the function is small enough that every intra-function
+    // label is within cb(n)z's ±1MB imm19 reach ⟹ the 2-insn near branch form is safe.
+    near_branch: bool,
 }
 
 
@@ -1081,7 +1089,7 @@ enum ASlot {
 
 impl<'a> Cg<'a> {
     fn ir_toff(&self, i: Tmp) -> u32 {
-        self.ir_tbase + 8 + i * 8
+        self.ir_tbase + 8 + self.spill_off[i as usize]
     }
     // Stage 5b — a temp's home is a physical register (Chaitin color) or a spill slot.
     // `reg` is always a 64-bit GPR (verified: every call site passes an x-form); an
@@ -1947,27 +1955,43 @@ impl<'a> Cg<'a> {
         }
     }
 
-    fn emit_term(&mut self, t: &Term) {
+    // `ft` = the block index that PHYSICALLY follows this one (bi+1, or None if last). A
+    // successor equal to `ft` falls through with no branch. Block-layout fall-through (§6):
+    // the fall-through edge is 0 distance ⟹ any cb(n)z to the ADJACENT next label is always
+    // in imm19 range; the far edge takes the ±128MB `b`. Control-flow identity, opt-parity.
+    fn emit_term(&mut self, t: &Term, ft: Option<u32>) {
         match t {
-            Term::Jmp(b) => _ = writeln!(self.s, "\tb {}", self.ir_label(*b)),
+            Term::Jmp(b) => {
+                if ft != Some(*b) {
+                    _ = writeln!(self.s, "\tb {}", self.ir_label(*b));
+                }
+            }
             Term::Br(c, tb, eb) => {
                 // Tier-1 #1 compute-into-home for the branch condition: `cbz` can test ANY
                 // register, so test c's HOME directly instead of funnelling it through x0.
                 // src_gp returns c's home when GP-resident (no `mov x0,xHome`), else
-                // materializes into x0 (rc=0) ⟹ BYTE-IDENTICAL to the old `ld_val c,x0; cbz
-                // x0` on the spilled/imm/FP path. A C branch condition is integer truthiness
-                // (never FP-homed), satisfying src_gp's precondition. Pressure-free
-                // (removes a copy) — validated by opt-parity.
+                // materializes into x0 (rc=0). A C branch condition is integer truthiness
+                // (never FP-homed), satisfying src_gp's precondition. Pressure-free.
                 let rc = self.src_gp(*c, 0);
                 let (lt, le) = (self.ir_label(*tb), self.ir_label(*eb));
-                // Branch relaxation: cbnz/b.cond encode only a ±1MB displacement (imm19),
-                // but the two IR block labels can sit arbitrarily far apart in a very large
-                // function (e.g. -O0 output of an arithmetic fuzzer, hundreds of thousands
-                // of instructions). Reach each target with an unconditional `b` (±128MB,
-                // imm26), gated by a conditional skip to an ADJACENT local label that is
-                // always within range. c!=0 → then; c==0 → skip to else.
-                let n = self.labels(1);
-                _ = writeln!(self.s, "\tcbz x{rc}, L{n}\n\tb {lt}\nL{n}:\n\tb {le}");
+                if ft == Some(*eb) {
+                    // else-edge falls through: c==0 → next block (jump-to-adjacent = fall),
+                    // c!=0 → `b then`. cbz targets the adjacent L{eb} (in range); 2 insns.
+                    _ = writeln!(self.s, "\tcbz x{rc}, {le}\n\tb {lt}");
+                } else if ft == Some(*tb) {
+                    // then-edge falls through: c!=0 → next block, c==0 → `b else`. cbnz targets
+                    // the adjacent L{tb} (in range); 2 insns.
+                    _ = writeln!(self.s, "\tcbnz x{rc}, {lt}\n\tb {le}");
+                } else if self.near_branch {
+                    // Small function: every intra-function label is within cb(n)z's ±1MB
+                    // imm19 reach, so branch straight to `then` and `b` the far else. 2 insns.
+                    _ = writeln!(self.s, "\tcbnz x{rc}, {lt}\n\tb {le}");
+                } else {
+                    // Huge function (fuzzer -O0): labels may exceed ±1MB. Reach both with `b`
+                    // (±128MB), gated by a conditional skip to an ADJACENT local label in range.
+                    let n = self.labels(1);
+                    _ = writeln!(self.s, "\tcbz x{rc}, L{n}\n\tb {lt}\nL{n}:\n\tb {le}");
+                }
             }
             Term::Ret(v) => {
                 match v {
@@ -2001,6 +2025,19 @@ impl<'a> Cg<'a> {
         } else {
             vec![None; irf.temps.len()]
         };
+        // Compact spill slots: only SPILLED temps (talloc[t]==None) consume a stack slot,
+        // packed densely. A register-homed temp never calls ir_toff, so its slot is dead.
+        // Shrinks the frame from temps.len()*8 to num_spilled*8 — the frame bloat that pushed
+        // slot offsets past sp-scaling range into the dynamic `sub x?,x29,x10` form. §5/§3.
+        let mut spill_off = vec![0u32; irf.temps.len()];
+        let mut ns = 0u32;
+        for (i, h) in self.talloc.iter().enumerate() {
+            if h.is_none() {
+                spill_off[i] = ns * 8;
+                ns += 1;
+            }
+        }
+        self.spill_off = spill_off;
         // collect the distinct CALLEE-saved physical registers used (color ≥ ncaller)
         self.csave_gp.clear();
         self.csave_fp.clear();
@@ -2021,7 +2058,7 @@ impl<'a> Cg<'a> {
                 _ => {}
             }
         }
-        let tbytes = (irf.temps.len() as u32 * 8).next_multiple_of(16);
+        let tbytes = (ns * 8).next_multiple_of(16);
         let csave = ((self.csave_gp.len() + self.csave_fp.len()) as u32 * 8).next_multiple_of(16);
         self.ir_tspill = tbytes + csave; // reset_sp_base (VLA-dealloc) must also subtract this region
         if self.ir_tspill > 0 {
@@ -2035,6 +2072,10 @@ impl<'a> Cg<'a> {
             .blocks
             .iter()
             .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Alloca(..))));
+        // near_branch: an upper bound on emitted size (≤12 insns per IR inst + 4 per block).
+        // Under 200k emitted insns (~800 KB) every label is well within cb(n)z's ±1MB reach.
+        let est = irf.blocks.iter().map(|b| b.insts.len()).sum::<usize>() * 12 + irf.blocks.len() * 4;
+        self.near_branch = est < 200_000;
         // Tier-1 #2: function-wide temp READ counts (the authoritative opt::each_use visitor
         // over a clone — codegen is not hot). A single-use address temp is fold-and-deletable.
         self.use_count = vec![0u32; irf.temps.len()];
@@ -2079,7 +2120,8 @@ impl<'a> Cg<'a> {
                 self.emit_inst(&blk.insts[ii]);
                 ii += 1;
             }
-            self.emit_term(&blk.term);
+            let ft = (bi + 1 < irf.blocks.len()).then_some(bi as u32 + 1);
+            self.emit_term(&blk.term, ft);
         }
     }
 }
@@ -2804,11 +2846,13 @@ pub fn emit_ir(ast: &Ast) -> String {
         regalloc: false, // set per function from opt_ok[fi] in the emit loop
         coalesce: passes.coalesce,
         talloc: Vec::new(),
+        spill_off: Vec::new(),
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
         use_count: Vec::new(),
         sp_at_base: true,
         fdynstack: false,
+        near_branch: false,
     };
     for a in &ast.raw_asm {
         g.s += a;
