@@ -2610,6 +2610,588 @@ pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass — POINTER-IV STRENGTH REDUCTION + LFTR (the gcc-O1 loop-nest recipe).
+//
+// THE MEASURED LEVER (OPT.md §4): the accumulator-φ `strength_reduce` above turns a
+// derived `i·d` into a marching add but LEAVES the invariant base add and the loop
+// counter — matmul's inner loop keeps a per-iter `mul`, a `base+index` add and a
+// counter compare (2.92× even fully un-starved). gcc-O1 collapses the same loop to
+// SIX instructions by (1) folding the invariant base INTO the induction, producing a
+// MARCHING POINTER, and (2) LFTR — replacing the counter test with a pointer/limit
+// compare so the counter dies. This pass does both. Unlike the accumulator SR it is
+// PRESSURE-REDUCING (a pointer replaces {counter, base, index-mul, base-add}).
+//
+// GOVERNING THEOREM (CbC): `⟦f⟧ = ⟦pointer_iv(f)⟧`, MEASURED by `equiv`. Two legs:
+//   • BASE-FOLD leg. For an address `a = base + iv·s` (base loop-invariant, iv a basic
+//     induction φ `i₁=φ(i₀,i₂)`, `i₂=i₁+c`), introduce `p₁=φ(ph: base+i₀·s, tail: p₂)`,
+//     `p₂=p₁+c·s`, and replace `a` with `p₁`. CLAIM p₁ = base+i₁·s at every head:
+//       BASE k=0: p₁ = base+i₀·s = base+i₁·s (i₁=i₀ on entry). STEP: p₂ = p₁+c·s =
+//       base+i₁·s+c·s = base+(i₁+c)·s = base+i₂·s. ✓ (distribution exact in ℤ/2ⁿ.)
+//     Value-preserving casts between iv and the multiply are transparent (a widening in
+//     the same signedness class keeps the integer value), so `Cast(i₁)·d` reduces too —
+//     the exact form the accumulator SR missed on matmul.
+//   • LFTR leg. When after base-fold the counter i₁ feeds ONLY its increment and a header
+//     test `i₁ < N` (N invariant, step c>0, stride s>0), replace the test with `p₁ < L`,
+//     L = base+N·s (preheader). Since s>0 the map i₁↦p₁ is strictly monotone ⟹ `i₁<N`
+//     ⇔ `p₁<L` on every iteration ⟹ the observable branch outcome is identical. The now-
+//     dead counter φ/increment are reclaimed by DCE (next fixpoint round).
+//
+// SAFETY FENCES: integer IV only (float × non-associative); constant step c and stride s
+// (c·s folds to a constant ⟹ the latch op is a pure add); EXACTLY ONE iv-linear term in
+// the address (all other Add leaves loop-invariant); single-def i₁,i₂,a; reducible
+// single-latch loop; `cfg_complete`-guarded. The invariant base is RECOMPUTED into the
+// preheader (a self-contained mini-LICM, so the pass does not depend on LICM running or
+// being pressure-unblocked first). Ships behind the `Passes` toggle; measured on the box
+// before any default-ON flip (OPT.md §4).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A cast that PRESERVES the integer value of an induction variable: an integer widening
+/// in the same signedness class (sign/zero-extension keeps the value). Narrowing may wrap
+/// ⟹ rejected; float casts never qualify.
+fn iv_preserving_cast(tt: &TyTab, from: TypeId, to: TypeId) -> bool {
+    !tt.is_float(from)
+        && !tt.is_float(to)
+        && tt.size(to) >= tt.size(from)
+        && tt.is_unsigned(from) == tt.is_unsigned(to)
+}
+
+/// Recognize a temp whose loop value is `biv·stride`, through value-preserving casts and
+/// constant multiplies/shifts. Returns (biv i₁, stride). Read-only (defs via `def_of`).
+fn iv_linear(
+    f: &IrFunc,
+    tt: &TyTab,
+    def_of: &[Option<(BlockId, usize)>],
+    t: Tmp,
+    biv_of: &HashMap<Tmp, (Val, i64)>,
+) -> Option<(Tmp, i64)> {
+    if biv_of.contains_key(&t) {
+        return Some((t, 1));
+    }
+    let (b, i) = def_of[t as usize]?;
+    match &f.blocks[b as usize].insts[i] {
+        Inst::Cast(_, from, to, Val::Tmp(s)) if iv_preserving_cast(tt, *from, *to) => {
+            iv_linear(f, tt, def_of, *s, biv_of)
+        }
+        // A Copy preserves the value exactly ⟹ same (biv, stride). Copy-prop residue (a
+        // widened index copied for a second address) must not block that address's reduction.
+        Inst::Copy(_, _, Val::Tmp(s)) => iv_linear(f, tt, def_of, *s, biv_of),
+        Inst::Bin(_, Op::Mul, _, a, c) => match (a, c) {
+            (Val::Tmp(s), Val::Imm(m)) | (Val::Imm(m), Val::Tmp(s)) => {
+                iv_linear(f, tt, def_of, *s, biv_of).map(|(bi, st)| (bi, st.wrapping_mul(*m)))
+            }
+            _ => None,
+        },
+        Inst::Bin(_, Op::Shl, _, Val::Tmp(s), Val::Imm(sh)) if *sh >= 0 && *sh < 63 => {
+            iv_linear(f, tt, def_of, *s, biv_of).map(|(bi, st)| (bi, st.wrapping_shl(*sh as u32)))
+        }
+        _ => None,
+    }
+}
+
+/// Walk the Add-tree of address value `v`, sorting each leaf into an invariant `base`
+/// term or THE (single) iv-linear term. Returns false if any leaf is neither.
+#[allow(clippy::too_many_arguments)]
+fn decompose_addr(
+    f: &IrFunc,
+    tt: &TyTab,
+    def_of: &[Option<(BlockId, usize)>],
+    v: &Val,
+    body: &HashSet<BlockId>,
+    biv_of: &HashMap<Tmp, (Val, i64)>,
+    inv: &[bool],
+    base: &mut Vec<Val>,
+    lin: &mut Vec<(Tmp, i64)>,
+) -> bool {
+    let t = match v {
+        Val::Tmp(t) => *t,
+        _ => {
+            base.push(v.clone()); // a constant addend is loop-invariant
+            return true;
+        }
+    };
+    if inv[t as usize] {
+        base.push(Val::Tmp(t));
+        return true;
+    }
+    if let Some(ls) = iv_linear(f, tt, def_of, t, biv_of) {
+        lin.push(ls);
+        return true;
+    }
+    // Not invariant, not a bare linear term ⟹ must be an in-body Add to recurse through.
+    if let Some((b, i)) = def_of[t as usize] {
+        if body.contains(&b) {
+            if let Inst::Bin(_, Op::Add, _, a, c) = &f.blocks[b as usize].insts[i] {
+                return decompose_addr(f, tt, def_of, a, body, biv_of, inv, base, lin)
+                    && decompose_addr(f, tt, def_of, c, body, biv_of, inv, base, lin);
+            }
+        }
+    }
+    false
+}
+
+/// Rewrite an instruction's destination temp (only the pure invariant producers this pass
+/// clones into the preheader).
+fn set_dst(i: &mut Inst, d: Tmp) {
+    match i {
+        Inst::Bin(x, ..)
+        | Inst::Un(x, ..)
+        | Inst::Copy(x, ..)
+        | Inst::Cast(x, ..)
+        | Inst::Lea(x, ..)
+        | Inst::FunAddr(x, ..) => *x = d,
+        _ => unreachable!("set_dst on a non-clonable inst: {i:?}"),
+    }
+}
+
+/// Clone the invariant computation of temp `t` (defined inside `body`) into preheader
+/// `ph`, with fresh temps, operands first (a targeted hoist). A temp defined OUTSIDE the
+/// body is already available ⟹ returned unchanged. Memoized.
+fn clone_inv_to_ph(
+    f: &mut IrFunc,
+    ph: BlockId,
+    body: &HashSet<BlockId>,
+    t: Tmp,
+    def_of: &[Option<(BlockId, usize)>],
+    memo: &mut HashMap<Tmp, Tmp>,
+) -> Tmp {
+    if let Some(&nt) = memo.get(&t) {
+        return nt;
+    }
+    let (b, i) = match def_of[t as usize] {
+        Some(loc) if body.contains(&loc.0) => loc,
+        _ => return t, // available in the preheader already
+    };
+    // Operands first (so the memo is populated before we remap this inst's uses).
+    let mut us = Vec::new();
+    inst_uses(&f.blocks[b as usize].insts[i], &mut us);
+    for u in us {
+        clone_inv_to_ph(f, ph, body, u, def_of, memo);
+    }
+    let mut inst = f.blocks[b as usize].insts[i].clone();
+    each_use_mut(&mut inst, |val| {
+        if let Val::Tmp(x) = val {
+            if let Some(&nu) = memo.get(x) {
+                *x = nu;
+            }
+        }
+    });
+    let ty = f.temps[t as usize];
+    let nt = f.temps.len() as Tmp;
+    f.temps.push(ty);
+    set_dst(&mut inst, nt);
+    f.blocks[ph as usize].insts.push(inst);
+    memo.insert(t, nt);
+    nt
+}
+
+pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
+    if !cfg_complete(f) {
+        return 0; // computed goto ⟹ dominance/back-edges unsound (as LICM/SR)
+    }
+    let dom = dominators(f);
+    let backs = back_edges(f, &dom);
+    let mut changed = 0u32;
+    for &(tail, header) in &backs {
+        if backs.iter().filter(|(_, h)| *h == header).count() != 1 {
+            continue; // reducible single-latch only
+        }
+        let nt = f.temps.len();
+        // def location of every temp, against the CURRENT function (prior loops appended temps).
+        let mut def_of: Vec<Option<(BlockId, usize)>> = vec![None; nt];
+        let mut defcnt = vec![0u32; nt];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                if let Some(d) = inst_def(inst) {
+                    def_of[d as usize] = Some((bi as BlockId, ii));
+                    defcnt[d as usize] += 1;
+                }
+            }
+        }
+        let body = natural_loop(f, tail, header);
+        // BASIC INDUCTION VARIABLES: header φ i₁=φ(ext: i₀, tail: i₂) with i₂=i₁+c (const c),
+        // integer, single-def — the same recognition as the accumulator SR.
+        let mut biv_of: HashMap<Tmp, (Val, i64)> = HashMap::new();
+        for inst in &f.blocks[header as usize].insts {
+            let Inst::Phi(i1, ty, arms) = inst else { continue };
+            if tt.is_float(*ty) || arms.len() != 2 || defcnt[*i1 as usize] != 1 {
+                continue;
+            }
+            let (Some((_, Val::Tmp(i2))), Some((_, i0))) =
+                (arms.iter().find(|(p, _)| *p == tail), arms.iter().find(|(p, _)| *p != tail))
+            else {
+                continue;
+            };
+            if defcnt[*i2 as usize] != 1 {
+                continue;
+            }
+            let mut step = None;
+            for &bid in &body {
+                for di in &f.blocks[bid as usize].insts {
+                    if let Inst::Bin(d, Op::Add, dty, a, b) = di {
+                        if *d == *i2 && *dty == *ty {
+                            step = tmp_times_imm(a, b, *i1);
+                        }
+                    }
+                }
+            }
+            if let Some(c) = step {
+                biv_of.insert(*i1, (i0.clone(), c));
+            }
+        }
+        if biv_of.is_empty() {
+            continue;
+        }
+        // LOOP-INVARIANT set over the body: const / defined outside body / (in-body, pure,
+        // all operands invariant). Fixpoint. φ is never invariant (excludes the BIVs).
+        let mut inv = vec![false; nt];
+        for t in 0..nt {
+            if let Some((b, _)) = def_of[t] {
+                if !body.contains(&b) {
+                    inv[t] = true;
+                }
+            }
+        }
+        loop {
+            let mut grew = false;
+            for &bid in &body {
+                for inst in &f.blocks[bid as usize].insts {
+                    let Some(d) = inst_def(inst) else { continue };
+                    if inv[d as usize] || !is_hoistable(inst) {
+                        continue;
+                    }
+                    let mut us = Vec::new();
+                    inst_uses(inst, &mut us);
+                    if us.iter().all(|&u| inv[u as usize]) {
+                        inv[d as usize] = true;
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        // RECOGNIZE reducible addresses (Load/Store whose address = base + iv·stride).
+        struct Reduction {
+            addr: Tmp,
+            ty: TypeId,
+            base: Vec<Val>,
+            biv: Tmp,
+            stride: i64,
+        }
+        let mut reds: Vec<Reduction> = Vec::new();
+        let mut seen: HashSet<Tmp> = HashSet::new();
+        for &bid in &body {
+            for inst in &f.blocks[bid as usize].insts {
+                let addr = match inst {
+                    Inst::Load(_, _, Val::Tmp(a)) => *a,
+                    Inst::Store(_, Val::Tmp(a), _) => *a,
+                    _ => continue,
+                };
+                if !seen.insert(addr) || defcnt[addr as usize] != 1 {
+                    continue;
+                }
+                match def_of[addr as usize] {
+                    Some((b, _)) if body.contains(&b) => {}
+                    _ => continue, // address already invariant / outside loop ⟹ nothing to march
+                }
+                let (mut base, mut lin) = (Vec::new(), Vec::new());
+                if decompose_addr(
+                    f,
+                    tt,
+                    &def_of,
+                    &Val::Tmp(addr),
+                    &body,
+                    &biv_of,
+                    &inv,
+                    &mut base,
+                    &mut lin,
+                ) && lin.len() == 1
+                    && lin[0].1 != 0
+                {
+                    reds.push(Reduction {
+                        addr,
+                        ty: f.temps[addr as usize],
+                        base,
+                        biv: lin[0].0,
+                        stride: lin[0].1,
+                    });
+                }
+            }
+        }
+        if reds.is_empty() {
+            continue;
+        }
+        // MATERIALIZE. Preheader first (no empty preheaders).
+        let ph = match ensure_preheader(f, header, &body) {
+            Some(p) => p,
+            None => continue,
+        };
+        let mut memo: HashMap<Tmp, Tmp> = HashMap::new();
+        let mut lftr: Option<(Tmp /*pphi*/, Tmp /*pbase sum*/, i64 /*stride*/, Tmp /*biv*/)> = None;
+        for r in &reds {
+            // pbase = Σ base terms, recomputed once in the preheader.
+            let mut acc: Option<Val> = None;
+            for bt in &r.base {
+                let v = match bt {
+                    Val::Tmp(t) => Val::Tmp(clone_inv_to_ph(f, ph, &body, *t, &def_of, &mut memo)),
+                    other => other.clone(),
+                };
+                acc = Some(match acc {
+                    None => v,
+                    Some(prev) => {
+                        let d = f.temps.len() as Tmp;
+                        f.temps.push(r.ty);
+                        f.blocks[ph as usize].insts.push(Inst::Bin(d, Op::Add, r.ty, prev, v));
+                        Val::Tmp(d)
+                    }
+                });
+            }
+            let pbase = acc.unwrap_or(Val::Imm(0));
+            let pbase_t = match pbase {
+                Val::Tmp(t) => t,
+                imm => {
+                    let d = f.temps.len() as Tmp;
+                    f.temps.push(r.ty);
+                    f.blocks[ph as usize].insts.push(Inst::Copy(d, r.ty, imm));
+                    d
+                }
+            };
+            // pinit = pbase + i₀·stride  (folded; i₀ is the φ external arm, available in ph).
+            let (i0, c) = biv_of[&r.biv].clone();
+            let pinit = match i0 {
+                Val::Imm(0) => Val::Tmp(pbase_t),
+                Val::Imm(v) => {
+                    let d = f.temps.len() as Tmp;
+                    f.temps.push(r.ty);
+                    f.blocks[ph as usize].insts.push(Inst::Bin(
+                        d,
+                        Op::Add,
+                        r.ty,
+                        Val::Tmp(pbase_t),
+                        Val::Imm(v.wrapping_mul(r.stride)),
+                    ));
+                    Val::Tmp(d)
+                }
+                Val::Tmp(t) => {
+                    let t = clone_inv_to_ph(f, ph, &body, t, &def_of, &mut memo);
+                    let off = f.temps.len() as Tmp;
+                    f.temps.push(r.ty);
+                    f.blocks[ph as usize].insts.push(Inst::Bin(
+                        off,
+                        Op::Mul,
+                        r.ty,
+                        Val::Tmp(t),
+                        Val::Imm(r.stride),
+                    ));
+                    let d = f.temps.len() as Tmp;
+                    f.temps.push(r.ty);
+                    f.blocks[ph as usize].insts.push(Inst::Bin(
+                        d,
+                        Op::Add,
+                        r.ty,
+                        Val::Tmp(pbase_t),
+                        Val::Tmp(off),
+                    ));
+                    Val::Tmp(d)
+                }
+                Val::FImm(_) => continue,
+            };
+            // p₁ = φ(ph: pinit, tail: p₂); p₂ = p₁ + c·stride.
+            let p2 = f.temps.len() as Tmp;
+            f.temps.push(r.ty);
+            let pphi = f.temps.len() as Tmp;
+            f.temps.push(r.ty);
+            let pos = f.blocks[header as usize]
+                .insts
+                .iter()
+                .position(|i| !matches!(i, Inst::Phi(..)))
+                .unwrap_or(0);
+            f.blocks[header as usize].insts.insert(
+                pos,
+                Inst::Phi(pphi, r.ty, vec![(ph, pinit), (tail, Val::Tmp(p2))]),
+            );
+            f.blocks[tail as usize].insts.push(Inst::Bin(
+                p2,
+                Op::Add,
+                r.ty,
+                Val::Tmp(pphi),
+                Val::Imm(c.wrapping_mul(r.stride)),
+            ));
+            // Replace the address def with `a = p₁` (uses unchanged; the old base+index
+            // computation is left for DCE to reclaim).
+            if let Some(cur) =
+                f.blocks[def_of[r.addr as usize].unwrap().0 as usize]
+                    .insts
+                    .iter()
+                    .position(|i| inst_def(i) == Some(r.addr))
+            {
+                let blk = def_of[r.addr as usize].unwrap().0 as usize;
+                f.blocks[blk].insts[cur] = Inst::Copy(r.addr, r.ty, Val::Tmp(pphi));
+            }
+            if lftr.is_none() && c > 0 && r.stride > 0 {
+                lftr = Some((pphi, pbase_t, r.stride, r.biv));
+            }
+            changed += 1;
+        }
+        // LFTR: replace the header counter test `i₁ < N` with `p₁ < L`, L = pbase + N·stride,
+        // so the counter chain dies (DCE reclaims it next round). Conservative: exact shape.
+        if let Some((pphi, pbase_t, stride, biv)) = lftr {
+            // The counter must now feed ONLY its increment and the test. The address
+            // reduction left the old index arithmetic (`biv·stride`, casts) ORPHANED —
+            // still present but dead until DCE runs. Counting raw uses would see those and
+            // block LFTR forever, so count against a DCE-accurate liveness (fixpoint: a use
+            // inside a dead-defined pure instruction does not keep `biv` alive).
+            let live = {
+                let mut live = vec![false; f.temps.len()];
+                loop {
+                    let mut ch = false;
+                    let mark = |v: &[Tmp], live: &mut Vec<bool>, ch: &mut bool| {
+                        for &u in v {
+                            if !live[u as usize] {
+                                live[u as usize] = true;
+                                *ch = true;
+                            }
+                        }
+                    };
+                    for b in &f.blocks {
+                        for inst in &b.insts {
+                            let keep = !is_pure(inst)
+                                || inst_def(inst).map_or(true, |d| live[d as usize]);
+                            if keep {
+                                let mut us = Vec::new();
+                                inst_uses(inst, &mut us);
+                                mark(&us, &mut live, &mut ch);
+                            }
+                        }
+                        let mut us = Vec::new();
+                        term_uses(&b.term, &mut us);
+                        mark(&us, &mut live, &mut ch);
+                    }
+                    if !ch {
+                        break;
+                    }
+                }
+                live
+            };
+            let mut uses = 0u32;
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    let keep =
+                        !is_pure(inst) || inst_def(inst).map_or(true, |d| live[d as usize]);
+                    if !keep {
+                        continue;
+                    }
+                    let mut us = Vec::new();
+                    inst_uses(inst, &mut us);
+                    uses += us.iter().filter(|&&u| u == biv).count() as u32;
+                }
+                let mut us = Vec::new();
+                term_uses(&b.term, &mut us);
+                uses += us.iter().filter(|&&u| u == biv).count() as u32;
+            }
+            // find the header test: Bin(cmp, Lt, biv, bound), bound invariant, feeding Br.
+            let mut applied = false;
+            let hdr = header as usize;
+            let test = f.blocks[hdr].insts.iter().position(|i| {
+                matches!(i, Inst::Bin(_, Op::Lt, _, Val::Tmp(x), bound)
+                    if *x == biv && matches!(bound, Val::Imm(_) | Val::Tmp(_)))
+            });
+            // biv used exactly twice (increment + this test) ⟹ removing the test-use frees it.
+            if uses == 2 {
+                if let Some(ti) = test {
+                    if let Inst::Bin(_, _, cty, _, bound) = f.blocks[hdr].insts[ti].clone() {
+                        let bound_ok = match &bound {
+                            Val::Imm(_) => true,
+                            Val::Tmp(t) => inv[*t as usize],
+                            _ => false,
+                        };
+                        if bound_ok {
+                            // L = pbase + bound·stride  (in the preheader)
+                            let boundv = match bound {
+                                Val::Tmp(t) => {
+                                    Val::Tmp(clone_inv_to_ph(f, ph, &body, t, &def_of, &mut memo))
+                                }
+                                other => other,
+                            };
+                            let scaled = f.temps.len() as Tmp;
+                            f.temps.push(f.temps[pbase_t as usize]);
+                            f.blocks[ph as usize].insts.push(Inst::Bin(
+                                scaled,
+                                Op::Mul,
+                                f.temps[pbase_t as usize],
+                                boundv,
+                                Val::Imm(stride),
+                            ));
+                            let limit = f.temps.len() as Tmp;
+                            f.temps.push(f.temps[pbase_t as usize]);
+                            f.blocks[ph as usize].insts.push(Inst::Bin(
+                                limit,
+                                Op::Add,
+                                f.temps[pbase_t as usize],
+                                Val::Tmp(pbase_t),
+                                Val::Tmp(scaled),
+                            ));
+                            // rewrite the test to compare the pointer against the limit
+                            if let Inst::Bin(_, _, ty, a, b) = &mut f.blocks[hdr].insts[ti] {
+                                *ty = f.temps[pphi as usize];
+                                *a = Val::Tmp(pphi);
+                                *b = Val::Tmp(limit);
+                            }
+                            let _ = cty;
+                            applied = true;
+                            // Clear the orphaned index arithmetic (old `biv·stride`, casts,
+                            // copies) the address reduction left behind — it is non-cyclic
+                            // dead code that still NAMES biv, so it must go before biv's def
+                            // can be removed (else a dead use dangles). DCE cannot touch the
+                            // counter's φ↔increment cycle itself (each keeps the other live).
+                            dce(f);
+                            // The counter is now a dead self-cycle: biv (φ result) feeds
+                            // only its increment i₂, and i₂ feeds only the φ. Break it here —
+                            // find the header φ(biv), take its tail arm i₂, and if i₂ is used
+                            // nowhere but that φ, delete both the increment and the φ.
+                            let i2 = f.blocks[hdr].insts.iter().find_map(|i| match i {
+                                Inst::Phi(d, _, arms) if *d == biv => arms
+                                    .iter()
+                                    .find(|(p, _)| *p == tail)
+                                    .and_then(|(_, v)| match v {
+                                        Val::Tmp(t) => Some(*t),
+                                        _ => None,
+                                    }),
+                                _ => None,
+                            });
+                            if let Some(i2) = i2 {
+                                let i2_uses: u32 = f
+                                    .blocks
+                                    .iter()
+                                    .flat_map(|b| b.insts.iter())
+                                    .map(|i| {
+                                        let mut u = Vec::new();
+                                        inst_uses(i, &mut u);
+                                        u.iter().filter(|&&x| x == i2).count() as u32
+                                    })
+                                    .sum();
+                                // exactly one use of i₂ = the φ's tail arm ⟹ cycle is dead.
+                                if i2_uses == 1 {
+                                    for b in f.blocks.iter_mut() {
+                                        b.insts.retain(|i| {
+                                            !matches!(i, Inst::Phi(d, ..) if *d == biv)
+                                                && inst_def(i) != Some(i2)
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = applied;
+        }
+    }
+    changed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass — FUNCTION INLINING (Tier-1 #5; β-reduction across the call graph).
 //
 // Theorem (call-substitution / β-reduction): in any context,
@@ -2885,6 +3467,7 @@ pub struct Passes {
     pub cfg_simplify: bool,
     pub licm: bool,
     pub strength_reduce: bool,
+    pub pointer_iv: bool, // pointer-IV strength reduction + LFTR (gcc-O1 loop-nest recipe)
     pub coalesce: bool, // register coalescing (biased coloring, inside abi_alloc)
     pub peephole: bool, // backend machine-level redundant-move elimination (arm64_elf)
     pub ldst_pair: bool, // B4: backend adjacent load/store → ldp/stp pairing (arm64_elf)
@@ -2906,6 +3489,7 @@ impl Default for Passes {
             cfg_simplify: true,
             licm: false, // proven-correct but measured-negative on the naive-slot backend
             strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
+            pointer_iv: false, // pressure-reducing loop reducer; measured on the box before default-ON
             coalesce: true,
             peephole: true, // measured win: removes the x0-funnel redundant reg-reg moves
             ldst_pair: true, // B4: adjacent str/ldr → stp/ldp; static win, translation-validated
@@ -2921,7 +3505,13 @@ impl Passes {
     /// at runtime the same effect is `ZCC_OPT_ON=licm` over the default profile.
     #[cfg(test)]
     pub fn all() -> Self {
-        Passes { licm: true, strength_reduce: true, remat: true, ..Passes::default() }
+        Passes {
+            licm: true,
+            strength_reduce: true,
+            pointer_iv: true,
+            remat: true,
+            ..Passes::default()
+        }
     }
     fn set(&mut self, name: &str, v: bool) {
         match name {
@@ -2935,6 +3525,7 @@ impl Passes {
             "cfg_simplify" | "cfg" => self.cfg_simplify = v,
             "licm" => self.licm = v,
             "strength_reduce" | "strength" | "sr" => self.strength_reduce = v,
+            "pointer_iv" | "piv" | "pointeriv" => self.pointer_iv = v,
             "coalesce" => self.coalesce = v,
             "peephole" | "peep" => self.peephole = v,
             "ldst_pair" | "ldp" | "stp" | "pair" => self.ldst_pair = v,
@@ -3347,6 +3938,9 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
         }
         if p.strength_reduce {
             n += strength_reduce(tt, f, gp_k); // i·d → add-accumulator φ (pressure-guarded)
+        }
+        if p.pointer_iv {
+            n += pointer_iv(tt, f, gp_k); // base+i·d → marching pointer + LFTR (pressure-reducing)
         }
         if n == 0 {
             break; // fixpoint
@@ -5062,6 +5656,77 @@ mod tests {
         equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("variant must be preserved");
         // f(3) = 1*2*2*2 = 8 (the variant multiply stayed in the loop).
         assert_eq!(interp(&ast.tt, &vec![opt], "f", &[3]).unwrap(), 8);
+    }
+
+    // POINTER-IV + LFTR — the commuting square ⟦to_ssa(f)⟧=⟦pointer_iv(·)⟧ on the exact
+    // shapes it targets: a 1-D indexed sum, a 2-D matmul inner product (the §4 kernel), and
+    // an offset/non-unit-step loop (LFTR boundary). equiv samples inputs; a wrong base-fold
+    // or a wrong limit shows as a value divergence.
+    // LOCAL arrays + local induction vars: parameters are not promoted (read via an in-loop
+    // Load that blocks base-invariance — the real matmul uses locals), and interp does not model
+    // GLOBAL/string addresses, so the base must be a frame `Lea(Local)`. Param-free ⟹ interp is
+    // total (no OOB UB) and equiv is non-vacuous.
+    fn pointer_iv_srcs() -> Vec<&'static str> {
+        vec![
+            // 1-D fill then sum: both a marching store and a marching load, LFTR i<32
+            "long f(void){long A[32];int i;for(i=0;i<32;i=i+1)A[i]=i*i;\
+             long s=0;for(i=0;i<32;i=i+1)s=s+A[i];return s;}",
+            // 2-D inner product (matmul k-loop shape): two strides, invariant local indices ii,jj
+            "long f(void){long A[8][8],B[8][8];int i,j;\
+             for(i=0;i<8;i=i+1)for(j=0;j<8;j=j+1){A[i][j]=i+j;B[i][j]=i*j;}\
+             long s=0;int ii=3,jj=5,k;for(k=0;k<8;k=k+1)s=s+A[ii][k]*B[k][jj];return s;}",
+            // offset start + step 2: LFTR must use base+N·s, not assume i0=0/step=1
+            "long f(void){int V[100];int i;for(i=0;i<100;i=i+1)V[i]=i;\
+             long s=0;for(i=3;i<40;i=i+2)s=s+V[i];return s;}",
+            // full nested matmul (the §4 kernel): i,j,k all local, k-loop the reduction target
+            "long f(void){long A[8][8],B[8][8],C[8][8];int i,j,k;\
+             for(i=0;i<8;i=i+1)for(j=0;j<8;j=j+1){A[i][j]=i+j;B[i][j]=i-j;}\
+             long t=0;for(i=0;i<8;i=i+1)for(j=0;j<8;j=j+1){long s=0;\
+             for(k=0;k<8;k=k+1)s=s+A[i][k]*B[k][j];C[i][j]=s;t=t+s;}return t;}",
+        ]
+    }
+    #[test]
+    fn pointer_iv_semantics_preserved() {
+        for src in pointer_iv_srcs() {
+            let (ast, ir) = compile("piv", src);
+            let mut ssa = ir.clone();
+            for f in ssa.iter_mut() {
+                to_ssa(&ast.tt, f);
+                copy_prop(f); // canonicalize the mem2reg copies onto the φ (enabling, as SR)
+            }
+            let mut opt = ssa.clone();
+            for f in opt.iter_mut() {
+                pointer_iv(&ast.tt, f, GP_K);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("verify piv {src}: {e}"));
+            }
+            equiv(&ast.tt, &ssa, &opt, "f")
+                .unwrap_or_else(|e| panic!("⟦to_ssa(f)⟧ ≠ ⟦pointer_iv(·)⟧ for {src}: {e}"));
+        }
+    }
+    #[test]
+    fn pointer_iv_fires_and_stays_finite() {
+        // Fires on the matmul k-loop, and the LFTR-rewritten loop still TERMINATES with the
+        // right value (a wrong limit → infinite loop → interp step-budget Err, caught here).
+        let (ast, ir) = compile(
+            "pivf",
+            "long f(void){long A[8][8],B[8][8];int i,j;\
+             for(i=0;i<8;i=i+1)for(j=0;j<8;j=j+1){A[i][j]=i+1;B[i][j]=j+1;}\
+             long s=0;int ii=3,jj=5,k;for(k=0;k<8;k=k+1)s=s+A[ii][k]*B[k][jj];return s;}",
+        );
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        copy_prop(&mut ssa);
+        let base = vec![ssa.clone()];
+        let mut opt = ssa.clone();
+        let n = pointer_iv(&ast.tt, &mut opt, GP_K);
+        verify(&opt).unwrap();
+        assert!(n >= 2, "pointer_iv must reduce both A[ii][k] and B[k][jj] addresses (got {n})");
+        // A[ii][k]=ii+1=4 for all k; B[k][jj]=jj+1=6 ⟹ s = Σ_{k<8} 4*6 = 192. A wrong LFTR
+        // limit would loop forever (interp step-budget Err) or give a wrong count.
+        assert_eq!(interp(&ast.tt, &vec![opt.clone()], "f", &[]).unwrap(), 192);
+        equiv(&ast.tt, &base, &vec![opt], "f").expect("pointer_iv fires: ⟦·⟧ preserved");
     }
 
     // REGRESSION (partial-SSA soundness): a loop whose CONDITION temp is multi-def must

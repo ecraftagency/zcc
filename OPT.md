@@ -34,11 +34,27 @@ Ratio = zcc_time / gcc_time (**lower is faster; 1.0 = parity**). Measured bench,
 **matmul (3.44×) + sieve (2.60×)** — both loop-nest memory kernels. Note **matmul O1 ≈ O2** (3.44 vs
 3.46): gcc lands the whole matmul win *at O1*, so O1 is a real, sufficient target here.
 
-**CONFIRMED (§4, box-measured):** gcc-O1 beats matmul with **LICM (hoist the invariant `adrp`/base) +
-strength-reduction (index `mul` → pointer-increment IV)**. zcc's *existing* `licm`/`strength_reduce`
-passes are **INERT on matmul** — `ZCC_OPT_ON=licm,strength_reduce,remat` leaves the adrp count (7) and
-the runtime (230µs) UNCHANGED. So O1 is **not** "flip a flag": the loop passes must be *made to fire*
-on the matmul shape (the §4 work). This is the one remaining lever and it is on the §1 path.
+**RESOLVED (this batch, box-measured) — the mechanism exists and reaches 1.80×; the finish is now a
+register question, not an optimizer question.** The lever gcc-O1 uses is **pointer-IV strength-reduction
++ LFTR** (index `mul` → marching pointer `p+=stride`; counter test → pointer-limit test, counter dies).
+zcc's old `licm`/`strength_reduce` were INERT on matmul (accumulator-shape, not pointer-shape). The new
+`pointer_iv` pass (`opt.rs`, equiv-gated) FIRES: matmul inner loop → gcc's exact 7-insn form (2 marching
+pointers + `madd`, no counter). Measured, correctness MATCH:
+
+| k (GP regs) | matmul | note |
+|---|---|---|
+| **k=10 (default, shipped)** | **5.47×** ❌ | full 2-pointer reduction SPILLS — matmul needs ~13 live regs, has 10 |
+| **k=18 (probe, reverted)** | **1.80×** ✅ | spill-free — the finish line is *reached* with enough registers |
+
+**The gap is now `k`, not the pass.** pointer_iv is default-**OFF** because at k=10 it regresses (spills).
+Raising k>10 is the finish — but it is a **documented hang-prone minefield** (`arm64_elf.rs:35–38`:
+"pr64006 hung when x14/x15 were pooled"): x0–x15 are emitter scratch across BOTH `arm64_elf.rs` and
+`ext.rs`, x16–x18 ABI-reserved, so the GP pool is exactly callee-saved x19–x28. The k=18 probe broke 4
+torture tests (caller-saved clobber across `bl`). See §4 for the two safe paths to bank the 1.80×.
+
+**Shipped this batch (default-ON, gated):** add/sub-imm12 peephole (`mov #k;add`→`add #k`; universal,
+pressure-free) — marginal on these benches (3.44→3.40) but real code-size/cleanliness. pointer_iv +
+LFTR + dead-counter-elim land as proven **FOUNDATION** (default-OFF, equiv 102/102, 1.80× at k=18).
 
 ---
 
@@ -72,6 +88,42 @@ faith. Law 3 in its purest form: proven at the earliest decidable layer, *confir
 
 ---
 
+## §2b — Resource-fidelity: `k=10` is a convenience-truncation (the root of every flat pass)
+
+The Article-E **resource-fidelity gate** asks of every resource-constant: *"is this the spec's
+number, or my convenience's number?"* Apply it to `GP_BUDGET = { k: 10, ncaller: 0 }`
+(`arm64_elf.rs`):
+
+- **Spec's number (Side-II, AAPCS64 §6.1.1):** 31 GPRs. Callee-saved x19–x28 (10); temporary /
+  caller-saved x9–x15 (7); arg x0–x7 (8). In a **leaf** context (no `bl`) the caller-saved temps
+  are free homes too → **~18 GPRs are honestly allocatable**, minus the emitter's live scratch.
+  Measured scratch footprint (this session): the emitter simultaneously uses only **{x0, x1, x2,
+  x9}** — x3–x8 and x10–x18 (**15 registers**) are *entirely unused*, neither home nor scratch.
+- **Convenience's number:** `ncaller: 0` means **zero caller-saved registers are allocatable** —
+  the allocator was built to touch x19–x28 *only*, to avoid ever reasoning about call-clobbering.
+  That is a **Side-I algorithmic shortcut wearing a Side-II costume.** `k=10` is not the ABI's
+  number; it is the number that let us skip call-crossing analysis.
+
+**Verdict under the gate:** `k=10` is a **Law-2 Side-II defect** (a spec-value wrongly injected),
+not a missing feature. It fails resource-fidelity: Chaitin coloring instantiated over 10 of ~18
+usable colors is not a *faithful* realization of graph-coloring allocation — it is graph-coloring
+restricted to a convenient subset.
+
+**This single defect is the common root of every "flat / INERT" verdict in §3 and §4.** LICM's
+guard is `#hoists ≤ k − P`; strength-reduction needs `P + 2 ≤ k`; rematerialization only pays when
+something spills. With `k=10` and matmul's inner-loop `P=13`, headroom is **negative** — so all
+three are *correctly* refusing to fire (firing would spill and lose). They are not weak passes;
+they are **register-starved by a truncated `k`.** The "default-OFF pending box" residual in §2 and
+the "INERT on matmul" rows in §3 are the *same* symptom, one cause.
+
+**Path A = restore `k` to the ABI-true number** (add caller-saved registers as homes; pay the
+call-crossing analysis the `ncaller: 0` shortcut skipped). It is not "an optimization we chose" —
+it is *fixing the Side-II defect the gate caught*, after which the already-proven LICM/SR/remat
+fire on their own with positive headroom. The scoreboard target is unchanged; the lever moved from
+"write more passes" to "un-starve the passes that exist."
+
+---
+
 ## §3 — Done ledger (one line each; measured effect; on/off)
 
 Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simplify · register-coalescing
@@ -90,6 +142,8 @@ Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simpli
 | LICM (pressure-guarded) | **INERT on matmul** — does NOT hoist the invariant adrp (§4); flat elsewhere | **OFF** |
 | strength-reduction (pressure-guarded) | **INERT on matmul** — does NOT reduce the index mul (§4) | **OFF** |
 | #26 rematerialization (operand-free pure defs) | **flat** — nothing spills to relieve | **OFF** |
+| **add/sub-imm12 peephole** (backend) | `mov #k;add`→`add #k`; matmul inner 12→9 insn; marginal on bench (3.44→3.40) but universal + pressure-free | **ON** |
+| **pointer_iv (SR + LFTR + dead-counter)** | FIRES on matmul (gcc's 7-insn form); **k=10 5.47× (spills), k=18 1.80×** ✅; equiv 102/102. Default-OFF: regresses at k=10, is FOUNDATION for the k-decouple (§4) | **OFF** |
 
 **P1 note (levels are distinct):** copy-propagation is a **backend peephole on emitted `.s` text**
 (post-isel). It does NOT touch the SSA IR, so it does NOT change the SSA pressure the LICM guard
@@ -125,19 +179,83 @@ loop and caps hoists at 0, and/or **(c)** the invariant address `Lea(A)`/`Lea(B)
 `k·8`, `k·1920` are not in the single-def form LICM/SR recognize. Cause **(b)** (genuinely pressure-
 bound) is *unlikely* — gcc-O1 keeps the same kernel register-resident, so the registers exist.
 
-**The gate for the O1 work (each step measured on the exact matmul/sieve shape, SSA-IR level):**
-1. **Instrument at the SSA level** (not `.s`): print the inner-loop `P` the LICM guard computes and
-   *why* it refuses — is headroom 0 (cause a), or is `Lea(A)` never marked loop-invariant (cause c)?
-2. If **(a)**: the guard is too conservative *because it counts pre-`out_of_ssa` pressure*; the fix is
-   a truer pressure estimate or letting the hoist proceed when the hoisted value REPLACES a per-iter
-   recompute (net-zero pressure — hoisting `Lea(A)` deletes the in-loop `adrp`, it does not add live
-   range beyond what the recompute already needed).
-3. If **(c)**: teach LICM to recognize `Lea(global)` as invariant and SR to reduce the affine index
-   `base + k·stride` to a pointer IV (`p += stride`) — the classic combo. This is the real O1 win.
-4. **STOP when geomean-vs-O1 ≈ 1.0.** O1 is the finish line (top-of-doc). Do not chase O2/O3.
+**RESOLVED, box-measured (2026-08-22, SSA-level `ZCC_DBG_LICM` + `ZCC_DUMP_IR` + k-probe isolation).**
+The diagnostic ran to the bottom; both open causes are now answered, and the answer **inverts the
+plan**:
 
-**Measure before writing a single pass.** Nothing enters the batch that cannot show, on matmul/sieve,
-that it deletes inner-loop instructions and moves the vs-O1 ratio toward 1.0.
+- **Cause (a) is real but NOT the lever.** Inner k-loop: `P=13, gp_k=10, headroom=0, candidates=4`
+  (Cast·i, Cast·j, Lea·A, Lea·B) — LICM refuses, SR refuses (`P+2=15>10`). So at k=10 the passes are
+  register-starved, exactly as (a) said.
+- **But un-starving them does NOT reach O1.** Isolation probe raising `k` (extra colors → caller-saved
+  regs the loop doesn't scratch), full LICM+SR firing: matmul **3.47× → 2.92×** (correctness-gated,
+  output identical to gcc). k=16 (partial): 3.30×. **Ceiling of (raise-k ⊕ current LICM+SR) ≈ 2.92× —
+  the gap to gcc-O1 (1.0) does NOT close by adding registers.** So **Path A (raise k / free caller-saved
+  homes) + the scratch-band decouple it needs are OFF the O1 critical path** — proven insufficient.
+  `k=10` stays a real resource-fidelity debt (§2b) but is **parked**, not pursued.
+- **Cause (c) is the lever — the current SR is the wrong SHAPE.** gcc-O1's inner loop (measured) is the
+  textbook pointer-IV + LFTR form, **6 insns, zero `mul`, zero `adrp`:**
+  `ldr x4,[x2],8 · ldr x3,[x0] · madd x1,x4,x3,x1 · add x0,x0,1920 · cmp x0,x5 · bne`.
+  Two marching pointers (A post-indexed `+8`, B `+=1920`), loop terminated by **comparing a pointer to
+  a precomputed limit** (LFTR), madd-fused. zcc's inner loop *even fully un-starved* KEEPS a per-iter
+  `mul x,k,stride` + `add base,index` + counter `cmp` — the current `strength_reduce` builds a derived-IV
+  accumulator but never **folds the base into the IV init**, never does **LFTR**, never reaches pointer
+  form. That residual multiply + address-add + live counter is the whole 2.92→1.0 gap.
+
+**THE ONE REMAINING LEVER (revised §4 target): a proper pointer-IV strength-reduction + LFTR pass.**
+- Recognize `Load/Store [ base_invariant + iv·stride ]` (iv = the loop's basic induction φ).
+- Materialize a pointer IV: `p = base` in the preheader, use `[p]`, `p += stride` on the latch.
+- **LFTR:** replace the counter test `iv < N` with `p != limit` (`limit = base + N·stride`, preheader-
+  computed) so the counter and its `mul`/`cmp` die.
+- Backend then folds `[p]`,`p+=stride` into post-indexed `ldr x,[p],#stride` (small isel peephole; madd
+  already fused, #3).
+- **Crucially PRESSURE-REDUCING:** two pointers + accumulator + limit ≈ 4 live values REPLACE {counter,
+  base, i·stride, index-mul-result} — so it fits under **k=10 with NO Path A.** Cost falls, pressure
+  falls: the guard is satisfied trivially, not fought.
+- Ships under the CbC gate: commuting-square `⟦f⟧=⟦sr(f)⟧` (induction proof already in §-SR theorem,
+  extended with the base-fold + LFTR legs) + machine translation-validation (opt-parity 0 DIVERGE) +
+  isolation number on matmul/sieve BEFORE default-ON.
+
+---
+
+**RESULT (this batch, box-measured) — the pass is BUILT and correct; ONE §4 prediction was wrong.**
+`opt::pointer_iv` implements exactly the above (recognize `base+iv·stride` through Cast/Mul/Shl/**Copy**;
+materialize pointer φ + `p+=c·stride`; LFTR the counter test to `p<limit`; DCE-accurate liveness so the
+orphaned index chain doesn't block LFTR; dead-counter-cycle elimination since naive DCE can't kill a
+self-referential φ↔increment). Plus an add/sub-imm12 backend peephole so `p+=stride` is one `add #k`, not
+`mov;add`. cargo 102/102, equiv green on 4 kernels, LFTR fires (matmul inner loop = gcc's 7-insn form).
+
+**The wrong prediction: "pressure-REDUCING ⟹ fits k=10 with NO Path A." FALSE — measured.** matmul's inner
+loop is `P=13` (diagnostic, headroom=0 at k=10). pointer-IV kills the counter (−1) but materializes TWO
+marching pointers + a limit (+3 long-lived) — **net pressure does NOT drop below 10.** At k=10 the full
+reduction SPILLS: **matmul 3.42 → 5.47× (WORSE).** Reducing only ONE pointer avoids the spill (2.11×) but
+leaves the other index explicit. So pointer-IV alone is NOT a k=10 default win.
+
+**The real synthesis: BOTH the right pass-shape AND enough registers are needed — neither alone.**
+- pass-only, k=10:  5.47× (spill)  — the pass without registers
+- k-only, OLD SR:   2.92× (ceiling) — registers without the right pass (the earlier probe)
+- **pass + k=18:    1.80×** ✅ — both together reach the finish
+
+This **puts Path A (raise k) BACK on the O1 critical path** — the earlier "2.92× ceiling ⟹ Path A off-path"
+verdict was measured against the *old* SR shape; with the correct pointer-IV shape, raising k reaches 1.80×.
+`k=10` is no longer just a §2b fidelity debt — it is **the** remaining O1 blocker.
+
+### §4-next — two safe paths to bank the 1.80× (pick one; both keep k=10 correct)
+
+Raising k is a **documented hang graveyard** (`arm64_elf.rs:35–38`, pr64006). Do it carefully or route around:
+
+- **Path B (lower risk, partial): pressure-guarded pointer-IV, default-ON at k=10 → ~2.1×.** Reduce only as
+  many pointers as fit under `k−P` (reuse the LICM pressure guard, §2). At k=10 that reduces 1 pointer →
+  matmul ~2.11×, sieve ~2.1× — a real default-ON win banked NOW, pure-IR (equiv-gated), ZERO register risk.
+  Banks ~40% of the gap. Does not reach 1.80×.
+- **Path A (higher risk, full): scratch-band reclaim → k≈15 → pointer-IV default-ON → 1.80×.** Methodically
+  move wide-lowering scratch (struct-copy, VLA, atomics, **ext.rs overflow x14/x15**) off x11–x15 into a
+  reserved band, set `GP_BUDGET {k:15, ncaller:5}` (caller-saved x11–x15 confined to non-cross-call temps
+  by the existing `abi_alloc` ncaller machinery), gp_phys maps colors→physregs. Re-hammer struct/overflow
+  paths with csmith BEFORE trusting it (that is where pr64006 bit). Reaches the finish; touches Article-F
+  ABI/frame/atomics code, so it is its own careful batch, not a tail-end edit.
+
+**STOP when geomean-vs-O1 ≈ 1.0.** Measure before writing: the pass enters only if it shows, on
+matmul/sieve, the inner loop collapsing toward the 6-insn form and the vs-O1 ratio toward 1.0.
 
 ---
 

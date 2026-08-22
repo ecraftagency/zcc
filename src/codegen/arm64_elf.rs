@@ -42,6 +42,19 @@ const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16 };
 fn gp_phys(idx: u32) -> u32 {
     19 + idx // x19–x28 (ncaller=0 ⟹ every GP color is callee-saved)
 }
+// Add/Sub with a small constant right operand → (mnemonic, magnitude) for the AArch64
+// imm12 form. Side-II: the imm12 field is an *unsigned* 0..4096; a negative Add becomes a
+// Sub and vice versa. Returns None when the operand is not an in-range immediate.
+fn add_sub_imm12(op: Op, b: Val) -> Option<(&'static str, u64)> {
+    let Val::Imm(k) = b else { return None };
+    let mnem = match (op, k >= 0) {
+        (Op::Add, true) | (Op::Sub, false) => "add",
+        (Op::Add, false) | (Op::Sub, true) => "sub",
+        _ => return None,
+    };
+    let mag = k.unsigned_abs();
+    (mag < 4096).then_some((mnem, mag))
+}
 fn fp_phys(idx: u32) -> u32 {
     if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
 }
@@ -1588,6 +1601,20 @@ impl<'a> Cg<'a> {
                     self.ld_val(*b, "x1");
                     self.ir_bin(*op, *ty);
                     self.tmp_store(*d, "x0");
+                } else if let Some((mnem, mag)) = add_sub_imm12(*op, *b) {
+                    // Add/Sub-immediate peephole (Side-II: AAPCS64 imm12 field, unsigned
+                    // 0..4096): fold a small constant operand into the instruction instead of
+                    // materializing it (`mov x1,#k; add` → `add xD,xA,#k`). Pressure-free —
+                    // one fewer scratch live per loop increment; validated by opt-parity.
+                    let ra = self.src_gp(*a, 0);
+                    let rd = self.gp_home(*d).unwrap_or(0);
+                    _ = writeln!(self.s, "\t{mnem} x{rd}, x{ra}, #{mag}");
+                    if self.a.tt.is_integer(*ty) && self.a.tt.size(*ty) == 4 {
+                        self.ext_r(rd, *ty);
+                    }
+                    if self.gp_home(*d).is_none() {
+                        self.tmp_store(*d, "x0");
+                    }
                 } else {
                     // Tier-1 #1: read operands from their homes, compute into d's home.
                     // Sources first (x0/x1 scratch for spilled/imm), THEN pick rd — if d is
