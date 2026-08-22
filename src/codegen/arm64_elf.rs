@@ -1089,7 +1089,8 @@ impl<'a> Cg<'a> {
     // Tier-1 #1 (compute-into-home) source resolution: the GP register that already HOLDS
     // integer value `v`. A GP-homed temp is read from its home directly (no x0 funnel);
     // anything else (spilled temp / immediate) is materialized into `scratch` and returned.
-    // Only ever called on the integer Bin/Un path ⟹ v is an integer value, never FP-homed.
+    // Called on the integer Bin/Un path and the branch-condition path ⟹ v is an integer
+    // value (never FP-homed); an FP-homed v would still be handled safely via ld_val's fmov.
     fn src_gp(&mut self, v: Val, scratch: u32) -> u32 {
         if let Val::Tmp(t) = v {
             if let Some((false, idx)) = self.talloc.get(t as usize).copied().flatten() {
@@ -1701,8 +1702,20 @@ impl<'a> Cg<'a> {
             // on the predecessor edges before codegen. Reaching the backend = a bug.
             Inst::Phi(..) => unreachable!("Inst::Phi must be eliminated by out_of_ssa before codegen"),
             Inst::Copy(d, _ty, a) => {
-                self.ld_val(*a, "x0");
-                self.tmp_store(*d, "x0");
+                // Compute-into-home: move a's home straight into d's home (ONE mov) instead
+                // of the x0 double-funnel (`mov x0,aHome; mov dHome,x0`). When the allocator
+                // coalesced d and a to the SAME register the copy is a no-op and is elided
+                // (rd==ra). src_gp loads a spilled/imm/FP `a` into x0 first (ra=0), and the
+                // spilled-`d` path stores from x0 — so both are byte-identical to the old
+                // `ld_val a,x0; tmp_store d,x0`. Pressure-free; validated by opt-parity.
+                let ra = self.src_gp(*a, 0);
+                let rd = self.gp_home(*d).unwrap_or(0);
+                if rd != ra {
+                    _ = writeln!(self.s, "\tmov x{rd}, x{ra}");
+                }
+                if self.gp_home(*d).is_none() {
+                    self.tmp_store(*d, "x0");
+                }
             }
             // B4 if-conversion: dst = (cond ≠ 0) ? a : b. Home-independent x0/x1/x2 funnel
             // (opt::if_convert produces only non-float scalar Selects). `csel` copies the
@@ -1871,7 +1884,14 @@ impl<'a> Cg<'a> {
         match t {
             Term::Jmp(b) => _ = writeln!(self.s, "\tb {}", self.ir_label(*b)),
             Term::Br(c, tb, eb) => {
-                self.ld_val(*c, "x0");
+                // Tier-1 #1 compute-into-home for the branch condition: `cbz` can test ANY
+                // register, so test c's HOME directly instead of funnelling it through x0.
+                // src_gp returns c's home when GP-resident (no `mov x0,xHome`), else
+                // materializes into x0 (rc=0) ⟹ BYTE-IDENTICAL to the old `ld_val c,x0; cbz
+                // x0` on the spilled/imm/FP path. A C branch condition is integer truthiness
+                // (never FP-homed), satisfying src_gp's precondition. Pressure-free
+                // (removes a copy) — validated by opt-parity.
+                let rc = self.src_gp(*c, 0);
                 let (lt, le) = (self.ir_label(*tb), self.ir_label(*eb));
                 // Branch relaxation: cbnz/b.cond encode only a ±1MB displacement (imm19),
                 // but the two IR block labels can sit arbitrarily far apart in a very large
@@ -1880,7 +1900,7 @@ impl<'a> Cg<'a> {
                 // imm26), gated by a conditional skip to an ADJACENT local label that is
                 // always within range. c!=0 → then; c==0 → skip to else.
                 let n = self.labels(1);
-                _ = writeln!(self.s, "\tcbz x0, L{n}\n\tb {lt}\nL{n}:\n\tb {le}");
+                _ = writeln!(self.s, "\tcbz x{rc}, L{n}\n\tb {lt}\nL{n}:\n\tb {le}");
             }
             Term::Ret(v) => {
                 match v {
