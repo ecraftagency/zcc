@@ -37,10 +37,17 @@ use std::fmt::Write;
 //   — so the GP pool is exactly the callee-saved file x19–x28 (ncaller=0). (Measured the
 //   hard way: pr64006 hung when x14/x15 were pooled — ext.rs was outside the first grep.)
 //   FP: caller-saved v16–v31 then callee-saved v8–v15 (only d8–d15 preserved across a bl).
-const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0 };
+// GP allocation budgets. §3 keystone: the emitter's fixed scratch that clobbers x10–x15 lives
+// ONLY in three body instructions — Overflow (ext.rs), Sync, VaArg (+ the prologue struct-copy,
+// which runs before any home is live). A function free of those three can therefore use x10–x15
+// as 6 CALLER-saved homes (WIDE); a function containing one falls back to NARROW (x19–x28 only).
+// x10–x15 are not argument registers, so opening them adds no call-marshalling shuffle hazard,
+// and color_abi's crossing[] already confines any call-crossing temp to the callee-saved band.
+const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0 }; // NARROW: x19–x28
+const GP_BUDGET_WIDE: ClassBudget = ClassBudget { k: 16, ncaller: 6 }; // WIDE: x10–x15 | x19–x28
 const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16 };
-fn gp_phys(idx: u32) -> u32 {
-    19 + idx // x19–x28 (ncaller=0 ⟹ every GP color is callee-saved)
+fn fp_phys(idx: u32) -> u32 {
+    if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
 }
 // Add/Sub with a small constant right operand → (mnemonic, magnitude) for the AArch64
 // imm12 form. Side-II: the imm12 field is an *unsigned* 0..4096; a negative Add becomes a
@@ -54,9 +61,6 @@ fn add_sub_imm12(op: Op, b: Val) -> Option<(&'static str, u64)> {
     };
     let mag = k.unsigned_abs();
     (mag < 4096).then_some((mnem, mag))
-}
-fn fp_phys(idx: u32) -> u32 {
-    if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
 }
 
 // Side-II: ARMv8 logical-immediate encoding (`and/orr/eor #imm`). A 64-bit value is
@@ -142,6 +146,9 @@ struct Cg<'a> {
     // dead (0). This shrinks the frame from temps.len()*8 to num_spilled*8 — the frame bloat
     // that pushed slot offsets past sp-scaling range into the dynamic `sub x?,x29,x10` form.
     spill_off: Vec<u32>,
+    // §3: this function uses the WIDE GP budget (x10–x15 caller-saved homes). Set per function
+    // in emit_ir_body from the heavy-instruction scan; drives gpp()/gp_ncaller().
+    gp_wide: bool,
     csave_gp: Vec<u32>,
     csave_fp: Vec<u32>,
     // Tier-1 #2 (addressing-mode fold): function-wide READ count per temp, computed once
@@ -544,16 +551,19 @@ impl Cg<'_> {
         if off <= 4095 {
             _ = writeln!(self.s, "\tsub {reg}, x29, #{off}");
         } else {
-            self.imm("x10", off as i64);
-            _ = writeln!(self.s, "\tsub {reg}, x29, x10");
+            // Large-offset scratch is x16 (IP0), NOT x10: x10–x15 are caller-saved allocation
+            // homes in the wide GP budget (§3), so this frame-address path must not clobber
+            // one. x16 is ABI scratch (used transiently, no bl between imm and sub → veneer-safe).
+            self.imm("x16", off as i64);
+            _ = writeln!(self.s, "\tsub {reg}, x29, x16");
         }
     }
     fn sp_adjust(&mut self, op: &str, n: u32) {
         if n <= 4095 {
             _ = writeln!(self.s, "\t{op} sp, sp, #{n}");
         } else {
-            self.imm("x10", n as i64);
-            _ = writeln!(self.s, "\t{op} sp, sp, x10");
+            self.imm("x16", n as i64); // x16 (IP0), not x10 — see lea_local (§3 wide GP budget)
+            _ = writeln!(self.s, "\t{op} sp, sp, x16");
         }
     }
     // C99 6.8.6.1: SP returns to the frame's fixed base = x29 - (frame + variadic reg-save).
@@ -1136,13 +1146,26 @@ impl<'a> Cg<'a> {
     fn ir_toff(&self, i: Tmp) -> u32 {
         self.ir_tbase + 8 + self.spill_off[i as usize]
     }
+    // GP color → physical register, per the ACTIVE budget for this function (§3). WIDE opens
+    // 6 caller-saved homes x10–x15 (colors 0..6) ahead of the callee-saved x19–x28; NARROW is
+    // the callee-only file. `gp_ncaller()` reports the split so csave / verify agree.
+    fn gpp(&self, idx: u32) -> u32 {
+        if self.gp_wide {
+            if idx < GP_BUDGET_WIDE.ncaller { 10 + idx } else { 19 + (idx - GP_BUDGET_WIDE.ncaller) }
+        } else {
+            19 + idx
+        }
+    }
+    fn gp_ncaller(&self) -> u32 {
+        if self.gp_wide { GP_BUDGET_WIDE.ncaller } else { GP_BUDGET.ncaller }
+    }
     // Stage 5b — a temp's home is a physical register (Chaitin color) or a spill slot.
     // `reg` is always a 64-bit GPR (verified: every call site passes an x-form); an
     // FP-homed temp holds the f64 bit pattern (SEMANTICS §1), moved via `fmov` GPR↔d-reg.
     fn tmp_load(&mut self, i: Tmp, reg: &str) {
         match self.talloc.get(i as usize).copied().flatten() {
             Some((true, idx)) => _ = writeln!(self.s, "\tfmov {reg}, d{}", fp_phys(idx)),
-            Some((false, idx)) => _ = writeln!(self.s, "\tmov {reg}, x{}", gp_phys(idx)),
+            Some((false, idx)) => _ = writeln!(self.s, "\tmov {reg}, x{}", self.gpp(idx)),
             None => {
                 let off = self.ir_toff(i);
                 if let Some(pos) = self.sp_slot(off) {
@@ -1164,7 +1187,7 @@ impl<'a> Cg<'a> {
     fn tmp_store(&mut self, i: Tmp, reg: &str) {
         match self.talloc.get(i as usize).copied().flatten() {
             Some((true, idx)) => _ = writeln!(self.s, "\tfmov d{}, {reg}", fp_phys(idx)),
-            Some((false, idx)) => _ = writeln!(self.s, "\tmov x{}, {reg}", gp_phys(idx)),
+            Some((false, idx)) => _ = writeln!(self.s, "\tmov x{}, {reg}", self.gpp(idx)),
             None => {
                 let off = self.ir_toff(i);
                 if let Some(pos) = self.sp_slot(off) {
@@ -1214,7 +1237,7 @@ impl<'a> Cg<'a> {
     fn src_gp(&mut self, v: Val, scratch: u32) -> u32 {
         if let Val::Tmp(t) = v {
             if let Some((false, idx)) = self.talloc.get(t as usize).copied().flatten() {
-                return gp_phys(idx);
+                return self.gpp(idx);
             }
         }
         self.ld_val(v, &format!("x{scratch}"));
@@ -1223,7 +1246,7 @@ impl<'a> Cg<'a> {
     // The GP home register of temp `d` if it is GP-register-resident, else None (spilled).
     fn gp_home(&self, d: Tmp) -> Option<u32> {
         match self.talloc.get(d as usize).copied().flatten() {
-            Some((false, idx)) => Some(gp_phys(idx)),
+            Some((false, idx)) => Some(self.gpp(idx)),
             _ => None,
         }
     }
@@ -2143,8 +2166,17 @@ impl<'a> Cg<'a> {
         self.ir_tbase = irf.frame + if self.fvariadic { 192 } else { 0 };
         self.ir_temps = irf.temps.clone();
         // Stage 5b: assign each temp a home. regalloc off ⟹ all-spill = the memory model.
+        // §3 keystone — pick the GP budget. WIDE (x10–x15 caller homes) is sound iff the body
+        // never clobbers x10–x15 as fixed scratch, which by exhaustive enumeration means it
+        // contains no Overflow / Sync / VaArg (the prologue struct-copy runs before any home is
+        // live; lea_local's large-offset path uses x16). Any such instruction ⟹ NARROW.
+        let heavy = irf.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(i, Inst::Overflow(..) | Inst::Sync(..) | Inst::VaArg(..))
+        });
+        self.gp_wide = self.regalloc && !heavy;
+        let gpb = if self.gp_wide { &GP_BUDGET_WIDE } else { &GP_BUDGET };
         self.talloc = if self.regalloc {
-            crate::opt::abi_alloc(&self.a.tt, irf, &GP_BUDGET, &FP_BUDGET, self.coalesce)
+            crate::opt::abi_alloc(&self.a.tt, irf, gpb, &FP_BUDGET, self.coalesce)
         } else {
             vec![None; irf.temps.len()]
         };
@@ -2172,8 +2204,8 @@ impl<'a> Cg<'a> {
                         self.csave_fp.push(r);
                     }
                 }
-                Some((false, idx)) if idx >= GP_BUDGET.ncaller => {
-                    let r = gp_phys(idx);
+                Some((false, idx)) if idx >= self.gp_ncaller() => {
+                    let r = self.gpp(idx);
                     if !self.csave_gp.contains(&r) {
                         self.csave_gp.push(r);
                     }
@@ -2970,6 +3002,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         coalesce: passes.coalesce,
         talloc: Vec::new(),
         spill_off: Vec::new(),
+        gp_wide: false,
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
         use_count: Vec::new(),
