@@ -738,6 +738,35 @@ impl Cg<'_> {
             _ => writeln!(self.s, "\tstur x{rv}, [x29, #-{off}]"),
         };
     }
+    // Scaled base+offset load: x{rd} = *(x{rbase} + off), width per t. The ARMv8 scaled
+    // immediate form `[Xn, #imm]` requires imm to be a multiple of the access size, imm/size ≤
+    // 4095 — checked by scaled_off. Folds a struct-field `add xB,xB,#off; ldr [xB]` into ONE
+    // instruction (§4 maximal munch). rd may alias rbase (base read before rd written).
+    fn load_gp_off(&mut self, rd: u32, rbase: u32, off: u32, t: TypeId) {
+        let u = self.a.tt.is_unsigned(t);
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tldrsb x{rd}, [x{rbase}, #{off}]"),
+            (1, true) => writeln!(self.s, "\tldrb w{rd}, [x{rbase}, #{off}]"),
+            (2, false) => writeln!(self.s, "\tldrsh x{rd}, [x{rbase}, #{off}]"),
+            (2, true) => writeln!(self.s, "\tldrh w{rd}, [x{rbase}, #{off}]"),
+            (4, false) => writeln!(self.s, "\tldrsw x{rd}, [x{rbase}, #{off}]"),
+            (4, true) => writeln!(self.s, "\tldr w{rd}, [x{rbase}, #{off}]"),
+            _ => writeln!(self.s, "\tldr x{rd}, [x{rbase}, #{off}]"),
+        };
+    }
+    fn store_gp_off(&mut self, rv: u32, rbase: u32, off: u32, t: TypeId) {
+        _ = match self.a.tt.size(t) {
+            1 => writeln!(self.s, "\tstrb w{rv}, [x{rbase}, #{off}]"),
+            2 => writeln!(self.s, "\tstrh w{rv}, [x{rbase}, #{off}]"),
+            4 => writeln!(self.s, "\tstr w{rv}, [x{rbase}, #{off}]"),
+            _ => writeln!(self.s, "\tstr x{rv}, [x{rbase}, #{off}]"),
+        };
+    }
+    // ARMv8 scaled-immediate reachability for an access of `size` bytes: off is a non-negative
+    // multiple of size and off/size ≤ 4095 (the imm12 field). Side-II.
+    fn scaled_off(&self, off: u32, size: u32) -> bool {
+        size != 0 && off % size == 0 && off / size <= 4095
+    }
     // Tier-1 #2 — register-offset load: x{rd} = *(x{rbase} + x{rindex}), width per t. The
     // ARM64 `[Xn, Xm]` addressing form adds the full 64-bit Xm; it exists for every ldr
     // variant used here (ldr/ldrb/ldrh/ldrsb/ldrsh/ldrsw). rd may alias rbase/rindex (base
@@ -771,12 +800,7 @@ impl Cg<'_> {
         if self.a.tt.size(*ct) != 8 {
             return None;
         }
-        let (Val::Tmp(ta), Val::Tmp(tb)) = (a, b) else {
-            return None;
-        };
-        let (Some(rbase), Some(rindex)) = (self.gp_home(*ta), self.gp_home(*tb)) else {
-            return None;
-        };
+        // the address temp must feed exactly one Load, which must be simple-GP-widthed
         let Some(Inst::Load(d, lty, Val::Tmp(la))) = insts.get(i + 1) else {
             return None;
         };
@@ -786,8 +810,30 @@ impl Cg<'_> {
         if self.use_count.get(*t as usize).copied().unwrap_or(0) != 1 {
             return None;
         }
+        // base + immediate byte-offset (struct-field access): fold to `ldr [base, #off]` when
+        // the offset is scaled-reachable. Add is commutative, so the Imm may be either operand.
+        let imm_form = match (a, b) {
+            (Val::Tmp(base), Val::Imm(n)) | (Val::Imm(n), Val::Tmp(base)) => {
+                let (Some(rbase), Ok(off)) = (self.gp_home(*base), u32::try_from(*n)) else {
+                    return None;
+                };
+                self.scaled_off(off, self.a.tt.size(*lty)).then_some((rbase, off))
+            }
+            _ => None,
+        };
         let rd = self.gp_home(*d).unwrap_or(0);
-        self.load_idx(rd, rbase, rindex, *lty);
+        if let Some((rbase, off)) = imm_form {
+            self.load_gp_off(rd, rbase, off, *lty);
+        } else {
+            // base + index register form: `ldr [base, index]`
+            let (Val::Tmp(ta), Val::Tmp(tb)) = (a, b) else {
+                return None;
+            };
+            let (Some(rbase), Some(rindex)) = (self.gp_home(*ta), self.gp_home(*tb)) else {
+                return None;
+            };
+            self.load_idx(rd, rbase, rindex, *lty);
+        }
         if self.gp_home(*d).is_none() {
             self.tmp_store(*d, "x0");
         }
@@ -804,6 +850,40 @@ impl Cg<'_> {
     // to width n makes them equal, since `(c + trunc_n(x·y)) ≡ (c + x·y) (mod 2ⁿ)` (addition
     // commutes with mod; the low n bits, all `ext_r` observes, are identical). Signedness is
     // irrelevant to `mul`'s low bits. Scratch x0/x1/x2 for spilled/imm operands (never homes).
+    // Store counterpart of the base+immediate fold: `add xB,xB,#off; str rv,[xB]` (a struct
+    // field WRITE) → one `str rv,[xB,#off]` (§4). Same scaled-reachability + single-use guard.
+    // Simple-GP store widths only (Bool/Float/Bitfield/LDouble keep their special [x1] path).
+    fn try_fuse_store_addr(&mut self, insts: &[Inst], i: usize) -> Option<usize> {
+        let Inst::Bin(t, Op::Add, ct, a, b) = &insts[i] else {
+            return None;
+        };
+        if self.a.tt.size(*ct) != 8 {
+            return None;
+        }
+        let Some(Inst::Store(sty, Val::Tmp(ta), v)) = insts.get(i + 1) else {
+            return None;
+        };
+        if *ta != *t || !self.simple_gp_store_ty(*sty) {
+            return None;
+        }
+        if self.use_count.get(*t as usize).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let (base, n) = match (a, b) {
+            (Val::Tmp(base), Val::Imm(n)) | (Val::Imm(n), Val::Tmp(base)) => (*base, *n),
+            _ => return None,
+        };
+        let (Some(rbase), Ok(off)) = (self.gp_home(base), u32::try_from(n)) else {
+            return None;
+        };
+        if !self.scaled_off(off, self.a.tt.size(*sty)) {
+            return None;
+        }
+        // read the value from its home (store_gp_off never clobbers it); rbase read as base.
+        let rv = self.src_gp(*v, 0);
+        self.store_gp_off(rv, rbase, off, *sty);
+        Some(2)
+    }
     fn try_fuse_madd(&mut self, insts: &[Inst], i: usize) -> Option<usize> {
         let Inst::Bin(m, Op::Mul, ctm, mx, my) = &insts[i] else {
             return None;
@@ -2320,6 +2400,7 @@ impl<'a> Cg<'a> {
             while ii < blk.insts.len() {
                 if let Some(n) = self
                     .try_fuse_addr(&blk.insts, ii)
+                    .or_else(|| self.try_fuse_store_addr(&blk.insts, ii))
                     .or_else(|| self.try_fuse_madd(&blk.insts, ii))
                     .or_else(|| self.try_fuse_local(&blk.insts, ii))
                 {
