@@ -17,6 +17,11 @@
 set -u
 export ZCC="${ZCC:-/usr/local/bin/zcc}"
 export INC=/suites/csmith/include
+# Compile-timeout ceiling (s): bounds a pathological zcc compile (e.g. yarpgen s0940,
+# super-linear opt path) so a 10k run cannot stall. An overrun is a PERF fault, named
+# CTIMEOUT — NEVER DIVERGE (a slow compile is not a miscompile). Generous: only true
+# pathology trips it; on 64 cores the tail is max(one case), not the sum.
+: "${ZCC_CTIMEOUT:=300}"; export ZCC_CTIMEOUT
 DIR=/suites/csmith
 LIM="${1:-0}"                       # 0 = all
 JOBS="${CSMITH_JOBS:-$(nproc 2>/dev/null || echo 4)}"
@@ -34,13 +39,15 @@ work='
   # gcc did not COMPLETE normally (124=timeout, >127=signal) → junk reference → SKIP
   { [ "$grc" = 124 ] || [ "$grc" -gt 127 ]; } && { printf "SKIP\t%s\t0\tgcc-run\n" "$b"; exit 0; }
   # zcc -O0 (optimizer off) — compile-fail = NOT-IMPL (completeness gap, named)
-  if ! ZCC_O0=1 "$ZCC" -I"$INC" "$f" -o "$d/z" 2>"$d/ze"; then
-      printf "NOTIMPL\t%s\t0\t%s\n" "$b" "$(head -1 "$d/ze" | cut -c1-40)"; exit 0; fi
+  timeout "$ZCC_CTIMEOUT" env ZCC_O0=1 "$ZCC" -I"$INC" "$f" -o "$d/z" 2>"$d/ze"; crc=$?
+  [ "$crc" = 124 ] && { printf "CTIMEOUT\t%s\t0\to0-compile>%ss\n" "$b" "$ZCC_CTIMEOUT"; exit 0; }
+  [ "$crc" != 0 ] && { printf "NOTIMPL\t%s\t0\t%s\n" "$b" "$(head -1 "$d/ze" | cut -c1-40)"; exit 0; }
   bytes=$(wc -c < "$d/z")
   timeout 60 "$d/z" > "$d/zo" 2>&1; zrc=$?
   # zcc default optimizer (SSA + regalloc, no env)
-  if ! "$ZCC" -I"$INC" "$f" -o "$d/zp" 2>/dev/null; then
-      printf "DIVERGE\t%s\t%s\tOPT-COMPILE-FAIL\n" "$b" "$bytes"; exit 0; fi
+  timeout "$ZCC_CTIMEOUT" "$ZCC" -I"$INC" "$f" -o "$d/zp" 2>/dev/null; crc=$?
+  [ "$crc" = 124 ] && { printf "CTIMEOUT\t%s\t%s\topt-compile>%ss\n" "$b" "$bytes" "$ZCC_CTIMEOUT"; exit 0; }
+  [ "$crc" != 0 ] && { printf "DIVERGE\t%s\t%s\tOPT-COMPILE-FAIL\n" "$b" "$bytes"; exit 0; }
   timeout 60 "$d/zp" > "$d/zpo" 2>&1; prc=$?
   # zcc did not COMPLETE (124=timeout, >127=signal) → NOT a checksum divergence.
   # An honest 3rd state: perf boundary (zcc -O0 naive codegen ≫ gcc -O0) OR a masked
@@ -61,11 +68,12 @@ if [ "$LIM" -gt 0 ]; then list | head -n "$LIM"; else list; fi \
 
 par=$(grep -c '^PARITY'  "$RES"); div=$(grep -c '^DIVERGE'  "$RES")
 ni=$(grep -c '^NOTIMPL' "$RES"); skip=$(grep -c '^SKIP'    "$RES")
-to=$(grep -c '^TIMEOUT' "$RES")
+to=$(grep -c '^TIMEOUT' "$RES"); ct=$(grep -c '^CTIMEOUT' "$RES")
 bytes=$(awk -F'\t' '{s+=$3} END{print s+0}' "$RES")
-n=$((par+div+ni+to+skip))
-echo "csmith: $par PARITY / $div DIVERGE / $to TIMEOUT / $ni NOT-IMPL / $skip SKIP  (scanned $n, ${JOBS} jobs; zcc-ELF ${bytes}B)"
+n=$((par+div+ni+to+ct+skip))
+echo "csmith: $par PARITY / $div DIVERGE / $to TIMEOUT / $ct CTIMEOUT / $ni NOT-IMPL / $skip SKIP  (scanned $n, ${JOBS} jobs; zcc-ELF ${bytes}B)"
 [ "$div"  -gt 0 ] && { printf 'DIVERGE:'; awk -F'\t' '$1=="DIVERGE"{printf " %s(%s)",$2,$4} END{print ""}' "$RES"; }
 [ "$to"   -gt 0 ] && { printf 'TIMEOUT (zcc -O0 ≫ gcc -O0 budget; correctness re-checked run-to-completion):'; awk -F'\t' '$1=="TIMEOUT"{printf " %s(%s)",$2,$4} END{print ""}' "$RES"; }
+[ "$ct"   -gt 0 ] && { printf 'CTIMEOUT (zcc compile > %ss — PERF pathology, not a miscompile; isolate the pass):' "$ZCC_CTIMEOUT"; awk -F'\t' '$1=="CTIMEOUT"{printf " %s(%s)",$2,$4} END{print ""}' "$RES"; }
 [ "$ni"   -gt 0 ] && { printf 'NOT-IMPL:'; awk -F'\t' '$1=="NOTIMPL"{printf " %s:%s",$2,$4} END{print ""}' "$RES" | cut -c1-400; echo; }
 [ "$div" = 0 ]
