@@ -15,8 +15,21 @@ scalar-replacement or tiling, Tier-3), not per-instruction. The fib call-overhea
 the remaining Tier-1 item is **#4 sxtw-elim** (trims loop-counter extension litter).
 
 **Done:** const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simplify · register-coalescing
-(biased) · LICM (off) · strength-reduction (off) · backend peephole (redundant + dead move elim)
-· **compute-into-home (#1)** · **addressing-mode fold (#2)** · **madd fusion (#3)** · **inlining (#5)**.
+(biased) · **LICM (pressure-guarded, off—box-pending)** · **strength-reduction (pressure-guarded,
+off—box-pending)** · backend peephole (redundant + dead move elim) · **compute-into-home (#1)** ·
+**addressing-mode fold (#2)** · **madd fusion (#3)** · **inlining (#5)** · **rematerialization (#26,
+off—box-pending)**.
+
+**Batch 2026-08-22 (guards + remat).** Answered *why proof-faster meets reality-slower* (the
+`⟦·⟧`-vs-`C_M` category split — see "measured-reality" above) and converted the LICM/SR **speed** claim
+from a gamble into a **theorem**: a decidable register-pressure guard (`#hoists ≤ k − P`, `k=GP_BUDGET.k`
+threaded in) makes each ship-eligible hoist provably spill-free ⟹ `C_M` strictly decreases. Added
+**rematerialization** (#26) — the CbC-pure slice of register allocation. All three proven `⟦·⟧`-preserving
+on mac (`cargo` 100/100, incl. new `licm_pressure_guard_caps` · `strength_reduce_pressure_guard_caps` ·
+`remat_recomputes_pressured_address` · `remat_refuses_operand_bearing_defs`) and kept **default-OFF**:
+the SSA-vs-backend pressure residual is closed by the box A/B, not asserted. Default build output is
+**byte-unchanged** (all three OFF; only an inert `gp_k` param threaded). **NEXT (box):** `ZCC_OPT_ON=licm,
+strength,remat` bench A/B + torture + opt-parity → flip the winners default-ON.
 
 ---
 
@@ -89,18 +102,62 @@ the complexity tax spiking.
 
 ---
 
-## The measured-reality principle (read first)
+## The measured-reality principle — why proof-faster meets reality-slower (read first)
 
-The commuting-square proof establishes identical **output**, and says **nothing about cost**.
-Performance is an orthogonal axis governed by the *backend*. On the current x0-accumulator emitter
-the dominant cost is **register-move traffic**, not instruction count or memory — which is why:
-- The backend peephole (deletes moves) was the biggest win: 1.39×→0.98×.
-- LICM and strength-reduction (which *add* loop-carried values + copies) are measured-neutral/negative.
+This is the deepest question the fork answers, and the whole reason LICM/SR ship guarded, not raw.
 
-**Corollary for prioritization:** until instruction *selection* stops funnelling every value through
-x0, IR-level passes that add live values will keep under-paying. The highest-leverage remaining work
-is therefore **backend/instruction-selection**, then **inlining**, then the classical IR passes whose
-payoff unlocks once values are register-resident.
+**The two axes are two different categories.** The commuting square `⟦f⟧ = ⟦opt(f)⟧` is a statement
+in the category of **values** — the denotation `⟦·⟧` is a map (inputs → outputs), machine-independent,
+decidable. It establishes identical *output* and says **nothing about cost**. Performance lives in a
+*different* category: the operational **cost** `C_M : IR → ℝ⁺` of realizing `⟦·⟧` on a concrete machine
+`M` with **finite registers** (k=10 GP here), a **memory hierarchy** (L1/L2/DRAM latencies), and a
+**pipeline** (issue width, latencies, ports). `C_M` is **not** a homomorphism of `⟦·⟧`: two programs
+with `⟦f⟧=⟦g⟧` routinely have `C_M(f) ≠ C_M(g)` — that is the entire point of optimization. But the
+crucial fact is the converse: **the *sign* of `C_M(opt(f)) − C_M(f)` is NOT determined by the IR-level
+transform.** It is decided by how the transform collides with `M`'s scarce resources. A proof about
+`⟦·⟧` therefore cannot, even in principle, prove a speedup — it is silent on the axis that carries cost.
+
+**Why the theory says "faster" and the machine says "slower" (the exact mechanism).** Take LICM. It
+hoists an invariant `x=e` out of a loop of trip `N`.
+- *In the theory's cost model* (`C_count` = dynamic instruction count, the model with **infinite
+  registers**), it saves `(N−1)` executions of `e` ⟹ strictly faster. LICM is *optimal* in that world.
+- *On `M`*, `x` must now be **live across the whole loop body**. If, at any point inside, the count of
+  simultaneously-live values exceeds `k`, the allocator must **spill** — a store at the def and a
+  **reload per use, `N` times**. LICM has then traded `(N−1)` register-resident 1-cycle ALU recomputes
+  for `N` 4-cycle memory reloads. Net **`≈ N·3` cycles slower**. This is the precise 2026 regression.
+
+So the gap is not sloppiness in the theory — it is that **LICM trades recomputation (a claim on ALU
+bandwidth, which is plentiful) for live-range extension (a claim on registers, which are scarce =
+k).** When registers are the binding constraint, the trade is a loss, and `⟦·⟧` cannot see it because
+registers do not appear in `⟦·⟧`. Count ≠ cost; fewer *static* instructions can be *more* real cycles.
+
+**Closing the gap without leaving CbC — the decidable pressure guard (shipped 2026-08-22).** The
+honest fix is not "measure and hope" but to make speed-positivity a **theorem about a guarded
+transform**. Define loop register-pressure `P = max over points p in the loop of |{GP temps live at
+p}|` (computed from `liveness()` — measured, no tuned weight). Each hoist raises the live-count at any
+point by **at most 1**, so post-hoist max pressure `≤ P + (#hoists)`. **Cap #hoists at `k − P`** ⟹
+pressure stays `≤ k` ⟹ the k-colouring survives ⟹ the allocator introduces **no new spill** ⟹ each
+hoist strictly deletes `(N−1)` dynamic ops with **zero** added memory traffic ⟹ `C_M` strictly
+decreases. Now BOTH obligations are discharged *before* ship: output identity (`⟦f⟧=⟦licm_guarded f⟧`,
+a subset of the proven hoist set — `equiv`, mac) **and** speed-positivity (the pressure theorem). SR
+carries the same guard for its accumulator φ (`P + 2 ≤ k`). `k` is the ONE Side-II ABI constant
+(`GP_BUDGET.k`), threaded from the backend so it is never duplicated.
+
+**The residual gap (honesty about the guard itself).** `P` is **SSA**-pressure, measured *before*
+`out_of_ssa`; the real allocator runs *after* it, and φ-destruction inserts edge copies that can bump
+pressure at latches. So the guard is a *sound-ish proxy*, not an airtight identity with the backend's
+pressure — the guard is itself a **model**, and a model has a residual gap with the machine (the very
+phenomenon this section is about, one level up). That residual is exactly what a box A/B closes, which
+is why the guarded passes stay **default-OFF pending the box measurement**, not flipped on faith. This
+is Law 3 in its purest form: proven at the earliest decidable layer, *confirmed* — never discovered —
+in the suite.
+
+**Corollary for prioritization.** The dominant backend cost here is **register-move traffic + spills**,
+not raw instruction count (the peephole that deletes x0-funnel moves was the biggest single win,
+1.39×→0.98×). So the highest-leverage remaining work is the part of **register allocation** that is
+CbC-pure: **rematerialization** (#26, this batch) — recompute a pure operand-free value at its use
+instead of spilling it — plus the now-guarded classical loop passes whose payoff unlocks once values
+are register-resident.
 
 ---
 
@@ -154,7 +211,7 @@ payoff unlocks once values are register-resident.
 | 24 | **Branch → conditional-select (`csel`)** | if-conversion of a diamond with no side effects | removes unpredictable branches |
 | 25 | **Full iterated register coalescing** (Briggs/George) | the interference graph stays k-colourable after a merge | ~~beyond biased-colouring~~ **made MOOT by B6** — QBE's SSA-chordal `rega` gets coalescing from register *hints* over a guaranteed-colorable graph, no iterated rebuild |
 | 21′ | **Escape analysis → stack allocation** (now FREE with B1) | a stack slot never stored-through/passed opaquely is provably local | QBE's `alias.c` computes `AEsc` as a by-product of the alias pass — B1 delivers escape analysis at zero extra cost (see Tier-4 #21) |
-| 26 | **Rematerialization** | recompute a cheap value instead of spilling it | spill-heavy functions |
+| 26 | **Rematerialization** ✅ **DONE (guarded, off—box-pending)** | recompute a pure OPERAND-FREE value (`Copy(Imm)` / `Lea` / `FunAddr` / `LabelAddr`) at its use instead of spilling it. Theorem `⟦f⟧=⟦remat f⟧`: an operand-free pure def is a function of nothing ⟹ its value is identical at every point ⟹ cloning it before a use is a `⟦·⟧`-identity (`equiv`, mac). Fires ONLY on a temp live at a point of GP pressure ≥ k (a spill victim) ⟹ trades {store + N reloads} for {N cheap recomputes} — the CbC-pure slice of the register-allocation gap the QBE cross-check named (Belady spill stays below the purity line) | spill-heavy functions; the pressured `&local`/constant |
 | 27 | **Block layout / branch alignment** | order blocks so the hot path falls through | I-cache + branch prediction |
 
 ## Tier 6 — research / beyond -O2 (out of current scope)

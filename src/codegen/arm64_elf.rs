@@ -2205,7 +2205,7 @@ pub fn emit_ir(ast: &Ast) -> String {
             crate::opt::inline(&ast.tt, &mut funcs, &caller_ok);
         }
         for f in funcs.iter_mut() {
-            crate::opt::optimize_ssa(&ast.tt, f, &passes);
+            crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k);
             debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
         }
     }

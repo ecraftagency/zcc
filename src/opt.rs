@@ -2285,7 +2285,47 @@ fn operands_avail(i: &Inst, avail: &[bool]) -> bool {
     u.iter().all(|&t| avail[t as usize])
 }
 
-pub fn licm(f: &mut IrFunc) -> u32 {
+/// Register-PRESSURE of a loop body = the max, over every program point in `body`, of the
+/// number of simultaneously-live GP (non-float) temps. This is the SCARCE resource the
+/// speed-positivity guard protects: the GP class has only `k` colours (AAPCS64 allocatable
+/// set, a Side-II constant threaded from the backend budget), so a point with pressure > k
+/// forces a spill. Computed by the standard backward live-set walk (the transfer function
+/// abi_alloc's crossing scan uses), each block seeded with live-out ∪ terminator-uses.
+fn loop_gp_pressure(tt: &TyTab, f: &IrFunc, lv: &Liveness, body: &HashSet<BlockId>) -> u32 {
+    let nt = f.temps.len();
+    let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
+    let gp_count = |live: &[bool]| (0..nt).filter(|&t| live[t] && !is_fp[t]).count() as u32;
+    let mut maxp = 0u32;
+    let mut buf = Vec::new();
+    for &bid in body {
+        let b = &f.blocks[bid as usize];
+        let mut live = lv.live_out[bid as usize].clone();
+        buf.clear();
+        term_uses(&b.term, &mut buf);
+        for &u in &buf {
+            live[u as usize] = true; // at block exit the terminator operands are live
+        }
+        maxp = maxp.max(gp_count(&live));
+        for i in b.insts.iter().rev() {
+            if let Some(d) = inst_def(i) {
+                live[d as usize] = false;
+            }
+            buf.clear();
+            inst_uses(i, &mut buf);
+            for &u in &buf {
+                live[u as usize] = true;
+            }
+            maxp = maxp.max(gp_count(&live));
+        }
+    }
+    maxp
+}
+
+/// `gp_k` = the GP colour budget (AAPCS64 allocatable count, the backend's `GP_BUDGET.k`),
+/// threaded in so the SPEED-POSITIVITY guard shares the ONE Side-II constant rather than
+/// duplicating it. Correctness (`⟦f⟧=⟦licm f⟧`) is independent of `gp_k`; it only caps how
+/// many invariants may be hoisted per loop (see the guard note inline).
+pub fn licm(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
     if !cfg_complete(f) {
         return 0; // computed goto ⟹ incomplete CFG ⟹ dominance/back-edges unsound
     }
@@ -2332,14 +2372,35 @@ pub fn licm(f: &mut IrFunc) -> u32 {
         if !has_candidate {
             continue;
         }
+        // SPEED-POSITIVITY GUARD — the mathematical fence that makes LICM ship-safe on a
+        // k-register machine. Correctness lives on one axis (the commuting square ⟦f⟧=⟦licm f⟧,
+        // still an identity because a partial hoist is a SUBSET of the proven hoist set); COST
+        // lives on the orthogonal axis this guard governs. Each hoist makes one value live
+        // ACROSS the whole body, so it can raise the live-count at any point by at most 1 ⟹
+        // post-hoist max GP pressure ≤ P + (#hoists). Capping #hoists at (k − P) keeps pressure
+        // ≤ k = the GP colour budget ⟹ the k-colouring survives ⟹ the allocator introduces NO
+        // new spill ⟹ each hoist strictly deletes (trip−1) dynamic ALU ops with ZERO added
+        // memory traffic ⟹ C_M strictly decreases. P is MEASURED (liveness); k is a Side-II ABI
+        // constant — no tuned weight anywhere. (Residual: P is SSA-pressure, a proxy for the
+        // post-φ-destruction allocator's pressure; the box A/B closes that gap before the
+        // default-ON flip — OPTIMIZATION-ROADMAP §"why proof-faster meets reality-slower".)
+        let lv = liveness(f);
+        let headroom = gp_k.saturating_sub(loop_gp_pressure(tt, f, &lv, &body));
+        if headroom == 0 {
+            continue; // loop already at/over budget — ANY hoist would spill; refuse (no regress)
+        }
         let ph = match ensure_preheader(f, header, &body) {
             Some(p) => p,
             None => continue,
         };
-        // Fixpoint hoist: each round moves the first newly-available invariant instruction
-        // and marks its (single) def available, so a dependent invariant becomes hoistable
-        // next round — and lands AFTER its producer in the preheader (dependency order kept).
+        // Fixpoint hoist, CAPPED at `headroom`: each round moves the first newly-available
+        // invariant instruction and marks its (single) def available, so a dependent invariant
+        // becomes hoistable next round — landing AFTER its producer (dependency order kept).
+        let mut here = 0u32;
         loop {
+            if here >= headroom {
+                break; // GP-pressure budget for this loop exhausted
+            }
             let mut found = None;
             'scan: for &bid in body.iter() {
                 for (ix, inst) in f.blocks[bid as usize].insts.iter().enumerate() {
@@ -2359,6 +2420,7 @@ pub fn licm(f: &mut IrFunc) -> u32 {
             }
             f.blocks[ph as usize].insts.push(inst);
             hoisted += 1;
+            here += 1;
         }
     }
     hoisted
@@ -2419,7 +2481,7 @@ fn tmp_times_imm(a: &Val, b: &Val, want: Tmp) -> Option<i64> {
     }
 }
 
-pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc) -> u32 {
+pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
     if !cfg_complete(f) {
         return 0; // computed goto ⟹ dominance/back-edges unsound (as LICM/GVN/SCCP)
     }
@@ -2444,6 +2506,19 @@ pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc) -> u32 {
             }
         }
         let body = natural_loop(f, tail, header);
+        // SPEED-POSITIVITY GUARD (same axis-split as LICM). The reduction trades a per-iter
+        // `mul` for a per-iter `add` (a win in the count model) but INSERTS an accumulator that
+        // is live across the loop: an added φ (`j₁`, live header→latch) + its latch step (`j₂`)
+        // ⟹ up to +2 GP values live across the body. If the body is already within 2 colours of
+        // the budget, that accumulator spills and the reload-per-iteration outweighs the
+        // mul→add saving (the exact 2026 regression). Refuse unless P + 2 ≤ k. Correctness is
+        // unaffected (⟦f⟧=⟦sr f⟧ holds whether or not a given loop is transformed).
+        {
+            let lv = liveness(f);
+            if loop_gp_pressure(tt, f, &lv, &body) + 2 > gp_k {
+                continue; // no register headroom for the accumulator φ ⟹ would spill
+            }
+        }
         // 1. BASIC INDUCTION VARIABLES from the header φ region: i₁ = φ(ext: i₀, tail: i₂)
         //    with i₂ = i₁ + c (constant c), integer, all single-def.
         let mut bivs: Vec<(Tmp, TypeId, Val, i64)> = Vec::new(); // (i₁, ty, i₀, step c)
@@ -2815,6 +2890,7 @@ pub struct Passes {
     pub ldst_pair: bool, // B4: backend adjacent load/store → ldp/stp pairing (arm64_elf)
     pub if_convert: bool, // B4: side-effect-free diamond → Select (csel); runs before out_of_ssa
     pub inline: bool,   // Tier-1 #5: whole-program depth-1 inlining (runs before to_ssa)
+    pub remat: bool,    // Tier-5 #26: rematerialize pure operand-free defs under pressure (last)
 }
 
 impl Default for Passes {
@@ -2835,6 +2911,7 @@ impl Default for Passes {
             ldst_pair: true, // B4: adjacent str/ldr → stp/ldp; static win, translation-validated
             if_convert: true, // B4: diamond → csel; proven (equiv), B1-licensed load speculation
             inline: true, // Tier-1 #5: β-reduction; proven (equiv) — measured on the bench before ship
+            remat: false, // Tier-5 #26: proven (equiv) but speed-gated on the box A/B (like licm/sr)
         }
     }
 }
@@ -2844,7 +2921,7 @@ impl Passes {
     /// at runtime the same effect is `ZCC_OPT_ON=licm` over the default profile.
     #[cfg(test)]
     pub fn all() -> Self {
-        Passes { licm: true, strength_reduce: true, ..Passes::default() }
+        Passes { licm: true, strength_reduce: true, remat: true, ..Passes::default() }
     }
     fn set(&mut self, name: &str, v: bool) {
         match name {
@@ -2863,6 +2940,7 @@ impl Passes {
             "ldst_pair" | "ldp" | "stp" | "pair" => self.ldst_pair = v,
             "if_convert" | "ifconv" | "csel" => self.if_convert = v,
             "inline" => self.inline = v,
+            "remat" => self.remat = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -3047,7 +3125,196 @@ pub fn if_convert(tt: &TyTab, f: &mut IrFunc) -> u32 {
     n
 }
 
-pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — REMATERIALIZATION (Tier-5 #26; the CbC-PURE slice of register allocation).
+//
+// The QBE cross-check named register allocation as zcc's real QBE-class gap, but its
+// Belady-spill core rides a tuned loop-weight ⟹ below the CbC-purity line (rejected). Remat
+// is the slice that IS a total theorem: a value whose definition is PURE and OPERAND-FREE —
+// a constant (`Copy(Imm)`), a frame/symbol/string address (`Lea`), a function/label address
+// (`FunAddr`/`LabelAddr`) — can be RECOMPUTED at any program point unconditionally, because
+// it depends on nothing (its availability is the whole-program constant `true`). So instead
+// of keeping it live across a high-pressure region — where the allocator must SPILL it
+// (store at def + reload per use, memory traffic) — we clone the 1–2-instruction recompute
+// right before each use and shorten its live range to ~zero.
+//
+// THEOREM (CbC): `⟦f⟧ = ⟦remat(f)⟧`. A pure operand-free instruction `D` computes a value
+// that is a function of NOTHING (no temp, no memory) ⟹ its result is identical at every
+// program point ⟹ replacing a use of `t=D` by a use of a fresh `t'=D` cloned immediately
+// before it is a ⟦·⟧-identity (Law-1 Side-I: ⟦·⟧ is a function of the operands, here empty).
+// The original def, now useless, is dropped (mark-sweep in one shot). Validated by `equiv`
+// over the structural corpus (commuting square) — see `remat_*` tests.
+//
+// SPEED (the orthogonal axis, Law 3 — MEASURED, not asserted): remat fires ONLY on a temp
+// live at some point of GP pressure ≥ k (exactly the temps the k-colouring must spill). It
+// trades {store + N reloads} for {N recomputes of a 1–2-inst value} and frees a register
+// across the span ⟹ statically fewer memory ops. Default-OFF until the box A/B confirms the
+// win on the real allocator (the SSA/backend-pressure proxy gap, same residual as LICM).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A def that can be recomputed anywhere: PURE and OPERAND-FREE (no temp/memory input, so
+/// available unconditionally). `Place` is `Local|Global|Str` — all operand-free — so every
+/// `Lea` qualifies; `inst_uses`-empty is asserted belt-and-suspenders.
+fn rematerializable(i: &Inst) -> bool {
+    let mut u = Vec::new();
+    inst_uses(i, &mut u);
+    u.is_empty()
+        && matches!(
+            i,
+            Inst::Copy(_, _, Val::Imm(_)) | Inst::Lea(..) | Inst::FunAddr(..) | Inst::LabelAddr(..)
+        )
+}
+
+pub fn remat(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
+    let nt = f.temps.len();
+    // 1. Per temp: def count + (if rematerializable) a clone of its defining instruction.
+    let mut defcnt = vec![0u32; nt];
+    let mut def_inst: Vec<Option<Inst>> = vec![None; nt];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = inst_def(i) {
+                defcnt[d as usize] += 1;
+                if rematerializable(i) {
+                    def_inst[d as usize] = Some(i.clone());
+                }
+            }
+        }
+    }
+    // 2. Under-pressure set: temps live at any point with GP pressure ≥ k (the spill victims).
+    //    Backward live-set walk; at each point of pressure ≥ k, mark every live GP temp.
+    let lv = liveness(f);
+    let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
+    let gp = |live: &[bool]| (0..nt).filter(|&t| live[t] && !is_fp[t]).count() as u32;
+    let mut pressured = vec![false; nt];
+    let mark = |live: &[bool], pr: &mut [bool]| {
+        if gp(live) >= gp_k {
+            for t in 0..nt {
+                if live[t] && !is_fp[t] {
+                    pr[t] = true;
+                }
+            }
+        }
+    };
+    let mut buf = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let mut live = lv.live_out[bi].clone();
+        buf.clear();
+        term_uses(&b.term, &mut buf);
+        for &u in &buf {
+            live[u as usize] = true;
+        }
+        mark(&live, &mut pressured);
+        for i in b.insts.iter().rev() {
+            if let Some(d) = inst_def(i) {
+                live[d as usize] = false;
+            }
+            buf.clear();
+            inst_uses(i, &mut buf);
+            for &u in &buf {
+                live[u as usize] = true;
+            }
+            mark(&live, &mut pressured);
+        }
+    }
+    // 3. Targets = single-def ∧ rematerializable ∧ under pressure.
+    let target: Vec<bool> =
+        (0..nt).map(|t| defcnt[t] == 1 && def_inst[t].is_some() && pressured[t]).collect();
+    if !target.iter().any(|&b| b) {
+        return 0;
+    }
+    // 4. Clone the def before each USE (fresh temp), redirect that use, drop the dead original.
+    //    A target's own def is operand-free ⟹ dropping it never orphans another use.
+    let mut count = 0u32;
+    for bi in 0..f.blocks.len() {
+        let old = std::mem::take(&mut f.blocks[bi].insts);
+        let mut out: Vec<Inst> = Vec::with_capacity(old.len());
+        for mut inst in old {
+            let fresh = clone_remats_before(f, &mut inst, &def_inst, &target, &mut out);
+            count += fresh;
+            if let Some(d) = inst_def(&inst) {
+                if target[d as usize] {
+                    continue; // the original def is now dead — drop it
+                }
+            }
+            out.push(inst);
+        }
+        // The terminator may also use a target (e.g. Ret(Tmp)): materialize before it.
+        let mut term = std::mem::replace(&mut f.blocks[bi].term, Term::Ret(None));
+        count += clone_remats_before_term(f, &mut term, &def_inst, &target, &mut out);
+        f.blocks[bi].insts = out;
+        f.blocks[bi].term = term;
+    }
+    count
+}
+
+/// For each target temp USED by `inst`, push a fresh clone of its def to `out` and rewrite
+/// the use to the clone (a temp used twice reuses one clone). Returns the clone count.
+fn clone_remats_before(
+    f: &mut IrFunc,
+    inst: &mut Inst,
+    def_inst: &[Option<Inst>],
+    target: &[bool],
+    out: &mut Vec<Inst>,
+) -> u32 {
+    let mut uses = Vec::new();
+    inst_uses(inst, &mut uses);
+    let mut map: Vec<(Tmp, Tmp)> = Vec::new();
+    for &t in &uses {
+        if !target[t as usize] || map.iter().any(|&(o, _)| o == t) {
+            continue;
+        }
+        let ty = f.temps[t as usize];
+        let fresh = f.temps.len() as Tmp;
+        f.temps.push(ty);
+        let mut clone = def_inst[t as usize].clone().unwrap();
+        each_def_mut(&mut clone, |d| *d = fresh);
+        out.push(clone);
+        map.push((t, fresh));
+    }
+    each_use_mut(inst, |v| {
+        if let Val::Tmp(t) = v
+            && let Some(&(_, fr)) = map.iter().find(|&&(o, _)| o == *t)
+        {
+            *t = fr;
+        }
+    });
+    map.len() as u32
+}
+
+/// Terminator variant of `clone_remats_before`.
+fn clone_remats_before_term(
+    f: &mut IrFunc,
+    term: &mut Term,
+    def_inst: &[Option<Inst>],
+    target: &[bool],
+    out: &mut Vec<Inst>,
+) -> u32 {
+    let mut uses = Vec::new();
+    term_uses(term, &mut uses);
+    let mut map: Vec<(Tmp, Tmp)> = Vec::new();
+    for &t in &uses {
+        if !target[t as usize] || map.iter().any(|&(o, _)| o == t) {
+            continue;
+        }
+        let ty = f.temps[t as usize];
+        let fresh = f.temps.len() as Tmp;
+        f.temps.push(ty);
+        let mut clone = def_inst[t as usize].clone().unwrap();
+        each_def_mut(&mut clone, |d| *d = fresh);
+        out.push(clone);
+        map.push((t, fresh));
+    }
+    each_use_term_mut(term, |v| {
+        if let Val::Tmp(t) = v
+            && let Some(&(_, fr)) = map.iter().find(|&&(o, _)| o == *t)
+        {
+            *t = fr;
+        }
+    });
+    map.len() as u32
+}
+
+pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
     to_ssa(tt, f);
     for _ in 0..32 {
         let mut n = 0;
@@ -3076,10 +3343,10 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
             n += cfg_simplify(f); // collapse the straight lines / dead blocks SCCP exposed
         }
         if p.licm {
-            n += licm(f); // hoist loop-invariant pure arithmetic to the preheader
+            n += licm(tt, f, gp_k); // hoist loop-invariant pure arithmetic (pressure-guarded)
         }
         if p.strength_reduce {
-            n += strength_reduce(tt, f); // i·d in a loop → add-accumulator φ (mul → add)
+            n += strength_reduce(tt, f, gp_k); // i·d → add-accumulator φ (pressure-guarded)
         }
         if n == 0 {
             break; // fixpoint
@@ -3096,6 +3363,11 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes) {
     }
     out_of_ssa(f); // φ → edge copies (swap/critical-edge safe) → executable IR
     optimize(tt, f); // the proven non-SSA cleanup (folds the φ-destruction copies)
+    if p.remat {
+        // LAST IR touch (nothing runs after ⟹ no CSE re-merges the clones): shorten the live
+        // ranges of pure operand-free values the allocator would otherwise spill. #26.
+        remat(tt, f, gp_k);
+    }
 }
 
 #[cfg(test)]
@@ -3104,6 +3376,12 @@ mod tests {
     use crate::ast::{TyTab, INT};
     use crate::ir::tests::{compile, equiv, interp, mk};
     use crate::ir::{verify, Block};
+
+    // The GP colour budget the shipped backend allocates against (arm64_elf `GP_BUDGET.k`).
+    // The commuting-square proofs are k-INDEPENDENT (a partial hoist is a subset of the proven
+    // hoist set), so the ⟦·⟧ tests pass this real value; the pressure-guard's teeth are proven
+    // separately with a tiny k that FORCES the cap to bite.
+    const GP_K: u32 = 10;
 
     fn count_calls(f: &IrFunc) -> usize {
         f.blocks.iter().flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Call(..))).count()
@@ -4154,7 +4432,7 @@ mod tests {
         );
         let mut ssa = ir.clone();
         for f in ssa.iter_mut() {
-            optimize_ssa(&ast.tt, f, &Passes::all());
+            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
         }
         for f in &ssa {
             verify(f).unwrap();
@@ -4721,7 +4999,7 @@ mod tests {
             }
             let mut opt = ssa.clone();
             for f in opt.iter_mut() {
-                licm(f);
+                licm(&ast.tt, f, GP_K);
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify licm {src}: {e}"));
@@ -4752,7 +5030,7 @@ mod tests {
         let mut opt = ssa.clone();
         let mut n = 0u32;
         for f in opt.iter_mut() {
-            n += licm(f);
+            n += licm(&ast.tt, f, GP_K);
         }
         for f in &opt {
             verify(f).unwrap();
@@ -4778,7 +5056,7 @@ mod tests {
         let mut ssa = ir[0].clone();
         to_ssa(&ast.tt, &mut ssa);
         let mut opt = ssa.clone();
-        licm(&mut opt);
+        licm(&ast.tt, &mut opt, GP_K);
         verify(&opt).unwrap();
         let base = vec![ssa];
         equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("variant must be preserved");
@@ -4801,7 +5079,7 @@ mod tests {
         // Full pipeline (the real backend path).
         let mut opt = ir.clone();
         for f in opt.iter_mut() {
-            optimize_ssa(&ast.tt, f, &Passes::all());
+            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
         }
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify: {e}"));
@@ -4857,7 +5135,7 @@ mod tests {
         let mut ssa = ir[0].clone();
         to_ssa(&ast.tt, &mut ssa);
         let mut opt = ssa.clone();
-        assert!(licm(&mut opt) > 0, "licm must fire (precondition for the teeth)");
+        assert!(licm(&ast.tt, &mut opt, GP_K) > 0, "licm must fire (precondition for the teeth)");
         verify(&opt).unwrap();
         let base = vec![ssa];
         equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("identity: licm preserves ⟦·⟧");
@@ -4878,6 +5156,154 @@ mod tests {
             equiv(&ast.tt, &base, &vec![bad], "f").is_err(),
             "a Mul→Add mutation of the hoisted invariant MUST be caught (else the gate is blind)"
         );
+    }
+
+    // ── SPEED-POSITIVITY GUARD — teeth on the COST axis ──────────────────────
+    // The regression that kept LICM default-OFF was register pressure: a hoist that lifts
+    // pressure past the k GP colours forces a spill whose per-iteration reload outweighs the
+    // saved recomputation. This test proves the guard actually BITES: on the exact nested-loop
+    // shape where `i*7` is hoistable, a budget of k=1 (any real loop is already ≥1-pressured ⟹
+    // zero headroom) refuses EVERY hoist, while the true budget k=10 hoists it — and, crucially,
+    // ⟦·⟧ is identical either way (a refused hoist is still a subset of the proven hoist set, so
+    // correctness never depended on the guard). This is the "prove speed-positive BEFORE ship"
+    // obligation discharged mechanically: LICM ships only where P + hoists ≤ k, i.e. no spill.
+    #[test]
+    fn licm_pressure_guard_caps() {
+        let src =
+            "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){int j;for(j=0;j<n;j=j+1){s=s+i*7;}}return s;}";
+        let (ast, ir) = compile("licmg", src);
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        let base = vec![ssa.clone()];
+
+        // k = 1: zero headroom (the inner loop is already pressured) ⟹ NO hoist.
+        let mut capped = ssa.clone();
+        let hc = licm(&ast.tt, &mut capped, 1);
+        assert_eq!(hc, 0, "k=1 must leave the loop at/over budget ⟹ refuse all hoists");
+        verify(&capped).unwrap();
+        equiv(&ast.tt, &base, &vec![capped], "f").expect("a refused hoist still preserves ⟦·⟧");
+
+        // k = 10 (the real GP budget): the invariant fits under budget ⟹ it IS hoisted.
+        let mut open = ssa.clone();
+        let ho = licm(&ast.tt, &mut open, GP_K);
+        assert!(ho > 0, "k=10 has headroom ⟹ i*7 must hoist (the guard is not vacuously off)");
+        verify(&open).unwrap();
+        equiv(&ast.tt, &base, &vec![open.clone()], "f").expect("a permitted hoist preserves ⟦·⟧");
+        assert_eq!(interp(&ast.tt, &vec![open], "f", &[3]).unwrap(), 63);
+    }
+
+    // The same teeth for strength reduction: its accumulator φ needs ≥2 GP colours of headroom,
+    // so k=1 refuses the reduction (the multiply stays), k=10 performs it — ⟦·⟧ identical.
+    #[test]
+    fn strength_reduce_pressure_guard_caps() {
+        let (ast, ir) =
+            compile("srg", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){s=s+i*7;}return s;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        copy_prop(&mut ssa); // ENABLING pass (see strength_reduce_fires)
+        let base = vec![ssa.clone()];
+
+        let mut capped = ssa.clone();
+        assert_eq!(strength_reduce(&ast.tt, &mut capped, 1), 0, "k=1 ⟹ no headroom for the accumulator φ");
+        verify(&capped).unwrap();
+        equiv(&ast.tt, &base, &vec![capped], "f").expect("refused SR preserves ⟦·⟧");
+
+        let mut open = ssa.clone();
+        assert!(strength_reduce(&ast.tt, &mut open, GP_K) > 0, "k=10 ⟹ SR fires");
+        verify(&open).unwrap();
+        equiv(&ast.tt, &base, &vec![open.clone()], "f").expect("permitted SR preserves ⟦·⟧");
+        assert_eq!(interp(&ast.tt, &vec![open], "f", &[4]).unwrap(), 42);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // REMATERIALIZATION (Tier-5 #26) — ⟦f⟧=⟦remat(f)⟧ + the pressure guard.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // A `&local` address (Lea, operand-free) is computed once and used at BOTH ends of a
+    // pressured region. remat must recompute it at each use (shortening its live range to
+    // ~0) and delete the single original — value preserved. The parametric budget proves
+    // BOTH directions: k=2 (the region is ≥2-pressured) fires; k=100 (never pressured)
+    // refuses. This is the CbC-pure slice of register allocation (no tuned weight anywhere).
+    #[test]
+    fn remat_recomputes_pressured_address() {
+        let tt = TyTab::new();
+        // f(n): scratch=7; return ((n+1)+(n+2))+(n+3)+scratch, read through &scratch (t0).
+        let build = || {
+            mk(
+                "f",
+                vec![ULONG, ULONG, INT, INT, INT, INT, INT, INT, INT, INT],
+                vec![(16, INT)],
+                32,
+                INT,
+                vec![Block {
+                    insts: vec![
+                        Inst::Lea(0, Place::Local(24)),           // t0 = &scratch (REMAT target)
+                        Inst::Store(INT, Val::Tmp(0), Val::Imm(7)), // scratch = 7  (use #1 of t0)
+                        Inst::Lea(1, Place::Local(16)),
+                        Inst::Load(2, INT, Val::Tmp(1)),          // t2 = n
+                        Inst::Bin(3, Op::Add, INT, Val::Tmp(2), Val::Imm(1)),
+                        Inst::Bin(4, Op::Add, INT, Val::Tmp(2), Val::Imm(2)),
+                        Inst::Bin(5, Op::Add, INT, Val::Tmp(2), Val::Imm(3)),
+                        Inst::Bin(6, Op::Add, INT, Val::Tmp(3), Val::Tmp(4)),
+                        Inst::Bin(7, Op::Add, INT, Val::Tmp(6), Val::Tmp(5)),
+                        Inst::Load(8, INT, Val::Tmp(0)),          // t8 = scratch (use #2 of t0)
+                        Inst::Bin(9, Op::Add, INT, Val::Tmp(7), Val::Tmp(8)),
+                    ],
+                    term: Term::Ret(Some(Val::Tmp(9))),
+                }],
+            )
+        };
+        let base = vec![build()];
+        verify(&base[0]).expect("well-formed");
+        // n=1: ((2)+(3))+4+7 = 16.
+        assert_eq!(interp(&tt, &base, "f", &[1]).unwrap(), 16);
+
+        // k=3: only &scratch (t0) is live across the ≥3-pressured middle region (the short-lived
+        // &n dies before it) ⟹ remat fires on t0 alone (2 uses → 2 clones).
+        let mut fired = build();
+        let n = remat(&tt, &mut fired, 3);
+        assert_eq!(n, 2, "both uses of the pressured address must be rematerialized");
+        verify(&fired).expect("remat output verifies");
+        let leas = fired.blocks[0].insts.iter().filter(|i| matches!(i, Inst::Lea(_, Place::Local(24)))).count();
+        assert_eq!(leas, 2, "the single original &scratch became two use-local recomputes");
+        equiv(&tt, &base, &vec![fired.clone()], "f").expect("remat preserves ⟦·⟧");
+        assert_eq!(interp(&tt, &vec![fired], "f", &[1]).unwrap(), 16);
+
+        // k=100: no point reaches pressure 100 ⟹ remat refuses (nothing to relieve).
+        let mut idle = build();
+        assert_eq!(remat(&tt, &mut idle, 100), 0, "no pressure ⟹ no remat");
+    }
+
+    // Teeth on the COST axis: remat must ONLY touch operand-free defs. A value with a temp
+    // operand (`n+1`) is NOT rematerializable (its operand may not be available at the use),
+    // so even under crushing pressure (k=1) remat must leave every arithmetic temp intact and
+    // only relieve the address — proving `rematerializable` is not over-firing.
+    #[test]
+    fn remat_refuses_operand_bearing_defs() {
+        let tt = TyTab::new();
+        let f0 = mk(
+            "g",
+            vec![ULONG, ULONG, INT, INT, INT],
+            vec![(16, INT)],
+            32,
+            INT,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Local(16)),
+                    Inst::Load(1, INT, Val::Tmp(0)),      // t1 = n (operand-bearing Load)
+                    Inst::Bin(2, Op::Add, INT, Val::Tmp(1), Val::Imm(1)), // t2 (operand-bearing)
+                    Inst::Bin(3, Op::Add, INT, Val::Tmp(1), Val::Tmp(2)),
+                    Inst::Bin(4, Op::Add, INT, Val::Tmp(3), Val::Tmp(2)),
+                ],
+                term: Term::Ret(Some(Val::Tmp(4))),
+            }],
+        );
+        let base = vec![f0.clone()];
+        let mut got = f0;
+        remat(&tt, &mut got, 1); // k=1 ⟹ everything is "under pressure", but nothing is operand-free
+        // No Load/Add was cloned: instruction count unchanged (only operand-free defs remat).
+        assert_eq!(got.blocks[0].insts.len(), base[0].blocks[0].insts.len(), "no operand-bearing clone");
+        equiv(&tt, &base, &vec![got], "g").expect("remat is a no-op on operand-bearing defs");
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -4902,7 +5328,7 @@ mod tests {
             }
             let mut opt = ssa.clone();
             for f in opt.iter_mut() {
-                strength_reduce(&ast.tt, f);
+                strength_reduce(&ast.tt, f, GP_K);
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify sr {src}: {e}"));
@@ -4934,7 +5360,7 @@ mod tests {
         copy_prop(&mut ssa); // ENABLING pass — collapse the mem2reg copies onto the φ
         let phis_before = phi_count(&ssa);
         let mut opt = ssa.clone();
-        let n = strength_reduce(&ast.tt, &mut opt);
+        let n = strength_reduce(&ast.tt, &mut opt, GP_K);
         verify(&opt).unwrap();
         assert!(n > 0, "strength_reduce must fire on i*7 (a derived induction variable)");
         assert!(
@@ -4957,7 +5383,7 @@ mod tests {
             compile("srp", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){s=s+i*3;}return s;}");
         let mut opt = ir.clone();
         for f in opt.iter_mut() {
-            optimize_ssa(&ast.tt, f, &Passes::all());
+            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
         }
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify: {e}"));
@@ -4977,7 +5403,7 @@ mod tests {
         to_ssa(&ast.tt, &mut ssa);
         copy_prop(&mut ssa); // ENABLING pass (see strength_reduce_fires)
         let mut opt = ssa.clone();
-        assert!(strength_reduce(&ast.tt, &mut opt) > 0, "must fire (precondition for teeth)");
+        assert!(strength_reduce(&ast.tt, &mut opt, GP_K) > 0, "must fire (precondition for teeth)");
         verify(&opt).unwrap();
         let base = vec![ssa];
         equiv(&ast.tt, &base, &vec![opt.clone()], "f").expect("identity: sr preserves ⟦·⟧");
@@ -5017,7 +5443,7 @@ mod tests {
             let (ast, ir) = compile("pipe", src);
             let mut opt = ir.clone();
             for f in opt.iter_mut() {
-                optimize_ssa(&ast.tt, f, &Passes::all());
+                optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify optimize_ssa {src}: {e}"));
@@ -5049,7 +5475,7 @@ mod tests {
             let before = count_insts(&ir);
             let mut opt = ir.clone();
             for f in opt.iter_mut() {
-                optimize_ssa(&ast.tt, f, &Passes::all());
+                optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify {nm}: {e}"));
