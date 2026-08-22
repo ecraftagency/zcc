@@ -32,17 +32,17 @@ use std::fmt::Write;
 // SPEC-TABLE side of the pass (the algorithm lives in opt.rs): a color index maps to a
 // physical register here. A color ≥ ncaller is callee-saved ⟹ obliges a prologue/
 // epilogue save/restore.
-//   GP: NO caller-saved register is free — the emitter's scratch set spans x0–x15 across
-//   BOTH arm64_elf.rs AND ext.rs (overflow_emit uses x14/x15), x16–x18 are ABI-reserved
-//   — so the GP pool is exactly the callee-saved file x19–x28 (ncaller=0). (Measured the
-//   hard way: pr64006 hung when x14/x15 were pooled — ext.rs was outside the first grep.)
 //   FP: caller-saved v16–v31 then callee-saved v8–v15 (only d8–d15 preserved across a bl).
-// GP allocation budgets. §3 keystone: the emitter's fixed scratch that clobbers x10–x15 lives
-// ONLY in three body instructions — Overflow (ext.rs), Sync, VaArg (+ the prologue struct-copy,
-// which runs before any home is live). A function free of those three can therefore use x10–x15
-// as 6 CALLER-saved homes (WIDE); a function containing one falls back to NARROW (x19–x28 only).
-// x10–x15 are not argument registers, so opening them adds no call-marshalling shuffle hazard,
-// and color_abi's crossing[] already confines any call-crossing temp to the callee-saved band.
+// GP allocation budgets — §3 keystone (the caller/callee split). The hazard that once forced
+// ncaller=0 is now precisely scoped: the emitter's fixed scratch that CLOBBERS x10–x15 lives in
+// exactly three body instructions — Overflow (ext.rs overflow_emit uses x14/x15), Sync, VaArg
+// (+ the prologue struct-copy, which runs before any home is live). This is the same clobber
+// that hung pr64006 when x14/x15 were pooled blindly (ext.rs was outside the first grep) — but
+// the cure is to gate on it, not to abandon the whole caller-saved file. A function FREE of
+// those three therefore uses x10–x15 as 6 CALLER-saved homes (WIDE, ncaller=6); a function
+// containing one falls back to NARROW (x19–x28 only, ncaller=0). x10–x15 are not argument
+// registers, so opening them adds no call-marshalling shuffle hazard, and color_abi's crossing[]
+// already confines any call-crossing temp to the callee-saved band.
 const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0 }; // NARROW: x19–x28
 const GP_BUDGET_WIDE: ClassBudget = ClassBudget { k: 16, ncaller: 6 }; // WIDE: x10–x15 | x19–x28
 const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16 };
@@ -3315,7 +3315,7 @@ mod tests {
         assert_eq!(count(&out, "mov x0, x24"), 1, "unknown insn ⟹ flush ⟹ keep the reload");
     }
 
-    // Chained equivalence: x0≡x24≡x0 across a 3-hop still resolves; a genuinely distinct
+    // Round-trip `mov x24,x0; mov x0,x24` is redundant and dropped; a genuinely distinct
     // move (different value) is preserved.
     #[test]
     fn peephole_preserves_distinct_move() {
