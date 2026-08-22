@@ -59,6 +59,49 @@ fn fp_phys(idx: u32) -> u32 {
     if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
 }
 
+// Side-II: ARMv8 logical-immediate encoding (`and/orr/eor #imm`). A 64-bit value is
+// encodable iff it is a rotation of a run of `ones` set bits (0<ones<size) within a
+// power-of-two element `size ∈ {2,4,8,16,32,64}`, replicated across the register. Neither
+// all-zeros nor all-ones is encodable. We always emit the x-form ⟹ check over 64 bits.
+fn is_logical_imm(val: u64) -> bool {
+    if val == 0 || val == u64::MAX {
+        return false;
+    }
+    let mut size = 2u32;
+    while size <= 64 {
+        let mask = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+        let elem = val & mask;
+        // val must be `elem` replicated every `size` bits
+        let mut replicated = true;
+        let mut s = size;
+        while s < 64 {
+            if (val >> s) & mask != elem {
+                replicated = false;
+                break;
+            }
+            s += size;
+        }
+        if replicated {
+            let ones = elem.count_ones();
+            if ones == 0 || ones == size {
+                return false; // degenerate at this (smallest) element ⟹ not encodable
+            }
+            // elem must be a rotation of the contiguous low-ones pattern (2^ones − 1)
+            let target = (1u64 << ones) - 1;
+            let mut rot = elem;
+            for _ in 0..size {
+                if rot == target {
+                    return true;
+                }
+                rot = ((rot >> 1) | (rot << (size - 1))) & mask; // rotate-right within `size`
+            }
+            return false;
+        }
+        size <<= 1;
+    }
+    false
+}
+
 const EPILOGUE: &str = "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n";
 
 struct Cg<'a> {
@@ -1317,6 +1360,74 @@ impl<'a> Cg<'a> {
         }
     }
 
+    // Fold a constant right operand into the instruction's immediate field (§4 instruction
+    // selection). Returns true and emits `op x{rd}, x{ra}, #imm` (byte-equivalent to the
+    // `mov x{scratch},#k; op x{rd},x{ra},x{scratch}` form, since imm() would load exactly #k)
+    // when the constant is encodable; false ⟹ caller materializes the operand and falls back
+    // to the register form. Handles: relational compares (cmp/cmn imm12 + cset), shifts
+    // (imm6), and logical and/orr/eor (ARM bitmask immediate). Add/Sub are handled earlier.
+    fn try_bin_imm(&mut self, op: Op, ct: TypeId, rd: u32, ra: u32, b: Val) -> bool {
+        let Val::Imm(k) = b else { return false };
+        let u = self.a.tt.is_unsigned(ct);
+        let is4 = self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4;
+        match op {
+            Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
+                // cmp x,#k for 0..4095; cmn x,#m (= cmp against −m) for −4095..0. Both set the
+                // NZCV of x−k identically to `cmp x,xK`, so every signed/unsigned cond holds.
+                let (mnem, mag) = if (0..4096).contains(&k) {
+                    ("cmp", k as u64)
+                } else if (-4095..=0).contains(&k) {
+                    ("cmn", (-k) as u64)
+                } else {
+                    return false;
+                };
+                let cond = match (op, u) {
+                    (Op::Eq, _) => "eq", (Op::Ne, _) => "ne",
+                    (Op::Lt, true) => "lo", (Op::Lt, false) => "lt",
+                    (Op::Le, true) => "ls", (Op::Le, false) => "le",
+                    (Op::Gt, true) => "hi", (Op::Gt, false) => "gt",
+                    (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
+                    _ => unreachable!(),
+                };
+                _ = writeln!(self.s, "\t{mnem} x{ra}, #{mag}\n\tcset x{rd}, {cond}");
+                true // 0/1 result, no ext
+            }
+            Op::Shl | Op::Shr => {
+                if !(0..64).contains(&k) {
+                    return false;
+                }
+                let mnem = match op {
+                    Op::Shl => "lsl",
+                    Op::Shr if u => "lsr",
+                    _ => "asr",
+                };
+                _ = writeln!(self.s, "\t{mnem} x{rd}, x{ra}, #{k}");
+                if is4 {
+                    self.ext_r(rd, ct);
+                }
+                true
+            }
+            Op::And | Op::Or | Op::Xor => {
+                if !is_logical_imm(k as u64) {
+                    return false;
+                }
+                let mnem = match op {
+                    Op::And => "and",
+                    Op::Or => "orr",
+                    _ => "eor",
+                };
+                // print the 64-bit pattern (k may be negative); the register form would have
+                // loaded exactly this pattern via imm(), so the fold is byte-equivalent.
+                _ = writeln!(self.s, "\t{mnem} x{rd}, x{ra}, #{}", k as u64);
+                if is4 {
+                    self.ext_r(rd, ct);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     // Canonicalize the return value (x0) per self.fret, then place it in the ABI register
     // (a copy of Node::Ret; uses self.fret/self.fsret set by emit_ir).
     fn ir_ret_conv(&mut self) {
@@ -1830,9 +1941,16 @@ impl<'a> Cg<'a> {
                     // spilled, rd=0 (x0) and the result is stored after; a/b are already
                     // consumed into their own scratch/home so x0-as-rd cannot clobber them.
                     let ra = self.src_gp(*a, 0);
-                    let rb = self.src_gp(*b, 1);
                     let rd = self.gp_home(*d).unwrap_or(0);
-                    self.ir_bin_r(*op, *ty, rd, ra, rb);
+                    // Immediate-operand instruction-selection fold (§4): a compare/shift/logical
+                    // with a constant right operand folds the constant into the instruction's
+                    // imm field instead of materializing it into a scratch (`mov x1,#k; op` →
+                    // `op …,#k`) — byte-equivalent since imm() would load exactly #k. Kills the
+                    // ~14k `mov xR,#N` that feed cmp/shift/bitmask. opt-parity certifies.
+                    if !self.try_bin_imm(*op, *ty, rd, ra, *b) {
+                        let rb = self.src_gp(*b, 1);
+                        self.ir_bin_r(*op, *ty, rd, ra, rb);
+                    }
                     if self.gp_home(*d).is_none() {
                         self.tmp_store(*d, "x0");
                     }
@@ -2919,10 +3037,30 @@ pub fn emit_ir(ast: &Ast) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{pair_ldst, peephole_moves};
+    use super::{is_logical_imm, pair_ldst, peephole_moves};
 
     fn count(s: &str, needle: &str) -> usize {
         s.lines().filter(|l| l.trim().starts_with(needle)).count()
+    }
+
+    // ARMv8 logical-immediate encodability (Side-II). Valid = rotation of a contiguous
+    // ones-run replicated at a power-of-two element size; all-0 / all-1 invalid.
+    #[test]
+    fn logical_imm_encoding() {
+        // valid patterns
+        assert!(is_logical_imm(0xFF)); // 8 low ones (size 64, ones 8)
+        assert!(is_logical_imm(0x1)); // single bit
+        assert!(is_logical_imm(0x8000_0000)); // single bit high
+        assert!(is_logical_imm(0xFFFF_FFFF_FFFF_FFFE)); // one zero bit (rotated run)
+        assert!(is_logical_imm(0xF0F0_F0F0_F0F0_F0F0)); // element size 8, replicated
+        assert!(is_logical_imm(0x5555_5555_5555_5555)); // element size 2, replicated
+        assert!(is_logical_imm(0xFFFF_0000_FFFF_0000)); // element size 32
+        assert!(is_logical_imm(0x0000_FFFF_0000_FFFF));
+        // invalid patterns
+        assert!(!is_logical_imm(0)); // all zeros
+        assert!(!is_logical_imm(u64::MAX)); // all ones
+        assert!(!is_logical_imm(0x3 | 0x18)); // 0b11011 — two runs, not a single rotated run
+        assert!(!is_logical_imm(0xFF00_FF00_FF00_0000)); // not uniformly replicated
     }
 
     // B4 ldp/stp — the callee-save slab pattern: consecutive same-base 8-byte stores fuse.
