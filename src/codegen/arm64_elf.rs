@@ -2022,18 +2022,21 @@ impl<'a> Cg<'a> {
             // on the predecessor edges before codegen. Reaching the backend = a bug.
             Inst::Phi(..) => unreachable!("Inst::Phi must be eliminated by out_of_ssa before codegen"),
             Inst::Copy(d, _ty, a) => {
-                // Compute-into-home: move a's home straight into d's home (ONE mov) instead
-                // of the x0 double-funnel (`mov x0,aHome; mov dHome,x0`). When the allocator
-                // coalesced d and a to the SAME register the copy is a no-op and is elided
-                // (rd==ra). src_gp loads a spilled/imm/FP `a` into x0 first (ra=0), and the
-                // spilled-`d` path stores from x0 — so both are byte-identical to the old
-                // `ld_val a,x0; tmp_store d,x0`. Pressure-free; validated by opt-parity.
-                let ra = self.src_gp(*a, 0);
-                let rd = self.gp_home(*d).unwrap_or(0);
-                if rd != ra {
-                    _ = writeln!(self.s, "\tmov x{rd}, x{ra}");
-                }
-                if self.gp_home(*d).is_none() {
+                // Compute-into-home, funnel-free. When d is GP-homed, materialize `a` DIRECTLY
+                // into d's home: an Imm becomes `mov dHome,#k` (not `mov x0,#k; mov dHome,x0`),
+                // a spilled/global `a` loads straight into dHome, and a GP-homed `a` becomes the
+                // single `mov dHome,aHome` (elided when the allocator coalesced d≡a). The spilled/
+                // FP-destination path keeps the exact x0 funnel — byte-identical to the -O0
+                // all-spill baseline (gp_home(d)=None ⟹ this arm), so ⟦all-spill⟧=⟦opt⟧ (opt-parity).
+                if let Some(rd) = self.gp_home(*d) {
+                    if !matches!(a, Val::Tmp(t) if self.gp_home(*t) == Some(rd)) {
+                        self.ld_val(*a, &format!("x{rd}"));
+                    }
+                } else {
+                    let ra = self.src_gp(*a, 0);
+                    if ra != 0 {
+                        _ = writeln!(self.s, "\tmov x0, x{ra}");
+                    }
                     self.tmp_store(*d, "x0");
                 }
             }
