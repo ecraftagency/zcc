@@ -98,11 +98,6 @@ struct P<'a> {
     // re-parse in the prologue after setup_params (parameters are now locals). Drained on
     // entering a funcdef; cleared for a non-definition.
     param_vla_dims: Vec<(usize, usize)>,
-    // [tok_lo, tok_hi) token span of each function DEFINITION (return type + params + body),
-    // recorded in `program()`. Used to attribute each `volatile` token: inside a span ⟹ that
-    // function is O0; outside every span ⟹ file-scope ⟹ Ast::has_global_volatile. (Per-function
-    // opt gate, C99 6.7.3.)
-    fn_tok_spans: Vec<(usize, usize)>,
     // currently parsing a parameter list (counted because of nesting): a non-constant
     // parameter-array size (glibc regex.h `__pmatch[__nmatch]` — __nmatch is a PRIOR
     // parameter, not in scope) → skip the expr; the parameter decays to a pointer, so the
@@ -434,14 +429,18 @@ impl P<'_> {
         let (mut base, mut direct) = (None::<&str>, None::<TypeId>);
         let (mut uns, mut sgn, mut short, mut longs, mut any) = (false, false, false, 0u32, false);
         let mut cplx = false; // C99: _Complex
+        let mut vol = false; // C99 6.7.3: a `volatile` qualifier in this specifier-list
         loop {
             let n = match self.toks.get(self.pos) {
                 Some(Tok::Ident(n)) => n.as_str(),
                 _ => break,
             };
             match n {
-                "const" | "volatile" | "auto" | "register" | "restrict" | "__restrict"
-                | "__restrict__" | "__extension__" | "__volatile" | "__volatile__" | "__const"
+                // C99 6.7.3 — volatile is captured (it changes access semantics);
+                // the other qualifiers stay no-ops at this ABI.
+                "volatile" | "__volatile" | "__volatile__" => vol = true,
+                "const" | "auto" | "register" | "restrict" | "__restrict"
+                | "__restrict__" | "__extension__" | "__const"
                 | "__const__" | "_Noreturn" => {}
                 // EXT(gcc): real __thread TLS (Mach-O @TLVP) — required by the redis-tests
                 // io-threads>=2 unit. A plain __thread on an auto local (which gcc forbids)
@@ -538,6 +537,7 @@ impl P<'_> {
             return Ok(None);
         }
         if let Some(t) = direct {
+            let t = if vol { self.tt.volatile_of(t) } else { t };
             return Ok(Some((t, storage)));
         }
         let t = match n {
@@ -591,8 +591,11 @@ impl P<'_> {
             } else {
                 DOUBLE // bare _Complex = double _Complex
             };
-            return Ok(Some((self.cplx_of(elem), storage)));
+            let ct = self.cplx_of(elem);
+            let ct = if vol { self.tt.volatile_of(ct) } else { ct };
+            return Ok(Some((ct, storage)));
         }
+        let t = if vol { self.tt.volatile_of(t) } else { t };
         Ok(Some((t, storage)))
     }
     // C99: intern a struct {re, im} representing _Complex elem — AAPCS64 passes a
@@ -612,11 +615,16 @@ impl P<'_> {
         self.cplx_tys.insert(elem, t);
         t
     }
-    // reverse lookup: is t a complex type → elem
+    // reverse lookup: is t a complex type → elem. Volatile-agnostic: a complex type is
+    // identified by its (unique) struct index, so a `volatile`-qualified complex — a distinct
+    // TypeId carrying the SAME Ty::Struct — still resolves (C99 complex-7: volatile _Complex).
     fn cplx_elem(&self, t: TypeId) -> Option<TypeId> {
+        let Ty::Struct(si) = self.tt.tys[t as usize] else {
+            return None;
+        };
         self.cplx_tys
             .iter()
-            .find(|kv| *kv.1 == t)
+            .find(|kv| matches!(self.tt.tys[*kv.1 as usize], Ty::Struct(s) if s == si))
             .map(|kv| *kv.0)
     }
     fn struct_union(&mut self, is_union: bool) -> Result<TypeId, String> {
@@ -843,16 +851,30 @@ impl P<'_> {
         self.skip_attrs()?;
         while self.eat(&Tok::Punct("*")) {
             t = self.tt.ptr_to(t);
-            while self.eat_kw("const")
-                || self.eat_kw("volatile")
-                || self.eat_kw("restrict")
-                || self.eat_kw("__restrict")
-                || self.eat_kw("__restrict__")
-                // EXT(clang): nullability qualifier — the SDK uses it bare in FILE...
-                || self.eat_kw("_Nullable")
-                || self.eat_kw("_Nonnull")
-                || self.eat_kw("_Null_unspecified")
-            {}
+            // C99 6.7.5.1 — a qualifier right of `*` qualifies the POINTER itself
+            // (`int * volatile p`: p is a volatile pointer to int), distinct from a
+            // qualifier in the specifier-list, which qualifies the pointee.
+            let mut pvol = false;
+            loop {
+                if self.eat_kw("volatile") || self.eat_kw("__volatile") || self.eat_kw("__volatile__")
+                {
+                    pvol = true;
+                } else if self.eat_kw("const")
+                    || self.eat_kw("restrict")
+                    || self.eat_kw("__restrict")
+                    || self.eat_kw("__restrict__")
+                    // EXT(clang): nullability qualifier — the SDK uses it bare in FILE...
+                    || self.eat_kw("_Nullable")
+                    || self.eat_kw("_Nonnull")
+                    || self.eat_kw("_Null_unspecified")
+                {
+                } else {
+                    break;
+                }
+            }
+            if pvol {
+                t = self.tt.volatile_of(t);
+            }
             self.skip_attrs()?; // "void *__attribute__((noinline)) f(...)"
         }
         if self.nested_ahead() {
@@ -1552,8 +1574,14 @@ impl P<'_> {
         Ok(e)
     }
     fn cplx_bin(&mut self, op: &'static str, l: NodeId, r: NodeId) -> R {
-        let lf = self.cplx_elem(self.ty(l)).unwrap_or(self.ty(l)) == FLOAT;
-        let rf = self.cplx_elem(self.ty(r)).unwrap_or(self.ty(r)) == FLOAT;
+        // "is the element FLOAT (vs DOUBLE)" — via the underlying Ty so a `volatile` qualifier
+        // on either the complex or a bare scalar float operand does not misroute to double.
+        let elemf = |s: &Self, n| {
+            let e = s.cplx_elem(s.ty(n)).unwrap_or(s.ty(n));
+            matches!(s.tt.tys[e as usize], Ty::Float)
+        };
+        let lf = elemf(self, l);
+        let rf = elemf(self, r);
         let elem = if lf && rf { FLOAT } else { DOUBLE };
         let ct = self.cplx_of(elem);
         let esz = self.tt.size(elem);
@@ -3810,10 +3838,6 @@ impl P<'_> {
         let mut funcs = Vec::new();
         let mut ranges: Vec<(u32, u32)> = Vec::new(); // body [n0,n1) per func
         while self.pos < self.toks.len() {
-            // Token span of THIS top-level item — the funcdef branch records it (see
-            // fn_tok_spans) so a `volatile` in the return type / params / body attributes to
-            // THIS function, and any `volatile` outside every span is file-scope.
-            let item_lo = self.pos;
             // EXT(gcc): global-level __asm__("...") → emitted verbatim (musl
             // crt_arch.h defines _start; MUST be caught before decl_specs because
             // skip_attrs would mistakenly consume it as an asm-label)
@@ -3919,12 +3943,15 @@ impl P<'_> {
                     // (C99 6.7.4p7) → a DCE candidate; codegen emits weak if non-static so that
                     // copies from multiple TUs can coalesce
                     let is_inline = inline_fn && !self.plain_decls.contains(&name);
-                    // C99 6.7.3: does a `volatile` token appear in THIS function's span
-                    // (return type + params + body)? [item_lo, self.pos) is that span (self.pos
-                    // now sits just past the body). If so, the function keeps the -O0 path.
-                    let has_volatile =
-                        self.toks[item_lo..self.pos].iter().any(is_volatile_tok);
-                    self.fn_tok_spans.push((item_lo, self.pos));
+                    // C99 6.7.3 — TYPE-accurate: does any lvalue in this function have a
+                    // volatile-qualified type? Every volatile access lowers from a node whose
+                    // type carries the bit (or from a volatile parameter slot), so scanning the
+                    // body's node range [n0,n1) + the param types catches the access wherever the
+                    // qualifier originated — a local decl, a pointee, a member, or a file-scope
+                    // typedef/object used here (which token-span detection could not see). If any
+                    // is volatile the function keeps the -O0 path (opt is proven only volatile-free).
+                    let has_volatile = params.iter().any(|&(_, pt)| self.tt.is_volatile(pt))
+                        || (n0..n1).any(|i| self.tt.is_volatile(self.types[i as usize]));
                     funcs.push(Func {
                         name,
                         params,
@@ -4073,12 +4100,6 @@ fn n_hack(base: Option<&str>) -> &str {
     base.unwrap_or("")
 }
 
-// C99 6.7.3 — the `volatile` type-qualifier keyword in its accepted spellings (GNU
-// __volatile / __volatile__ included). Sole predicate behind the per-function opt gate.
-fn is_volatile_tok(t: &Tok) -> bool {
-    matches!(t, Tok::Ident(n) if matches!(n.as_str(), "volatile" | "__volatile" | "__volatile__"))
-}
-
 pub fn parse(
     toks: &[Tok],
     locs: &[(u32, u32)],
@@ -4112,7 +4133,6 @@ pub fn parse(
         vla_inner: Vec::new(),
         vm_typedef_sz: HashMap::new(),
         param_vla_dims: Vec::new(),
-        fn_tok_spans: Vec::new(),
         in_params: 0,
         reg_pins: HashMap::new(),
         vla_arrs: HashMap::new(),
@@ -4238,13 +4258,6 @@ pub fn parse(
         aliases: p.aliases,
         pic: false,
         weak_decls: p.weak_decls,
-        // File-scope volatile = a `volatile` token OUTSIDE every function-definition span. A
-        // volatile global object may be accessed from a function whose own body has no
-        // `volatile` token, so its presence forces the whole TU back to -O0 (the safe
-        // fallback). Empty ⟺ every volatile is confined inside a function ⟹ per-function gate.
-        has_global_volatile: p.toks.iter().enumerate().any(|(i, t)| {
-            is_volatile_tok(t) && !p.fn_tok_spans.iter().any(|&(lo, hi)| i >= lo && i < hi)
-        }),
     })
 }
 

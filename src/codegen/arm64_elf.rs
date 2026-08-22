@@ -2653,11 +2653,13 @@ pub fn emit_ir(ast: &Ast) -> String {
     // ⟦·⟧-preserving (opt.rs::tests, commuting-square); verify rejects broken IR.
     // Two guards, both MANDATORY (not A/B scaffolding):
     //   (1) volatile — the IR does not model volatile (6.7.3), so ⟦·⟧-preservation is proven
-    //       only for volatile-free code. Gated PER FUNCTION: `opt_ok[i]` is false when function
-    //       i's own definition span carries `volatile` (Func::has_volatile) — that one function
-    //       keeps the naive -O0 path while its volatile-free peers optimize. A file-scope
-    //       volatile object (Ast::has_global_volatile) may be reached from a function with no
-    //       `volatile` token, so it disables opt for the WHOLE TU (the safe fallback).
+    //       only for volatile-free code. Gated PER FUNCTION on `Func::has_volatile`, which the
+    //       parser now computes TYPE-accurately: true ⟺ some lvalue in the function has a
+    //       volatile-qualified type (TyTab::vol rides the TypeId from the decl/typedef/pointee/
+    //       member to the access node). That flagged function keeps the naive -O0 path while its
+    //       volatile-free peers optimize — no whole-TU fallback, because a volatile file-scope
+    //       object reached here is read through a volatile-typed node and so flags THIS function
+    //       directly (the volatile-typedef-used-in-a-function case a token scan missed).
     //   (2) ZCC_O0 — the -O0 escape (debug + the bench baseline), the sole knob that turns
     //       the optimizer off. Default (unset) = full SSA optimization + regalloc.
     let zcc_o0 = std::env::var("ZCC_O0").is_ok();
@@ -2665,7 +2667,7 @@ pub fn emit_ir(ast: &Ast) -> String {
     let opt_ok: Vec<bool> = ast
         .funcs
         .iter()
-        .map(|f| !zcc_o0 && !ast.has_global_volatile && !f.has_volatile)
+        .map(|f| !zcc_o0 && !f.has_volatile)
         .collect();
     // Industrial toggleable pipeline: which passes run is read once from the environment
     // (ZCC_OPT_OFF / ZCC_OPT_ON over the default profile). `coalesce` is consumed later by
@@ -2761,10 +2763,15 @@ pub fn emit_ir(ast: &Ast) -> String {
         // Phase C — machine-level cleanup over just this body (the region begins fresh:
         // entered from the prologue, so an empty equivalence model is sound).
         let mut body = g.s.split_off(body_start);
-        // Redundant-load-after-store (store→load identity) is airtight at ANY opt level —
-        // frame-slot only, so valid even on the -O0 volatile path (see block comment). Run it
-        // always, on the raw stream, before copy-prop can rename an address register.
-        body = drop_redundant_loads(&body);
+        // Redundant-load-after-store (store→load identity) matches only `[sp,#k]` frame slots,
+        // which hold compiler temps — a program volatile object is accessed through an address
+        // register (`[xN]`), never this form. That invariant holds because volatile objects live
+        // only in `has_volatile` (→ -O0) functions, whose local Var accesses are not sp-folded.
+        // We still gate on `!has_volatile` so the pass's soundness is LOCAL (no reliance on a
+        // cross-pass fold invariant) — volatile-free functions, including at -O0, keep the win.
+        if !f.has_volatile {
+            body = drop_redundant_loads(&body); // run on the raw stream, before copy-prop renames
+        }
         if g.regalloc && passes.peephole {
             body = peephole_moves(&body); // redundant/dead reg-moves…
         }

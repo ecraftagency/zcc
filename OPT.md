@@ -34,6 +34,21 @@ Ratio = zcc_time / gcc_time (**lower is faster; 1.0 = parity**). Measured bench,
 **dropped 3.44→1.71× and 2.60→2.10×** this batch, pulling the geomean **1.78→1.40×**. Against gcc-O0
 zcc is now ~2× *faster* (0.52×). Residual O1 gap lives entirely in matmul/sieve index arithmetic + memory.
 
+**SIZE axis (the second finish-line number — must ALSO reach 1.0; user: "match O1 on size AND speed").**
+Metric = instruction count on sqlite3.c (amalgamation, musl headers), same mnemonic-line count on
+zcc & gcc-O1 `.s`. gcc-O1 = 157,074 insn (the target).
+
+| milestone | sqlite insn | gap ×gcc-O1 | lever |
+|---|---|---|---|
+| pre-size-work | ~1.95M | 12.4× | value-contract verbosity |
+| sp-addressing-fold (`778f82b`) | 1.05M | 6.65× | fold local addr into `[sp,#pos]` |
+| redundant-load-after-store (`e848888`) | (879k on its own metric) | — | store→load identity |
+| **type-aware volatile (this batch)** | **603,513** | **3.84×** | opt turned ON for real code |
+| next: coalescing (mov 5.3×) → branch → sxtw → spill | → ~1× | **TARGET 1.0** | §3b histogram |
+
+**3.84× is tcc-tier — NOT the finish.** The remaining gap is now REGALLOC/CODEGEN QUALITY (mov 5.3×,
+branch 7.8×, spill 3.5×, sxtw ∞), not "opt is off." Ranked levers + numbers: §3b post-unlock histogram.
+
 **RESOLVED (this batch) — the "register / `k`" framing was a MISDIAGNOSIS; the real defect was two
 Side-I pass bugs (Law 2).** The lever gcc-O1 uses is **pointer-IV strength-reduction + LFTR** (index
 `mul` → marching pointer `p+=stride`; counter test → pointer-limit test, counter dies). Earlier this
@@ -151,7 +166,8 @@ Always-on IR: const-fold · DCE · copy-prop · CSE · GVN · SCCP · CFG-simpli
 | **add/sub-imm12 peephole** (backend) | `mov #k;add`→`add #k`; matmul inner 12→9 insn; marginal on bench (3.44→3.40) but universal + pressure-free | **ON** |
 | **pointer_iv (SR + LFTR + dead-counter)** | FIRES on matmul (gcc's 7-insn form); **k=10 5.47× (spills), k=18 1.80×** ✅; equiv 102/102. Default-OFF: regresses at k=10, is FOUNDATION for the k-decouple (§4) | **OFF** |
 | **backend sp-relative addressing-fold** (local slot → `[sp,#pos]`) | **SIZE lever.** Folds `sub xN,x29,#off; ldr/str [xN]` → one `ldr/str [sp,#pos]` for every foldable local access (`Lea(Local)+Load/Store` fusion `try_fuse_local` + the `tmp_load/store` spill path). **sqlite3.c: 1.95M→1.05M insn (−46.3%), .text 7.89M→4.28M B (−45.8%), `sub` 728k→79k (−89%); gap-to-gcc 8.1×→4.4×.** Guarded: `!fhasvla && !fdynstack(alloca) && sp_at_base` (ir_call_abi/ir_asm clear it mid-marshalling) — same effective byte (`sp=x29−frame_total`), machine-translation-validated. Bench-perf FLAT (kernels are register-resident; the win is on memory-heavy real code + as/ld + compile-speed). | **ON** |
-| **redundant-load-after-store** (backend, store→load identity) | **SIZE lever, airtight at ANY opt level.** Deletes `ldr xN,[sp,#m]` immediately preceded by `str xN,[sp,#m]` — value-independent no-op (∵ adjacent ⟹ ρ(xN)=μ[m] already). Frame-slot (`[sp,`) only ⟹ never volatile/aliased ⟹ valid even on the -O0 path (runs UNCONDITIONALLY, before the regalloc-gated move peepholes). **sqlite3.c: ldr 319k→153k (−52%), total 1.05M→879k insn (−15.9%); gap-to-gcc 4.41×→3.71×.** 166,019 pairs = 52% of ALL loads = the value-contract's per-use spill/reload, invisible to IR-level B2 (§5). The veteran machine-level pass: gcc `postreload-cse`, LLVM MachineCSE + store→load forwarding, QBE `load.c`. | **ON** |
+| **redundant-load-after-store** (backend, store→load identity) | **SIZE lever, airtight at ANY opt level.** Deletes `ldr xN,[sp,#m]` immediately preceded by `str xN,[sp,#m]` — value-independent no-op (∵ adjacent ⟹ ρ(xN)=μ[m] already). Frame-slot (`[sp,`) only ⟹ never volatile/aliased ⟹ valid even on the -O0 path (runs before the regalloc-gated move peepholes; now gated `!has_volatile` — defensive). **sqlite3.c: ldr 319k→153k (−52%), total 1.05M→879k insn (−15.9%); gap-to-gcc 4.41×→3.71×.** 166,019 pairs = 52% of ALL loads = the value-contract's per-use spill/reload, invisible to IR-level B2 (§5). The veteran machine-level pass: gcc `postreload-cse`, LLVM MachineCSE + store→load forwarding, QBE `load.c`. | **ON** |
+| **type-aware volatile** (frontend: `TyTab.vol` bit rides the TypeId to each lvalue) | **SIZE unlock — turns opt ON for real code.** Was: any file-scope `volatile` (musl typedefs) → whole-TU O0 ⟹ opt DARK on every program that includes libc. Now: `Func::has_volatile` computed TYPE-accurately per function (node-range scan), `has_global_volatile` deleted (a volatile global is read through a volatile-typed node → flags the function directly). **sqlite3.c 1,045,515 → 603,513 insn (−42.3%), gap-to-gcc-O1 6.65×→3.84×** (spills collapse as regalloc finally runs). Sound: volatile access always lowers from a volatile-typed node ⟹ flagged ⟹ -O0; verified on local/pointer/global/complex. Zero IR change (access TypeId already on Load/Store). See §3b. | **ON** |
 
 **P1 note (levels are distinct):** copy-propagation is a **backend peephole on emitted `.s` text**
 (post-isel). It does NOT touch the SSA IR, so it does NOT change the SSA pressure the LICM guard
@@ -201,6 +217,44 @@ lowering from the accessed lvalue's type, and have passes skip only those — th
 (LLVM volatile MemoryDef). Then never-accessed header typedefs stop poisoning the TU. This is a
 frontend change (Article-B boundary) = **the next size batch**, deferred here as its own careful
 work under the full csmith/yarpgen volatile gate.
+
+**DONE — type-aware volatile SHIPPED (this batch).** Carried the qualifier as a bit PARALLEL to
+`TyTab.tys` (`vol: Vec<bool>`, `is_volatile`/`volatile_of`) rather than a `Ty` variant — qualified &
+unqualified share the same `Ty` (all size/align/signedness queries ignore the bit) and differ only as
+distinct interned TypeIds, so the qualifier rides the TypeId through decl→typedef→pointee→member to
+each lvalue node's type and thus onto the IR `Load`/`Store` it lowers to — **zero IR-field / lowering
+change** (the access TypeId was already on `Load`/`Store`). Gate flags recomputed TYPE-accurately:
+`Func::has_volatile` = any node in the function's arena range (or any param) has a volatile-qualified
+type; `Ast::has_global_volatile` DELETED — a volatile global reached here is read through a
+volatile-typed `GVar`/`Deref` node, so the *access* (not the token position) flags the function. This
+**closes the volatile-typedef-used-in-a-function hole** the token scan could not see, and — the point
+— stops musl's file-scope volatile typedefs from poisoning the whole TU. One regression found & fixed
+by the reject-diff: `cplx_elem` matched complex types by exact TypeId, so a `volatile _Complex`
+(distinct id, same `Ty::Struct`) was unrecognized → made volatile-agnostic (match by struct index;
+complex-7 restored). Backend `drop_redundant_loads` gated `!has_volatile` (defensive — makes its
+soundness local, not reliant on the sp-fold invariant). **Measured (same mnemonic-line metric on all
+three files): sqlite3.c 1,045,515 → 603,513 insn (−42.3%), gap-to-gcc-O1 (157,074) 6.65× → 3.84×** —
+approaching the §3b force-opt ceiling (−47.6%); the residual gap to it = functions that GENUINELY
+touch volatile types, correctly kept -O0. Gate: cargo 110/110, torture 1378/0 (reject-diff vs
+pre-change = 0 new), opt-parity 0 DIVERGE, complex-7 runs exit-0.
+
+**Post-unlock histogram (zcc 603k vs gcc-O1 157k) — the gap RE-PROFILED; new levers, ranked:**
+
+| mnemonic | zcc | gcc-O1 | ratio | excess | lever |
+|---|---|---|---|---|---|
+| **mov** | 178,618 | 33,608 | **5.3×** | ~145k | **coalescing / kill canonicalization-mov (the #1 lever now)** |
+| **b** | 65,656 | 8,466 | **7.8×** | ~57k | block-layout / jump-threading / redundant-branch-elim |
+| ldr+str | 110,785 | 31,794 | 3.5× | ~79k | regalloc spill quality (measured spill count vs gcc — a REAL k-gap, distinct from the dissolved pointer-IV "wall") |
+| sub | 55,886 | ~few k | large | ~50k | addressing-fold residual (Lea multi-use, param-spill, OOR) |
+| sxtw | 20,031 | ~0 | ∞ | ~20k | **sxtw-elim (Move 2)** — canonicalization tax gcc doesn't pay |
+
+**3.84× is tcc-tier, NOT the finish** (user: match O1 on size AND speed, no other option). This batch was
+the PREREQUISITE — opt was OFF on every real program (all include musl → file-scope volatile typedef →
+whole-TU O0), so every size/perf lever was dark on real code; now they apply. **Next size batches, ranked
+by the table:** (1) **mov / copy-coalescing** — ~145k excess, also a hot-loop perf lever (both axes at
+once); decompose the 178k mov into canonicalization-mov vs φ-copy vs spill-reload first. (2) branch/block
+layout. (3) sxtw-elim. (4) regalloc spill quality (this is where k=10 genuinely bites on SIZE — measured,
+not the misdiagnosed perf "wall").
 
 ---
 

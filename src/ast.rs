@@ -78,6 +78,15 @@ pub struct FnSig {
 
 pub struct TyTab {
     pub tys: Vec<Ty>,
+    // C99 6.7.3 — the `volatile` qualifier, carried PARALLEL to `tys` (one bit per
+    // TypeId) rather than as a `Ty` variant: qualified/unqualified share the same
+    // `Ty` (identical size/align/signedness/pointee — all queries below match on
+    // `tys[t]` and so ignore the bit), differing only in whether an access is a
+    // *volatile access*. A volatile-qualified type is a DISTINCT interned TypeId
+    // whose bit is set (see `volatile_of`); the qualifier then rides the TypeId
+    // through decls, typedefs, pointees, and members to each lvalue node's type —
+    // and thus onto the IR `Load`/`Store` it lowers to — with no IR field added.
+    pub vol: Vec<bool>,
     pub structs: Vec<StructDef>,
     pub fns: Vec<FnSig>,
 }
@@ -101,6 +110,7 @@ impl TyTab {
                 Ty::Bool,
                 Ty::LDouble,
             ],
+            vol: vec![false; 13], // the 13 primitives above are all unqualified
             structs: Vec::new(),
             fns: Vec::new(),
         }
@@ -209,10 +219,28 @@ impl TyTab {
     }
     pub fn add(&mut self, ty: Ty) -> TypeId {
         self.tys.push(ty);
+        self.vol.push(false); // keep `vol` parallel to `tys`; volatile_of sets the bit
         (self.tys.len() - 1) as TypeId
     }
     pub fn ptr_to(&mut self, t: TypeId) -> TypeId {
         self.add(Ty::Ptr(t))
+    }
+    // C99 6.7.3 — is an access to an lvalue of type `t` a *volatile access*?
+    pub fn is_volatile(&self, t: TypeId) -> bool {
+        self.vol[t as usize]
+    }
+    // The `volatile`-qualified counterpart of `t` (idempotent). Interns a fresh
+    // TypeId with the same `Ty` and the bit set — distinctness is what lets the
+    // qualifier travel by TypeId to each use site. (No dedup cache: a decl-site
+    // call count, not a per-access one, so growth is bounded and small.)
+    pub fn volatile_of(&mut self, t: TypeId) -> TypeId {
+        if self.vol[t as usize] {
+            return t;
+        }
+        let ty = self.tys[t as usize];
+        let id = self.add(ty);
+        self.vol[id as usize] = true;
+        id
     }
 }
 
@@ -355,11 +383,15 @@ pub struct Func {
     // goto leaving the VLA scope must deallocate; otherwise a VLA inside a goto
     // loop overflows the stack)
     pub has_vla: bool,
-    // C99 6.7.3: a `volatile` token appeared anywhere in THIS function's definition span
-    // (return type, params, or body). The IR drops the qualifier, so ⟦·⟧-preservation of the
-    // opt passes is proven only for volatile-free functions ⟹ a flagged function keeps the
-    // naive -O0 path while its volatile-free peers optimize (per-function opt gate). See
-    // `Ast::has_global_volatile` for the file-scope-object case that widens this to the whole TU.
+    // C99 6.7.3: some lvalue in THIS function has a `volatile`-qualified TYPE (computed
+    // type-accurately by the parser — any node in the function's arena range whose type
+    // has the volatile bit; see TyTab::vol). The opt passes' ⟦·⟧-preservation is proven
+    // only for volatile-free code, so a flagged function keeps the naive -O0 path while
+    // its volatile-free peers optimize (per-function opt gate). This TYPE-based test
+    // subsumes the old file-scope-object flag: a volatile global reached here is read
+    // through a volatile-typed GVar/Deref node, so the access — not the token position —
+    // is what flags the function (closing the volatile-typedef-used-in-a-function hole
+    // that token-span detection could not see).
     pub has_volatile: bool,
 }
 
@@ -386,11 +418,4 @@ pub struct Ast {
     // EXT(gcc): a weak prototype/extern — the TU emits .weak so the undefined
     // reference is weak
     pub weak_decls: Vec<String>,
-    // C99 6.7.3, file-scope case: a `volatile` token appeared OUTSIDE every function-definition
-    // span — i.e. on a file-scope object/typedef/prototype. A volatile GLOBAL OBJECT can be
-    // accessed from a function whose own body carries no `volatile` token, so per-function
-    // gating is unsound in its presence → this flag falls back to disabling opt for the WHOLE
-    // TU (the safe direction). Clear ⟺ every volatile is confined inside some function, and
-    // then each function is gated independently by `Func::has_volatile`.
-    pub has_global_volatile: bool,
 }
