@@ -2784,6 +2784,23 @@ fn clone_inv_to_ph(
     nt
 }
 
+/// (Block, index) locator of every temp's single def, sized to the CURRENT temp count.
+/// pointer_iv materialization INSERTS instructions (header φ) and PUSHES temps, which
+/// invalidates any previously-cached locator (a stale index reads the wrong instruction —
+/// or indexes past a freshly-created temp, the s0272 OOB). Rebuild this after every such
+/// mutation so `clone_inv_to_ph` always reads the instruction it means to.
+fn def_locations(f: &IrFunc) -> Vec<Option<(BlockId, usize)>> {
+    let mut d = vec![None; f.temps.len()];
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            if let Some(dd) = inst_def(inst) {
+                d[dd as usize] = Some((bi as BlockId, ii));
+            }
+        }
+    }
+    d
+}
+
 pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
     if !cfg_complete(f) {
         return 0; // computed goto ⟹ dominance/back-edges unsound (as LICM/SR)
@@ -2908,6 +2925,12 @@ pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
                     &mut lin,
                 ) && lin.len() == 1
                     && lin[0].1 != 0
+                    // THEOREM PRECONDITION (opt.rs:2625): the transform reduces `base + iv·stride`
+                    // where `base` is a loop-invariant address to be FOLDED into the pointer init.
+                    // `base = ∅` ⟹ the "address" is a bare induction variable (incl. a marching
+                    // pointer this pass already produced) — nothing to fold, the theorem does not
+                    // apply. Omitting this let the pass reduce its own output every fixpoint round.
+                    && !base.is_empty()
                 {
                     reds.push(Reduction {
                         addr,
@@ -2930,6 +2953,10 @@ pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
         let mut memo: HashMap<Tmp, Tmp> = HashMap::new();
         let mut lftr: Option<(Tmp /*pphi*/, Tmp /*pbase sum*/, i64 /*stride*/, Tmp /*biv*/)> = None;
         for r in &reds {
+            // The previous reduction's header-φ insert / temp pushes made the outer `def_of`
+            // stale. Rebuild it fresh (covers the temps materialized so far) so every locator
+            // clone_inv_to_ph / the addr-replacement below reads is valid — root fix for s0272.
+            let def_of = def_locations(f);
             // pbase = Σ base terms, recomputed once in the preheader.
             let mut acc: Option<Val> = None;
             for bt in &r.base {
@@ -3037,6 +3064,8 @@ pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
         // LFTR: replace the header counter test `i₁ < N` with `p₁ < L`, L = pbase + N·stride,
         // so the counter chain dies (DCE reclaims it next round). Conservative: exact shape.
         if let Some((pphi, pbase_t, stride, biv)) = lftr {
+            // The reds loop mutated every block; refresh the locators before LFTR's own clone.
+            def_of = def_locations(f);
             // The counter must now feed ONLY its increment and the test. The address
             // reduction left the old index arithmetic (`biv·stride`, casts) ORPHANED —
             // still present but dead until DCE runs. Counting raw uses would see those and
@@ -3489,7 +3518,8 @@ impl Default for Passes {
             cfg_simplify: true,
             licm: false, // proven-correct but measured-negative on the naive-slot backend
             strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
-            pointer_iv: false, // pressure-reducing loop reducer; measured on the box before default-ON
+            pointer_iv: true, // base-fold SR + LFTR; theorem-precondition base≠∅ (opt.rs:2933) —
+            // matmul 3.44→1.71×, sieve 2.60→2.10× vs O1 at k=10, spill-free (measured box best-of-3)
             coalesce: true,
             peephole: true, // measured win: removes the x0-funnel redundant reg-reg moves
             ldst_pair: true, // B4: adjacent str/ldr → stp/ldp; static win, translation-validated

@@ -22,39 +22,45 @@
 
 Ratio = zcc_time / gcc_time (**lower is faster; 1.0 = parity**). Measured bench, best-of-3:
 
-| kernel | vs O0 | **vs gcc-O1 (TARGET)** | vs O2 | where the O1 gap lives (measured) |
+| kernel | vs gcc-O0 | **vs gcc-O1 (TARGET)** | was (pre-pointer_iv) | note |
 |---|---|---|---|---|
-| fib    | 1.05 | **1.05 — ✅ PARITY** | 3.43 | O1≈O0 here; only O2 scheduling beyond |
-| loops  | 0.35 | **1.06 — ✅ PARITY** | 1.04 | already O1/O2-class |
-| matmul | 1.09 | **3.44 — ❌ GAP** | 3.46 | loop-nest: invariant `adrp`/base + index `mul`s not hoisted/reduced |
-| sieve  | 0.43 | **2.60 — ❌ GAP** | 3.22 | loop-nest memory + index arithmetic |
-| **geomean** | ~0.64 | **~1.78× (target 1.0)** | ~2.7× | — |
+| fib    | 1.16 | **1.06 — ✅ PARITY** | 1.05 | O1≈O0 here |
+| loops  | 0.35 | **1.02 — ✅ PARITY** | 1.06 | already O1-class |
+| matmul | 0.51 | **1.71 — ⬇ closing** | 3.44 | pointer-IV SR+LFTR fired at default k=10, spill-free |
+| sieve  | 0.36 | **2.10 — ⬇ closing** | 2.60 | pointer-IV SR fired; residual = index arith + mem |
+| **geomean** | **0.52** | **1.40× (target 1.0)** | ~1.78× | measured 2026-08-22, quiet box, best-of-3 |
 
-**Reading it:** **fib + loops already MATCH gcc-O1** (1.05, 1.06). The *entire* remaining O1 gap is
-**matmul (3.44×) + sieve (2.60×)** — both loop-nest memory kernels. Note **matmul O1 ≈ O2** (3.44 vs
-3.46): gcc lands the whole matmul win *at O1*, so O1 is a real, sufficient target here.
+**Reading it:** **fib + loops MATCH gcc-O1** (1.06, 1.02). matmul + sieve — the two loop-nest kernels —
+**dropped 3.44→1.71× and 2.60→2.10×** this batch, pulling the geomean **1.78→1.40×**. Against gcc-O0
+zcc is now ~2× *faster* (0.52×). Residual O1 gap lives entirely in matmul/sieve index arithmetic + memory.
 
-**RESOLVED (this batch, box-measured) — the mechanism exists and reaches 1.80×; the finish is now a
-register question, not an optimizer question.** The lever gcc-O1 uses is **pointer-IV strength-reduction
-+ LFTR** (index `mul` → marching pointer `p+=stride`; counter test → pointer-limit test, counter dies).
-zcc's old `licm`/`strength_reduce` were INERT on matmul (accumulator-shape, not pointer-shape). The new
-`pointer_iv` pass (`opt.rs`, equiv-gated) FIRES: matmul inner loop → gcc's exact 7-insn form (2 marching
-pointers + `madd`, no counter). Measured, correctness MATCH:
+**RESOLVED (this batch) — the "register / `k`" framing was a MISDIAGNOSIS; the real defect was two
+Side-I pass bugs (Law 2).** The lever gcc-O1 uses is **pointer-IV strength-reduction + LFTR** (index
+`mul` → marching pointer `p+=stride`; counter test → pointer-limit test, counter dies). Earlier this
+pass regressed at default k=10 (5.47×) and only reached 1.80× at a k=18 probe, which *looked* like a
+register-budget wall. It was not. Measurement located two defects in the pass itself:
 
-| k (GP regs) | matmul | note |
-|---|---|---|
-| **k=10 (default, shipped)** | **5.47×** ❌ | full 2-pointer reduction SPILLS — matmul needs ~13 live regs, has 10 |
-| **k=18 (probe, reverted)** | **1.80×** ✅ | spill-free — the finish line is *reached* with enough registers |
+1. **Empty-base reduction** (`opt.rs:2933`, `&& !base.is_empty()`) — the recognizer reduced *bare*
+   induction variables (empty base), including the marching pointers it had *just emitted*, so every
+   fixpoint round re-reduced its own output → code explosion (matmul 211→1231 insns, `x=x·1+0` unrolled
+   ~40 deep) → the spill that masqueraded as "needs more registers." The theorem's own hypothesis
+   (`base` = a loop-invariant address to FOLD) was simply missing as a guard.
+2. **Stale locators** (`opt.rs:2792` `def_locations`, rebuilt at 2959 + before LFTR) — `def_of`
+   (block,index) was cached before materialization, but inserting a header φ shifts indices → the clone
+   read the wrong instruction → the s0272/s0078 OPT-COMPILE-FAIL panic.
 
-**The gap is now `k`, not the pass.** pointer_iv is default-**OFF** because at k=10 it regresses (spills).
-Raising k>10 is the finish — but it is a **documented hang-prone minefield** (`arm64_elf.rs:35–38`:
-"pr64006 hung when x14/x15 were pooled"): x0–x15 are emitter scratch across BOTH `arm64_elf.rs` and
-`ext.rs`, x16–x18 ABI-reserved, so the GP pool is exactly callee-saved x19–x28. The k=18 probe broke 4
-torture tests (caller-saved clobber across `bl`). See §4 for the two safe paths to bank the 1.80×.
+With both fixed, **pointer_iv fires at the DEFAULT k=10, spill-free** — matmul 3.44→1.71×, sieve
+2.60→2.10× (measured above). No register work was needed; `k` stays 10. **Default-ON**, gate green:
+equiv 102/102, torture 1378/0, csmith+yarpgen 1000+1000 = **0 DIVERGE** on the local Debian-13 zcc-box
+AND a native AWS Graviton4 (Debian-13, environment-matched). The old Path-A/Path-B (raise-`k`) plans are
+**DISSOLVED** — there was no register wall, only two lines that did not faithfully realize the theorem.
 
-**Shipped this batch (default-ON, gated):** add/sub-imm12 peephole (`mov #k;add`→`add #k`; universal,
-pressure-free) — marginal on these benches (3.44→3.40) but real code-size/cleanliness. pointer_iv +
-LFTR + dead-counter-elim land as proven **FOUNDATION** (default-OFF, equiv 102/102, 1.80× at k=18).
+**Also shipped (default-ON):** add/sub-imm12 peephole (`mov #k;add`→`add #k`; pressure-free).
+
+**OPEN (compile-time perf, NOT correctness):** yarpgen `s0940` compiles CORRECT (PARITY everywhere) but
+the optimizer takes ~2.6min CPU on it (`ZCC_O0` = 2s) — a super-linear compile path, offending pass not
+yet isolated (pointer_iv vs another). Tracked separately; motivates a compile-timeout in the fuzz gate.
+Does NOT affect this correctness seal.
 
 ---
 
