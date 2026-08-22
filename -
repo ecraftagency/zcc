@@ -1,0 +1,25 @@
+.cfi_sections .eh_frame
+.text
+.globl g
+.type g, %function
+.p2align 2
+g:
+	.cfi_startproc
+	stp x29, x30, [sp, #-16]!
+	.cfi_def_cfa_offset 16
+	.cfi_offset 29, -16
+	.cfi_offset 30, -8
+	mov x29, sp
+	.cfi_def_cfa_register 29
+	sub sp, sp, #16
+	stur w0, [x29, #-4]
+.Lir_g_0:
+	ldrsw x10, [sp, #12]
+	add x10, x10, #1
+	sxtw x10, w10
+	mov x0, x10
+	mov sp, x29
+	ldp x29, x30, [sp], #16
+	ret
+	.cfi_endproc
+	.size g, .-g

@@ -1361,14 +1361,30 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
         return;
     }
     // ── 1. Promotability analysis ────────────────────────────────────────────
-    // Parameters live in ABI-seeded frame slots (never Stored in the body) → keep
-    // them in memory. Every Lea(t, Local(off)) makes t a "pointer to off".
-    let mut escaped: HashSet<u32> = f.params.iter().map(|&(off, _)| off).collect();
+    // A parameter's value is written to its ABI frame slot by emit_params (prologue),
+    // never by a Store in the body — so its promotable var has no in-body def to seed φ.
+    // We PROMOTE a non-address-taken scalar param by materializing its slot value ONCE at
+    // entry (an entry Load = the readback of the ABI spill) and threading it as SSA — this
+    // eliminates the per-use reloads. Address-taken params are still caught as escaped by
+    // the general Lea-escape scan below (a Lea used as a value ⟹ escape), so they stay in
+    // memory. `param_off` marks which promotable offsets need the entry seed; `addr_ty`
+    // records a pointer type per offset (reused for the seed Lea's dst).
+    let param_off: HashSet<u32> = f.params.iter().map(|&(off, _)| off).collect();
+    // SUB-WORD params (char/short, size < 4) stay in memory: a promoted sub-word value
+    // carried around a loop is not re-canonicalized to its width on the back-edge (the
+    // narrowing Store that a sub-word LOCAL still carries is gone), so its wrap (mod 2^8 /
+    // 2^16) is lost — a miscompile (pr81913: `u8 d; d--; while(d>=(u8)e)` never wraps at
+    // 256). Full-width scalars (int/long/ptr/float/double) wrap at the register width itself
+    // and are safe. Sub-word params are rare; the int/long/ptr bulk keeps the win.
+    let mut escaped: HashSet<u32> =
+        f.params.iter().filter(|&&(_, t)| tt.size(t) < 4).map(|&(off, _)| off).collect();
     let mut lea_off: HashMap<Tmp, u32> = HashMap::new();
+    let mut addr_ty: HashMap<u32, TypeId> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
             if let Inst::Lea(t, Place::Local(off)) = i {
                 lea_off.insert(*t, *off);
+                addr_ty.entry(*off).or_insert(f.temps[*t as usize]);
             }
         }
     }
@@ -1444,6 +1460,32 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
         new_temps: Vec::new(),
     };
 
+    // ── 1b. Seed promoted PARAMS. A param var has no in-body def; without a seed, a read at
+    // the entry (preds-empty) would resolve to Imm(0) (read_var_recursive) — a miscompile.
+    // Materialize the slot's ABI-spilled value once at entry (Lea+Load, kept by the fill
+    // loop via `seed_addr`), and seed currentDef[var][entry] with it. A later Store in the
+    // body overrides normally; a param reassigned before first read leaves this Load dead
+    // (DCE). Locals are NOT seeded — their own Store is the def.
+    const ENTRY: BlockId = 0;
+    let mut seed_addr: HashSet<Tmp> = HashSet::new();
+    let mut seed_insts: Vec<Inst> = Vec::new();
+    for (vi, &off) in promotable.iter().enumerate() {
+        if !param_off.contains(&off) {
+            continue;
+        }
+        let ty = s.var_ty[vi];
+        let a = s.new_temp(addr_ty[&off]);
+        let pt = s.new_temp(ty);
+        seed_addr.insert(a);
+        seed_insts.push(Inst::Lea(a, Place::Local(off)));
+        seed_insts.push(Inst::Load(pt, ty, Val::Tmp(a)));
+        s.write_var(vi, ENTRY, Val::Tmp(pt));
+    }
+    if !seed_insts.is_empty() {
+        seed_insts.append(&mut f.blocks[ENTRY as usize].insts);
+        f.blocks[ENTRY as usize].insts = seed_insts;
+    }
+
     // ── 2. Fill (RPO) — Store→writeVar (delete), Load→Copy(readVar), dead Lea→drop.
     // Seal a block on entry once all its predecessors are filled (forward joins seal
     // eagerly ⟹ minimal φ); a loop header's back-edge predecessor is still unfilled,
@@ -1458,7 +1500,11 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
         let mut new_insts: Vec<Inst> = Vec::with_capacity(f.blocks[blk].insts.len());
         for inst in std::mem::take(&mut f.blocks[blk].insts) {
             let act = match &inst {
-                Inst::Lea(_, Place::Local(off)) if off2var.contains_key(off) => Act::Drop,
+                Inst::Lea(t, Place::Local(off))
+                    if off2var.contains_key(off) && !seed_addr.contains(t) =>
+                {
+                    Act::Drop
+                }
                 Inst::Store(_, Val::Tmp(a), val)
                     if lea_off.get(a).is_some_and(|o| off2var.contains_key(o)) =>
                 {
