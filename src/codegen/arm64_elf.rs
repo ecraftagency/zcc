@@ -2481,9 +2481,17 @@ impl<'a> Cg<'a> {
             .blocks
             .iter()
             .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Alloca(..))));
-        // near_branch: an upper bound on emitted size (≤12 insns per IR inst + 4 per block).
-        // Under 200k emitted insns (~800 KB) every label is well within cb(n)z's ±1MB reach.
-        let est = irf.blocks.iter().map(|b| b.insts.len()).sum::<usize>() * 12 + irf.blocks.len() * 4;
+        // near_branch: a size ESTIMATE (Article-E heuristic, dated 2026-08 — NOT a proven bound).
+        // imm19's hard reach is ±2^18 words = 262,144 insns; the 200k threshold sits under it with
+        // ~24% margin. The ×20 per-IR-inst factor covers the fat lowerings the operand-audit
+        // flagged (VaArg HFA loop ~15-20, Sync CAS, bitfield RMW); the one lowering it does NOT
+        // strictly bound is a Call marshalling many by-value composites. This is SAFE because the
+        // failure mode is loud, not silent: a mis-classified far label makes GNU-as reject the
+        // cb(n)z with an out-of-range relocation (build fails), never a wrong-target miscompile.
+        // No real or fuzzed function (sqlite/musl/csmith/yarpgen) approaches 10k IR insts. The
+        // correct-but-deferred fix is a two-pass emit-measure-re-emit; unwarranted until a real
+        // program trips the assembler. Correctness is thus independent of this number.
+        let est = irf.blocks.iter().map(|b| b.insts.len()).sum::<usize>() * 20 + irf.blocks.len() * 4;
         self.near_branch = est < 200_000;
         // Tier-1 #2: function-wide temp READ counts (the authoritative opt::each_use visitor
         // over a clone — codegen is not hot). A single-use address temp is fold-and-deletable.
@@ -3243,6 +3251,12 @@ pub fn emit_ir(ast: &Ast) -> String {
         }
         for (i, f) in funcs.iter_mut().enumerate() {
             if opt_ok.get(i).copied().unwrap_or(false) {
+                // NARROW k=10 (not WIDE's 16) on purpose: the wide/narrow choice is made per
+                // function LATER, at emit time (self.gp_wide, line ~2430), from `heavy` — not yet
+                // known here. Passing the SMALLER budget makes licm/SR's pressure guard a
+                // conservative LOWER bound: k=10 ≤ whatever the allocator ends up with, so the
+                // guard can only under-hoist, never over-pressure. Correctness is k-independent
+                // (opt.rs:2326); size impact ≈ 0 (hoists are size-neutral).
                 crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k);
                 debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
             }

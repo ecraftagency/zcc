@@ -16,11 +16,11 @@
 //              (enforced by TYPE — `term` is a field, not the last vector element).
 //   - IrFunc = a finite control graph + the temporary type table (Γ: Tmp → TypeId).
 //
-// Baseline: IR only, optimization deferred. The pass layer is future work — see
-// OPT.md §7. The interpreter/verifier is a proof-checker (test-side; it does not
-// count against the 10k ceiling); the verifier lives here because it is light and
-// is an automaton that checks immediately after lowering.
-#![allow(dead_code)] // removed once lowering (step 2) + the backend IR→asm (step 3) consume it
+// This is the [ssa-qbe fork]: the SSA pass pipeline in opt.rs is shipped default-ON
+// (optimize_ssa), NOT deferred — see OPT.md. The interpreter/verifier is a proof-checker
+// (test-side ⟦·⟧ + well-formedness automaton); it lives here because it is light and checks
+// immediately after lowering. (The fork removed the LOC ceiling — CLAUDE.md fork override.)
+#![allow(dead_code)] // pub(crate) helpers consumed by verify/opt.rs; narrow as items settle
 
 use crate::ast::{Ast, Node, NodeId, SyncOp, Ty, TyTab, TypeId, INT, ULONG, VOID};
 use std::collections::HashMap;
@@ -73,11 +73,12 @@ pub enum Callee {
     Ptr(Val),    // indirect call through a function pointer
 }
 
-/// An IR instruction. Two CLASSES (see OPT.md §7):
-///   CORE   — evaluable by interp, covered by the verifier, (in future) touched by passes.
-///   OPAQUE — wraps an exotic construct (va/atomic/asm/…), lowered one-to-one to
-///            the backend exactly as the old AST→asm path did; interp treats any
-///            function containing one as "impure" (skips folding).
+/// An IR instruction. Two CLASSES (see OPT.md):
+///   CORE   — evaluable by interp, covered by the verifier, transformed by the SSA passes.
+///   EXOTIC — a typed instruction for an exotic construct (va/atomic/asm/overflow/…),
+///            lowered one-to-one to the backend; interp treats any function containing one
+///            as "impure" (returns ⊥ → the passes skip folding it). No Opaque wrapper
+///            remains: every exotic construct is its own typed Inst variant below.
 #[derive(Clone, Debug)]
 pub enum Inst {
     // ---- CORE ----
@@ -105,9 +106,9 @@ pub enum Inst {
     // speculatable diamond, AFTER all SSA opts, BEFORE out_of_ssa. The backend lowers it
     // to `cmp; csel`. (cond, a, b)
     Select(Tmp, TypeId, Val, Val, Val),
-    // ---- EXOTIC typed (gradually replacing Opaque; operand-free first) ----
+    // ---- EXOTIC typed ----
     // dst = &function (GOT if extern, adrp/add if static). A constant-symbol
-    // address, with NO Val operand. Kept impure (like Opaque) → no DCE/CSE → invariant asm.
+    // address, with NO Val operand. Impure → no DCE/CSE → invariant asm.
     FunAddr(Tmp, String),   // dst = the address of function `name`
     LabelAddr(Tmp, String), // EXT(gcc): dst = &&label (computed-goto) within the current function
     // memset(addr, 0, sz): zero-initialize a struct/array (C99 6.7.8). Void, with a
@@ -122,7 +123,7 @@ pub enum Inst {
     Overflow(Tmp, u8, TypeId, TypeId, TypeId, Val, Val, Val), // dst,op,ta,tb,rt,a,b,rp
     VaArea(Tmp, u32), // builtin __va_area__: dst = x29 + off (start of the anonymous-argument area)
     // EXT(gcc): computed-goto "goto *e": branch through a value. Ends the block at
-    // runtime (the IR block following it is dead — as with the old Opaque). Impure, with NO dst.
+    // runtime (the IR block following it is dead). Impure, with NO dst.
     GotoPtr(Val),
     // C99 6.7.5.2 VLA / __builtin_alloca: dst = a pointer to `size` bytes allocated
     // on the stack (sub sp, rounded to 16). Impure (mutates sp) → no DCE/CSE even if
@@ -411,9 +412,9 @@ pub fn verify(f: &IrFunc) -> Result<(), String> {
 // temporaries hold only the intermediate value of an expression. lower_expr(n)
 // emits instructions and returns a Val holding the result; lower_addr(n) returns a
 // Val = the ADDRESS of an lvalue; lower_stmt(n) weaves the blocks + CFG.
-// The exotic tail (va/atomic/asm/nested/struct/Switch/goto) → a temporary
-// Inst::Opaque(node), with the backend bridge re-emitting the old path (step 3
-// gradually replaces this with real lowering).
+// The exotic tail (va/atomic/asm/struct/goto) lowers to its own typed EXOTIC Inst
+// variant (FunAddr/VaStart/Overflow/Sync/Asm/GotoPtr/…), each emitted one-to-one by
+// the backend and treated impure by interp — there is no Opaque wrapper.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Is the FINAL element of a stmt-expr a VALUELESS statement (→ value = void)?
@@ -705,7 +706,7 @@ impl<'a> Lower<'a> {
                 self.push(Inst::CallX(Some(d), callee, cargs, ty, off));
                 Val::Tmp(d)
             }
-            // exotic with an existing typed Inst (operand-free) → lower directly, not via Opaque.
+            // exotic constructs lower directly to their typed EXOTIC Inst variant.
             Node::FunAddr(name) => {
                 let name = name.clone();
                 let t = self.t(ty);
@@ -1190,9 +1191,14 @@ pub(crate) fn eval_bin(tt: &TyTab, op: Op, ty: TypeId, x: i64, y: i64) -> Result
         Op::And => x & y,
         Op::Or => x | y,
         Op::Xor => x ^ y,
+        // Shift ≥ width is C99 6.5.7 UB. The backend lowers a ≥64 constant shift to the
+        // REGISTER form (try_bin_imm rejects imm6≥64), and ARMv8 LSLV/LSRV/ASRV mask the
+        // amount mod 64 — so const-fold must wrap mod 64 too, or it would (a) panic in a
+        // debug build and (b) diverge from the runtime shift (opt-parity). wrapping_sh*
+        // realizes exactly the hardware's mod-64 mask, symmetric across Shl/Shr.
         Op::Shl => x.wrapping_shl(y as u32),
-        Op::Shr if u => ((x as u64) >> (y as u32)) as i64,
-        Op::Shr => x >> (y as u32),
+        Op::Shr if u => (x as u64).wrapping_shr(y as u32) as i64,
+        Op::Shr => x.wrapping_shr(y as u32),
         Op::Eq => return Ok((x == y) as i64),
         Op::Ne => return Ok((x != y) as i64),
         Op::Lt => return Ok((if u { (x as u64) < (y as u64) } else { x < y }) as i64),
@@ -1787,7 +1793,7 @@ pub(crate) mod tests {
     #[test]
     fn lower_struct_assign() {
         // q = p is a COPY (Inst::Memcpy, CORE) — mutating q does NOT touch p. interp
-        // can execute it ⟺ struct-assign is already CORE (an Opaque would return Err → panic).
+        // can execute it ⟺ struct-assign is already CORE (an impure EXOTIC would return Err → panic).
         // f(3,4): p={3,4}; q=p; q.x+=100 ⟹ 3*1000+4*10+103 = 3143.
         let s = "struct P{int x,y;};int f(int a,int b){struct P p,q;p.x=a;p.y=b;q=p;q.x=q.x+100;return p.x*1000+p.y*10+q.x;}";
         assert_eq!(run("sa", s, "f", &[3, 4]), 3143);

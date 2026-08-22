@@ -121,7 +121,9 @@ impl TyTab {
             Ty::Char | Ty::UChar | Ty::Bool => 1,
             Ty::Short | Ty::UShort => 2,
             Ty::Int | Ty::UInt | Ty::Float => 4,
-            Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) | Ty::Func(_) => 8,
+            Ty::Long | Ty::ULong | Ty::Double | Ty::Ptr(_) => 8,
+            Ty::Func(_) => 1, // EXT(gcc): sizeof(func)==1; a function is not decayed under sizeof (C99 6.3.2.1 exempts sizeof/&), so this is its own size, not the pointer's
+
             Ty::LDouble => 16,
             Ty::Array(e, n) => self.size(e).wrapping_mul(n as u32),
             Ty::Struct(s) => self.structs[s as usize].size,
@@ -185,26 +187,56 @@ impl TyTab {
                 | Ty::Bool
         )
     }
-    // HFA (AAPCS64): a struct whose members are all float or all double, 1-4 of
-    // them → passed/returned in v0-v7 instead of GPRs/indirectly. Returns
-    // (is double, member count).
+    // HFA (AAPCS64 §5.9.5): a composite whose fundamental elements are ALL the same
+    // floating type (all float or all double), 1-4 of them after RECURSIVELY flattening
+    // nested structs, unions, and arrays → passed/returned in v0-v7 instead of GPRs/
+    // indirectly. Returns (is double, element count). The recursion is load-bearing: a
+    // flat-members-only check mis-classifies `struct{float v[4];}` (§5.9.5 says it IS a
+    // 4-float HFA) and garbles it at a gcc↔zcc boundary. Long double is soft-float here
+    // (THEORY II-2), not an HFA element. Only an aggregate passed BY VALUE reaches this
+    // rule; a bare array decays to a pointer, so the top level is always a struct/union.
     pub fn hfa(&self, t: TypeId) -> Option<(bool, u32)> {
-        let Ty::Struct(si) = self.tys[t as usize] else {
-            return None;
-        };
-        let sd = &self.structs[si as usize];
-        if sd.is_union || sd.members.is_empty() || sd.members.len() > 4 {
+        if !matches!(self.tys[t as usize], Ty::Struct(_)) {
             return None;
         }
-        let dbl = matches!(self.tys[sd.members[0].1 as usize], Ty::Double);
-        for &(_, mt, _) in &sd.members {
-            match self.tys[mt as usize] {
-                Ty::Float if !dbl => {}
-                Ty::Double if dbl => {}
-                _ => return None,
+        match self.hfa_flat(t) {
+            Some((dbl, n)) if (1..=4).contains(&n) => Some((dbl, n)),
+            _ => None,
+        }
+    }
+    // Recursively flatten `t` to its fundamental floating elements. Some((is double,
+    // count)) iff every element is the SAME float/double type; None on any non-FP element,
+    // a float/double mix, or an empty aggregate. Struct members lie in sequence (counts
+    // SUM); union members overlap (count is the WIDEST). The 1-4 cap is applied once, at
+    // the top, by `hfa`; `checked_mul` folds an oversized array to None (never ≤4 anyway).
+    fn hfa_flat(&self, t: TypeId) -> Option<(bool, u32)> {
+        match self.tys[t as usize] {
+            Ty::Float => Some((false, 1)),
+            Ty::Double => Some((true, 1)),
+            Ty::Array(e, n) if n > 0 => {
+                let (dbl, c) = self.hfa_flat(e)?;
+                Some((dbl, c.checked_mul(n as u32)?))
             }
+            Ty::Struct(si) => {
+                let sd = &self.structs[si as usize];
+                if sd.members.is_empty() {
+                    return None;
+                }
+                let mut kind: Option<bool> = None;
+                let mut total = 0u32;
+                for &(_, mt, _) in &sd.members {
+                    let (dbl, c) = self.hfa_flat(mt)?;
+                    match kind {
+                        None => kind = Some(dbl),
+                        Some(k) if k != dbl => return None, // mixed float/double
+                        _ => {}
+                    }
+                    total = if sd.is_union { total.max(c) } else { total + c };
+                }
+                kind.map(|k| (k, total))
+            }
+            _ => None,
         }
-        Some((dbl, sd.members.len() as u32))
     }
     // FnSig of a callable value: a function or a function pointer
     pub fn fnsig(&self, t: TypeId) -> Option<&FnSig> {

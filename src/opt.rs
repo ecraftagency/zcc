@@ -2632,8 +2632,13 @@ pub fn strength_reduce(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
 //     the exact form the accumulator SR missed on matmul.
 //   • LFTR leg. When after base-fold the counter i₁ feeds ONLY its increment and a header
 //     test `i₁ < N` (N invariant, step c>0, stride s>0), replace the test with `p₁ < L`,
-//     L = base+N·s (preheader). Since s>0 the map i₁↦p₁ is strictly monotone ⟹ `i₁<N`
-//     ⇔ `p₁<L` on every iteration ⟹ the observable branch outcome is identical. The now-
+//     L = base+N·s (preheader). The map i₁↦p₁=base+i₁·s is monotone over the values i₁ takes
+//     here NOT by abstract modular arithmetic (which would wrap) but because these pₖ are
+//     addresses the source already forms: C99 6.5.6 bounds a valid IV-addressed access to
+//     within the object (≤ one-past-end), so no pₖ wraps the address space and order is
+//     preserved ⟹ `i₁<N` ⇔ `p₁<L` on every iteration ⟹ the branch outcome is identical.
+//     (This is exactly why the pass fires only on address IVs, not arbitrary integer IVs.)
+//     The now-
 //     dead counter φ/increment are reclaimed by DCE (next fixpoint round).
 //
 // SAFETY FENCES: integer IV only (float × non-associative); constant step c and stride s
@@ -2801,6 +2806,12 @@ fn def_locations(f: &IrFunc) -> Vec<Option<(BlockId, usize)>> {
     d
 }
 
+// `_gp_k` is intentionally unused (kept only for call-site signature-uniformity with
+// licm/strength_reduce): pointer_iv is *pressure-REDUCING*, not pressure-increasing. It
+// replaces `base + i·stride` (a live index + a multiply per use) with a single marching
+// pointer advanced by an add, and LFTR drops the original index φ entirely — so it can only
+// LOWER the loop's GP live-count. licm/SR hoist values INTO the loop and thus need the `gp_k`
+// cap to bite; this transform has no such cap because there is no pressure to cap.
 pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
     if !cfg_complete(f) {
         return 0; // computed goto ⟹ dominance/back-edges unsound (as LICM/SR)
@@ -3419,6 +3430,12 @@ fn splice(caller: &mut IrFunc, b: BlockId, k: usize, callee: &IrFunc) {
 /// (splicing a volatile callee's body into an optimized caller would subject its volatile
 /// accesses to opt — C99 6.7.3 — so a volatile function is never a callee here).
 pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &[bool]) -> u32 {
+    // Article-E convenience thresholds (NOT spec constants — these are policy, dated 2026-08).
+    // Inlining trades call-overhead (≈4 insns: arg-marshal + bl + ret-marshal) for a body copy;
+    // the win is net-positive only while the body is small. 16/40 are tuned-not-derived cutoffs
+    // (gcc's -O1 `max-inline-insns-single` is analogous and likewise a policy knob, ~70 there on
+    // a finer GIMPLE count). Both are guarded by opt-parity + torture, so a wrong value costs
+    // SIZE, never correctness; revisit if the sqlite/O1 size gap traces to inline over/under-fire.
     const LEAF_MAX: usize = 16; // a non-recursive callee this small is a pure win to inline
     const SELF_MAX: usize = 40; // a self-recursive callee: depth-1 unroll if this small
     let snapshot: Vec<IrFunc> = funcs.to_vec();
