@@ -222,21 +222,36 @@ fn emit_params(g: &mut Cg, f: &crate::ast::Func) {
         }
         let fl = ast.tt.is_float(t);
         if fl && fp < 8 {
-            g.lea_local("x9", off);
-            match ast.tt.size(t) {
-                4 => _ = writeln!(g.s, "\tstr s{fp}, [x9]"),
-                16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: full binary128
-                _ => _ = writeln!(g.s, "\tstr d{fp}, [x9]"),
+            // Addressing-model fix (§5): x29 is the fixed frame pointer, so a register param
+            // spills straight to `[x29,#-off]` (one stur) instead of `sub x9,x29,#off; str [x9]`
+            // whenever off ≤ 256 (imm9). Identical effective address.
+            if off <= 256 {
+                match ast.tt.size(t) {
+                    4 => _ = writeln!(g.s, "\tstur s{fp}, [x29, #-{off}]"),
+                    16 => _ = writeln!(g.s, "\tstur q{fp}, [x29, #-{off}]"),
+                    _ => _ = writeln!(g.s, "\tstur d{fp}, [x29, #-{off}]"),
+                }
+            } else {
+                g.lea_local("x9", off);
+                match ast.tt.size(t) {
+                    4 => _ = writeln!(g.s, "\tstr s{fp}, [x9]"),
+                    16 => _ = writeln!(g.s, "\tstr q{fp}, [x9]"), // long double: full binary128
+                    _ => _ = writeln!(g.s, "\tstr d{fp}, [x9]"),
+                }
             }
             fp += 1;
         } else if !fl && gp < 8 {
-            g.lea_local("x9", off);
-            _ = match ast.tt.size(t) {
-                1 => writeln!(g.s, "\tstrb w{gp}, [x9]"),
-                2 => writeln!(g.s, "\tstrh w{gp}, [x9]"),
-                4 => writeln!(g.s, "\tstr w{gp}, [x9]"),
-                _ => writeln!(g.s, "\tstr x{gp}, [x9]"),
-            };
+            if off <= 256 {
+                g.store_gp_fp(gp, off, t); // stur w/x{gp}, [x29,#-off] per width
+            } else {
+                g.lea_local("x9", off);
+                _ = match ast.tt.size(t) {
+                    1 => writeln!(g.s, "\tstrb w{gp}, [x9]"),
+                    2 => writeln!(g.s, "\tstrh w{gp}, [x9]"),
+                    4 => writeln!(g.s, "\tstr w{gp}, [x9]"),
+                    _ => writeln!(g.s, "\tstr x{gp}, [x9]"),
+                };
+            }
             gp += 1;
         } else {
             // scalar on the caller's stack: rounded 8-byte slot at [x29 + 16 + boff]
@@ -624,6 +639,31 @@ impl Cg<'_> {
             _ => writeln!(self.s, "\tstr x{rv}, [sp, #{pos}]"),
         };
     }
+    // Frame-pointer-relative unscaled forms (ldur/stur, imm9 signed −256..255). x29 is the
+    // fixed frame pointer (`mov x29,sp`, never reassigned), so `[x29,#-off]` is the SAME
+    // effective address as `sub x9,x29,#off; ldr/str [x9]` in one instruction — used when the
+    // sp-relative scaled form is out of range (a large frame) but off ≤ 256. `[sp,#pos]` is
+    // preferred when available (positive scaled reaches 32 KB); this catches the tail.
+    fn load_gp_fp(&mut self, rd: u32, off: u32, t: TypeId) {
+        let u = self.a.tt.is_unsigned(t);
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tldursb x{rd}, [x29, #-{off}]"),
+            (1, true) => writeln!(self.s, "\tldurb w{rd}, [x29, #-{off}]"),
+            (2, false) => writeln!(self.s, "\tldursh x{rd}, [x29, #-{off}]"),
+            (2, true) => writeln!(self.s, "\tldurh w{rd}, [x29, #-{off}]"),
+            (4, false) => writeln!(self.s, "\tldursw x{rd}, [x29, #-{off}]"),
+            (4, true) => writeln!(self.s, "\tldur w{rd}, [x29, #-{off}]"),
+            _ => writeln!(self.s, "\tldur x{rd}, [x29, #-{off}]"),
+        };
+    }
+    fn store_gp_fp(&mut self, rv: u32, off: u32, t: TypeId) {
+        _ = match self.a.tt.size(t) {
+            1 => writeln!(self.s, "\tsturb w{rv}, [x29, #-{off}]"),
+            2 => writeln!(self.s, "\tsturh w{rv}, [x29, #-{off}]"),
+            4 => writeln!(self.s, "\tstur w{rv}, [x29, #-{off}]"),
+            _ => writeln!(self.s, "\tstur x{rv}, [x29, #-{off}]"),
+        };
+    }
     // Tier-1 #2 — register-offset load: x{rd} = *(x{rbase} + x{rindex}), width per t. The
     // ARM64 `[Xn, Xm]` addressing form adds the full 64-bit Xm; it exists for every ldr
     // variant used here (ldr/ldrb/ldrh/ldrsb/ldrsh/ldrsw). rd may alias rbase/rindex (base
@@ -743,18 +783,33 @@ impl Cg<'_> {
         }
         match insts.get(i + 1)? {
             Inst::Load(d, lty, Val::Tmp(la)) if la == t && self.simple_gp_load_ty(*lty) => {
-                let pos = self.sp_slot_sz(*off, self.a.tt.size(*lty))?;
+                // Prefer the positive scaled sp form (reaches 32 KB); fall back to the x29
+                // unscaled form for a small offset in a frame too large for sp-scaling; only
+                // then keep the eager lea. Decide BEFORE any emission.
+                let pos = self.sp_slot_sz(*off, self.a.tt.size(*lty));
+                if pos.is_none() && *off > 256 {
+                    return None;
+                }
                 let rd = self.gp_home(*d).unwrap_or(0);
-                self.load_gp_sp(rd, pos, *lty);
+                match pos {
+                    Some(p) => self.load_gp_sp(rd, p, *lty),
+                    None => self.load_gp_fp(rd, *off, *lty),
+                }
                 if self.gp_home(*d).is_none() {
                     self.tmp_store(*d, "x0");
                 }
                 Some(2)
             }
             Inst::Store(sty, Val::Tmp(la), v) if la == t && self.simple_gp_store_ty(*sty) => {
-                let pos = self.sp_slot_sz(*off, self.a.tt.size(*sty))?;
+                let pos = self.sp_slot_sz(*off, self.a.tt.size(*sty));
+                if pos.is_none() && *off > 256 {
+                    return None;
+                }
                 let rv = self.src_gp(*v, 0);
-                self.store_gp_sp(rv, pos, *sty);
+                match pos {
+                    Some(p) => self.store_gp_sp(rv, p, *sty),
+                    None => self.store_gp_fp(rv, *off, *sty),
+                }
                 Some(2)
             }
             _ => None,
@@ -1036,10 +1091,18 @@ impl<'a> Cg<'a> {
             Some((true, idx)) => _ = writeln!(self.s, "\tfmov {reg}, d{}", fp_phys(idx)),
             Some((false, idx)) => _ = writeln!(self.s, "\tmov {reg}, x{}", gp_phys(idx)),
             None => {
-                if let Some(pos) = self.sp_slot(self.ir_toff(i)) {
+                let off = self.ir_toff(i);
+                if let Some(pos) = self.sp_slot(off) {
                     _ = writeln!(self.s, "\tldr {reg}, [sp, #{pos}]");
+                } else if off <= 256 {
+                    // Addressing-model fix (§4/§5): x29 is a fixed frame pointer (`mov x29,sp`,
+                    // never reassigned) so `[x29,#-off]` is the identical effective address as
+                    // `sub x9,x29,#off; ldr [x9]` — one `ldur` (imm9 unscaled, −256..255)
+                    // replaces the two-instruction lea form and clobbers no x9. Valid even
+                    // when sp is displaced (marshalling/VLA), since x29 does not move.
+                    _ = writeln!(self.s, "\tldur {reg}, [x29, #-{off}]");
                 } else {
-                    self.lea_local("x9", self.ir_toff(i));
+                    self.lea_local("x9", off);
                     _ = writeln!(self.s, "\tldr {reg}, [x9]");
                 }
             }
@@ -1050,10 +1113,14 @@ impl<'a> Cg<'a> {
             Some((true, idx)) => _ = writeln!(self.s, "\tfmov d{}, {reg}", fp_phys(idx)),
             Some((false, idx)) => _ = writeln!(self.s, "\tmov x{}, {reg}", gp_phys(idx)),
             None => {
-                if let Some(pos) = self.sp_slot(self.ir_toff(i)) {
+                let off = self.ir_toff(i);
+                if let Some(pos) = self.sp_slot(off) {
                     _ = writeln!(self.s, "\tstr {reg}, [sp, #{pos}]");
+                } else if off <= 256 {
+                    // See tmp_load: `stur {reg},[x29,#-off]` = `sub x9,x29,#off; str [x9]`.
+                    _ = writeln!(self.s, "\tstur {reg}, [x29, #-{off}]");
                 } else {
-                    self.lea_local("x9", self.ir_toff(i));
+                    self.lea_local("x9", off);
                     _ = writeln!(self.s, "\tstr {reg}, [x9]");
                 }
             }
