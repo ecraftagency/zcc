@@ -28,8 +28,21 @@ threaded in) makes each ship-eligible hoist provably spill-free ⟹ `C_M` strict
 on mac (`cargo` 100/100, incl. new `licm_pressure_guard_caps` · `strength_reduce_pressure_guard_caps` ·
 `remat_recomputes_pressured_address` · `remat_refuses_operand_bearing_defs`) and kept **default-OFF**:
 the SSA-vs-backend pressure residual is closed by the box A/B, not asserted. Default build output is
-**byte-unchanged** (all three OFF; only an inert `gp_k` param threaded). **NEXT (box):** `ZCC_OPT_ON=licm,
-strength,remat` bench A/B + torture + opt-parity → flip the winners default-ON.
+**byte-unchanged** (all three OFF; only an inert `gp_k` param threaded).
+
+**BOX A/B MEASURED (2026-08-22, `zcc-box` docker, ELF aarch64-musl, referee gcc-O0):** the flip
+verdict is **KEEP OFF — no win on the bench.** `ZCC_OPT_ON=licm,strength,remat` leaves geomean
+**0.69× unchanged** (fib 1.06→1.05, loops 0.37→0.37, matmul **1.23→1.25**, sieve 0.48→0.48). The tiny
+matmul *regression* is the residual the guard could not see — `out_of_ssa` φ-copies the SSA-pressure
+proxy doesn't count — now **measured, not asserted**, and it confirms default-OFF is correct. Root
+cause is structural: the 4 kernels are **register-resident** (k=10 suffices ⟹ nothing spills), so remat
+has nothing to relieve and LICM/SR only *relocate* (a dynamic win the bench loops don't expose). The
+passes stay **proven-correct + speed-safe + default-OFF**, latent for genuinely spill-heavy code.
+
+**Where the O2 gap actually is (same run, vs gcc-O2 = 2.68× geomean):** fib **3.44×** · loops **1.08×
+(≈par!)** · matmul **3.87×** · sieve **3.60×**. The gap is NOT classical scalar passes (flat) — it is
+**loop-nest memory + SIMD**: matmul/sieve need #14 scalar-replacement / #15 tiling / #16
+vectorization (the -O2/-O3 cache+throughput wins), fib needs O2 scheduling. loops is already at O2 par.
 
 ---
 
