@@ -49,6 +49,14 @@
   - **Result: sqlite 298,070 → 296,591 (−1,479, −0.50%); ratio 1.916×→1.879× gcc-O1.** Ceiling was
     ~12.8k projected; realized 1,479 (11.5%) — structural projection realizes 5–10%, as expected.
     Gate all-green. +6 inline lever-7 tests (cargo 122→128). **PROCEEDING to Phase B.**
+- **Phase B — AUDIT PASS 1 (Law-1 Side I: every LOC ↔ theorem space, NO exception).** ✅ DONE — no LOC outside theorem∪spec; every pass carries its commuting-square / translation-validation. Full report: `AUDIT-RC1.md`.
+- **Phase C — AUDIT PASS 2 (Side II).** ✅ DONE — no unprovenanced constant; every bound cites ARMv8/AAPCS64/ELF. 1 hardening (post_index str Rt==Rn writeback) + 1 doc (cbz_fuse NZCV invariant). Committed `0174e15`.
+- **Phase D — AUDIT PASS 3 (inline-test coverage).** ✅ DONE — levers 5/6/7 byte-level tests + pointer_iv/dead_static_fns teeth; cargo 122→136.
+- **Phase E — DETERMINISM.** ✅ 100% — sqlite .s+.o IDENTICAL (3×, sha 54dd50b0c707), csmith .o IDENTICAL, yarpgen .s IDENTICAL.
+- **Phase F — RELEASE CANDIDATE 1.** ✅ committed + pushed (all preconditions met: lever-7 banked, audit clean, gate green, deterministic).
+
+<details><summary>original Phase B/C/D/E/F spec (superseded by the ✅ lines above)</summary>
+
 - **Phase B — AUDIT PASS 1 (Law-1 Side I: every LOC ↔ theorem space, NO exception).** ⬜ TODO
   - Walk `src/*.rs` file by file (fan out to subagents to keep context clean; write findings to
     `AUDIT-RC1.md`). For each function/block: does it realize a THEORY.md Part-I theorem
@@ -71,6 +79,8 @@
   - `git add -A && git commit -m "release candidate 1"` then `git push origin ssa-qbe`. If any gate
     is red or determinism fails, DO NOT push — record the blocker in this runbook and stop.
     (May go open-source after this phase — so the tree must be clean + green.)
+
+</details>
 
 **Runbook resume rule:** the phases are STRICTLY ORDERED. On resume, the first `⬜`/IN-PROGRESS
 phase is the work. Never skip ahead; never restart a `✅` phase. All results land in this runbook +
