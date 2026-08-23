@@ -49,6 +49,15 @@ const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16 };
 fn fp_phys(idx: u32) -> u32 {
     if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
 }
+// GP register name in x/w form. Reg 31 is the ZERO register (XZR/WZR) in every operand
+// position these helpers emit (load/store Rt, data-processing Rm/Rn-of-flag-forms) — NOT
+// sp; callers must never pass 31 where the encoding reads it as sp (add/sub-immediate Rn).
+fn xr(n: u32) -> String {
+    if n == 31 { "xzr".into() } else { format!("x{n}") }
+}
+fn wr(n: u32) -> String {
+    if n == 31 { "wzr".into() } else { format!("w{n}") }
+}
 // Add/Sub with a small constant right operand → (mnemonic, magnitude) for the AArch64
 // imm12 form. Side-II: the imm12 field is an *unsigned* 0..4096; a negative Add becomes a
 // Sub and vice versa. Returns None when the operand is not an in-range immediate.
@@ -756,11 +765,12 @@ impl Cg<'_> {
         };
     }
     fn store_gp_sp(&mut self, rv: u32, pos: u32, t: TypeId) {
+        let (w, x) = (wr(rv), xr(rv));
         _ = match self.a.tt.size(t) {
-            1 => writeln!(self.s, "\tstrb w{rv}, [sp, #{pos}]"),
-            2 => writeln!(self.s, "\tstrh w{rv}, [sp, #{pos}]"),
-            4 => writeln!(self.s, "\tstr w{rv}, [sp, #{pos}]"),
-            _ => writeln!(self.s, "\tstr x{rv}, [sp, #{pos}]"),
+            1 => writeln!(self.s, "\tstrb {w}, [sp, #{pos}]"),
+            2 => writeln!(self.s, "\tstrh {w}, [sp, #{pos}]"),
+            4 => writeln!(self.s, "\tstr {w}, [sp, #{pos}]"),
+            _ => writeln!(self.s, "\tstr {x}, [sp, #{pos}]"),
         };
     }
     // Frame-pointer-relative unscaled forms (ldur/stur, imm9 signed −256..255). x29 is the
@@ -781,11 +791,12 @@ impl Cg<'_> {
         };
     }
     fn store_gp_fp(&mut self, rv: u32, off: u32, t: TypeId) {
+        let (w, x) = (wr(rv), xr(rv));
         _ = match self.a.tt.size(t) {
-            1 => writeln!(self.s, "\tsturb w{rv}, [x29, #-{off}]"),
-            2 => writeln!(self.s, "\tsturh w{rv}, [x29, #-{off}]"),
-            4 => writeln!(self.s, "\tstur w{rv}, [x29, #-{off}]"),
-            _ => writeln!(self.s, "\tstur x{rv}, [x29, #-{off}]"),
+            1 => writeln!(self.s, "\tsturb {w}, [x29, #-{off}]"),
+            2 => writeln!(self.s, "\tsturh {w}, [x29, #-{off}]"),
+            4 => writeln!(self.s, "\tstur {w}, [x29, #-{off}]"),
+            _ => writeln!(self.s, "\tstur {x}, [x29, #-{off}]"),
         };
     }
     // Scaled base+offset load: x{rd} = *(x{rbase} + off), width per t. The ARMv8 scaled
@@ -1009,7 +1020,8 @@ impl Cg<'_> {
                 if pos.is_none() && *off > 256 {
                     return None;
                 }
-                let rv = self.src_gp(*v, 0);
+                // ISA: constant 0 stores via the zero register (str wzr/xzr) — reg 31.
+                let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, 0) };
                 match pos {
                     Some(p) => self.store_gp_sp(rv, p, *sty),
                     None => self.store_gp_fp(rv, *off, *sty),
@@ -1022,6 +1034,15 @@ impl Cg<'_> {
     // store x{reg} → [x1] per type. MUST NOT clobber x{reg}: the value may be a live home
     // (compute-from-home path passes v's home register), so any transformation of the stored
     // value uses a scratch (x9) rather than writing back into x{reg}.
+    // Store constant 0 via the zero register (caller guarantees simple_gp_store_ty).
+    fn store_z(&mut self, t: TypeId) {
+        _ = match self.a.tt.size(t) {
+            1 => writeln!(self.s, "\tstrb wzr, [x1]"),
+            2 => writeln!(self.s, "\tstrh wzr, [x1]"),
+            4 => writeln!(self.s, "\tstr wzr, [x1]"),
+            _ => writeln!(self.s, "\tstr xzr, [x1]"),
+        };
+    }
     fn store(&mut self, reg: u32, t: TypeId) {
         match self.a.tt.tys[t as usize] {
             Ty::Bool => {
@@ -2137,10 +2158,11 @@ impl<'a> Cg<'a> {
                 // d's home, ext in place — no x0 funnel (§residence). The loads before cmp are
                 // flag-neutral (mov/ldr/movz), so the compare's flags survive to the csel.
                 let rc = self.src_gp(*c, 0);
-                let ra = self.src_gp(*a, 1);
-                let rb = self.src_gp(*b, 2);
+                // ISA: a 0 select-arm reads the zero register (csel Rn/Rm=31 → xzr), no mov.
+                let ra = if matches!(a, Val::Imm(0)) { 31 } else { self.src_gp(*a, 1) };
+                let rb = if matches!(b, Val::Imm(0)) { 31 } else { self.src_gp(*b, 2) };
                 let rd = self.gp_home(*d).unwrap_or(0);
-                _ = writeln!(self.s, "\tcmp x{rc}, #0\n\tcsel x{rd}, x{ra}, x{rb}, ne");
+                _ = writeln!(self.s, "\tcmp x{rc}, #0\n\tcsel {}, {}, {}, ne", xr(rd), xr(ra), xr(rb));
                 self.ext_r(rd, *ty);
                 if self.gp_home(*d).is_none() {
                     self.tmp_store(*d, "x0");
@@ -2235,9 +2257,16 @@ impl<'a> Cg<'a> {
                 // Read the value from its home (no `mov x0,vHome` funnel) — store() is now
                 // clobber-free so passing a live home is safe. Address still funnels to x1
                 // (store hardcodes [x1]); loading it there cannot clobber a spilled v in x0.
-                let rv = self.src_gp(*v, 0);
-                self.ld_val(*a, "x1");
-                self.store(rv, *ty);
+                // ISA: a Store of constant 0 uses the zero register directly (str wzr/xzr),
+                // never `mov xN,#0; str xN` (AArch64 XZR/WZR = 0; Rt=31 → zero, not sp).
+                if matches!(v, Val::Imm(0)) && self.simple_gp_store_ty(*ty) {
+                    self.ld_val(*a, "x1");
+                    self.store_z(*ty);
+                } else {
+                    let rv = self.src_gp(*v, 0);
+                    self.ld_val(*a, "x1");
+                    self.store(rv, *ty);
+                }
             }
             Inst::Memcpy(d, s, sz) => {
                 self.ld_val(*s, "x0"); // src
