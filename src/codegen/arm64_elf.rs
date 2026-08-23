@@ -1812,25 +1812,107 @@ impl<'a> Cg<'a> {
         }
     }
 
+    // AAPCS64 scalar-arg marshalling for Inst::Call: GP args → x0..x7, FP args → d0..d7
+    // (≤8 each; overflow/composite are routed to ir_call_abi upstream, ir::call_composite).
+    //
+    // SIMULTANEOUS-COPY semantics (the ABI writes all arg registers "at once"). When every
+    // GP source lives OUTSIDE the arg-register file — always true before x0..x7 join the
+    // allocatable pool, and for the majority of calls after — this is the straight arg-order
+    // sequence, BYTE-IDENTICAL to the historical loop. When register targeting places a GP
+    // source INSIDE an arg register that another arg overwrites, a left-to-right sequence
+    // would clobber it; we then emit the GP writes as a PARALLEL MOVE: emit any write whose
+    // target is not still needed as a source, and break a residual cycle by parking one
+    // source in x8 (the indirect-result reg — never a home, never an arg, never touched by
+    // ld_val/tmp_load, which use only x9). FP sources are never arg registers, so FP stays
+    // in arg order. `⟦·⟧`: the emitted moves realize the same register→register function as
+    // the simultaneous copy — a standard parallel-move sequentialization.
+    fn marshal_call_args(&mut self, args: &[Val]) {
+        let (mut gp, mut fp) = (0u32, 0u32);
+        let mut kinds: Vec<(bool, u32, Val)> = Vec::with_capacity(args.len());
+        for &a in args {
+            if self.val_is_float(a) {
+                debug_assert!(fp < 8, "Inst::Call fp>8 — call_composite must route to CallX");
+                kinds.push((true, fp, a));
+                fp += 1;
+            } else {
+                debug_assert!(gp < 8, "Inst::Call gp>8 — call_composite must route to CallX");
+                kinds.push((false, gp, a));
+                gp += 1;
+            }
+        }
+        let ngp = gp;
+        // Hazard ⟺ some GP arg is sourced from a temp homed in an arg register x{j}, j<ngp.
+        let hazard = kinds
+            .iter()
+            .any(|&(isfp, _, v)| !isfp && matches!(v, Val::Tmp(t) if self.gp_home(t).is_some_and(|p| p < ngp)));
+        if !hazard {
+            for &(isfp, idx, a) in &kinds {
+                if isfp {
+                    self.ld_val(a, "x9");
+                    _ = writeln!(self.s, "\tfmov d{idx}, x9");
+                } else {
+                    self.ld_val(a, &format!("x{idx}"));
+                }
+            }
+            return;
+        }
+        // FP first (sources never in arg regs ⟹ order-independent).
+        for &(isfp, idx, a) in &kinds {
+            if isfp {
+                self.ld_val(a, "x9");
+                _ = writeln!(self.s, "\tfmov d{idx}, x9");
+            }
+        }
+        // GP parallel move: (target x{k}, source Val, Some(phys) if GP-reg-homed else None).
+        let mut mv: Vec<(u32, Val, Option<u32>)> = kinds
+            .iter()
+            .filter(|k| !k.0)
+            .map(|&(_, k, v)| (k, v, if let Val::Tmp(t) = v { self.gp_home(t) } else { None }))
+            .collect();
+        let mut done = vec![false; mv.len()];
+        let mut left = mv.len();
+        while left > 0 {
+            let mut progressed = false;
+            for i in 0..mv.len() {
+                if done[i] {
+                    continue;
+                }
+                let tk = mv[i].0;
+                if mv.iter().enumerate().any(|(j, m)| !done[j] && j != i && m.2 == Some(tk)) {
+                    continue; // x{tk} is still a live source — writing it now would clobber
+                }
+                match mv[i].2 {
+                    Some(p) => {
+                        if p != tk {
+                            _ = writeln!(self.s, "\tmov x{tk}, x{p}");
+                        }
+                    }
+                    None => self.ld_val(mv[i].1, &format!("x{tk}")),
+                }
+                done[i] = true;
+                left -= 1;
+                progressed = true;
+            }
+            if !progressed {
+                // pure register cycle — park one source in x8, redirect its readers, resume.
+                let i = (0..mv.len()).find(|&i| !done[i] && mv[i].2.is_some()).unwrap();
+                let p = mv[i].2.unwrap();
+                _ = writeln!(self.s, "\tmov x8, x{p}");
+                for m in mv.iter_mut() {
+                    if m.2 == Some(p) {
+                        m.2 = Some(8);
+                    }
+                }
+            }
+        }
+    }
+
     fn ir_call(&mut self, dst: &Option<Tmp>, callee: &Callee, args: &[Val]) {
         // INVARIANT (ir::call_composite, ir.rs): Inst::Call carries ONLY ≤8 GP + ≤8 FP
         // SCALAR args — any register overflow (gp>8 / fp>8), composite (struct/HFA/>16B),
         // or non-8B float is routed to Inst::CallX/ir_call_abi instead. So neither counter
         // can reach 8 here; the debug_asserts pin that delegated precondition.
-        let (mut gp, mut fp) = (0u32, 0u32);
-        for &a in args {
-            if self.val_is_float(a) {
-                debug_assert!(fp < 8, "Inst::Call fp>8 — call_composite must route to CallX");
-                self.ld_val(a, "x9");
-                _ = writeln!(self.s, "\tfmov d{fp}, x9");
-                fp += 1;
-            } else {
-                debug_assert!(gp < 8, "Inst::Call gp>8 — call_composite must route to CallX");
-                let r = format!("x{gp}");
-                self.ld_val(a, &r);
-                gp += 1;
-            }
-        }
+        self.marshal_call_args(args);
         match callee {
             Callee::Sym(name) => _ = writeln!(self.s, "\tbl {}", sym(name)),
             Callee::Ptr(p) => {
