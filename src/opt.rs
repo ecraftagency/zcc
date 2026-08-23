@@ -1085,30 +1085,137 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coa
             }
         }
     }
-    // Conservative coalescing candidates: a Copy whose dst/src are distinct temps that
-    // do NOT interfere (their live ranges are disjoint) can share a register. Same class
-    // by construction (a Copy preserves type); the per-class select filters anyway. Empty
-    // when coalescing is toggled off ⟹ the plain Stage-5b coloring.
-    let mut move_adj: Vec<Vec<Tmp>> = vec![Vec::new(); nt];
+    let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
+    // ── Conservative (Briggs) register COALESCING ──────────────────────────────
+    // A Copy(d,s) with disjoint live ranges (d,s do NOT interfere) may share ONE
+    // register — the copy then lowers to a self-move the peephole elides (this is
+    // the home←home residency lever: ~22k reg-reg mov on sqlite3.c). We MERGE such
+    // move-related temps into a representative and color the QUOTIENT interference
+    // graph, but ONLY when the merge stays colorable — Briggs' test: the merged
+    // node has < k neighbours of significant degree (an over-merge would spill BOTH
+    // temps, worse than one copy). This strictly dominates the old biased-coloring,
+    // which could merely PREFER a partner's color when free but never force it.
+    //
+    // CORRECTNESS (no new proof obligation). Merging two NON-interfering temps is a
+    // sound rename — they are never simultaneously live, so one register holds both
+    // and every read sees the right value. Transitive safety: a merge is refused
+    // whenever the combined neighbourhood already contains the other group (found via
+    // the same union-find), so two originally-interfering temps can NEVER end up
+    // sharing a home. `verify_abi` re-derives interference on the ORIGINAL graph and
+    // confirms every simultaneously-live pair still holds a DISTINCT home — the SAME
+    // theorem as plain Stage-5b coloring. `coalesce=false` ⟹ every temp is its own
+    // representative ⟹ byte-identical to the un-coalesced coloring.
+    fn find(rep: &mut [Tmp], x: Tmp) -> Tmp {
+        let mut r = x;
+        while rep[r as usize] != r {
+            r = rep[r as usize];
+        }
+        let mut c = x; // path-compress
+        while rep[c as usize] != r {
+            let n = rep[c as usize];
+            rep[c as usize] = r;
+            c = n;
+        }
+        r
+    }
+    let mut rep: Vec<Tmp> = (0..nt as u32).collect();
     if coalesce {
+        // `madj[root]` = the root's interference neighbours, stored as ids that were
+        // roots when inserted; every READ resolves them through `find` so staleness
+        // from later merges is corrected lazily (keeping merges ~O(edges), not O(V²)).
+        let mut madj: Vec<HashSet<Tmp>> = adj.clone();
+        let mut pairs: Vec<(Tmp, Tmp)> = Vec::new();
         for b in &f.blocks {
             for i in &b.insts {
                 if let Inst::Copy(d, _, Val::Tmp(s)) = i
                     && d != s
+                    && is_fp[*d as usize] == is_fp[*s as usize]
                     && !adj[*d as usize].contains(s)
                 {
-                    move_adj[*d as usize].push(*s);
-                    move_adj[*s as usize].push(*d);
+                    pairs.push((*d, *s)); // program order ⟹ deterministic merge sequence
+                }
+            }
+        }
+        for (d, s) in pairs {
+            let (rd, rs) = (find(&mut rep, d), find(&mut rep, s));
+            if rd == rs {
+                continue; // already one group
+            }
+            let nbrs_rd: Vec<Tmp> = madj[rd as usize].iter().copied().collect();
+            if nbrs_rd.iter().any(|&n| find(&mut rep, n) == rs) {
+                continue; // a prior merge made the two groups interfere — never coalesce
+            }
+            // effective colour count: a value crossing a call is confined to the
+            // callee-saved band, so its usable palette shrinks by ncaller.
+            let crosses = crossing[rd as usize] || crossing[rs as usize];
+            let (kk, ncall) = if is_fp[rd as usize] {
+                (fp.k as usize, fp.ncaller as usize)
+            } else {
+                (gp.k as usize, gp.ncaller as usize)
+            };
+            let eff_k = kk - if crosses { ncall } else { 0 };
+            // Briggs: merged neighbourhood (resolved to roots), count high-degree ones
+            let nbrs_rs: Vec<Tmp> = madj[rs as usize].iter().copied().collect();
+            let mut nb: HashSet<Tmp> = HashSet::new();
+            for &n in nbrs_rd.iter().chain(nbrs_rs.iter()) {
+                let rn = find(&mut rep, n);
+                if rn != rd && rn != rs {
+                    nb.insert(rn);
+                }
+            }
+            let signif = nb.iter().filter(|&&n| madj[n as usize].len() >= eff_k).count();
+            if eff_k == 0 || signif >= eff_k {
+                continue; // merge risks an extra spill — keep the copy, safer
+            }
+            // commit: fold rs into rd, union adjacency, propagate the crossing flag
+            rep[rs as usize] = rd;
+            if crosses {
+                crossing[rd as usize] = true;
+            }
+            for &n in &nbrs_rs {
+                let rn = find(&mut rep, n);
+                if rn != rd {
+                    madj[rd as usize].insert(rn);
+                    madj[rn as usize].insert(rd);
                 }
             }
         }
     }
-    let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
-    let gp_in: Vec<bool> = is_fp.iter().map(|&b| !b).collect();
-    let gc = color_abi(&adj, &gp_in, gp, &crossing, &move_adj);
-    let fc = color_abi(&adj, &is_fp, fp, &crossing, &move_adj);
+    // Quotient interference graph over representatives (color reps only).
+    let mut qadj: Vec<HashSet<Tmp>> = vec![HashSet::new(); nt];
+    for u in 0..nt {
+        let ru = find(&mut rep, u as Tmp);
+        let nbrs: Vec<Tmp> = adj[u].iter().copied().collect();
+        for v in nbrs {
+            let rv = find(&mut rep, v);
+            if ru != rv {
+                qadj[ru as usize].insert(rv);
+            }
+        }
+    }
+    // Residual move-bias among representatives: a Copy whose merge Briggs REFUSED can
+    // still be nudged onto a shared colour when one is free (the old Phase-A behaviour).
+    let mut move_adj: Vec<Vec<Tmp>> = vec![Vec::new(); nt];
+    if coalesce {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Copy(d, _, Val::Tmp(s)) = i {
+                    let (rd, rs) = (find(&mut rep, *d), find(&mut rep, *s));
+                    if rd != rs && !qadj[rd as usize].contains(&rs) {
+                        move_adj[rd as usize].push(rs);
+                        move_adj[rs as usize].push(rd);
+                    }
+                }
+            }
+        }
+    }
+    let gp_in: Vec<bool> = (0..nt).map(|t| !is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
+    let fp_in: Vec<bool> = (0..nt).map(|t| is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
+    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj);
+    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj);
     for t in 0..nt {
-        home[t] = if is_fp[t] { fc[t] } else { gc[t] }.map(|c| (is_fp[t], c));
+        let r = find(&mut rep, t as Tmp) as usize;
+        home[t] = if is_fp[t] { fc[r] } else { gc[r] }.map(|c| (is_fp[t], c));
     }
     home
 }
