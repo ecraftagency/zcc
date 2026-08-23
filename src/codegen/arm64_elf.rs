@@ -2419,7 +2419,51 @@ impl<'a> Cg<'a> {
                 let rb = if matches!(b, Val::Imm(0)) { 31 } else { self.src_gp(*b, f + 2) };
                 let rd = self.gp_home(*d).unwrap_or(f);
                 _ = writeln!(self.s, "\tcmp x{rc}, #0\n\tcsel {}, {}, {}, ne", xr(rd), xr(ra), xr(rb));
-                self.ext_r(rd, *ty);
+                // csel copies the full 64-bit selected operand; canon(ty,·) is idempotent on a
+                // value ALREADY canonical for ty, so the re-canonicalization is dead when BOTH
+                // arms are provably canonical for ty. Provable arms: the xzr arm (Imm(0) → 0,
+                // canonical for every width) and a same-typed temp (its home holds canon(ty) by
+                // the value contract). A general Imm / cross-typed temp is NOT proven → keep the
+                // ext. Sound because a skipped ext never changes bits the kept ext would have
+                // (idempotence); the kept case is byte-identical to before. [csel→sxtw = 3,412
+                // dead in-place sxtw on sqlite3.c — GCC combine's redundant-extend elimination.]
+                // Canonical for `ty` ⟺ same canon-signature: exact TypeId, or two plain integers
+                // of equal size & signedness (TyTab is not width-deduped, so int32 temps can carry
+                // distinct TypeIds — comparing the (size, unsigned) that DRIVES ext_rd is the true
+                // predicate). Bool/Bitfield fall to exact-TypeId only (their canon is not a width).
+                // canon(ty,·) as ext_rd realizes it, computed on an i64 — for proving an arm
+                // already-canonical. Bitfield/Bool are not plain widths ⟹ excluded (None).
+                let canon_i64 = |k: i64| -> Option<i64> {
+                    match self.a.tt.tys[*ty as usize] {
+                        Ty::Bool | Ty::Bitfield(..) => None,
+                        _ => Some(match (self.a.tt.size(*ty), self.a.tt.is_unsigned(*ty)) {
+                            (1, false) => k as i8 as i64,
+                            (1, true) => k as u8 as i64,
+                            (2, false) => k as i16 as i64,
+                            (2, true) => k as u16 as i64,
+                            (4, false) => k as i32 as i64,
+                            (4, true) => k as u32 as i64,
+                            _ => k,
+                        }),
+                    }
+                };
+                let arm_canon = |v: &Val| match v {
+                    Val::Imm(0) => true, // xzr = 0, canonical for every width
+                    // a materialized `mov reg,#k` holds exactly k ⟹ canonical iff k == canon(ty,k)
+                    Val::Imm(k) => canon_i64(*k) == Some(*k),
+                    Val::Tmp(t) => {
+                        let ot = self.ir_temps[*t as usize];
+                        ot == *ty
+                            || (!matches!(self.a.tt.tys[*ty as usize], Ty::Bool | Ty::Bitfield(..))
+                                && !matches!(self.a.tt.tys[ot as usize], Ty::Bool | Ty::Bitfield(..))
+                                && self.a.tt.size(ot) == self.a.tt.size(*ty)
+                                && self.a.tt.is_unsigned(ot) == self.a.tt.is_unsigned(*ty))
+                    }
+                    _ => false,
+                };
+                if !(arm_canon(a) && arm_canon(b)) {
+                    self.ext_r(rd, *ty);
+                }
                 if self.gp_home(*d).is_none() {
                     self.tmp_store(*d, &format!("x{f}"));
                 }
