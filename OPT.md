@@ -40,15 +40,26 @@ NOT part of the locked run.
 **Tripwire (user pastes this any time the AI starts drifting):** `OPT.md lever N — stick or amend?`
 → forces the AI back to this ledger; it continues the plan, or waits for an explicit "re-plan".
 
-### The GRINDING rule (bank everything positive; cap the chase)
+### The GRINDING rule (bank positive; abandon dead; cap the chase; run autonomously)
 
-1. **≥0.5% is positive and gets banked.** Any green, positive cut is committed — never wasted,
-   never "too small to bother". Bank it, record it, move on.
-2. **If real yield < 20% of the projected ceiling** → exactly **ONE (1) and only one** round of
-   review-and-push-the-limit on that lever. Not two. Not "just one more".
-3. **After that one round, ADVANCE to the next lever**, banking whatever positive was achieved.
-   The projection was never a promise — direct site-counts realize ~fully, structural projections
-   realize 5–10%; a low number *is the finding*, not a failure.
+Decide by measured yield vs the ledger baseline — **no user question at any branch:**
+
+- **yield ≤ 0 (zero or negative)** → **ABANDON immediately.** Revert the lever to the last green
+  commit (a negative made it worse; a zero is dead code — neither is kept), mark it
+  `ABANDONED: zero/negative`, ADVANCE to the next lever. **No review-push round. No question.**
+- **0 < yield < 20% of the projected ceiling** → exactly **ONE (1) and only one** review-and-push
+  round, then bank whatever positive and ADVANCE. Not two. Not "just one more".
+- **yield ≥ 20%** → bank and ADVANCE.
+
+Any positive **≥0.5% is banked** — never wasted, never "too small to bother". The projection was
+never a promise: direct site-counts realize ~fully, structural projections 5–10%; a low/zero
+number *is the finding*, not a failure.
+
+**RUN AUTONOMOUSLY — do NOT interrupt the user per-lever.** The 1→6 run proceeds on its own:
+bank / abandon / BLOCKED per the rules above — no "should I continue?", no "this one was low, ok?"
+(every such question is a drift opening). Accumulate results and deliver **ONE consolidated report
+at the end of the run** (or at a genuine hard stop — e.g. all remaining levers BLOCKED). The user
+set the machine running; report when it's done, not per step.
 
 ### The two pre-decided responses (so the AI doesn't improvise under pressure)
 
@@ -91,6 +102,37 @@ the 7–10 decision is then the user's via "re-plan", never an AI escalation.
 A lever is DONE only when: **cargo + opt-parity + torture + csmith(300) + yarpgen(300) all green**,
 the real insn-delta is recorded in the ledger below, and it is **committed**. No lever is "done",
 and no lever is "a failure", by feel — the gate and the measured number decide.
+
+### Closure check — the loop is TOTAL (every outcome maps to an action; none maps to "ask the user")
+
+**Pre-run, ONCE:** capture the **baseline** — build green, run the full gate, record (a) the sqlite
+insn count, (b) the exact gate result including any KNOWN pre-existing non-green (e.g. s0035
+CTIMEOUT, s2611 parked). Every later judgment is a **DELTA vs this baseline**: a gate failure that
+ALSO fails at baseline is NOT this lever's fault and never counts as a blocker.
+
+Then per lever N, the outcome→action function is total — **no row asks the user:**
+
+| outcome of working lever N | action (silent, no question) |
+|---|---|
+| build/gate red, fixable in a bounded Law-2 pass | fix to green, re-evaluate |
+| build/gate red vs baseline, NOT fixable in the bounded attempt | revert N to last green → `BLOCKED: <reason>` → advance |
+| won't fire / needs infrastructure that doesn't exist | `BLOCKED: needs <X>` → advance |
+| green, yield ≤ 0 (zero/negative) | revert N → `ABANDONED: zero/neg` → advance |
+| green, 0 < yield < 20% of ceiling | ONE push round → bank positive → advance |
+| green, yield ≥ 20% | bank → advance |
+| lever 6 done/blocked/abandoned | END → consolidated report |
+
+Mechanics that make the table executable:
+- **One commit per banked lever** ⟹ **revert = `git reset --hard <last-green-commit>`** (banked
+  commits stay; only the failed lever's work is discarded). Never ambiguous.
+- **The ONLY two AI-initiated stops:** (1) end of lever 6 → consolidated report; (2) all remaining
+  locked levers `BLOCKED`/`ABANDONED` → hard-stop report. No other pause exists; everything else
+  advances silently.
+- Measurement is exact (zcc is deterministic) ⟹ no "is this yield noise?" ambiguity ever.
+
+**Verdict: ENCLOSED.** Every lever outcome has a pre-decided no-question transition; the run is a
+total function `1→6 ↦ {banked | abandoned | blocked}` + one report. The string *"should we try
+another branch?"* is not in the codomain — the AI cannot legally reach it.
 
 ### The ledger (baseline: sqlite `-c` = **303,933** insn @ commit `c7cf2f3`; gcc-O1 = 157,883; **1.925×**)
 
