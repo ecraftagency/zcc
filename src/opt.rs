@@ -1506,6 +1506,181 @@ fn cfg_complete(f: &IrFunc) -> bool {
     !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::GotoPtr(..))))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SROA — Scalar Replacement of Aggregates.  An IR→IR pass that runs AFTER inlining
+// and BEFORE to_ssa.  A struct/array field access is lowered as an ADDRESS COMPUTATION
+// `Lea(Local(base)) (+ Add const)*` feeding a scalar Load/Store; the base Lea escapes
+// via the Add, so to_ssa (which only promotes offsets accessed through a bare Lea(Local))
+// leaves the whole aggregate in the frame.  SROA rewrites each constant-offset field
+// address into a SINGLE `Lea(Local(base − off))` — the identical byte, but now a bare
+// Lea(Local(_)) that to_ssa promotes to an SSA scalar.  This is the lever for struct-heavy
+// code: fields become registers instead of frame memory.
+//
+// WHY an IR pass after inline, NOT a lowering-time fold: after `bump(&q)` is inlined, the
+// callee body reaches `q.f` through the SAME substituted base tmp, so ALL accesses (the
+// caller's Member accesses and the inlinee's pointer arithmetic) go through one base Lea and
+// are rewritten UNIFORMLY — no aliasing split.  A lowering-time fold sees only the caller's
+// Member syntax and would rewrite half, leaving the inlined pointer half unfolded → a store
+// forwarded across an aliasing write (miscompile).  Doing it here is why compilers put SROA
+// on a mid-level IR with escape analysis.
+//
+// SOUNDNESS (the decomposability gate).  A base local is split ONLY if:
+//   (1) every use of any address tmp of it is a Load/Store ADDRESS or the operand of a
+//       resolved constant `Add` — never stored as a value, passed to a call, compared, or
+//       returned (⟹ no pointer escapes to alias its storage), and
+//   (2) no two DISTINCT field offsets partially overlap (unions / cast-punning): overlapping
+//       fields would be promoted to independent SSA scalars yet share bytes → miscompile.
+// (Same-offset type conflicts are left to to_ssa's note_ty, which escapes that one offset.)
+//
+// GOVERNING THEOREM (CbC): ⟦f⟧ = ⟦sroa(f)⟧.  Each rewritten address is value-identical —
+// `⟦Lea(Local(base−c))⟧ = frame − (base−c) = (frame − base) + c = ⟦Add(Lea(Local(base)), c)⟧`
+// (Lea interp, ir.rs) — and the gate guarantees no other access reaches the storage, so
+// splitting one slot into per-field slots preserves the memory model.  MEASURED by `equiv`.
+// Pre-to_ssa the IR is single-def per temp (each lowered value gets a fresh temp), so an
+// address tmp resolves to one (base, offset).
+pub fn sroa(tt: &TyTab, f: &mut IrFunc) -> u32 {
+    // 1. Resolve local-address tmps to (base, resolved local offset). Lea(Local) seeds;
+    //    `Add(tmp, +const)` extends. Fixpoint (an Add may textually precede its base's Lea).
+    let mut addr: HashMap<Tmp, (u32, u32)> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Lea(t, Place::Local(off)) if !addr.contains_key(t) => {
+                        addr.insert(*t, (*off, *off));
+                        changed = true;
+                    }
+                    Inst::Bin(t, Op::Add, _, x, y) if !addr.contains_key(t) => {
+                        let one = match (x, y) {
+                            (Val::Tmp(s), Val::Imm(c)) | (Val::Imm(c), Val::Tmp(s)) => Some((*s, *c)),
+                            _ => None,
+                        };
+                        if let Some((s, c)) = one
+                            && c >= 0
+                            && let Some(&(base, roff)) = addr.get(&s)
+                            && let Some(nr) = roff.checked_sub(c as u32)
+                        {
+                            addr.insert(*t, (base, nr));
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if addr.is_empty() {
+        return 0;
+    }
+    let base_of = |t: Tmp| addr.get(&t).map(|&(b, _)| b);
+
+    // 2. Escape / decomposability. A base is BAD if any address tmp of it is used as anything
+    //    other than a Load/Store address or the operand of a resolved const-Add.
+    // A PARAMETER's storage is ABI-delivered into its frame slot as a WHOLE unit (emit_params),
+    // not by in-body Stores. Splitting a struct param's fields into distinct offsets would make
+    // to_ssa promote offsets it cannot seed from the ABI delivery (no def, not a param_off) →
+    // an undefined read (931004-5, 20000707-1: struct-by-value args). Never split a param base.
+    let mut bad: HashSet<u32> = f.params.iter().map(|&(off, _)| off).collect();
+    let mut buf = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            match i {
+                Inst::Load(_, _, Val::Tmp(_)) => {} // address use — ok
+                Inst::Bin(d, Op::Add, _, _, _) if addr.contains_key(d) => {} // field-Add — ok
+                Inst::Store(_, _, val) => {
+                    // the address (2nd operand) is a fine use; a stored VALUE that is an
+                    // address tmp is a pointer escaping into memory → its base is BAD.
+                    if let Val::Tmp(v) = val
+                        && let Some(bb) = base_of(*v)
+                    {
+                        bad.insert(bb);
+                    }
+                }
+                other => {
+                    buf.clear();
+                    inst_uses(other, &mut buf);
+                    for &u in &buf {
+                        if let Some(bb) = base_of(u) {
+                            bad.insert(bb);
+                        }
+                    }
+                }
+            }
+        }
+        buf.clear();
+        term_uses(&b.term, &mut buf);
+        for &u in &buf {
+            if let Some(bb) = base_of(u) {
+                bad.insert(bb);
+            }
+        }
+    }
+
+    // 3. Partial-overlap guard: distinct field offsets whose byte ranges intersect (union /
+    //    cast punning) cannot both be promoted to independent scalars.
+    let mut acc: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            let (u, ty) = match i {
+                Inst::Load(_, ty, Val::Tmp(u)) => (*u, *ty),
+                Inst::Store(ty, Val::Tmp(u), _) => (*u, *ty),
+                _ => continue,
+            };
+            if let Some(&(base, roff)) = addr.get(&u) {
+                acc.entry(base).or_default().push((roff, tt.size(ty)));
+            }
+        }
+    }
+    for (&base, list) in &acc {
+        'pair: for a in 0..list.len() {
+            for c in (a + 1)..list.len() {
+                let ((o1, s1), (o2, s2)) = (list[a], list[c]);
+                if o1 == o2 {
+                    continue; // same offset ⟹ note_ty in to_ssa arbitrates the type
+                }
+                // address of a field at local offset o = frame − o; interval [−o, −o+size).
+                let (lo1, hi1) = (-(o1 as i64), -(o1 as i64) + s1 as i64);
+                let (lo2, hi2) = (-(o2 as i64), -(o2 as i64) + s2 as i64);
+                if lo1 < hi2 && lo2 < hi1 {
+                    bad.insert(base);
+                    break 'pair;
+                }
+            }
+        }
+    }
+
+    // 4. Rewrite each address tmp of a GOOD base to a single folded Lea(Local(resolved)).
+    let mut changed = 0u32;
+    for b in &mut f.blocks {
+        for i in &mut b.insts {
+            let resolved = match i {
+                Inst::Lea(t, Place::Local(_)) | Inst::Bin(t, Op::Add, _, _, _) => addr.get(t).copied(),
+                _ => None,
+            };
+            let Some((base, roff)) = resolved else { continue };
+            if bad.contains(&base) {
+                continue;
+            }
+            if let Inst::Lea(_, Place::Local(off)) = i
+                && *off == roff
+            {
+                continue; // already the folded form (a base Lea at offset 0)
+            }
+            let t = match i {
+                Inst::Lea(t, _) | Inst::Bin(t, ..) => *t,
+                _ => unreachable!(),
+            };
+            *i = Inst::Lea(t, Place::Local(roff));
+            changed += 1;
+        }
+    }
+    changed
+}
+
 pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
     if !cfg_complete(f) {
         return;
@@ -3905,6 +4080,7 @@ pub struct Passes {
     pub if_convert: bool, // B4: side-effect-free diamond → Select (csel); runs before out_of_ssa
     pub inline: bool,   // Tier-1 #5: whole-program depth-1 inlining (runs before to_ssa)
     pub remat: bool,    // Tier-5 #26: rematerialize pure operand-free defs under pressure (last)
+    pub sroa: bool,     // SROA: split non-escaping aggregate locals into per-field slots (before to_ssa)
 }
 
 impl Default for Passes {
@@ -3928,6 +4104,7 @@ impl Default for Passes {
             if_convert: true, // B4: diamond → csel; proven (equiv), B1-licensed load speculation
             inline: true, // Tier-1 #5: β-reduction; proven (equiv) — measured on the bench before ship
             remat: false, // Tier-5 #26: proven (equiv) but speed-gated on the box A/B (like licm/sr)
+            sroa: true,   // SROA: field-split non-escaping aggregates; proven (equiv) — feeds to_ssa
         }
     }
 }
@@ -3964,6 +4141,7 @@ impl Passes {
             "if_convert" | "ifconv" | "csel" => self.if_convert = v,
             "inline" => self.inline = v,
             "remat" => self.remat = v,
+            "sroa" => self.sroa = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -4338,6 +4516,9 @@ fn clone_remats_before_term(
 }
 
 pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
+    if p.sroa {
+        sroa(tt, f); // field-split non-escaping aggregates so to_ssa can promote their fields
+    }
     to_ssa(tt, f);
     for _ in 0..32 {
         let mut n = 0;
@@ -5379,6 +5560,82 @@ mod tests {
         // header ⟹ φ. (gen_ptr's locals are address-taken → stay in memory, no φ.)
         assert!(with_phi >= 36, "loop/branch shapes must introduce φ (anti-vacuous), got {with_phi}");
         eprintln!("to_ssa theorem: {proven} exprs proven ⟦f⟧=⟦to_ssa(f)⟧; {with_phi} introduced φ");
+    }
+
+    #[test]
+    fn sroa_splits_and_commutes() {
+        // A non-escaping local struct: SROA folds each field address to a per-field
+        // Lea(Local), and ⟦f⟧ = ⟦sroa(f)⟧ (the Lea-address identity). Anti-vacuous: sroa
+        // MUST fire, and after to_ssa the split fields promote (Lea(Local) count drops).
+        let src = "struct P{int x,y,z;};\
+                   int f(int n){struct P p;p.x=n;p.y=n+1;p.z=n+2;return p.x+p.y+p.z;}";
+        let (ast, ir) = compile("sroa", src);
+        let leas0: usize = ir
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Lea(_, Place::Local(_))))
+            .count();
+        let mut opt = ir.clone();
+        let mut fired = 0;
+        for f in opt.iter_mut() {
+            fired += sroa(&ast.tt, f);
+        }
+        assert!(fired > 0, "sroa must fire on a non-escaping struct");
+        for f in &opt {
+            verify(f).unwrap_or_else(|e| panic!("verify sroa: {e}"));
+        }
+        equiv(&ast.tt, &ir, &opt, "f").expect("⟦f⟧ = ⟦sroa(f)⟧");
+        assert_eq!(interp(&ast.tt, &opt, "f", &[10]).unwrap(), 33);
+        // End-to-end: the folded fields promote and the value is unchanged.
+        for f in opt.iter_mut() {
+            to_ssa(&ast.tt, f);
+        }
+        equiv(&ast.tt, &ir, &opt, "f").expect("⟦f⟧ = ⟦to_ssa(sroa(f))⟧");
+        assert_eq!(interp(&ast.tt, &opt, "f", &[10]).unwrap(), 33);
+        let leas1: usize = opt
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, Inst::Lea(_, Place::Local(_))))
+            .count();
+        assert!(leas1 < leas0, "the promoted fields must drop Lea(Local) count ({leas0}→{leas1})");
+    }
+
+    #[test]
+    fn sroa_respects_escape_and_overlap() {
+        // The soundness gates, each proven through the full split+promote pipeline against
+        // the naive semantics. (a) a pointer into the struct aliases a sibling field — SROA
+        // must NOT split (else the promoted sibling misses the pointer write). (b) union
+        // punning: two overlapping fields cannot both become independent scalars.
+        for (nm, src, arg, want) in [
+            (
+                "alias",
+                "struct P{int x,y;};\
+                 int f(int n){struct P p;int*q=&p.x;p.y=n;q[1]=99;return p.y;}",
+                5,
+                99,
+            ),
+            (
+                "union",
+                "union U{int i;struct{short a,b;}s;};\
+                 int f(int n){union U u;u.i=0;u.s.b=(short)n;return u.i;}",
+                7,
+                7 << 16,
+            ),
+        ] {
+            let (ast, ir) = compile(nm, src);
+            let mut opt = ir.clone();
+            for f in opt.iter_mut() {
+                sroa(&ast.tt, f);
+                to_ssa(&ast.tt, f);
+            }
+            for f in &opt {
+                verify(f).unwrap_or_else(|e| panic!("{nm} verify: {e}"));
+            }
+            equiv(&ast.tt, &ir, &opt, "f").unwrap_or_else(|e| panic!("{nm}: ⟦f⟧≠⟦opt(f)⟧ {e}"));
+            assert_eq!(interp(&ast.tt, &opt, "f", &[arg]).unwrap(), want, "{nm}");
+        }
     }
 
     #[test]
