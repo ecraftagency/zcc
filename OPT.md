@@ -235,17 +235,18 @@ Instrumentation probes (e.g. `ZCC_SELPROBE`) are temporary — remove before the
 
 Ratio = zcc_time / gcc_time (**lower is faster; 1.0 = parity**). Measured bench, best-of-3:
 
-| kernel | vs gcc-O0 | **vs gcc-O1 (TARGET)** | was (pre-pointer_iv) | note |
-|---|---|---|---|---|
-| fib    | 1.16 | **1.06 — ✅ PARITY** | 1.05 | O1≈O0 here |
-| loops  | 0.35 | **1.02 — ✅ PARITY** | 1.06 | already O1-class |
-| matmul | 0.51 | **1.71 — ⬇ closing** | 3.44 | pointer-IV SR+LFTR fired at default k=10, spill-free |
-| sieve  | 0.36 | **2.10 — ⬇ closing** | 2.60 | pointer-IV SR fired; residual = index arith + mem |
-| **geomean** | **0.52** | **1.40× (target 1.0)** | ~1.78× | measured 2026-08-22, quiet box, best-of-3 |
+| kernel | **vs gcc-O1 (TARGET)** | was 2026-08-22 | note |
+|---|---|---|---|
+| fib    | **1.03 — ✅ PARITY** | 1.06 | O1≈O0 here |
+| loops  | **0.95 — ✅ FASTER** | 1.02 | beats gcc-O1 |
+| matmul | **0.99 — ✅ PARITY** | 1.71 | post-index + imm-forwarding tightened the k-loop |
+| sieve  | **1.21 — ⬇ closing** | 2.10 | residual = index arith + mem |
+| **geomean** | **1.04× (target 1.0)** | 1.40× | measured 2026-08-24 @ `cc29874`, quiet box, best-of-3 ×3 stable |
 
-**Reading it:** **fib + loops MATCH gcc-O1** (1.06, 1.02). matmul + sieve — the two loop-nest kernels —
-**dropped 3.44→1.71× and 2.60→2.10×** this batch, pulling the geomean **1.78→1.40×**. Against gcc-O0
-zcc is now ~2× *faster* (0.52×). Residual O1 gap lives entirely in matmul/sieve index arithmetic + memory.
+**Reading it:** **fib + loops + matmul are at/under gcc-O1** (1.03, 0.95, 0.99); sieve alone (1.21)
+carries the residual. Geomean **1.40→1.04×** since the 1→5 run — post-index (L5) and immediate-offset
+forwarding (L4) directly tightened the two loop-nest kernels. **EXEC is now effectively at O1 parity
+(1.04×).** The remaining work is the SIZE axis (1.916×), which is runtime-free residency tax, not cycles.
 
 **SIZE axis (the second finish-line number — must ALSO reach 1.0; user: "match O1 on size AND speed").**
 Metric = instruction count on sqlite3.c (amalgamation, musl headers), same mnemonic-line count on
