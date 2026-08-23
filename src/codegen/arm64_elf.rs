@@ -3429,6 +3429,69 @@ fn drop_redundant_loads(body: &str) -> String {
     out
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// COST-SQUARE — the Law-3 cost-theorem instrument (dual of the correctness commuting
+// square). Correctness proves ⟦f⟧=⟦opt(f)⟧; cost proves the instruction-count is what the
+// lowering theorems SAY it is, at the theorem layer — not grepped out of the compiled `.s`
+// after a slow patch→build→suite cycle. The final emitted count decomposes EXACTLY:
+//
+//     FINAL(f) = LOWER(f) − Δload(f) − Δmove(f) − Δpair(f) − Δthread(f)
+//
+// where LOWER is the pre-peephole lowering catamorphism (Σ over IR insts of their machine-
+// insn expansion) and each Δ is the reduction realized by one post-emit theorem. The four Δ
+// are string→string passes, so their contribution is FAITHFUL BY CONSTRUCTION — measured by
+// counting instruction lines before/after. LOWER is the one layer needing an independent
+// model (`emit_len`, Layer 1): the square `Σ emit_len(f) ≡ LOWER(f)` certifies the Rust in
+// `emit_inst` faithfully realizes its lowering theorem; a mismatch is a Law-2 defect localized
+// to one function. This census is Layer 0: the exact per-stage decomposition, gated on
+// ZCC_COSTSQUARE, printed to stderr — deterministic, in-process, no `.s` grep.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Count EMITTED MACHINE INSTRUCTIONS in an assembly fragment: exactly the lines beginning
+/// with `\t` + a lowercase mnemonic letter. Labels (`.L…:`, `lg_…:` — no leading tab) and
+/// directives (`\t.cfi…`, `\t.size` — the byte after `\t` is `.`, not a-z) are excluded. This
+/// is the ground-truth `len(·)` the whole cost-model is built on.
+fn count_insn_lines(s: &str) -> usize {
+    s.lines()
+        .filter(|l| {
+            let b = l.as_bytes();
+            b.first() == Some(&b'\t') && b.get(1).is_some_and(|c| c.is_ascii_lowercase())
+        })
+        .count()
+}
+
+/// Print the per-stage cost-square census (ZCC_COSTSQUARE). `log[i] = (fname, [LOWER,
+/// after-load, after-move, after-pair, FINAL])` — five cumulative snapshots; the theorem Δ are
+/// the successive differences. Aggregate first (the TU-wide decomposition), then the top
+/// functions by FINAL size — where residual bloat concentrates, i.e. the Law-4 targets.
+fn report_cost_square(log: &[(String, [usize; 5])]) {
+    let mut t = [0usize; 5];
+    for (_, c) in log {
+        for i in 0..5 {
+            t[i] += c[i];
+        }
+    }
+    let [lower, a_load, a_move, a_pair, fin] = t;
+    eprintln!("── COST-SQUARE census ({} funcs) ─────────────────────", log.len());
+    eprintln!("  LOWER  (Σ lowering)   {lower:>9}   ← Layer-1 target: Σ emit_len must equal this");
+    eprintln!("  − load-elim           {:>9}   (store→load identity)", lower - a_load);
+    eprintln!("  − move-peephole       {:>9}   (redundant/dead reg-mov)", a_load - a_move);
+    eprintln!("  − ldp/stp pair        {:>9}", a_move - a_pair);
+    eprintln!("  − branch-thread       {:>9}", a_pair - fin);
+    eprintln!("  FINAL  (emitted)      {fin:>9}");
+    let mut idx: Vec<usize> = (0..log.len()).collect();
+    idx.sort_by(|&a, &b| log[b].1[4].cmp(&log[a].1[4]));
+    eprintln!("  ── top-15 by FINAL ──          LOWER  -LOAD  -MOVE  -PAIR  -THRD    FINAL");
+    for &i in idx.iter().take(15) {
+        let (n, c) = &log[i];
+        let nm: String = n.chars().take(26).collect();
+        eprintln!(
+            "    {:<26} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8}",
+            nm, c[0], c[0] - c[1], c[1] - c[2], c[2] - c[3], c[3] - c[4], c[4]
+        );
+    }
+}
+
 /// Backend entry point — the SOLE path: lower(AST) → IR → passes → asm. Covers the
 /// full suite/csmith/musl; the AST-walk emit() has been removed. The backend simulates per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
@@ -3555,6 +3618,9 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.s += a;
         g.s += "\n.text\n";
     }
+    // Cost-square census (Layer 0): five cumulative instruction-line snapshots per function.
+    let costsq = std::env::var("ZCC_COSTSQUARE").is_ok();
+    let mut cost_log: Vec<(String, [usize; 5])> = Vec::new();
     for (fi, f) in ast.funcs.iter().enumerate() {
         if dead.get(fi).copied().unwrap_or(false) {
             continue; // dead-function elimination: unreferenced static, fully inlined away
@@ -3614,6 +3680,9 @@ pub fn emit_ir(ast: &Ast) -> String {
         // Phase C — machine-level cleanup over just this body (the region begins fresh:
         // entered from the prologue, so an empty equivalence model is sound).
         let mut body = g.s.split_off(body_start);
+        // Layer-0 snapshot #1: the pre-peephole lowering count (LOWER) — the ground truth the
+        // independent emit_len catamorphism (Layer 1) is proven equal to.
+        let c_lower = costsq.then(|| count_insn_lines(&body));
         // Redundant-load-after-store (store→load identity) matches only `[sp,#k]` frame slots,
         // which hold compiler temps — a program volatile object is accessed through an address
         // register (`[xN]`), never this form. That invariant holds because volatile objects live
@@ -3623,21 +3692,34 @@ pub fn emit_ir(ast: &Ast) -> String {
         if !f.has_volatile {
             body = drop_redundant_loads(&body); // run on the raw stream, before copy-prop renames
         }
+        let c_load = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.peephole {
             body = peephole_moves(&body); // redundant/dead reg-moves…
         }
+        let c_move = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.ldst_pair {
             body = pair_ldst(&body); // …then the exposed adjacent accesses → ldp/stp
         }
+        let c_pair = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.peephole {
             // collapse forwarder blocks left empty once their φ-copies coalesced away.
             body = thread_asm_branches(&body);
+        }
+        if costsq {
+            let c_final = count_insn_lines(&body);
+            cost_log.push((
+                f.name.clone(),
+                [c_lower.unwrap(), c_load.unwrap(), c_move.unwrap(), c_pair.unwrap(), c_final],
+            ));
         }
         g.s.push_str(&body);
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
     }
     emit_module_tail(&mut g, ast);
+    if costsq {
+        report_cost_square(&cost_log);
+    }
     g.s
 }
 
