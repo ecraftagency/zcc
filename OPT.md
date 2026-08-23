@@ -146,7 +146,7 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 2 | redundant-sxtw peephole (ldrsw→sxtw, double, bitwise) | ~350 + tail | HI | LOW | S+P | ✅ DONE | **−410** (>100% of ceil) |
 | 3 | `smull`/`umull` fuse (ext+mul→1) | 98 sites | HI | LOW | S+P | ⛔ ABANDONED (fundamental-limit) | **0** (see note ▼) |
 | 4 | immediate-offset addr forwarding (`t=base+#off`, all-mem uses → `[base,#off]`, drop add) | 1,088 sound (pred) | HI | LOW-MED | S | ✅ DONE `4fa83c8+` | **−1,664** (>150% of pred; pair_ldst 2nd-order) |
-| 5 | pre/post-index for sequential pointer loops | fixes sieve/matmul | MED | MED | S+P | ⬜ TODO | — |
+| 5 | post-index addressing (`mem [xP]; add xP,xP,#k` → `mem [xP],#k`, drop add) | 187 sound (pred) | MED | MED | S+P | ✅ DONE `1709d9c+` | **−102** (hot-loop exec win; caught+fixed a cross-block bug) |
 | — | **▲▲▲ LOCK LINE — 1→6 to death; everything above ships before anything below ▲▲▲** | | | | | | |
 | 6 | **w-form arithmetic** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,744 + ldrsw 4,116 ≈ **12.8k** | MED | MED-HIGH | S+P | ⬜ TODO | — |
 | 7 | local reload elim (keep spilled value resident in-block) | part of mem **+27k** | LO | HIGH | S | ☐ conditional | — |
@@ -181,6 +181,21 @@ output to `try_fuse_addr`'s imm arm. **Residual (Law-4):** spilled-base cases (r
 category-(a)-ish — loading base to a register costs the add they'd save (no win); cross-block
 base-liveness declined by the block-local `index_live_at` is category-(b) but marginal. Lever
 over-performed its projection → no push round needed; banked, advance to Lever 5.
+
+**LEVER 5 — DONE, post-index addressing, committed 2026-08-24.** A bare-base access `mem Rt,[xP]`
+with a later same-block `add xP,xP,#k` (0<k≤255, post-index simm9) and xP untouched between folds
+to `mem Rt,[xP],#k`, deleting the add (asm-peephole `post_index`, modeled on drop_dead_moves +
+reg_uses liveness). −102 insn on sqlite (small static, but every site is a LOOP body → disproportionate
+exec/cycle win; lever's S+P value). **Law-2 bug caught by the gate + fixed:** first build DIVERGED on
+ssad-run/usad-run/930603-2 (opt=SIGABRT). Cause = Side-I: the scan checked `starts_with('.')`
+(directive-skip) BEFORE `ends_with(':')` (label boundary); a `.Lir_*:` label is BOTH, so the scan
+swallowed labels and crossed into a merge block, deleting a SHARED pointer-increment (the else-branch
+lost its advance → OOB write). Fix = test the label boundary first. This is the gate proving its worth
+(opt-parity O0-vs-fork behavioral diff surfaced it instantly). Residual: register-stride increments
+(`add xP,xP,xM`) and cross-block loop-carried forms are not post-indexed (would need CFG-level IV
+analysis) — category-(b), deferred, not on the 1–6 path.
+
+**★ 1→5 RUN COMPLETE (paused here per user; 6–9 next session).** Ledger deltas below.
 
 **Session-start ritual (every time):** (1) re-read this §0; (2) state which numbered lever is next
 and its ceiling+confidence; (3) work it under the gate; (4) record real banked yield here; (5)

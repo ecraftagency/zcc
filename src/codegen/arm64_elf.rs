@@ -3947,6 +3947,99 @@ fn pair_ldst(body: &str) -> String {
     out
 }
 
+/// POST-INDEX ADDRESSING (loop-IV walk — Tier-1 #5). A bare-base access `mem Rt, [xP]` followed
+/// later in the same straight-line region by `add xP, xP, #k` (0<k≤255, the post-index simm9
+/// range) — with xP neither read nor written on any line between — folds into `mem Rt, [xP], #k`
+/// and deletes the add. THEOREM: post-index means "access [xP], THEN xP += k"; with no read or
+/// write of xP in the gap, hoisting the increment up to the access changes no observation — every
+/// xP consumer at/after the original add still reads xP+k, and none exists before it. An
+/// intervening bare `[xP]` access itself READS xP, so it aborts the scan: only the access
+/// immediately preceding the increment (in xP-liveness) is fused. Excludes a LOAD whose Rt aliases
+/// xP (`ldr xP,[xP],#k` is architecturally UNPREDICTABLE); a store with Rt==xP is sound (it stores
+/// the pre-increment value, identical to the unfused pair). A region boundary — label, branch,
+/// call, ret, writeback/`],` line, or unknown mnemonic (reg_uses.boundary) — ends the scan.
+/// Machine translation-validation (opt-parity); one fewer insn per fused loop step (size + a hot
+/// per-iteration cycle). Runs after peephole_moves exposes the clean increment.
+fn post_index(body: &str) -> String {
+    // parse `<ldr*|str*> <w|x>Rt, [xP]` (bare base, no offset) → (is_load, rt, base).
+    fn parse_bare(t: &str) -> Option<(bool, u32, u32)> {
+        let mn = t.split(|c: char| c.is_whitespace()).next()?;
+        let is_load = match mn {
+            "ldr" | "ldrb" | "ldrh" | "ldrsw" | "ldrsb" | "ldrsh" => true,
+            "str" | "strb" | "strh" => false,
+            _ => return None,
+        };
+        let rest = t[mn.len()..].trim_start();
+        let (reg_s, mem) = rest.split_once(", [")?;
+        let base = mem.strip_suffix(']')?; // bare only — a `, #off]` or `], #k` keeps the ']'/','
+        if base.contains([',', '!', ' ']) {
+            return None;
+        }
+        let rt = reg_s.strip_prefix('x').or_else(|| reg_s.strip_prefix('w'))?.parse().ok()?;
+        let base = base.strip_prefix('x')?.parse().ok()?;
+        Some((is_load, rt, base))
+    }
+    // parse `add xP, xP, #k` → (dst, src, k).
+    fn parse_add_imm(t: &str) -> Option<(u32, u32, i64)> {
+        let rest = t.strip_prefix("add ")?;
+        let mut it = rest.split(", ");
+        let d = it.next()?.strip_prefix('x')?.parse().ok()?;
+        let s = it.next()?.strip_prefix('x')?.parse().ok()?;
+        let k = it.next()?.strip_prefix('#')?.parse().ok()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some((d, s, k))
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut post: Vec<Option<i64>> = vec![None; lines.len()]; // access line → post-inc k
+    let mut drop = vec![false; lines.len()]; // add line to delete
+    for (i, li) in lines.iter().enumerate() {
+        let Some((is_load, rt, base)) = parse_bare(li.trim()) else { continue };
+        if is_load && rt == base {
+            continue; // ldr xP,[xP],#k is UNPREDICTABLE
+        }
+        for (off, lj) in lines[i + 1..].iter().enumerate() {
+            let t = lj.trim();
+            // Label FIRST — a `.Lir_*:` label both starts with '.' and ends with ':', and is a
+            // region boundary (a merge point may be reached from other predecessors); the
+            // directive-skip below must not swallow it, or the scan crosses a block boundary and
+            // deletes a SHARED increment (ssad-run: the else-branch loses its pointer advance).
+            if t.ends_with(':') {
+                break;
+            }
+            if t.is_empty() || t.starts_with('.') {
+                continue; // blank / directive (.cfi_*, .p2align, …) — no register effect
+            }
+            if let Some((d, s, k)) = parse_add_imm(t) {
+                if d == base && s == base && k > 0 && k <= 255 {
+                    post[i] = Some(k);
+                    drop[i + 1 + off] = true;
+                    break;
+                }
+            }
+            let (reads, writes, boundary) = reg_uses(t);
+            if boundary || reads.contains(&base) || writes.contains(&base) {
+                break; // xP touched (or an opaque line) before the increment
+            }
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for (i, li) in lines.iter().enumerate() {
+        if drop[i] {
+            continue;
+        }
+        if let Some(k) = post[i] {
+            // rewrite `mem Rt, [xP]` → `mem Rt, [xP], #k` (the ']' stays; the offset follows it)
+            _ = writeln!(out, "{}, #{k}", li.trim_end());
+        } else {
+            out.push_str(li);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// DEAD-MOVE ELIMINATION (region-local backward liveness). A `mov xD,xS` is deleted when xD
 /// is redefined later in the same straight-line region BEFORE any read of xD — its value is
 /// never observed. The coalescer gives many short-lived temps the same home register, so the
@@ -4452,6 +4545,11 @@ pub fn emit_ir(ast: &Ast) -> String {
         let c_load = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.peephole {
             body = peephole_moves(&body); // redundant/dead reg-moves…
+            if !f.has_volatile {
+                // …then fold a loop-IV `mem [xP]; add xP,xP,#k` into a post-index access. Skipped
+                // for volatile functions (the increment's hoist reorders relative to the access).
+                body = post_index(&body);
+            }
         }
         let c_move = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.ldst_pair && !f.has_volatile {
