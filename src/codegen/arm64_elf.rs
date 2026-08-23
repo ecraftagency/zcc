@@ -5111,4 +5111,58 @@ mod tests {
         let out = drop_wform_sxtw("\tsxtw x5, w2\n\tmov w5, w9\n");
         assert_eq!(count(&out, "sxtw x5, w2"), 1, "a widening move is not the in-place form");
     }
+
+    use super::{cbz_fuse, post_index};
+
+    // LEVER 5 CORE: `ldr x5,[x6]` + `add x6,x6,#8` (base incremented, no intervening use) folds
+    // into a post-index `ldr x5,[x6],#8`, the add deleted.
+    #[test]
+    fn post_index_folds_increment() {
+        let out = post_index("\tldr x5, [x6]\n\tadd x6, x6, #8\n");
+        assert!(out.contains("ldr x5, [x6], #8"), "the increment folds into the access");
+        assert_eq!(count(&out, "add x6, x6, #8"), 0, "the separate add is deleted");
+    }
+
+    // TEETH: `ldr x6,[x6]` (loaded value overwrites the base) is UNPREDICTABLE as a post-index —
+    // must NOT fold; the add stays.
+    #[test]
+    fn post_index_declines_load_into_base() {
+        let out = post_index("\tldr x6, [x6]\n\tadd x6, x6, #8\n");
+        assert_eq!(count(&out, "add x6, x6, #8"), 1, "load-into-base cannot post-index");
+    }
+
+    // TEETH: an intervening READ of the base before the increment means the un-incremented base is
+    // observed ⟹ must NOT fold.
+    #[test]
+    fn post_index_declines_when_base_used_between() {
+        let out = post_index("\tldr x5, [x6]\n\tadd x9, x6, x2\n\tadd x6, x6, #8\n");
+        assert!(out.contains("ldr x5, [x6]\n"), "the access is not post-indexed");
+        assert_eq!(count(&out, "add x6, x6, #8"), 1, "base read before increment ⟹ no fold");
+    }
+
+    // TEETH: a label between access and increment is a merge point — the increment may be shared;
+    // folding it would lose a predecessor's advance (the ssad-run bug). Must NOT fold.
+    #[test]
+    fn post_index_declines_across_label() {
+        let out = post_index("\tldr x5, [x6]\n.Lx:\n\tadd x6, x6, #8\n");
+        assert_eq!(count(&out, "add x6, x6, #8"), 1, "increment past a label is a boundary ⟹ keep");
+    }
+
+    // LEVER 6 CORE: `cmp x5,#0` + `b.eq L` collapses to `cbz x5, L`, deleting the cmp; `b.ne`→cbnz.
+    #[test]
+    fn cbz_fuse_collapses_eq_and_ne() {
+        let eq = cbz_fuse("\tcmp x5, #0\n\tb.eq .Lx\n\tmov x0, x1\n");
+        assert!(eq.contains("cbz x5, .Lx"), "cmp #0 + b.eq ⟹ cbz");
+        assert_eq!(count(&eq, "cmp x5, #0"), 0, "the cmp is deleted");
+        let ne = cbz_fuse("\tcmp w3, #0\n\tb.ne .Ly\n\tret\n");
+        assert!(ne.contains("cbnz w3, .Ly"), "cmp #0 + b.ne ⟹ cbnz");
+    }
+
+    // TEETH: a later flag-reader on the fall-through (`cset` reads NZCV) means the cmp's flags are
+    // still LIVE ⟹ the cmp must NOT be deleted.
+    #[test]
+    fn cbz_fuse_declines_when_flags_live() {
+        let out = cbz_fuse("\tcmp x5, #0\n\tb.eq .Lx\n\tcset w0, gt\n");
+        assert_eq!(count(&out, "cmp x5, #0"), 1, "flags read after ⟹ cmp still needed ⟹ keep");
+    }
 }
