@@ -2292,6 +2292,57 @@ mod tests {
         );
     }
 
+    // GATE-HAS-TEETH (audit RC1 #2): pointer_iv must DECLINE on a loop with no pointer-linear
+    // address term (a pure scalar reduction) — there is nothing to strength-reduce, so it returns
+    // 0 and leaves ⟦·⟧ untouched. This proves the matcher is selective (it does not fire spuriously
+    // and rewrite an induction variable that has no marching memory access).
+    #[test]
+    fn pointer_iv_declines_scalar_loop() {
+        let (ast, ir) = compile("pivneg", "int f(int n){int s=0,i;for(i=0;i<n;i=i+1)s=s+i;return s;}");
+        let mut ssa = ir[0].clone();
+        to_ssa(&ast.tt, &mut ssa);
+        copy_prop(&mut ssa);
+        let base = vec![ssa.clone()];
+        let mut opt = ssa.clone();
+        let n = pointer_iv(&ast.tt, &mut opt, GP_K);
+        assert_eq!(n, 0, "no pointer-linear term ⟹ pointer_iv must not fire");
+        verify(&opt).unwrap();
+        equiv(&ast.tt, &base, &vec![opt], "f").expect("a declined pass is the identity on ⟦·⟧");
+    }
+
+    // dead_static_fns GATE-HAS-TEETH (audit RC1 #3, previously untested): an unreferenced static
+    // is removed; a static that is CALLED from a root, address-taken (named in root_syms), or
+    // exported (non-static) is KEPT. Removing a live function is a link error, so the gate must
+    // never over-remove; leaving a provably-dead one wastes size, so it must remove it.
+    #[test]
+    fn dead_static_fns_gate_has_teeth() {
+        let (_ast, ir) = compile(
+            "dsf",
+            "static int used(int x){return x+1;} \
+             static int viaptr(int x){return x*2;} \
+             static int deadf(int x){return x-1;} \
+             int pub(int x){return used(x);}",
+        );
+        let idx = |n: &str| {
+            ir.iter()
+                .position(|f| f.name.strip_prefix('\u{1}').unwrap_or(&f.name) == n)
+                .unwrap_or_else(|| panic!("no func {n}"))
+        };
+        let mut is_static = vec![false; ir.len()];
+        for nm in ["used", "viaptr", "deadf"] {
+            is_static[idx(nm)] = true;
+        }
+        // `pub` is a non-static root (is_static=false); `viaptr` is address-taken via a global
+        // initializer, which the real driver records in root_syms under the func's own name.
+        let root: std::collections::HashSet<String> =
+            [ir[idx("viaptr")].name.clone()].into_iter().collect();
+        let dead = dead_static_fns(&ir, &is_static, &root);
+        assert!(!dead[idx("pub")], "an exported (non-static) function is a root ⟹ kept");
+        assert!(!dead[idx("used")], "a static reached by a Call from a root ⟹ kept");
+        assert!(!dead[idx("viaptr")], "an address-taken static (in root_syms) ⟹ kept");
+        assert!(dead[idx("deadf")], "an unreferenced static ⟹ dead ⟹ removable");
+    }
+
     // The industrial toggle: the default profile ships licm OFF (measured-negative), all()
     // turns it ON, and set() flips individual elements — so any pass can be disabled without
     // touching the others. Correctness of every profile is covered by the equiv proofs;

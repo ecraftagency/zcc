@@ -4028,14 +4028,17 @@ fn pair_ldst(body: &str) -> String {
 
 /// POST-INDEX ADDRESSING (loop-IV walk — Tier-1 #5). A bare-base access `mem Rt, [xP]` followed
 /// later in the same straight-line region by `add xP, xP, #k` (0<k≤255, the post-index simm9
-/// range) — with xP neither read nor written on any line between — folds into `mem Rt, [xP], #k`
-/// and deletes the add. THEOREM: post-index means "access [xP], THEN xP += k"; with no read or
-/// write of xP in the gap, hoisting the increment up to the access changes no observation — every
-/// xP consumer at/after the original add still reads xP+k, and none exists before it. An
-/// intervening bare `[xP]` access itself READS xP, so it aborts the scan: only the access
-/// immediately preceding the increment (in xP-liveness) is fused. Excludes a LOAD whose Rt aliases
-/// xP (`ldr xP,[xP],#k` is architecturally UNPREDICTABLE); a store with Rt==xP is sound (it stores
-/// the pre-increment value, identical to the unfused pair). A region boundary — label, branch,
+/// range, a conservative subset of the true simm9 −256..255 — the negative/`sub` half is a Law-4
+/// coverage residual, not a bug) — with xP neither read nor written on any line between — folds
+/// into `mem Rt, [xP], #k` and deletes the add. THEOREM: post-index means "access [xP], THEN
+/// xP += k"; with no read or write of xP in the gap, hoisting the increment up to the access
+/// changes no observation — every xP consumer at/after the original add still reads xP+k, and none
+/// exists before it. An intervening bare `[xP]` access itself READS xP, so it aborts the scan:
+/// only the access immediately preceding the increment (in xP-liveness) is fused. Excludes ANY
+/// access whose Rt aliases the base xP (`mem xP,[xP],#k`): ARMv8-A makes base-writeback with the
+/// transfer reg == base reg (base ≠ 31) CONSTRAINED UNPREDICTABLE for loads AND stores alike (a
+/// store there may write an UNKNOWN value, not the pre-increment one), so it is never folded in
+/// either direction. A region boundary — label, branch,
 /// call, ret, writeback/`],` line, or unknown mnemonic (reg_uses.boundary) — ends the scan.
 /// Machine translation-validation (opt-parity); one fewer insn per fused loop step (size + a hot
 /// per-iteration cycle). Runs after peephole_moves exposes the clean increment.
@@ -4074,9 +4077,12 @@ fn post_index(body: &str) -> String {
     let mut post: Vec<Option<i64>> = vec![None; lines.len()]; // access line → post-inc k
     let mut drop = vec![false; lines.len()]; // add line to delete
     for (i, li) in lines.iter().enumerate() {
-        let Some((is_load, rt, base)) = parse_bare(li.trim()) else { continue };
-        if is_load && rt == base {
-            continue; // ldr xP,[xP],#k is UNPREDICTABLE
+        let Some((_is_load, rt, base)) = parse_bare(li.trim()) else { continue };
+        if rt == base {
+            // ARMv8-A: base-register writeback with the transfer reg == base reg (and base ≠ 31)
+            // is CONSTRAINED UNPREDICTABLE for BOTH loads AND stores (a store may write an UNKNOWN
+            // value, not the pre-increment one) — never fold `mem xP,[xP],#k` regardless of dir.
+            continue;
         }
         for (off, lj) in lines[i + 1..].iter().enumerate() {
             let t = lj.trim();
@@ -4126,7 +4132,14 @@ fn post_index(body: &str) -> String {
 /// of reach. SOUNDNESS obligation — the cmp's NZCV flags must be dead on the fall-through past the
 /// branch (cbz sets no flags): scan forward from the branch; a flag-WRITER or a control boundary
 /// (label / b / bl / ret / cbz…) first ⟹ flags dead ⟹ SAFE; a flag-READER first (a second `b.cc`,
-/// cset, csel, adc, ccmp…) ⟹ the cmp is still needed ⟹ DECLINE. Machine translation-validation
+/// cset, csel, adc, ccmp…) ⟹ the cmp is still needed ⟹ DECLINE. The scan inspects ONLY the
+/// fall-through successor, NOT the taken-branch target — sound under a standing zcc invariant:
+/// **NZCV is never live-IN to a basic block.** zcc's SSA lowering emits every flag producer
+/// (cmp/subs/…) and its consumer (b.cc/cset/csel) within one block, producer-before-consumer, so
+/// no block reads NZCV as a live-in; arriving at `label` via a flag-clearing `cbz` therefore
+/// observes nothing the original `b.eq` would have preserved. (A general assembler WITHOUT this
+/// invariant could break on `cmp;b.eq .L; …flag-writer…; .L: cset` — not emittable by zcc.)
+/// Machine translation-validation
 /// (opt-parity); one fewer insn per branch (size + a hot compare-branch cycle). This is the
 /// bare-truth-branch case the IR cbr-fusion misses (it fires only when the tested value is itself
 /// a relational compare; here Rn is a plain integer — null-checks, `if(x)`, `while(n)`).
