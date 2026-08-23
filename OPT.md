@@ -16,6 +16,134 @@
 
 ---
 
+## §0 — PLAN-OF-RECORD (LOCKED) — read THIS before touching anything
+
+> **The plan lives HERE, not in the chat.** Chat gets compacted and forgotten; this file does
+> not. Every session opens by re-reading §0. Every lever starts from §0's ledger. We drifted
+> before because the plan lived in conversation and vanished — this section is the fix.
+
+### The lock (user directive, 2026-08-23): **"1→6 is 1→6 until death."**
+
+Execute levers **1 through 6 in order, to completion.** Do not reorder, skip, or substitute.
+Levers **7–10** are the size-only grind toward binary-1× — attempted **only if** binary-1× is
+still required *after* 1–6 are measured, and **only** on an explicit user "re-plan"/go. They are
+NOT part of the locked run.
+
+### The NO-PIVOT contract (this rule contradicts the AI when it drifts)
+
+> When a lever yields less than expected OR hits a miscompile, the ONLY permitted responses are:
+> **(a)** debug to green by Law-2 decomposition, or **(b)** bank the real yield in the ledger and
+> advance to the next numbered lever. Proposing a new direction, a new lever, or a re-sequencing
+> is **FORBIDDEN** unless the user types the word **"re-plan"**. A disappointing yield is the
+> calibration DATA we came for — never a reason to abandon the sequence.
+
+**Tripwire (user pastes this any time the AI starts drifting):** `OPT.md lever N — stick or amend?`
+→ forces the AI back to this ledger; it continues the plan, or waits for an explicit "re-plan".
+
+### The GRINDING rule (bank everything positive; cap the chase)
+
+1. **≥0.5% is positive and gets banked.** Any green, positive cut is committed — never wasted,
+   never "too small to bother". Bank it, record it, move on.
+2. **If real yield < 20% of the projected ceiling** → exactly **ONE (1) and only one** round of
+   review-and-push-the-limit on that lever. Not two. Not "just one more".
+3. **After that one round, ADVANCE to the next lever**, banking whatever positive was achieved.
+   The projection was never a promise — direct site-counts realize ~fully, structural projections
+   realize 5–10%; a low number *is the finding*, not a failure.
+
+### The two pre-decided responses (so the AI doesn't improvise under pressure)
+
+- **Miscompile** → Law-2 decompose (Side I algorithm / Side II constant), **never blame the test
+  first**; fix to green, or revert *that lever only* and mark it `BLOCKED: <reason>`, then next
+  number. Never "let me rethink the whole approach."
+- **Low yield** → write the real number in the ledger, apply the grinding rule, advance.
+
+### The BLOCKER protocol (the plan's REAL failure mode — this is where it dies)
+
+The happy path (1→6, each banks nicely) is NOT where the plan collapses. It collapses at the
+**blocker**: the AI hits a wall on lever N — a miscompile it can't crack in-budget, a lever that
+won't fire, a lever that needs infrastructure that doesn't exist — and comes back to the user with
+*"this is blocked, should we try another branch / a different approach?"* **That escalation IS the
+collapse.** It reopens the whole sequence for re-litigation and the plan evaporates. Pre-decided
+response — a blocker is **QUARANTINED to lever N, never escalated to plan-level**:
+
+1. **Bound the attempt.** Yield-blocker (fires but <20% of ceiling) → the grinding rule's ONE
+   review-push round. Hard-blocker (can't get green / won't fire at all) → **one** bounded Law-2
+   decomposition pass (Side I algorithm / Side II constant) — not open-ended thrashing, not a
+   "completely different approach".
+2. **Still blocked after the bounded attempt → revert THAT lever to the last green commit**
+   (tree stays green, banked levers intact), **mark it `BLOCKED: <specific one-line reason>`** in
+   the ledger, **bank any partial positive that was already green**, and **ADVANCE to N+1.**
+3. **FORBIDDEN as a blocker response:** proposing a new branch, a new lever, a different approach,
+   or asking the user "what should we do instead." A blocker NEVER produces a request for a new
+   direction. Only the user, via the word **"re-plan"**, reopens the sequence. At a blocker the
+   AI does exactly three things: **quarantine, mark, advance** — and stays silent on strategy.
+
+**Reframe (encode this):** a `BLOCKED` lever is the process **WORKING, not failing.** The plan's
+job is to march 1→6 and bank what is bankable; a lever that proves hard is *data* (needs infra X /
+hits ISA wall Y), recorded and left behind. The plan only collapses if one blocked lever is allowed
+to STOP the march or REOPEN the strategy. **Quarantine = survival.** Even if 3 of 6 end `BLOCKED`,
+the run is a SUCCESS — it banked 3 levers + 3 precise findings and never drifted. A blocker on
+lever 6 (the last locked one) simply ENDS the run at "1–6 attempted; banked = X; BLOCKED = …";
+the 7–10 decision is then the user's via "re-plan", never an AI escalation.
+
+### DONE is the gate, never the AI's judgment
+
+A lever is DONE only when: **cargo + opt-parity + torture + csmith(300) + yarpgen(300) all green**,
+the real insn-delta is recorded in the ledger below, and it is **committed**. No lever is "done",
+and no lever is "a failure", by feel — the gate and the measured number decide.
+
+### The ledger (baseline: sqlite `-c` = **303,933** insn @ commit `c7cf2f3`; gcc-O1 = 157,883; **1.925×**)
+
+Confidence: **HI** = direct site-count (banks ~fully, like csel's 3,246→3,381); **LO** = structural
+projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = size only.
+
+| # | lever | measured ceiling | conf | risk | axes | status | real banked |
+|---|---|---|---|---|---|---|---|
+| 0 | csel→sxtw dead-extend elim | 3,246 sites | HI | — | S | ✅ DONE `c7cf2f3` | **−3,381** |
+| 1 | `ubfx`/`sbfiz` fuse (shift+mask→1) | 730 sites (gcc has, zcc 0) | HI | LOW | S+P | ⬜ TODO | — |
+| 2 | redundant-sxtw peephole (ldrsw→sxtw, double, bitwise) | ~350 + tail | HI | LOW | S+P | ⬜ TODO | — |
+| 3 | `smull`/`umull` fuse (ext+mul→1) | 98 sites | HI | LOW | S+P | ⬜ TODO | — |
+| 4 | scaled-index residual (extend `ExtFold`) | ~376 sites | MED | LOW-MED | S+P | ⬜ TODO | — |
+| 5 | pre/post-index for sequential pointer loops | fixes sieve/matmul | MED | MED | S+P | ⬜ TODO | — |
+| — | **▲▲▲ LOCK LINE — 1→6 to death; everything above ships before anything below ▲▲▲** | | | | | | |
+| 6 | **w-form arithmetic** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,744 + ldrsw 4,116 ≈ **12.8k** | MED | MED-HIGH | S+P | ⬜ TODO | — |
+| 7 | local reload elim (keep spilled value resident in-block) | part of mem **+27k** | LO | HIGH | S | ☐ conditional | — |
+| 8 | coalescing extension (marshalling/param movs) | part of mov **+38k** | LO | HIGH | S | ☐ conditional | — |
+| 9 | compare-branch fusion / flag residency | cmp **+8.8k** | LO | MED | S+P | ☐ conditional | — |
+| 10 | SSA global register allocator (the rewrite / fork) | true 1× | — | HIGHEST | S | ☐ conditional | — |
+
+**Session-start ritual (every time):** (1) re-read this §0; (2) state which numbered lever is next
+and its ceiling+confidence; (3) work it under the gate; (4) record real banked yield here; (5)
+commit; (6) advance. Neither human nor AI needs to *remember* the plan — the file remembers.
+
+**What 1–6 buys (honest, discounted):** ~1.93× → **~1.85×** (≈ 8–11k insn). It does NOT reach 1×.
+Binary-1× is gated behind 7–10 (size-only) or 10 (the rewrite). 1–6 = the bankable, both-axes,
+weak-case-fixing, high-confidence portion + the calibration that decides whether 7–10 is worth it.
+
+### Turnkey recipe (zero rediscovery — copy/paste; box = `zccbox`, repo mounted at `/work`)
+
+```sh
+# BUILD (after every edit):
+docker exec zccbox sh -c 'cd /work && CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc'
+
+# MEASURE the one number (sqlite -c instruction count; compare to the ledger baseline):
+docker exec zccbox sh -c 'cd /tmp && zcc -c /suites/sqlite/sqlite3.c -o out.o && objdump -d out.o | grep -cE "^\s+[0-9a-f]+:\s"'
+
+# GATE (a lever is DONE only when ALL of these are green):
+cargo test --release                                                         # 122/0 (host)
+docker exec zccbox sh -c 'cd /work && ZCC_SUITE_CACHE=/suites ZCC=/usr/local/bin/zcc sh tests/opt-parity.sh'        # 1552 PARITY / 0 DIVERGE
+docker exec zccbox sh -c 'cd /work && ZCC_SUITE_CACHE=/suites ZCC=/usr/local/bin/zcc sh tests/suites/torture.sh'    # 0 FAIL
+docker exec zccbox sh -c 'cd /work && ZCC_SUITE_CACHE=/suites ZCC=/usr/local/bin/zcc sh tests/suites/csmith.sh 300' # 0 DIVERGE
+docker exec zccbox sh -c 'cd /work && ZCC_SUITE_CACHE=/suites ZCC=/usr/local/bin/zcc sh tests/suites/yarpgen.sh 300'# 0 DIVERGE
+
+# BEFORE COMMIT (torture.sh regenerates referee text — revert that noise):
+git checkout tests/suites/torture.not-impl
+```
+
+Instrumentation probes (e.g. `ZCC_SELPROBE`) are temporary — remove before the lever's commit.
+
+---
+
 ## §1 — Scoreboard: the one number (measured, `zcc-box` docker, ELF aarch64-musl)
 
 **The finish line = gcc -O1 parity. The gap = the two loop-nest kernels; everything reduces to them.**
