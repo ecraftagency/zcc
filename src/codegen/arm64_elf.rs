@@ -3216,7 +3216,7 @@ fn reg_uses(t: &str) -> (Vec<u32>, Vec<u32>, bool) {
         "orr", "eor", "bic", "lsl", "lsr", "asr", "sdiv", "udiv", "sxtw", "sxth", "sxtb",
         "uxtw", "uxth", "uxtb", "cset", "csel", "csinc", "cinc", "adrp", "ldr", "ldrb",
         "ldrh", "ldrsw", "ldrsb", "ldrsh", "fmov", "scvtf", "ucvtf", "fcvt", "fadd", "fsub",
-        "fmul", "fdiv", "fneg", "fcvtzs", "fcvtzu", "sxtl",
+        "fmul", "fdiv", "fneg", "fcvtzs", "fcvtzu", "sxtl", "ubfx", "ubfiz", "sbfx", "sbfiz",
     ];
     if mn.starts_with("b.") || BOUNDARY.contains(&mn) {
         (vec![], vec![], true)
@@ -3324,11 +3324,85 @@ fn fuse_bitfield(body: &str) -> String {
     out
 }
 
+/// LEVER 2 — REDUNDANT SIGN-EXTEND elimination. The value contract re-canonicalizes every int32
+/// to sign-extended-64 (`sxtw xD, wD`) at each materialization; when the value in xD is ALREADY
+/// sign-canonical (bit63==bit31), that `sxtw` is a pure no-op. Track a per-block set of registers
+/// known sign-canonical, produced by the 64-bit sign-extending ops (`sxtw`/`ldrsw`/`sxth`/`sxtb`/
+/// `ldrsb`/`ldrsh` with an X destination — bits 32..63 filled from the sign) and `cset` (0/1).
+/// Drop `sxtw xD, wD` iff D is in the set. Cleared at every block boundary (label / branch / call /
+/// unknown) — sound by construction (only PROVEN-canonical regs enter the set). Same translation-
+/// validation tier as the move peephole. [sqlite: 343 ldrsw→sxtw + 36 double-sxtw + tail.]
+/// W-form producers are deliberately excluded (a `w`-dst leaves bits 32..63 zero, not sign-filled),
+/// as are mov/bitwise propagation (their canonicality is width-subtle — safety over the extra ~17).
+fn drop_redundant_sxtw(body: &str) -> String {
+    use std::collections::HashSet;
+    let mut canon: HashSet<u32> = HashSet::new();
+    let mut out = String::with_capacity(body.len());
+    // `sxtw xD, wS` → (D, S), else None.
+    let parse_sxtw = |t: &str| -> Option<(u32, u32)> {
+        let r = t.strip_prefix("sxtw ")?;
+        let mut it = r.split(',');
+        let d = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
+        let s = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        it.next().is_none().then_some((d, s))
+    };
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if t.ends_with(':') {
+            canon.clear(); // basic-block boundary
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if t.starts_with('.') {
+            out.push_str(line); // directive — touches no register
+            out.push('\n');
+            continue;
+        }
+        if let Some((d, s)) = parse_sxtw(t) {
+            if d == s && canon.contains(&s) {
+                continue; // value already sign-canonical → the sxtw is a no-op → DROP
+            }
+            canon.insert(d); // sxtw makes its X dest canonical (kept or not)
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let (_, writes, boundary) = reg_uses(t);
+        if boundary {
+            canon.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        let operands = t[mn.len()..].trim_start();
+        // 64-bit sign-extending producer (X dst) ⟹ result canonical; cset ⟹ 0/1, canonical.
+        let prod = (matches!(mn, "sxth" | "sxtb" | "ldrsw" | "ldrsb" | "ldrsh")
+            && operands.starts_with('x'))
+            || mn == "cset";
+        for &w in &writes {
+            if prod {
+                canon.insert(w);
+            } else {
+                canon.remove(&w); // any other def clobbers the known-canonical status
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// COPY PROPAGATION first (funnel every read to its value's producer, so the x0-scratch
 /// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores,
-/// THEN bitfield fusion (LEVER 1) on the settled shift stream.
+/// THEN bitfield fusion (LEVER 1) + redundant sign-extend elim (LEVER 2) on the settled stream.
 fn peephole_moves(body: &str) -> String {
-    drop_dead_moves(&fuse_bitfield(&drop_redundant_moves(&propagate_copies(body))))
+    drop_dead_moves(&drop_redundant_sxtw(&fuse_bitfield(&drop_redundant_moves(&propagate_copies(body)))))
 }
 
 // The target `.L` label of a local branch, or None if the line is not one. Branches to a
