@@ -22,6 +22,55 @@
 > not. Every session opens by re-reading §0. Every lever starts from §0's ledger. We drifted
 > before because the plan lived in conversation and vanished — this section is the fix.
 
+---
+
+### ⏱ OVERNIGHT AUTONOMOUS RUNBOOK (started 2026-08-24, user asleep → target: RC1 push)
+
+> **AUTO-EXECUTE. Context WILL reset many times overnight. On EVERY resume: read this runbook,
+> find the first `⬜` phase, continue it. Do NOT ask the user anything — they are asleep. Bank /
+> revert / advance per the mechanism. The user's standing order: grind lever 7 ~3 rounds for max
+> cut, THEN run the 2-pass audit regardless of lever-7 outcome, THEN if determinism holds commit
+> + push "release candidate 1".** Progress checkboxes below are the resume pointer — update them
+> as each phase completes (a phase is done only when its gate is green + result recorded here).
+
+- **Phase A — LEVER 7 (w-form arithmetic, THE HINGE), 3 grind rounds.** ⬜ IN PROGRESS
+  - Goal: eliminate the residual `sxtw`/`ldrsw` re-canonicalization (measured ~8.3k sxtw + ldrsw
+    ≈ 12.8k) that the partial w-form contract still emits. Root: int32 kept sign-canonical in
+    64-bit homes; w-form makes high bits don't-care so most sxtw are dead.
+  - Each round: (1) measure sxtw sources by emit-site on the sqlite `.s`; (2) classify genuine
+    widening (Cast int→long, address-index — KEEP) vs redundant re-canon (DROP); (3) kill the
+    biggest redundant class; (4) FULL GATE (cargo + opt-parity + torture + csmith300 + yarpgen300);
+    (5) any DIVERGE → `git reset --hard` that round, mark the class BLOCKED, advance. Bank每 positive.
+  - Round ledger: R1 ⬜  · R2 ⬜  · R3 ⬜  — record Δinsn + commit hash each.
+  - Exit Phase A when 3 rounds done OR sxtw residual = genuine-widening-only (exhausted). Record
+    final sqlite insn count + ratio. **Whether it banks or not, PROCEED to Phase B.**
+- **Phase B — AUDIT PASS 1 (Law-1 Side I: every LOC ↔ theorem space, NO exception).** ⬜ TODO
+  - Walk `src/*.rs` file by file (fan out to subagents to keep context clean; write findings to
+    `AUDIT-RC1.md`). For each function/block: does it realize a THEORY.md Part-I theorem
+    (algorithm/control-flow/data-structure) OR inject a Part-II spec-constant? Flag any LOC that
+    is NEITHER — that is a Law-1 violation to fix or justify. The new fork passes to scrutinize
+    hardest: `compute_imm_folds`, `post_index`, `cbz_fuse`, `drop_redundant_sxtw`, `fuse_bitfield`,
+    and all of Phase-A's lever-7 code — each must carry its commuting-square / translation-validation
+    argument in-comment.
+- **Phase C — AUDIT PASS 2 (Law-1 Side II: every operand/constant ↔ ultimate-fact, NO exception).** ⬜ TODO
+  - Every magic number / offset / ABI value / mnemonic must trace to a spec line (AAPCS64, ELF,
+    ISA encoding) — no unprovenanced constant. `grep` numeric literals in codegen; each gets a
+    citation or is flagged. Record in `AUDIT-RC1.md`.
+- **Phase D — AUDIT PASS 3 (inline-test coverage of the newest patches).** ⬜ TODO
+  - Confirm each new pass has an inline `#[test]` (parse + a fold/no-fold case). If missing, ADD
+    it (byte-level assertion on emitted asm). Levers 4/5/6 + lever-7 code especially.
+- **Phase E — DETERMINISM VERIFICATION (the RC1 gate).** ⬜ TODO
+  - Compile sqlite3.c twice, assert byte-identical `.s` (and `.o`). Repeat on 2–3 other inputs.
+    Must be 100% deterministic (same input → byte-identical output). Record the proof.
+- **Phase F — RELEASE CANDIDATE 1 (only if E is 100% deterministic + full gate green).** ⬜ TODO
+  - `git add -A && git commit -m "release candidate 1"` then `git push origin ssa-qbe`. If any gate
+    is red or determinism fails, DO NOT push — record the blocker in this runbook and stop.
+    (May go open-source after this phase — so the tree must be clean + green.)
+
+**Runbook resume rule:** the phases are STRICTLY ORDERED. On resume, the first `⬜`/IN-PROGRESS
+phase is the work. Never skip ahead; never restart a `✅` phase. All results land in this runbook +
+`AUDIT-RC1.md` so a reset loses nothing.
+
 ### The lock (user directive, 2026-08-23): **"1→6 is 1→6 until death."** — AMENDED 2026-08-24 → **1→7**.
 
 Execute levers **1 through 7 in order, to completion.** Do not reorder, skip, or substitute.
