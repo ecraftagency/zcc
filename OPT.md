@@ -142,7 +142,7 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | # | lever | measured ceiling | conf | risk | axes | status | real banked |
 |---|---|---|---|---|---|---|---|
 | 0 | csel→sxtw dead-extend elim | 3,246 sites | HI | — | S | ✅ DONE `c7cf2f3` | **−3,381** |
-| 1 | `ubfx`/`sbfiz` fuse (shift+mask→1) | 730 sites (gcc has, zcc 0) | HI | LOW | S+P | ⬜ TODO | — |
+| 1 | `ubfx`/`sbfiz` fuse (shift+mask→1) | 730 sites (gcc has, zcc 0) | HI | LOW | S+P | ✅ DONE | **−252** (260 ubfx; 35% of ceil) |
 | 2 | redundant-sxtw peephole (ldrsw→sxtw, double, bitwise) | ~350 + tail | HI | LOW | S+P | ⬜ TODO | — |
 | 3 | `smull`/`umull` fuse (ext+mul→1) | 98 sites | HI | LOW | S+P | ⬜ TODO | — |
 | 4 | scaled-index residual (extend `ExtFold`) | ~376 sites | MED | LOW-MED | S+P | ⬜ TODO | — |

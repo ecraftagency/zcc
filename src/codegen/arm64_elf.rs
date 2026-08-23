@@ -3245,10 +3245,90 @@ fn reg_uses(t: &str) -> (Vec<u32>, Vec<u32>, bool) {
 }
 
 /// Machine-level move cleanup over one function body (see the block comment).
+/// LEVER 1 — BITFIELD FUSION (ARM64 delicacy #6: ubfm-family). A two-instruction shift/mask
+/// bitfield idiom is one AArch64 bitfield insn. Translation-validation tier (pure ISA identity,
+/// like the move peephole) — fused ONLY when the two are ADJACENT, the second reads+writes the
+/// first's dest (the in-place form zcc emits), same register width; the intermediate value dies
+/// at the second insn so nothing observes it. N = 64 (`x`) or 32 (`w`).
+///   `lsl rD,rS,#a ; lsr rD,rD,#b`  ≡ (rS<<a)>>b  →  b≥a: `ubfx rD,rS,#(b-a),#(N-b)`
+///                                                    b<a: `ubfiz rD,rS,#(a-b),#(N-a)`
+///   `lsr rD,rS,#k ; and rD,rD,#m`  ≡ (rS>>k)&m   →  m=2^w−1 ∧ k+w≤N: `ubfx rD,rS,#k,#w`
+/// (two shifts compose to one unsigned field extract for ANY a,b; the mask arm needs a
+/// contiguous low-bit mask.) Both replacements are 1 insn for 2 — size and dep-chain both shrink.
+fn fuse_bitfield(body: &str) -> String {
+    // parse "mnem rD, rS, #imm" (imm decimal or 0x-hex) → (mnem, 'x'/'w', d, s, imm); the two
+    // register operands must share the width prefix, else not a form we rewrite.
+    fn p3(t: &str) -> Option<(&str, char, u32, u32, i64)> {
+        let t = t.trim();
+        let mn = t.split(|c: char| c.is_whitespace()).next()?;
+        if mn != "lsl" && mn != "lsr" && mn != "and" {
+            return None;
+        }
+        let mut it = t[mn.len()..].trim_start().split(',');
+        let (dt, st, it3) = (it.next()?.trim(), it.next()?.trim(), it.next()?.trim());
+        if it.next().is_some() {
+            return None; // a 4th operand (shifted reg) ⟹ not the plain form
+        }
+        let pref = dt.chars().next()?;
+        if (pref != 'x' && pref != 'w') || st.chars().next()? != pref {
+            return None;
+        }
+        let d = dt[1..].parse::<u32>().ok()?;
+        let s = st[1..].parse::<u32>().ok()?;
+        let imm = it3.strip_prefix('#')?;
+        let imm = match imm.strip_prefix("0x") {
+            Some(h) => i64::from_str_radix(h, 16).ok()?,
+            None => imm.parse::<i64>().ok()?,
+        };
+        Some((mn, pref, d, s, imm))
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 1 < lines.len()
+            && let (Some((m1, p1, d1, s1, a)), Some((m2, p2, d2, s2, b))) =
+                (p3(lines[i]), p3(lines[i + 1]))
+            && p1 == p2
+            && d2 == d1
+            && s2 == d1
+        // second insn is in-place on the first's dest
+        {
+            let n = if p1 == 'x' { 64i64 } else { 32 };
+            let ind = &lines[i][..lines[i].len() - lines[i].trim_start().len()];
+            let fused = match (m1, m2) {
+                ("lsl", "lsr") if a < n && b < n => Some(if b >= a {
+                    format!("{ind}ubfx {p1}{d1}, {p1}{s1}, #{}, #{}", b - a, n - b)
+                } else {
+                    format!("{ind}ubfiz {p1}{d1}, {p1}{s1}, #{}, #{}", a - b, n - a)
+                }),
+                ("lsr", "and") => {
+                    let m = b as u64;
+                    let w = m.count_ones() as i64;
+                    ((m & (m.wrapping_add(1))) == 0 && m != 0 && a + w <= n)
+                        .then(|| format!("{ind}ubfx {p1}{d1}, {p1}{s1}, #{a}, #{w}"))
+                }
+                _ => None,
+            };
+            if let Some(fl) = fused {
+                out.push_str(&fl);
+                out.push('\n');
+                i += 2;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// COPY PROPAGATION first (funnel every read to its value's producer, so the x0-scratch
-/// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores.
+/// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores,
+/// THEN bitfield fusion (LEVER 1) on the settled shift stream.
 fn peephole_moves(body: &str) -> String {
-    drop_dead_moves(&drop_redundant_moves(&propagate_copies(body)))
+    drop_dead_moves(&fuse_bitfield(&drop_redundant_moves(&propagate_copies(body))))
 }
 
 // The target `.L` label of a local branch, or None if the line is not one. Branches to a
