@@ -1400,13 +1400,24 @@ impl P<'_> {
     fn scalar(&self, t: TypeId) -> bool {
         !matches!(self.tt.tys[t as usize], Ty::Struct(_) | Ty::Array(..))
     }
+    // A lvalue whose address is a pure constant offset from a local/global — no Deref, no
+    // array-index, no side effect. `L` may then appear twice (load + store) WITHOUT an address
+    // temp: re-lowering it is free and side-effect-free. This is also the SROA precondition —
+    // a Member field-chain kept out of a pointer temp stays a bare Lea(Local) the pass can split.
+    fn pure_lval_addr(&self, n: NodeId) -> bool {
+        match self.nodes[n as usize] {
+            Node::Var(_) | Node::GVar(_) => true,
+            Node::Member(b, _) => self.pure_lval_addr(b),
+            _ => false, // Deref (p->x), array-index (a[i].x): may have a side effect → keep temp
+        }
+    }
     // L op= R (and ++L/--L): L appears twice in the tree (load + store) — if the
     // address has a side effect (a[*s++] |= 1) it must be held in a temp and evaluated once:
     // (tmp = &L, *tmp = *tmp op R)
     fn opassign(&mut self, l: NodeId, bop: &'static str, r: NodeId) -> R {
         match self.nodes[l as usize] {
-            Node::Var(_) | Node::GVar(_) => {
-                // static address, no temp needed
+            _ if self.pure_lval_addr(l) => {
+                // static / pure-offset address (local, global, or their struct fields): no temp
                 let r = self.mkbin(bop, l, r)?;
                 self.mkassign(l, r)
             }
