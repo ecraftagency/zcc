@@ -3485,11 +3485,90 @@ fn drop_redundant_sxtw(body: &str) -> String {
     out
 }
 
+/// LEVER 7 — W-FORM SIGN-EXTEND elimination (the DEMAND-side dual of `drop_redundant_sxtw`).
+/// Value contract (db9cb93): an int32 lives in the LOW 32 bits of its 64-bit home; bits 32..63 are
+/// DON'T-CARE. An in-place re-canonicalization `sxtw xD, wD` is therefore DEAD unless a later
+/// instruction OBSERVES those high bits — i.e. reads D in **x-form** (a 64-bit operand or an
+/// address base/index). Scanning forward from the sxtw within its region:
+///   - x-form read of D reached first  → high bits observed        → KEEP
+///   - D fully redefined first (w- or x-dest) → old value incl. sign bits dead → DROP
+///   - w-form read of D                → this use ignores bits 32..63 → keep scanning
+///   - region boundary first (label / branch / call / writeback / unknown) → live-out
+///                                       unknown, an x-form read may exist downstream → KEEP
+/// Translation-validation tier (pure ISA identity, like the move peephole): the rewrite preserves
+/// ⟦·⟧ because every reader that could observe a difference — an x-form read — forces KEEP; only
+/// extensions whose high bits are provably never observed before redefinition are dropped. This is
+/// the exact dual of LEVER 2's supply-side canonical-set: there `sxtw` is dropped when the value is
+/// ALREADY canonical; here when the canonicality is never DEMANDED.
+fn drop_wform_sxtw(body: &str) -> String {
+    // `sxtw xD, wD` (same reg, the in-place re-canon form) → Some(D); the widening `sxtw xD, wS`
+    // (D≠S) is a genuine int→long move and is never touched.
+    fn parse_inplace(t: &str) -> Option<u32> {
+        let r = t.strip_prefix("sxtw ")?;
+        let mut it = r.split(',');
+        let d = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
+        let s = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        (it.next().is_none() && d == s).then_some(d)
+    }
+    // Does any operand token of `t` name GP register `d` at width `pref` ('x'/'w')? Brackets are
+    // stripped so an address `[x5, w6, sxtw]` is matched component-wise across the comma split.
+    let token_present = |t: &str, pref: char, d: u32| -> bool {
+        let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        let operands = t[mn.len()..].trim_start();
+        let want = format!("{pref}{d}");
+        operands.split(',').any(|tok| {
+            tok.trim().trim_start_matches('[').trim_end_matches(']') == want
+        })
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let mut drop = vec![false; lines.len()];
+    for (i, li) in lines.iter().enumerate() {
+        let Some(d) = parse_inplace(li.trim()) else { continue };
+        for lj in &lines[i + 1..] {
+            let t = lj.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t.ends_with(':') {
+                break; // label = region boundary (merge point) → live-out unknown → KEEP
+            }
+            if t.starts_with('.') {
+                continue; // directive — no register effect
+            }
+            let (reads, writes, boundary) = reg_uses(t);
+            if boundary {
+                break; // branch/call/ret/writeback/unknown → conservative KEEP
+            }
+            let read_x = reads.contains(&d) && token_present(t, 'x', d);
+            if read_x {
+                break; // high bits observed → the extension is demanded → KEEP
+            }
+            if writes.contains(&d) {
+                drop[i] = true; // D redefined before any x-form read → sxtw is DEAD → DROP
+                break;
+            }
+            // reads D only in w-form, or does not touch D → keep scanning
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        if drop[i] {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// COPY PROPAGATION first (funnel every read to its value's producer, so the x0-scratch
 /// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores,
-/// THEN bitfield fusion (LEVER 1) + redundant sign-extend elim (LEVER 2) on the settled stream.
+/// THEN bitfield fusion (LEVER 1) + redundant sign-extend elim (LEVER 2) + the demand-side w-form
+/// sign-extend elim (LEVER 7) on the settled stream.
 fn peephole_moves(body: &str) -> String {
-    drop_dead_moves(&drop_redundant_sxtw(&fuse_bitfield(&drop_redundant_moves(&propagate_copies(body)))))
+    drop_wform_sxtw(&drop_dead_moves(&drop_redundant_sxtw(&fuse_bitfield(&drop_redundant_moves(
+        &propagate_copies(body),
+    )))))
 }
 
 // The target `.L` label of a local branch, or None if the line is not one. Branches to a
@@ -4153,6 +4232,20 @@ fn drop_dead_moves(body: &str) -> String {
                 drop[i] = true; // xD is dead here ⟹ this store is never observed
                 continue; // deleted ⟹ it neither reads nor writes
             }
+        }
+        // LEVER 7 (R2) — a dead in-place `sxtw xD, wD` is pure dead code: it writes xD and, when
+        // xD is not live below, nothing observes the extension. Same dead-store proof as `mov x,x`
+        // above, but the backward liveness sees ACROSS region boundaries where the forward
+        // `drop_wform_sxtw` scan conservatively stops (a value live-out of the block but dead in
+        // every successor is caught here, not there). Dropping removes both the write and the
+        // same-register read, leaving xD's (already-dead) liveness above unchanged.
+        if t.starts_with("sxtw ")
+            && writes.len() == 1
+            && reads == writes
+            && !live.contains(&writes[0])
+        {
+            drop[i] = true;
+            continue;
         }
         for w in &writes {
             if !reads.contains(w) {
@@ -4965,5 +5058,57 @@ mod tests {
         let body = "\tmov x0, x10\n\tfmov x0, d0\n\tmov x1, x0\n";
         let out = drop_dead_moves(body);
         assert_eq!(count(&out, "mov x0, x10"), 0, "fmov x0,d0 overwrites x0 ⟹ prior store dead");
+    }
+
+    // LEVER 7 (R2): a dead in-place `sxtw x24,w24` (x24 overwritten before any read) is pure
+    // dead code and removed by the backward-liveness pass.
+    #[test]
+    fn dce_drops_dead_inplace_sxtw() {
+        let body = "\tsxtw x24, w24\n\tmov x24, x1\n\tmov x2, x24\n";
+        let out = drop_dead_moves(body);
+        assert_eq!(count(&out, "sxtw x24, w24"), 0, "the re-canon whose result is overwritten is dead");
+    }
+
+    use super::drop_wform_sxtw;
+
+    // LEVER 7 (R1) CORE: `sxtw x5,w5` followed only by a w-form read then a redefinition — the
+    // high bits are never observed ⟹ the extension is DEAD and dropped.
+    #[test]
+    fn wform_sxtw_dropped_when_only_wform_read() {
+        let body = "\tsxtw x5, w5\n\tadd w6, w5, w1\n\tmov w5, w2\n";
+        let out = drop_wform_sxtw(body);
+        assert_eq!(count(&out, "sxtw x5, w5"), 0, "high bits never read ⟹ sxtw dead");
+        assert!(out.contains("add w6, w5, w1"), "the w-form use is untouched");
+    }
+
+    // TEETH: an x-form read of the extended register OBSERVES the high bits ⟹ the sxtw must be
+    // KEPT (dropping it would corrupt the 64-bit operand — a miscompile).
+    #[test]
+    fn wform_sxtw_kept_when_xform_read() {
+        let out = drop_wform_sxtw("\tsxtw x5, w5\n\tadd x6, x5, x1\n");
+        assert_eq!(count(&out, "sxtw x5, w5"), 1, "x-form read demands the extension ⟹ keep");
+    }
+
+    // An address-index x-form read (`[x0, x5]`) also observes the high bits ⟹ KEEP.
+    #[test]
+    fn wform_sxtw_kept_when_used_as_address_index() {
+        let out = drop_wform_sxtw("\tsxtw x5, w5\n\tldr x0, [x0, x5]\n");
+        assert_eq!(count(&out, "sxtw x5, w5"), 1, "index read is 64-bit ⟹ keep");
+    }
+
+    // A region boundary (branch) before any redefinition leaves the value live-out with unknown
+    // downstream width ⟹ conservatively KEEP.
+    #[test]
+    fn wform_sxtw_kept_across_boundary() {
+        let out = drop_wform_sxtw("\tsxtw x5, w5\n\tb .Lx\n");
+        assert_eq!(count(&out, "sxtw x5, w5"), 1, "live-out at a boundary ⟹ keep");
+    }
+
+    // The genuine widening `sxtw x5, w2` (D≠S) is an int→long move, never an in-place re-canon —
+    // the pass must not touch it regardless of how x5 is later used.
+    #[test]
+    fn wform_sxtw_ignores_genuine_widening() {
+        let out = drop_wform_sxtw("\tsxtw x5, w2\n\tmov w5, w9\n");
+        assert_eq!(count(&out, "sxtw x5, w2"), 1, "a widening move is not the in-place form");
     }
 }
