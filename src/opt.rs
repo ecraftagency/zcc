@@ -114,7 +114,65 @@ pub(crate) fn each_use_term_mut(t: &mut Term, mut g: impl FnMut(&mut Val)) {
 //   • Div/Rem by 0 → eval_bin returns Err → do NOT fold (keep the instruction, preserving the target's UB behavior).
 //   • const-branch: Br(Imm c)→Jmp (opening the way for DCE to remove the dead block later).
 // Constants are NOT propagated through temporaries (that is copy_prop, pass 3) — this pass folds only already-constant operands.
+//
+// ALGEBRAIC IDENTITIES (one variable + one neutral/absorbing constant, or a self-operand):
+// a second family of rewrite-soundness laws, each a ⟦Bin⟧ algebraic identity over ℤ/2^n
+// (THEORY §A7), so `algebraic_identity` is faithful by the SAME construction as the folder
+// — it returns only rewrites that hold in the interpreted structure `eval_bin` realizes:
+//   neutral element   x+0, 0+x, x−0, x*1, 1*x, x|0, 0|x, x^0, 0^x, x<<0, x>>0, x/1  → x
+//   absorbing element x*0, 0*x, x&0, 0&x                                             → 0
+//   equal operands    x−x, x^x → 0;   x&x, x|x → x   (idempotence / annihilation)
+// INTEGER ONLY — float breaks x+0 (−0.0) and x*1 (sNaN); floats carry FImm so the Imm
+// patterns already exclude them, the !is_float guard is belt-and-suspenders. Pointer-typed
+// Bins are included and benefit (p+0 → p is common). NOT folded: 0−x (a negation, not an
+// identity), x/2^k (signed rounds toward 0, shift toward −∞ — unsound), x/−1 (INT_MIN UB).
+// gcc/LLVM instcombine; measured sqlite residual = 1,311 `x*1` + 615 `x+0`.
 // ─────────────────────────────────────────────────────────────────────────────
+fn algebraic_identity(d: Tmp, op: Op, ty: TypeId, a: Val, b: Val) -> Option<Inst> {
+    let copy = |v: Val| Some(Inst::Copy(d, ty, v));
+    let zero = Some(Inst::Copy(d, ty, Val::Imm(0)));
+    let is0 = |v: Val| matches!(v, Val::Imm(0));
+    let is1 = |v: Val| matches!(v, Val::Imm(1));
+    let same = matches!((a, b), (Val::Tmp(x), Val::Tmp(y)) if x == y);
+    match op {
+        Op::Add => {
+            if is0(b) { return copy(a); }
+            if is0(a) { return copy(b); }
+        }
+        Op::Sub => {
+            if is0(b) { return copy(a); }
+            if same { return zero; } // x − x = 0
+        }
+        Op::Mul => {
+            if is0(a) || is0(b) { return zero; } // x * 0 = 0 (absorbing)
+            if is1(b) { return copy(a); }
+            if is1(a) { return copy(b); }
+        }
+        Op::Div => {
+            if is1(b) { return copy(a); } // x / 1 = x  (NOT x/−1: INT_MIN UB)
+        }
+        Op::And => {
+            if is0(a) || is0(b) { return zero; } // x & 0 = 0 (absorbing)
+            if same { return copy(a); }          // x & x = x
+        }
+        Op::Or => {
+            if is0(b) { return copy(a); }
+            if is0(a) { return copy(b); }
+            if same { return copy(a); } // x | x = x
+        }
+        Op::Xor => {
+            if is0(b) { return copy(a); }
+            if is0(a) { return copy(b); }
+            if same { return zero; } // x ^ x = 0
+        }
+        Op::Shl | Op::Shr => {
+            if is0(b) { return copy(a); } // x << 0 = x, x >> 0 = x
+        }
+        _ => {}
+    }
+    None
+}
+
 pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
     let mut n = 0u32;
     for blk in f.blocks.iter_mut() {
@@ -134,6 +192,9 @@ pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
                 Inst::Cast(d, from, to, Val::Imm(x)) if !tt.is_float(*from) && !tt.is_float(*to) => {
                     Some(Inst::Copy(*d, *to, Val::Imm(eval_cast(tt, *from, *to, *x))))
                 }
+                // One-variable algebraic identity (the both-Imm arm above already claimed
+                // the constant-fold case) → Copy(x) / Copy(0), ⟦·⟧-preserving.
+                Inst::Bin(d, op, ty, a, b) if !tt.is_float(*ty) => algebraic_identity(*d, *op, *ty, *a, *b),
                 _ => None,
             };
             if let Some(r) = repl {
@@ -4670,6 +4731,64 @@ mod tests {
         equiv(&tt, &before, &after, "f").expect("const-fold must preserve ⟦·⟧");
         assert!(matches!(after[0].blocks[0].insts[0], Inst::Copy(0, _, Val::Imm(42))));
         assert_eq!(interp(&tt, &after, "f", &[]).unwrap(), 42);
+    }
+
+    // Algebraic identities: each one-variable rewrite preserves ⟦·⟧ (commuting square
+    // over a function exercising every law) AND the interpreted result is unchanged for
+    // a probe input, AND the pass actually FIRES (anti-vacuous). x is param temp 0.
+    #[test]
+    fn cf_algebraic_identities() {
+        let tt = TyTab::new();
+        // param x in frame slot 16, loaded into t1. Then one Bin per identity law:
+        //   keep-x:  t2=x+0  t3=t2*1  t6=x^0  t8=x|0  t9=x<<0  t10=x>>0  t11=x/1
+        //   zero:    t4=x*0  t5=x-x   t7=x&0
+        // Sum the six keep-x temps (⟹ 6x) + the three zeros (⟹ 0)  ⟹  f(x) = 6x.
+        let x = Val::Tmp(1);
+        let before = vec![mk(
+            "f",
+            vec![INT; 20],
+            vec![(16, INT)],
+            16,
+            INT,
+            vec![Block {
+                insts: vec![
+                    Inst::Lea(0, Place::Local(16)),
+                    Inst::Load(1, INT, Val::Tmp(0)), // t1 = x
+                    Inst::Bin(2, Op::Add, INT, x, Val::Imm(0)),           // x+0 = x
+                    Inst::Bin(3, Op::Mul, INT, Val::Tmp(2), Val::Imm(1)), // *1  = x
+                    Inst::Bin(4, Op::Mul, INT, x, Val::Imm(0)),           // x*0 = 0
+                    Inst::Bin(5, Op::Sub, INT, x, x),                     // x-x = 0
+                    Inst::Bin(6, Op::Xor, INT, x, Val::Imm(0)),           // x^0 = x
+                    Inst::Bin(7, Op::And, INT, x, Val::Imm(0)),           // x&0 = 0
+                    Inst::Bin(8, Op::Or, INT, x, Val::Imm(0)),            // x|0 = x
+                    Inst::Bin(9, Op::Shl, INT, x, Val::Imm(0)),           // x<<0 = x
+                    Inst::Bin(10, Op::Shr, INT, x, Val::Imm(0)),          // x>>0 = x
+                    Inst::Bin(11, Op::Div, INT, x, Val::Imm(1)),          // x/1 = x
+                    // sum the six keep-x temps ⟹ 6x
+                    Inst::Bin(12, Op::Add, INT, Val::Tmp(3), Val::Tmp(6)),
+                    Inst::Bin(13, Op::Add, INT, Val::Tmp(12), Val::Tmp(8)),
+                    Inst::Bin(14, Op::Add, INT, Val::Tmp(13), Val::Tmp(9)),
+                    Inst::Bin(15, Op::Add, INT, Val::Tmp(14), Val::Tmp(10)),
+                    Inst::Bin(16, Op::Add, INT, Val::Tmp(15), Val::Tmp(11)),
+                    // sum the three zeros ⟹ 0
+                    Inst::Bin(17, Op::Add, INT, Val::Tmp(4), Val::Tmp(5)),
+                    Inst::Bin(18, Op::Add, INT, Val::Tmp(17), Val::Tmp(7)),
+                    Inst::Bin(19, Op::Add, INT, Val::Tmp(16), Val::Tmp(18)),
+                ],
+                term: Term::Ret(Some(Val::Tmp(19))),
+            }],
+        )];
+        let mut after = before.clone();
+        let n = const_fold(&tt, &mut after[0]);
+        assert!(n >= 10, "all 10 identity Bins must be rewritten (got {n})");
+        verify(&after[0]).unwrap();
+        equiv(&tt, &before, &after, "f").expect("algebraic identities must preserve ⟦·⟧");
+        assert_eq!(interp(&tt, &after, "f", &[7]).unwrap(), 42);   // 6·7
+        assert_eq!(interp(&tt, &after, "f", &[-5]).unwrap(), -30); // 6·(−5)
+        // x+0 (t2) and x*1 (t3) are now plain Copies — the sieve `mul x,x,1` / sqlite lever.
+        assert!(matches!(after[0].blocks[0].insts[2], Inst::Copy(2, _, _)));
+        assert!(matches!(after[0].blocks[0].insts[3], Inst::Copy(3, _, _)));
+        assert!(matches!(after[0].blocks[0].insts[4], Inst::Copy(4, _, Val::Imm(0)))); // x*0
     }
 
     // const-branch: Br(Imm 0) → Jmp(else); interp takes the correct branch.
