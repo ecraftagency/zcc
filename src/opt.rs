@@ -168,6 +168,21 @@ pub fn const_fold(tt: &TyTab, f: &mut IrFunc) -> u32 {
 // removed ⟹ certainly dead. Iterate to a fixpoint: removing an instruction can make
 // its operands dead → a later round removes them too.
 // ─────────────────────────────────────────────────────────────────────────────
+/// C99 6.7.3 — is this instruction a VOLATILE ACCESS (a Load/Store through a
+/// volatile-qualified type)? A volatile access is an observable side effect of the
+/// abstract machine: it must occur exactly as written — never removed, merged,
+/// duplicated, reordered across another volatile access, or promoted out of memory.
+/// The volatile bit rides the access TypeId (TyTab::vol), set at the decl/pointee/member
+/// where the qualifier originated, so no separate IR flag is needed. Every memory pass
+/// consults this to PIN volatile accesses while optimizing the volatile-free remainder
+/// normally — replacing the old whole-function -O0 fallback (`has_volatile`).
+pub fn is_volatile_access(tt: &TyTab, i: &Inst) -> bool {
+    match i {
+        Inst::Load(_, ty, _) | Inst::Store(ty, _, _) => tt.is_volatile(*ty),
+        _ => false,
+    }
+}
+
 fn is_pure(i: &Inst) -> bool {
     matches!(
         i,
@@ -182,7 +197,7 @@ fn is_pure(i: &Inst) -> bool {
     )
 }
 
-pub fn dce(f: &mut IrFunc) -> u32 {
+pub fn dce(tt: &TyTab, f: &mut IrFunc) -> u32 {
     let mut removed = 0u32;
     let mut buf: Vec<u32> = Vec::new();
     loop {
@@ -206,7 +221,8 @@ pub fn dce(f: &mut IrFunc) -> u32 {
         for b in f.blocks.iter_mut() {
             let before = b.insts.len();
             b.insts.retain(|i| match inst_def(i) {
-                Some(d) if !used[d as usize] && is_pure(i) => false, // dead + pure → remove
+                // A dead volatile Load is NOT removable (C99 6.7.3 — the access must occur).
+                Some(d) if !used[d as usize] && is_pure(i) && !is_volatile_access(tt, i) => false,
                 _ => true,
             });
             let cut = before - b.insts.len();
@@ -333,7 +349,7 @@ fn bin_key(op: Op, ty: u32, a: &Val, b: &Val) -> (u16, u32, (u8, i64), (u8, i64)
     (op as u16, ty, o1, o2)
 }
 
-pub fn cse(f: &mut IrFunc) -> u32 {
+pub fn cse(tt: &TyTab, f: &mut IrFunc) -> u32 {
     let mut n = 0u32;
     for b in f.blocks.iter_mut() {
         // arith: key (op-tag, ty, o1, o2). Un tag=100+, Cast tag=200 (from in o2).
@@ -384,7 +400,7 @@ pub fn cse(f: &mut IrFunc) -> u32 {
                         }
                     }
                 }
-                Inst::Load(d, ty, addr) => {
+                Inst::Load(d, ty, addr) if !tt.is_volatile(*ty) => {
                     let k = (enc(addr), *ty);
                     match loads.get(&k) {
                         Some(&prev) => Some(Inst::Copy(*d, *ty, Val::Tmp(prev))),
@@ -393,6 +409,12 @@ pub fn cse(f: &mut IrFunc) -> u32 {
                             None
                         }
                     }
+                }
+                // A volatile Load is a memory barrier: it must EXECUTE (never reuse a cached
+                // value) and never be reused later ⟹ clear the load cache and record nothing.
+                Inst::Load(_, _, _) => {
+                    loads.clear();
+                    None
                 }
                 // Lea(Local off) is PURE, its value = a frame address (invariant) → it
                 // can be value-numbered, deduplicating addresses so load-CSE matches
@@ -729,6 +751,13 @@ pub fn load_elim(tt: &TyTab, f: &mut IrFunc) -> u32 {
         // available memory contents, in program order: (address, byte width, type, value).
         let mut avail: Vec<(Val, u32, TypeId, Val)> = Vec::new();
         for i in b.insts.iter_mut() {
+            // C99 6.7.3 — a volatile access is a barrier: never FORWARD a volatile store's
+            // value to a later load (that would elide the load), never forward/cache a volatile
+            // load (each read must execute). Clear the available set and leave the access intact.
+            if is_volatile_access(tt, i) {
+                avail.clear();
+                continue;
+            }
             match i {
                 Inst::Store(ty, addr, v) => {
                     let sz = tt.size(*ty);
@@ -1302,8 +1331,8 @@ pub fn optimize(tt: &TyTab, f: &mut IrFunc) {
         let mut n = 0;
         n += const_fold(tt, f);
         n += copy_prop(f);
-        n += cse(f);
-        n += dce(f);
+        n += cse(tt, f);
+        n += dce(tt, f);
         if n == 0 {
             break; // fixpoint: no instruction changes any further
         }
@@ -1589,9 +1618,21 @@ pub fn sroa(tt: &TyTab, f: &mut IrFunc) -> u32 {
     for b in &f.blocks {
         for i in &b.insts {
             match i {
-                Inst::Load(_, _, Val::Tmp(_)) => {} // address use — ok
+                // A VOLATILE field access (C99 6.7.3) must stay in memory — mark its base BAD
+                // so the aggregate is never scalarized (a promoted field would be register-cached).
+                Inst::Load(_, ty, Val::Tmp(a)) => {
+                    if tt.is_volatile(*ty) && let Some(bb) = base_of(*a) {
+                        bad.insert(bb);
+                    }
+                }
                 Inst::Bin(d, Op::Add, _, _, _) if addr.contains_key(d) => {} // field-Add — ok
-                Inst::Store(_, _, val) => {
+                Inst::Store(ty, addr_v, val) => {
+                    if tt.is_volatile(*ty)
+                        && let Val::Tmp(a) = addr_v
+                        && let Some(bb) = base_of(*a)
+                    {
+                        bad.insert(bb);
+                    }
                     // the address (2nd operand) is a fine use; a stored VALUE that is an
                     // address tmp is a pointer escaping into memory → its base is BAD.
                     if let Val::Tmp(v) = val
@@ -1721,15 +1762,23 @@ pub fn to_ssa(tt: &TyTab, f: &mut IrFunc) {
     for b in &f.blocks {
         for i in &b.insts {
             match i {
+                // A volatile local access (C99 6.7.3) ESCAPES its offset: the value must
+                // stay in memory (never promoted to an SSA scalar, which would cache it).
                 Inst::Load(_, ty, Val::Tmp(a)) => {
                     if let Some(&off) = lea_off.get(a) {
                         note_ty(&mut ty_of, &mut escaped, off, *ty);
+                        if tt.is_volatile(*ty) {
+                            escaped.insert(off);
+                        }
                         has_mem.insert(off);
                     }
                 }
                 Inst::Store(ty, Val::Tmp(a), _) => {
                     if let Some(&off) = lea_off.get(a) {
                         note_ty(&mut ty_of, &mut escaped, off, *ty);
+                        if tt.is_volatile(*ty) {
+                            escaped.insert(off);
+                        }
                         has_mem.insert(off);
                     }
                 }
@@ -3633,7 +3682,7 @@ pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
                             // dead code that still NAMES biv, so it must go before biv's def
                             // can be removed (else a dead use dangles). DCE cannot touch the
                             // counter's φ↔increment cycle itself (each keeps the other live).
-                            dce(f);
+                            dce(tt, f);
                             // The counter is now a dead self-cycle: biv (φ result) feeds
                             // only its increment i₂, and i₂ feeds only the φ. Break it here —
                             // find the header φ(biv), take its tail arm i₂, and if i₂ is used
@@ -4194,7 +4243,9 @@ fn speculatable(tt: &TyTab, al: &AliasInfo, i: &Inst) -> bool {
     match i {
         Inst::Bin(_, Op::Div | Op::Rem, ty, _, _) => tt.is_float(*ty), // int /0 traps
         Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Cast(..) | Inst::Lea(..) => true,
-        Inst::Load(_, _, addr) => al.fault_free(*addr),
+        // A volatile Load is an observable side effect (C99 6.7.3): it must execute exactly
+        // on the paths the source dictates — never speculated out of a conditional arm.
+        Inst::Load(_, ty, addr) => !tt.is_volatile(*ty) && al.fault_free(*addr),
         _ => false, // Store/Call/Phi/… — a side effect or a control artifact
     }
 }
@@ -4535,13 +4586,13 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
             n += gvn(f); // global redundant-expression elimination (dominator-based)
         }
         if p.cse {
-            n += cse(f); // block-local load reuse (GVN skips memory)
+            n += cse(tt, f); // block-local load reuse (GVN skips memory)
         }
         if p.load_elim {
             n += load_elim(tt, f); // B2: alias-aware store→load forwarding + NoAlias survival
         }
         if p.dce {
-            n += dce(f); // reclaim the temps the above passes deadened (incl. φ)
+            n += dce(tt, f); // reclaim the temps the above passes deadened (incl. φ)
         }
         if p.cfg_simplify {
             n += cfg_simplify(f); // collapse the straight lines / dead blocks SCCP exposed
@@ -4564,7 +4615,7 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
         // Runs ONCE after the fixpoint: it consumes SSA form, and the branches it removes
         // were already exposed by cfg_simplify. dce+cfg_simplify reclaim the now-dead arms.
         if if_convert(tt, f) > 0 {
-            dce(f);
+            dce(tt, f);
             cfg_simplify(f);
         }
     }
@@ -4672,7 +4723,7 @@ mod tests {
     fn dce_removes_dead() {
         let (ast, ir) = compile("dce1", "int g(int a,int b){a*b; return a+b;}");
         let mut opt = ir.clone();
-        let removed: u32 = opt.iter_mut().map(dce).sum();
+        let removed: u32 = opt.iter_mut().map(|f| dce(&ast.tt, f)).sum();
         assert!(removed >= 1, "must remove ≥1 dead instruction");
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
@@ -4688,7 +4739,7 @@ mod tests {
         let calls_before: usize = ir.iter().map(count_calls).sum();
         let mut opt = ir.clone();
         for f in opt.iter_mut() {
-            dce(f);
+            dce(&ast.tt, f);
         }
         let calls_after: usize = opt.iter().map(count_calls).sum();
         assert_eq!(calls_before, calls_after, "DCE must NOT remove a Call");
@@ -4709,7 +4760,7 @@ mod tests {
             let (ast, ir) = compile(nm, src);
             let mut opt = ir.clone();
             for f in opt.iter_mut() {
-                dce(f);
+                dce(&ast.tt, f);
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
@@ -4789,7 +4840,7 @@ mod tests {
             }],
         )];
         let mut after = before.clone();
-        let n = cse(&mut after[0]);
+        let n = cse(&TyTab::new(), &mut after[0]);
         assert!(n >= 1, "must CSE ≥1");
         assert!(matches!(after[0].blocks[0].insts[3], Inst::Copy(3, _, Val::Tmp(2))));
         verify(&after[0]).unwrap();
@@ -4805,11 +4856,11 @@ mod tests {
         let loads0 = count_loads(&ir);
         let mut opt = ir.clone();
         for f in opt.iter_mut() {
-            cse(f);
+            cse(&ast.tt, f);
             copy_prop(f);
-            cse(f);
+            cse(&ast.tt, f);
             copy_prop(f);
-            dce(f);
+            dce(&ast.tt, f);
         }
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
@@ -4830,10 +4881,10 @@ mod tests {
             let (ast, ir) = compile(nm, src);
             let mut opt = ir.clone();
             for f in opt.iter_mut() {
-                cse(f);
+                cse(&ast.tt, f);
                 copy_prop(f);
-                cse(f);
-                dce(f);
+                cse(&ast.tt, f);
+                dce(&ast.tt, f);
             }
             for f in &opt {
                 verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
@@ -5063,7 +5114,7 @@ mod tests {
             for f in opt.iter_mut() {
                 to_ssa(&ast.tt, f);
                 fired += if_convert(&ast.tt, f);
-                dce(f);
+                dce(&ast.tt, f);
                 cfg_simplify(f);
                 out_of_ssa(f);
             }
@@ -5432,8 +5483,8 @@ mod tests {
         match which {
             0 => { const_fold(tt, f); }
             1 => { copy_prop(f); }
-            2 => { cse(f); }
-            3 => { dce(f); }
+            2 => { cse(tt, f); }
+            3 => { dce(tt, f); }
             4 => optimize(tt, f),
             _ => unreachable!(),
         }
@@ -5485,9 +5536,9 @@ mod tests {
         // Correct CSE must commute:
         let mut ok = ir.clone();
         for f in ok.iter_mut() {
-            cse(f);
+            cse(&ast.tt, f);
             copy_prop(f);
-            dce(f);
+            dce(&ast.tt, f);
         }
         equiv(&ast.tt, &ir, &ok, "f").expect("correct CSE must commute");
         // Mutation: remove a memory write by replacing a Store with a Copy, so the
@@ -5755,6 +5806,43 @@ mod tests {
         let got = interp(&ast.tt, &ssa, "f", &[]).unwrap();
         assert_eq!(got, ((a * b) as f32 as f64).to_bits() as i64, "must be f32-narrowed");
         assert_ne!(got, (a * b).to_bits() as i64, "must NOT keep the raw f64 product");
+    }
+
+    // C99 6.7.3 — VOLATILE-ACCESS PRESERVATION (the structural dual of the ⟦·⟧ commuting
+    // square). ⟦·⟧-equivalence alone cannot certify volatile correctness: two reads of the
+    // same location yield the same value, so a wrongly-merged pair is ⟦·⟧-invisible. What IS
+    // observable is the MULTISET of volatile accesses — their number and kind must be exactly
+    // preserved. This test would FAIL without the per-pass guards: CSE would merge `a=g;b=g`,
+    // load_elim would forward `g=a` into `c=g`, DCE would drop an unused read, if_convert would
+    // speculate one, to_ssa would promote a volatile local. The count must neither DROP (an
+    // access elided) nor RISE (an access duplicated by block cloning).
+    #[test]
+    fn volatile_accesses_preserved() {
+        let (ast, ir) = compile(
+            "vol",
+            "volatile int g; int f(void){ int a=g; int b=g; g=a; int c=g; return b+c; }",
+        );
+        let count = |fns: &[IrFunc]| -> usize {
+            fns.iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.insts)
+                .filter(|i| is_volatile_access(&ast.tt, i))
+                .count()
+        };
+        let before = count(&ir);
+        assert!(before >= 4, "test must exercise ≥4 volatile accesses (got {before})");
+        let mut ssa = ir.clone();
+        for f in ssa.iter_mut() {
+            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+        }
+        for f in &ssa {
+            verify(f).unwrap();
+        }
+        assert_eq!(
+            count(&ssa),
+            before,
+            "every volatile access must survive optimization, none duplicated (C99 6.7.3)"
+        );
     }
 
     // Bitfield truncation through const-fold (C99 6.7.2.1). GCC torture 921016-1:
@@ -6057,7 +6145,7 @@ mod tests {
         let mut opt = ssa.clone();
         for f in opt.iter_mut() {
             sccp(&ast.tt, f);
-            dce(f); // strip the now-dead pre-fold arithmetic so the surviving Imm is LIVE
+            dce(&ast.tt, f); // strip the now-dead pre-fold arithmetic so the surviving Imm is LIVE
         }
         equiv(&ast.tt, &ssa, &opt, "f").expect("correct sccp must commute");
         // Corrupt a folded immediate (b was 10) and confirm the gate bites.

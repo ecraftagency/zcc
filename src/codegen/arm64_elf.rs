@@ -3615,11 +3615,24 @@ pub fn emit_ir(ast: &Ast) -> String {
     //       the optimizer off. Default (unset) = full SSA optimization + regalloc.
     let zcc_o0 = std::env::var("ZCC_O0").is_ok();
     // funcs[i] ↔ ast.funcs[i] by construction (ir::lower pushes one per AST func, in order).
-    let opt_ok: Vec<bool> = ast
-        .funcs
-        .iter()
-        .map(|f| !zcc_o0 && !f.has_volatile)
-        .collect();
+    // opt_ok now gates ONLY on ZCC_O0: the IR passes are volatile-SAFE per access (each pins
+    // volatile Load/Store via TyTab::vol — is_volatile_access — so a volatile access is never
+    // removed/merged/duplicated/hoisted/promoted), so a function with a volatile access is
+    // FULLY optimized (regalloc + SSA passes) while only its volatile accesses stay memory-bound.
+    // This replaces the old whole-function -O0 fallback that de-optimized giant functions
+    // (sqlite3VdbeExec: one volatile `db->u1.isInterrupted` read all-spilled 14,522 temps).
+    // `vol_free` remains for the two places that still need whole-function volatile caution: the
+    // inline callee gate (a volatile callee is not spliced), and the backend `[sp,#k]` memory
+    // peepholes (which cannot tell a volatile local slot from a compiler temp in text).
+    // `has_vla` → -O0: a VLA function has a DYNAMIC frame (sp moves on each VLA alloc, and a
+    // backward goto to a label before the VLA def must deallocate via reset_sp_base). The SSA
+    // passes + regalloc do not yet model that SP dance — an optimized VLA function with a
+    // backward goto SEGFAULTS (gcc.c-torture vla-dealloc-1, reduced: a non-volatile VLA+goto also
+    // crashes under opt). This bug was MASKED because the suite's only VLA-dealloc test carries a
+    // `volatile` (→ old -O0 gate); enabling volatile optimization exposed it. Routing VLA to -O0
+    // is sound and rare (no VLA in sqlite's hot path); VLA+opt is TRACKED DEBT (OPT.md).
+    let opt_ok: Vec<bool> = ast.funcs.iter().map(|f| !zcc_o0 && !f.has_vla).collect();
+    let vol_free: Vec<bool> = ast.funcs.iter().map(|f| !zcc_o0 && !f.has_volatile).collect();
     // Industrial toggleable pipeline: which passes run is read once from the environment
     // (ZCC_OPT_OFF / ZCC_OPT_ON over the default profile). `coalesce` is consumed later by
     // abi_alloc, so it is stashed on Cg.
@@ -3639,7 +3652,7 @@ pub fn emit_ir(ast: &Ast) -> String {
                 .enumerate()
                 .map(|(i, f)| opt_ok[i] && !f.variadic && !f.has_vla)
                 .collect();
-            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &opt_ok, &crate::opt::InlineCfg::from_env());
+            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &vol_free, &crate::opt::InlineCfg::from_env());
         }
         for (i, f) in funcs.iter_mut().enumerate() {
             if opt_ok.get(i).copied().unwrap_or(false) {
@@ -3799,7 +3812,10 @@ pub fn emit_ir(ast: &Ast) -> String {
             body = peephole_moves(&body); // redundant/dead reg-moves…
         }
         let c_move = costsq.then(|| count_insn_lines(&body));
-        if g.regalloc && passes.ldst_pair {
+        if g.regalloc && passes.ldst_pair && !f.has_volatile {
+            // ldp/stp merges two adjacent `[sp,#k]` accesses — sound for compiler temps, but a
+            // volatile local slot could land there once volatile functions optimize; pairing it
+            // would merge/reorder volatile accesses (C99 6.7.3). Skip for volatile functions.
             body = pair_ldst(&body); // …then the exposed adjacent accesses → ldp/stp
         }
         let c_pair = costsq.then(|| count_insn_lines(&body));
