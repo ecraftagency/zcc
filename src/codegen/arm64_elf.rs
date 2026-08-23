@@ -3751,6 +3751,9 @@ fn drop_redundant_moves(body: &str) -> String {
         let operands = t[mn.len()..].trim_start();
         // The one rewrite: drop a mov xD,xS proven redundant; else record D≡S.
         if let Some((d, s)) = parse_mov_xx(t) {
+            if d == s {
+                continue; // `mov xN,xN` = orr xN,xzr,xN — an unconditional no-op (any value, no flags)
+            }
             match (eq.get(&d), eq.get(&s)) {
                 (Some(a), Some(b)) if a == b => continue, // D already ≡ S → DROP
                 _ => {

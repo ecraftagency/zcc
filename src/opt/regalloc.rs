@@ -168,6 +168,7 @@ pub fn color_abi(
     crossing: &[bool],
     bias: &[Vec<Tmp>],
     is_param: &[bool],
+    target: &[Option<u32>],
 ) -> Vec<Option<u32>> {
     let nt = adj.len();
     let k = b.k as usize;
@@ -239,6 +240,14 @@ pub fn color_abi(
         let forbid_arg = is_param[v as usize];
         let free =
             |c: u32| c >= lo && c < b.k && !used[c as usize] && !(forbid_arg && c >= arg_lo && c < b.ncaller);
+        // ABI TARGETING (Phase 2): an outgoing arg temp #i prefers color i (⟹ x{i}, the arg
+        // register), a call-result temp prefers color 0 (⟹ x0) — so marshal_call_args' `mov
+        // x{i},x{i}` / the result-capture `mov home,x0` become self-moves the peephole drops.
+        // Checked FIRST, but only among FREE & legal colors, so — exactly like `bias` below —
+        // it never forces an illegal color, never changes k-colorability, and rests on the SAME
+        // verify_abi theorem (no new proof obligation). Meaningful only in WIDE (caller color
+        // i = x{i}); abi_alloc leaves target=None otherwise.
+        let targeted = target[v as usize].filter(|&c| free(c));
         // biased coalescing: prefer a free, in-range color already held by a same-class
         // move partner (the copy becomes a self-move). Falls back to the smallest free
         // color — so the result is always a valid coloring regardless of the bias.
@@ -247,7 +256,7 @@ pub fn color_abi(
             .filter(|&&p| in_class[p as usize])
             .filter_map(|&p| colr[p as usize])
             .find(|&c| free(c));
-        colr[v as usize] = biased.or_else(|| (lo..b.k).find(|&c| free(c)));
+        colr[v as usize] = targeted.or(biased).or_else(|| (lo..b.k).find(|&c| free(c)));
     }
     colr
 }
@@ -505,10 +514,55 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coa
             }
         }
     }
+    // ABI TARGETING hints (Phase 2), per coalescing REP. Meaningful only when the caller
+    // color i maps to arg register x{i} — i.e. WIDE GP (gp.ncaller>0); NARROW leaves it empty
+    // (caller colors are x19–x28, no arg-register match) so its coloring stays byte-identical.
+    // A GP arg at position i<ncaller → prefer color i; a GP call result → prefer color 0. Only
+    // for NON-crossing (caller-band-eligible), NON-param (arg-register-barred) temps; first-set
+    // wins for determinism. CallX arg positions depend on a struct/stack plan, so only its
+    // RESULT (always x0) is targeted here; simple-Call args get full position targeting.
+    let mut target: Vec<Option<u32>> = vec![None; nt];
+    if gp.ncaller > 0 {
+        let mut set_tgt = |t: Tmp, c: u32, rep: &mut [Tmp]| {
+            if !is_fp[t as usize] && !crossing[t as usize] {
+                let r = find(rep, t) as usize;
+                if !is_param[r] && target[r].is_none() {
+                    target[r] = Some(c);
+                }
+            }
+        };
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Call(d, _, args, _) => {
+                        let mut gpi = 0u32;
+                        for a in args {
+                            let fparg = match a {
+                                Val::FImm(_) => true,
+                                Val::Imm(_) => false,
+                                Val::Tmp(t) => is_fp[*t as usize],
+                            };
+                            if !fparg {
+                                if gpi < gp.ncaller && let Val::Tmp(t) = a {
+                                    set_tgt(*t, gpi, &mut rep);
+                                }
+                                gpi += 1;
+                            }
+                        }
+                        if let Some(t) = d {
+                            set_tgt(*t, 0, &mut rep);
+                        }
+                    }
+                    Inst::CallX(Some(t), _, _, _, _) => set_tgt(*t, 0, &mut rep),
+                    _ => {}
+                }
+            }
+        }
+    }
     let gp_in: Vec<bool> = (0..nt).map(|t| !is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
     let fp_in: Vec<bool> = (0..nt).map(|t| is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
-    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj, &is_param);
-    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj, &is_param);
+    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj, &is_param, &target);
+    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj, &is_param, &target);
     for t in 0..nt {
         let r = find(&mut rep, t as Tmp) as usize;
         home[t] = if is_fp[t] { fc[r] } else { gc[r] }.map(|c| (is_fp[t], c));
