@@ -4040,6 +4040,88 @@ fn post_index(body: &str) -> String {
     out
 }
 
+/// CBZ/CBNZ FUSION (Tier-1 #6 — compare-and-branch against zero). An adjacent `cmp Rn, #0` /
+/// `b.eq|b.ne LABEL` pair collapses to `cbz|cbnz Rn, LABEL`, deleting the cmp. THEOREM: `cbz Rn,L`
+/// branches iff Rn==0 (exactly `cmp Rn,#0; b.eq L`); `cbnz` iff Rn≠0 (`b.ne`). Rn's width (w/x) is
+/// preserved; the branch range (imm19, ±1 MB) is identical to `b.cc`, so no target ever falls out
+/// of reach. SOUNDNESS obligation — the cmp's NZCV flags must be dead on the fall-through past the
+/// branch (cbz sets no flags): scan forward from the branch; a flag-WRITER or a control boundary
+/// (label / b / bl / ret / cbz…) first ⟹ flags dead ⟹ SAFE; a flag-READER first (a second `b.cc`,
+/// cset, csel, adc, ccmp…) ⟹ the cmp is still needed ⟹ DECLINE. Machine translation-validation
+/// (opt-parity); one fewer insn per branch (size + a hot compare-branch cycle). This is the
+/// bare-truth-branch case the IR cbr-fusion misses (it fires only when the tested value is itself
+/// a relational compare; here Rn is a plain integer — null-checks, `if(x)`, `while(n)`).
+fn cbz_fuse(body: &str) -> String {
+    fn mnem(t: &str) -> &str {
+        t.split(|c: char| c.is_whitespace() || c == '.').next().unwrap_or("")
+    }
+    // NZCV consumers (must run BEFORE the writer test — ccmp both reads and writes).
+    fn flag_reads(t: &str) -> bool {
+        if t.starts_with("b.") {
+            return true; // a conditional branch reads NZCV
+        }
+        matches!(mnem(t),
+            "cset" | "csetm" | "csel" | "csinc" | "csinv" | "csneg" | "cinc" | "cinv"
+            | "cneg" | "adc" | "adcs" | "sbc" | "sbcs" | "ccmp" | "ccmn")
+    }
+    fn flag_writes(t: &str) -> bool {
+        matches!(mnem(t),
+            "cmp" | "cmn" | "tst" | "ccmp" | "ccmn" | "adds" | "subs" | "ands" | "bics"
+            | "adcs" | "sbcs" | "negs" | "fcmp" | "fcmpe")
+    }
+    // control leaves this straight-line region (flags become don't-care past here).
+    fn boundary(t: &str) -> bool {
+        t.ends_with(':')
+            || matches!(mnem(t), "b" | "br" | "bl" | "blr" | "ret" | "cbz" | "cbnz" | "tbz" | "tbnz")
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        // cmp Rn, #0  (Rn a w/x register, immediate exactly 0)
+        if let Some(reg) = t.strip_prefix("cmp ").and_then(|r| r.strip_suffix(", #0")) {
+            if (reg.starts_with('w') || reg.starts_with('x')) && !reg.contains([',', ' ', '[']) {
+                if let Some(br) = lines.get(i + 1).map(|l| l.trim()) {
+                    let cbop = if let Some(l) = br.strip_prefix("b.eq ") {
+                        Some(("cbz", l))
+                    } else if let Some(l) = br.strip_prefix("b.ne ") {
+                        Some(("cbnz", l))
+                    } else {
+                        None
+                    };
+                    if let Some((op, label)) = cbop {
+                        // flags dead on the fall-through past the branch?
+                        let mut safe = true;
+                        for lj in &lines[i + 2..] {
+                            let u = lj.trim();
+                            if u.is_empty() || u.starts_with('.') && !u.ends_with(':') {
+                                continue;
+                            }
+                            if flag_reads(u) {
+                                safe = false;
+                                break;
+                            }
+                            if flag_writes(u) || boundary(u) {
+                                break; // flags overwritten / region left ⟹ dead ⟹ safe
+                            }
+                        }
+                        if safe {
+                            _ = writeln!(out, "\t{op} {reg}, {label}");
+                            i += 2; // consumed cmp + branch
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// DEAD-MOVE ELIMINATION (region-local backward liveness). A `mov xD,xS` is deleted when xD
 /// is redefined later in the same straight-line region BEFORE any read of xD — its value is
 /// never observed. The coalescer gives many short-lived temps the same home register, so the
@@ -4550,6 +4632,8 @@ pub fn emit_ir(ast: &Ast) -> String {
                 // for volatile functions (the increment's hoist reorders relative to the access).
                 body = post_index(&body);
             }
+            // …and collapse `cmp Rn,#0; b.eq/ne` → `cbz/cbnz Rn` (pure control flow, volatile-safe).
+            body = cbz_fuse(&body);
         }
         let c_move = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.ldst_pair && !f.has_volatile {

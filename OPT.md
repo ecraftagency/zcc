@@ -22,12 +22,25 @@
 > not. Every session opens by re-reading §0. Every lever starts from §0's ledger. We drifted
 > before because the plan lived in conversation and vanished — this section is the fix.
 
-### The lock (user directive, 2026-08-23): **"1→6 is 1→6 until death."**
+### The lock (user directive, 2026-08-23): **"1→6 is 1→6 until death."** — AMENDED 2026-08-24 → **1→7**.
 
-Execute levers **1 through 6 in order, to completion.** Do not reorder, skip, or substitute.
-Levers **7–10** are the size-only grind toward binary-1× — attempted **only if** binary-1× is
-still required *after* 1–6 are measured, and **only** on an explicit user "re-plan"/go. They are
+Execute levers **1 through 7 in order, to completion.** Do not reorder, skip, or substitute.
+Levers **8–11** are the size-only grind toward binary-1× — attempted **only if** binary-1× is
+still required *after* 1–7 are measured, and **only** on an explicit user "re-plan"/go. They are
 NOT part of the locked run.
+
+**Amendment (2026-08-24, user-authorized placement):** the MISSED-lever audit (user asked "did we
+miss a bang-for-buck lever / are 1–5 pushed to limit") measured the full ARM64 ISA-peephole surface
+against the sqlite stream. Finding: the surface is ~90% exhausted; the ONE genuine miss is **CBZ/CBNZ
+(3,435 sites)** — the cheap HIGH-conf core of old-lever-9, wrongly parked in the conditional band. It
+is **promoted to Lever 6** (runs NEXT, before the hinge). Old-9 splits: its cbz core → new 6, its
+flag-residency remainder stays a standalone lever → new 10 (NOT merged into the rewrite — a peephole
+and a from-scratch regalloc rewrite are different categories). The hinge (w-form) shifts to **Lever
+7** and STAYS committed; old 6/7/8 → 7/8/9; old-10 (the rewrite) → **Lever 11**, standalone endgame.
+Net +1 lever ⇒ **0–11 = 12 levers**. The lock band widens 1→6 ⇒ **1→7**. Also measured + recorded: the 1× gap is NOT instruction-selection — ISA residual ≈6k
+(2%), while the residency tax (reg-reg mov **41,399** + spill/reload **27,116** + sxtw **8,342**) ≈84k
+(~28% of stream, ~59% of the 143k gap). Levers 7–9 (w-form/reload/coalescing) target that tax; the
+plan is correctly aimed. The text's premise "ISA tricks → 1× perfect" is measurably false.
 
 ### The NO-PIVOT contract (this rule contradicts the AI when it drifts)
 
@@ -147,12 +160,13 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 3 | `smull`/`umull` fuse (ext+mul→1) | 98 sites | HI | LOW | S+P | ⛔ ABANDONED (fundamental-limit) | **0** (see note ▼) |
 | 4 | immediate-offset addr forwarding (`t=base+#off`, all-mem uses → `[base,#off]`, drop add) | 1,088 sound (pred) | HI | LOW-MED | S | ✅ DONE `4fa83c8+` | **−1,664** (>150% of pred; pair_ldst 2nd-order) |
 | 5 | post-index addressing (`mem [xP]; add xP,xP,#k` → `mem [xP],#k`, drop add) | 187 sound (pred) | MED | MED | S+P | ✅ DONE `1709d9c+` | **−102** (hot-loop exec win; caught+fixed a cross-block bug) |
-| — | **▲▲▲ LOCK LINE — 1→6 to death; everything above ships before anything below ▲▲▲** | | | | | | |
-| 6 | **w-form arithmetic** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,744 + ldrsw 4,116 ≈ **12.8k** | MED | MED-HIGH | S+P | ⬜ TODO | — |
-| 7 | local reload elim (keep spilled value resident in-block) | part of mem **+27k** | LO | HIGH | S | ☐ conditional | — |
-| 8 | coalescing extension (marshalling/param movs) | part of mov **+38k** | LO | HIGH | S | ☐ conditional | — |
-| 9 | compare-branch fusion / flag residency | cmp **+8.8k** | LO | MED | S+P | ☐ conditional | — |
-| 10 | SSA global register allocator (the rewrite / fork) | true 1× | — | HIGHEST | S | ☐ conditional | — |
+| — | **▲▲▲ LOCK LINE — 1→7 to death; everything above ships before anything below ▲▲▲** | | | | | | |
+| 6 | **CBZ/CBNZ from bare-truth branches** (`cmp Rn,#0; b.eq/ne` → `cbz/cbnz Rn`, drop cmp) — MISSED-lever audit 2026-08-24, promoted from old-9 core | **3,435 sites** (measured, adjacent+flags-single-use) | HI | LOW | S+P | ✅ DONE `c4acd0e+` | **−3,435** (100% of ceiling — direct site-count) |
+| 7 | **w-form arithmetic** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,342 + ldrsw ≈ **12.8k** | MED | MED-HIGH | S+P | ⬜ TODO | — |
+| 8 | local reload elim (keep spilled value resident in-block) | mem **27,116** (measured) | LO | HIGH | S | ☐ conditional | — |
+| 9 | coalescing extension (marshalling/param movs) | reg-reg mov **41,399** (measured) | LO | HIGH | S | ☐ conditional | — |
+| 10 | compare-branch / flag-residency remainder (old-9 non-cbz) | part of cmp **+8.8k** | LO | MED | S+P | ☐ conditional | — |
+| 11 | SSA global register allocator (the rewrite / fork) — endgame, standalone | true 1× | — | HIGHEST | S | ☐ conditional | — |
 
 **LEVER 3 — ABANDONED, fundamental-limit (Law-4 cat-(a)), measured 2026-08-23 @ `4fa83c8`.**
 Block-local canonical-operand scan of all **1,579** x-form `mul`s in the sqlite stream:
