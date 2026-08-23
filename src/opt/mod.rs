@@ -912,10 +912,10 @@ mod tests {
     // (x19–x28), NO caller-saved (the emitter's scratch spans x0–x15); FP = 16 caller
     // (v16–v31) ⊕ 8 callee (v8–v15).
     fn gp_budget() -> ClassBudget {
-        ClassBudget { k: 10, ncaller: 0 }
+        ClassBudget { k: 10, ncaller: 0, narg: 0 }
     }
     fn fp_budget() -> ClassBudget {
-        ClassBudget { k: 24, ncaller: 16 }
+        ClassBudget { k: 24, ncaller: 16, narg: 0 }
     }
 
     // ABI allocation VALIDATES over a corpus mixing calls (crossing temps) and floats:
@@ -979,8 +979,8 @@ mod tests {
     // caller-saved reg the `bl` would clobber. Proves the restriction actually bites.
     #[test]
     fn abi_alloc_no_clobber() {
-        let gp = ClassBudget { k: 2, ncaller: 2 }; // all caller-saved, no callee-saved
-        let fp = ClassBudget { k: 16, ncaller: 16 };
+        let gp = ClassBudget { k: 2, ncaller: 2, narg: 0 }; // all caller-saved, no callee-saved
+        let fp = ClassBudget { k: 16, ncaller: 16, narg: 0 };
         let (ast, ir) = compile("x", "int h(int);int f(int a){int x=a*a;return h(a)+x;}");
         let f = ir.iter().find(|f| f.name == "f").unwrap();
         let home = abi_alloc(&ast.tt, f, &gp, &fp, true);

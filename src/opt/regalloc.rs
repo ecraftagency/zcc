@@ -139,6 +139,13 @@ pub fn interference(f: &IrFunc, lv: &Liveness) -> Vec<HashSet<Tmp>> {
 pub struct ClassBudget {
     pub k: u32,       // total colors in the class
     pub ncaller: u32, // colors [0,ncaller) are caller-saved; [ncaller,k) callee-saved
+    // The TOP `narg` caller colors [ncaller-narg, ncaller) map to ARGUMENT registers (x6,x7
+    // in GP-WIDE). A PARAM temp must NOT be homed there: params arrive in the arg registers,
+    // so a param homed at a DIFFERENT arg register makes Inst::Param delivery a register
+    // permutation the sequential per-Param `mov` gets wrong (lost-copy). Excluding params from
+    // these colors keeps homes disjoint from arg registers for params, so any delivery order is
+    // safe. Non-param temps use them freely (crossing[] still confines call-crossers to callee).
+    pub narg: u32,
 }
 
 
@@ -160,6 +167,7 @@ pub fn color_abi(
     b: &ClassBudget,
     crossing: &[bool],
     bias: &[Vec<Tmp>],
+    is_param: &[bool],
 ) -> Vec<Option<u32>> {
     let nt = adj.len();
     let k = b.k as usize;
@@ -226,7 +234,11 @@ pub fn color_abi(
             }
         }
         let lo = if crossing[v as usize] { b.ncaller } else { 0 };
-        let free = |c: u32| c >= lo && c < b.k && !used[c as usize];
+        // A param temp may not take an arg-register caller color [ncaller-narg, ncaller).
+        let arg_lo = b.ncaller - b.narg;
+        let forbid_arg = is_param[v as usize];
+        let free =
+            |c: u32| c >= lo && c < b.k && !used[c as usize] && !(forbid_arg && c >= arg_lo && c < b.ncaller);
         // biased coalescing: prefer a free, in-range color already held by a same-class
         // move partner (the copy becomes a self-move). Falls back to the smallest free
         // color — so the result is always a valid coloring regardless of the bias.
@@ -302,6 +314,62 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coa
         }
     }
     let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
+    // PROBE (env-gated, zero-effect): realized x0-x7 targeting ceiling. For each Call,
+    // a GP arg at index i<8 that is a NON-CROSSING Tmp could be homed at x{i} (kills the
+    // marshal mov); a non-crossing result could be homed at x0 (kills the capture mov).
+    // Also counts args that are the temp's SOLE use (cleanly targetable, no home conflict).
+    if std::env::var("ZCC_PROBE").is_ok() {
+        let mut usec = vec![0u32; nt];
+        let mut ub = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                ub.clear();
+                inst_uses(i, &mut ub);
+                for &u in &ub {
+                    usec[u as usize] += 1;
+                }
+            }
+            ub.clear();
+            term_uses(&b.term, &mut ub);
+            for &u in &ub {
+                usec[u as usize] += 1;
+            }
+        }
+        let (mut arg_tot, mut arg_nc, mut arg_sole, mut res_tot, mut res_nc) = (0u32, 0u32, 0u32, 0u32, 0u32);
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(d, _, args, _) = i {
+                    let mut gpi = 0u32;
+                    for a in args {
+                        let fp = matches!(a, Val::Tmp(t) if is_fp[*t as usize]);
+                        if !fp {
+                            if gpi < 8 {
+                                arg_tot += 1;
+                                if let Val::Tmp(t) = a {
+                                    if !crossing[*t as usize] {
+                                        arg_nc += 1;
+                                        if usec[*t as usize] == 1 {
+                                            arg_sole += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            gpi += 1;
+                        }
+                    }
+                    if let Some(t) = d {
+                        if !is_fp[*t as usize] {
+                            res_tot += 1;
+                            if !crossing[*t as usize] {
+                                res_nc += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("PROBE arg_tot={arg_tot} arg_nc={arg_nc} arg_sole={arg_sole} res_tot={res_tot} res_nc={res_nc}");
+    }
     // ── Conservative (Briggs) register COALESCING ──────────────────────────────
     // A Copy(d,s) with disjoint live ranges (d,s do NOT interfere) may share ONE
     // register — the copy then lowers to a self-move the peephole elides (this is
@@ -425,10 +493,22 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coa
             }
         }
     }
+    // A PARAM temp (defined by Inst::Param) must avoid arg-register colors (see ClassBudget.narg).
+    // Flag the coalescing REPRESENTATIVE: if any temp merged into a rep is a param, the rep's
+    // home applies to it, so the rep inherits the exclusion.
+    let mut is_param = vec![false; nt];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Param(d, _) = i {
+                let r = find(&mut rep, *d) as usize;
+                is_param[r] = true;
+            }
+        }
+    }
     let gp_in: Vec<bool> = (0..nt).map(|t| !is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
     let fp_in: Vec<bool> = (0..nt).map(|t| is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
-    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj);
-    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj);
+    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj, &is_param);
+    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj, &is_param);
     for t in 0..nt {
         let r = find(&mut rep, t as Tmp) as usize;
         home[t] = if is_fp[t] { fc[r] } else { gc[r] }.map(|c| (is_fp[t], c));

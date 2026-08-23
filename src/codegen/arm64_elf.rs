@@ -43,9 +43,17 @@ use std::fmt::Write;
 // containing one falls back to NARROW (x19–x28 only, ncaller=0). x10–x15 are not argument
 // registers, so opening them adds no call-marshalling shuffle hazard, and color_abi's crossing[]
 // already confines any call-crossing temp to the callee-saved band.
-const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0 }; // NARROW: x19–x28
-const GP_BUDGET_WIDE: ClassBudget = ClassBudget { k: 16, ncaller: 6 }; // WIDE: x10–x15 | x19–x28
-const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16 };
+const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0, narg: 0 }; // NARROW: x19–x28
+// WIDE caller file = x10–x15 (colors 0–5) then x6,x7 (colors 6–7), callee x19–x28 (8–17).
+// x6,x7 ARE argument registers, so opening them reintroduces the marshalling shuffle hazard
+// (absorbed by marshal_call_args' parallel move) and the indirect-callee-clobber hazard (a
+// ≥7-arg `blr` whose call marshals an arg into x6/x7 that homes the pointer — fixed in ir_call
+// by snapshotting the pointer into x17 BEFORE marshalling). They sit LAST in the caller band so
+// color_abi reaches for them only under pressure; crossing[] still confines call-crossing temps
+// to the callee band. Value-placement targeting of x0–x7 is a later, deeper step (the x0-canonical
+// helper convention must move first); this budget banks the pure pressure-relief of +2 caller homes.
+const GP_BUDGET_WIDE: ClassBudget = ClassBudget { k: 18, ncaller: 8, narg: 2 }; // WIDE: x10–x15,x6,x7 | x19–x28
+const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16, narg: 0 };
 fn fp_phys(idx: u32) -> u32 {
     if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
 }
@@ -1452,7 +1460,12 @@ impl<'a> Cg<'a> {
     // the callee-only file. `gp_ncaller()` reports the split so csave / verify agree.
     fn gpp(&self, idx: u32) -> u32 {
         if self.gp_wide {
-            if idx < GP_BUDGET_WIDE.ncaller { 10 + idx } else { 19 + (idx - GP_BUDGET_WIDE.ncaller) }
+            // caller colors 0–5 → x10–x15, 6–7 → x6,x7 (arg regs, used last); callee 8–17 → x19–x28.
+            match idx {
+                0..=5 => 10 + idx,
+                6 | 7 => idx,
+                _ => 19 + (idx - GP_BUDGET_WIDE.ncaller),
+            }
         } else {
             19 + idx
         }
@@ -1912,13 +1925,16 @@ impl<'a> Cg<'a> {
         // SCALAR args — any register overflow (gp>8 / fp>8), composite (struct/HFA/>16B),
         // or non-8B float is routed to Inst::CallX/ir_call_abi instead. So neither counter
         // can reach 8 here; the debug_asserts pin that delegated precondition.
+        // Snapshot an indirect callee pointer into x17 (a register no home, arg, or marshalling
+        // scratch ever touches) BEFORE marshalling: with x6/x7 now allocatable homes, a ≥7-arg
+        // call marshals an arg into x6/x7 and would clobber a pointer homed there if read after.
+        if let Callee::Ptr(p) = callee {
+            self.ld_val(*p, "x17");
+        }
         self.marshal_call_args(args);
         match callee {
             Callee::Sym(name) => _ = writeln!(self.s, "\tbl {}", sym(name)),
-            Callee::Ptr(p) => {
-                self.ld_val(*p, "x9");
-                self.s += "\tblr x9\n";
-            }
+            Callee::Ptr(_) => self.s += "\tblr x17\n",
         }
         if let Some(d) = dst {
             let rt = self.ir_temps[*d as usize];
