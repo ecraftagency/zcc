@@ -44,15 +44,18 @@ use std::fmt::Write;
 // registers, so opening them adds no call-marshalling shuffle hazard, and color_abi's crossing[]
 // already confines any call-crossing temp to the callee-saved band.
 const GP_BUDGET: ClassBudget = ClassBudget { k: 10, ncaller: 0, narg: 0 }; // NARROW: x19–x28
-// WIDE caller file = x10–x15 (colors 0–5) then x6,x7 (colors 6–7), callee x19–x28 (8–17).
-// x6,x7 ARE argument registers, so opening them reintroduces the marshalling shuffle hazard
-// (absorbed by marshal_call_args' parallel move) and the indirect-callee-clobber hazard (a
-// ≥7-arg `blr` whose call marshals an arg into x6/x7 that homes the pointer — fixed in ir_call
-// by snapshotting the pointer into x17 BEFORE marshalling). They sit LAST in the caller band so
-// color_abi reaches for them only under pressure; crossing[] still confines call-crossing temps
-// to the callee band. Value-placement targeting of x0–x7 is a later, deeper step (the x0-canonical
-// helper convention must move first); this budget banks the pure pressure-relief of +2 caller homes.
-const GP_BUDGET_WIDE: ClassBudget = ClassBudget { k: 18, ncaller: 8, narg: 2 }; // WIDE: x10–x15,x6,x7 | x19–x28
+// WIDE caller file = x0–x7 (colors 0–7, the ARGUMENT/result registers), callee x19–x28 (8–17).
+// Opening the arg registers as homes is what enables VALUE-PLACEMENT TARGETING (an arg temp
+// homed at x{i} elides its marshal mov; a call result homed at x0 elides its capture mov) — the
+// ~27k-mov / ~8% sqlite lever. It reintroduces two call-boundary hazards the prior x10–x15 file
+// dodged, both handled: the marshalling shuffle (marshal_call_args' parallel move) and the
+// indirect-callee clobber (ir_call snapshots the pointer to x17 before marshalling). crossing[]
+// confines any call-crossing temp to the callee band; narg=8 keeps PARAM temps off the arg
+// registers (Inst::Param delivery stays a permutation-free arg→home copy). The backend funnel
+// scratch that used to live in x0–x5 was RELOCATED to x10–x15 (via the `fnl` base; disjoint from
+// this home file AND from the x9 internal address scratch); the heavy paths (Overflow/Sync/VaArg/
+// Asm, NARROW-only) keep their x0–x5 funnel — they never run WIDE (fnl=0).
+const GP_BUDGET_WIDE: ClassBudget = ClassBudget { k: 18, ncaller: 8, narg: 8 }; // WIDE: x0–x7 | x19–x28
 const FP_BUDGET: ClassBudget = ClassBudget { k: 24, ncaller: 16, narg: 0 };
 fn fp_phys(idx: u32) -> u32 {
     if idx < FP_BUDGET.ncaller { 16 + idx } else { 8 + (idx - FP_BUDGET.ncaller) }
@@ -214,9 +217,16 @@ struct Cg<'a> {
     // dead (0). This shrinks the frame from temps.len()*8 to num_spilled*8 — the frame bloat
     // that pushed slot offsets past sp-scaling range into the dynamic `sub x?,x29,x10` form.
     spill_off: Vec<u32>,
-    // §3: this function uses the WIDE GP budget (x10–x15 caller-saved homes). Set per function
+    // §3: this function uses the WIDE GP budget (x0–x7 caller-saved homes). Set per function
     // in emit_ir_body from the heavy-instruction scan; drives gpp()/gp_ncaller().
     gp_wide: bool,
+    // Funnel-scratch base register for the x0-funnel helpers (ir_bin float / load / store /
+    // cast_op / blk_copy / emit_zero / emit_{fun,label}addr / emit_vastart) and the spilled/imm
+    // fallback in emit_inst. NARROW ⟹ 0 (funnel = x0–x5, byte-identical to the historical path);
+    // WIDE ⟹ 10 (funnel = x10–x15, DISJOINT from the home file x0–x7 ∪ x19–x28 and from the x9
+    // internal address scratch). Set in lockstep with gp_wide. This is what lets x0–x7 be homes:
+    // the funnel that used to clobber them moves out of the way. Heavy paths force NARROW (fnl=0).
+    fnl: u32,
     csave_gp: Vec<u32>,
     csave_fp: Vec<u32>,
     // Tier-1 #2 (addressing-mode fold): function-wide READ count per temp, computed once
@@ -744,36 +754,39 @@ impl Cg<'_> {
         }
     }
     fn load(&mut self, t: TypeId) {
+        // Funnel value/address in x{v} (base-relative — see `fnl`); s0/d0/q0 are FP scratch.
+        let v = self.fnl;
         match self.a.tt.tys[t as usize] {
-            Ty::Float => self.s += "\tldr s0, [x0]\n\tfcvt d0, s0\n\tfmov x0, d0\n",
-            // long double: memory binary128 → narrowed to canonical f64 (libgcc rounds correctly)
-            Ty::LDouble => self.s += "\tldr q0, [x0]\n\tbl __trunctfdf2\n\tfmov x0, d0\n",
+            Ty::Float => _ = writeln!(self.s, "\tldr s0, [x{v}]\n\tfcvt d0, s0\n\tfmov x{v}, d0"),
+            // long double: memory binary128 → narrowed to canonical f64 (libgcc rounds correctly).
+            // LDouble Load forces NARROW (heavy scan) ⟹ v=0 here; the `bl` clobbers x10–x15 too.
+            Ty::LDouble => _ = writeln!(self.s, "\tldr q0, [x{v}]\n\tbl __trunctfdf2\n\tfmov x{v}, d0"),
             Ty::Bitfield(b, boff, w) => {
                 // load the whole containing unit (unsigned), then shift left/right to isolate the field
-                self.s += match self.a.tt.size(b) {
-                    1 => "\tldrb w0, [x0]\n",
-                    2 => "\tldrh w0, [x0]\n",
-                    4 => "\tldr w0, [x0]\n",
-                    _ => "\tldr x0, [x0]\n",
+                _ = match self.a.tt.size(b) {
+                    1 => writeln!(self.s, "\tldrb w{v}, [x{v}]"),
+                    2 => writeln!(self.s, "\tldrh w{v}, [x{v}]"),
+                    4 => writeln!(self.s, "\tldr w{v}, [x{v}]"),
+                    _ => writeln!(self.s, "\tldr x{v}, [x{v}]"),
                 };
-                _ = writeln!(self.s, "\tlsl x0, x0, #{}", 64 - boff - w);
+                _ = writeln!(self.s, "\tlsl x{v}, x{v}, #{}", 64 - boff - w);
                 let sh = if self.a.tt.is_unsigned(b) {
                     "lsr"
                 } else {
                     "asr"
                 };
-                _ = writeln!(self.s, "\t{sh} x0, x0, #{}", 64 - w);
+                _ = writeln!(self.s, "\t{sh} x{v}, x{v}, #{}", 64 - w);
             }
             _ => {
                 let u = self.a.tt.is_unsigned(t);
-                self.s += match (self.a.tt.size(t), u) {
-                    (1, false) => "\tldrsb x0, [x0]\n",
-                    (1, true) => "\tldrb w0, [x0]\n",
-                    (2, false) => "\tldrsh x0, [x0]\n",
-                    (2, true) => "\tldrh w0, [x0]\n",
-                    (4, false) => "\tldrsw x0, [x0]\n",
-                    (4, true) => "\tldr w0, [x0]\n",
-                    _ => "\tldr x0, [x0]\n",
+                _ = match (self.a.tt.size(t), u) {
+                    (1, false) => writeln!(self.s, "\tldrsb x{v}, [x{v}]"),
+                    (1, true) => writeln!(self.s, "\tldrb w{v}, [x{v}]"),
+                    (2, false) => writeln!(self.s, "\tldrsh x{v}, [x{v}]"),
+                    (2, true) => writeln!(self.s, "\tldrh w{v}, [x{v}]"),
+                    (4, false) => writeln!(self.s, "\tldrsw x{v}, [x{v}]"),
+                    (4, true) => writeln!(self.s, "\tldr w{v}, [x{v}]"),
+                    _ => writeln!(self.s, "\tldr x{v}, [x{v}]"),
                 };
             }
         }
@@ -989,7 +1002,7 @@ impl Cg<'_> {
             }
             _ => None,
         };
-        let rd = self.gp_home(*d).unwrap_or(0);
+        let rd = self.gp_home(*d).unwrap_or(self.fnl);
         if let Some((rbase, off)) = imm_form {
             self.load_gp_off(rd, rbase, off, *lty);
         } else if let Some(f) = self.ext_fold.get(t).copied() {
@@ -1007,7 +1020,7 @@ impl Cg<'_> {
             self.load_idx(rd, rbase, rindex, *lty);
         }
         if self.gp_home(*d).is_none() {
-            self.tmp_store(*d, "x0");
+            self.tmp_store(*d, &format!("x{}", self.fnl));
         }
         Some(2)
     }
@@ -1049,13 +1062,13 @@ impl Cg<'_> {
             if !self.scaled_off(off, self.a.tt.size(*sty)) {
                 return None;
             }
-            let rv = self.src_gp(*v, 0);
+            let rv = self.src_gp(*v, self.fnl);
             self.store_gp_off(rv, rbase, off, *sty);
             return Some(2);
         }
         // batch#2: `str rv, [base, w-index, extend #s]` (the widening Cast is skipped).
         if let Some(f) = self.ext_fold.get(t).copied() {
-            let rv = self.src_gp(*v, 0);
+            let rv = self.src_gp(*v, self.fnl);
             self.store_idx_ext(rv, &f, *sty);
             return Some(2);
         }
@@ -1067,7 +1080,7 @@ impl Cg<'_> {
         let (Some(rbase), Some(rindex)) = (self.gp_home(*ta), self.gp_home(*tb)) else {
             return None;
         };
-        let rv = self.src_gp(*v, 0);
+        let rv = self.src_gp(*v, self.fnl);
         self.store_idx(rv, rbase, rindex, *sty);
         Some(2)
     }
@@ -1092,14 +1105,15 @@ impl Cg<'_> {
         if self.use_count.get(*m as usize).copied().unwrap_or(0) != 1 {
             return None;
         }
-        let rx = self.src_gp(*mx, 0);
-        let ry = self.src_gp(*my, 1);
-        let ra = self.src_gp(addend, 2);
-        let rd = self.gp_home(*d).unwrap_or(0);
+        let fnl = self.fnl;
+        let rx = self.src_gp(*mx, fnl);
+        let ry = self.src_gp(*my, fnl + 1);
+        let ra = self.src_gp(addend, fnl + 2);
+        let rd = self.gp_home(*d).unwrap_or(fnl);
         _ = writeln!(self.s, "\tmadd x{rd}, x{rx}, x{ry}, x{ra}");
         self.ext_r(rd, *ctd);
         if self.gp_home(*d).is_none() {
-            self.tmp_store(*d, "x0");
+            self.tmp_store(*d, &format!("x{fnl}"));
         }
         Some(2)
     }
@@ -1131,13 +1145,13 @@ impl Cg<'_> {
                 if pos.is_none() && *off > 256 {
                     return None;
                 }
-                let rd = self.gp_home(*d).unwrap_or(0);
+                let rd = self.gp_home(*d).unwrap_or(self.fnl);
                 match pos {
                     Some(p) => self.load_gp_sp(rd, p, *lty),
                     None => self.load_gp_fp(rd, *off, *lty),
                 }
                 if self.gp_home(*d).is_none() {
-                    self.tmp_store(*d, "x0");
+                    self.tmp_store(*d, &format!("x{}", self.fnl));
                 }
                 Some(2)
             }
@@ -1147,7 +1161,7 @@ impl Cg<'_> {
                     return None;
                 }
                 // ISA: constant 0 stores via the zero register (str wzr/xzr) — reg 31.
-                let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, 0) };
+                let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, self.fnl) };
                 match pos {
                     Some(p) => self.store_gp_sp(rv, p, *sty),
                     None => self.store_gp_fp(rv, *off, *sty),
@@ -1162,58 +1176,64 @@ impl Cg<'_> {
     // value uses a scratch (x9) rather than writing back into x{reg}.
     // Store constant 0 via the zero register (caller guarantees simple_gp_store_ty).
     fn store_z(&mut self, t: TypeId) {
+        let ad = self.fnl + 1; // funnel address (x1/x11)
         _ = match self.a.tt.size(t) {
-            1 => writeln!(self.s, "\tstrb wzr, [x1]"),
-            2 => writeln!(self.s, "\tstrh wzr, [x1]"),
-            4 => writeln!(self.s, "\tstr wzr, [x1]"),
-            _ => writeln!(self.s, "\tstr xzr, [x1]"),
+            1 => writeln!(self.s, "\tstrb wzr, [x{ad}]"),
+            2 => writeln!(self.s, "\tstrh wzr, [x{ad}]"),
+            4 => writeln!(self.s, "\tstr wzr, [x{ad}]"),
+            _ => writeln!(self.s, "\tstr xzr, [x{ad}]"),
         };
     }
     fn store(&mut self, reg: u32, t: TypeId) {
+        // Funnel address in x{ad} (base-relative); bitfield RMW scratch in x{s3}/x{s4}/x{s5}.
+        // x{reg} (the stored value) is passed in and MUST NOT be clobbered — it may be a live
+        // home. w9/d7/s7/q0 are fixed scratch outside every home budget.
+        let (ad, s3, s4, s5) = (self.fnl + 1, self.fnl + 3, self.fnl + 4, self.fnl + 5);
         match self.a.tt.tys[t as usize] {
             Ty::Bool => {
                 _ = writeln!(
                     self.s,
-                    "\tcmp x{reg}, #0\n\tcset w9, ne\n\tstrb w9, [x1]"
+                    "\tcmp x{reg}, #0\n\tcset w9, ne\n\tstrb w9, [x{ad}]"
                 );
             }
             Ty::Float => {
-                _ = writeln!(self.s, "\tfmov d7, x{reg}\n\tfcvt s7, d7\n\tstr s7, [x1]");
+                _ = writeln!(self.s, "\tfmov d7, x{reg}\n\tfcvt s7, d7\n\tstr s7, [x{ad}]");
             }
             Ty::LDouble => {
-                // bl clobbers x1 (caller-saved) — shield the address via the stack
+                // bl clobbers x1 (caller-saved) — shield the address via the stack. LDouble Store
+                // forces NARROW (heavy scan) ⟹ ad=1 here.
                 _ = writeln!(
                     self.s,
-                    "\tstr x1, [sp, #-16]!\n\tfmov d0, x{reg}\n\tbl __extenddftf2\n\tldr x1, [sp], #16\n\tstr q0, [x1]"
+                    "\tstr x{ad}, [sp, #-16]!\n\tfmov d0, x{reg}\n\tbl __extenddftf2\n\tldr x{ad}, [sp], #16\n\tstr q0, [x{ad}]"
                 );
             }
             Ty::Bitfield(b, boff, w) => {
                 // read-modify-write the containing unit
                 let usz = self.a.tt.size(b);
-                self.s += match usz {
-                    1 => "\tldrb w3, [x1]\n",
-                    2 => "\tldrh w3, [x1]\n",
-                    4 => "\tldr w3, [x1]\n",
-                    _ => "\tldr x3, [x1]\n",
+                _ = match usz {
+                    1 => writeln!(self.s, "\tldrb w{s3}, [x{ad}]"),
+                    2 => writeln!(self.s, "\tldrh w{s3}, [x{ad}]"),
+                    4 => writeln!(self.s, "\tldr w{s3}, [x{ad}]"),
+                    _ => writeln!(self.s, "\tldr x{s3}, [x{ad}]"),
                 };
                 let mask = ((!0u64 >> (64 - w)) << boff) as i64;
-                self.imm("x4", mask);
-                self.s += "\tbic x3, x3, x4\n";
-                _ = writeln!(self.s, "\tlsl x5, x{reg}, #{boff}");
-                self.s += "\tand x5, x5, x4\n\torr x3, x3, x5\n";
-                self.s += match usz {
-                    1 => "\tstrb w3, [x1]\n",
-                    2 => "\tstrh w3, [x1]\n",
-                    4 => "\tstr w3, [x1]\n",
-                    _ => "\tstr x3, [x1]\n",
+                self.imm(&format!("x{s4}"), mask);
+                _ = writeln!(self.s, "\tbic x{s3}, x{s3}, x{s4}");
+                _ = writeln!(self.s, "\tlsl x{s5}, x{reg}, #{boff}");
+                _ = writeln!(self.s, "\tand x{s5}, x{s5}, x{s4}\n\torr x{s3}, x{s3}, x{s5}");
+                _ = match usz {
+                    1 => writeln!(self.s, "\tstrb w{s3}, [x{ad}]"),
+                    2 => writeln!(self.s, "\tstrh w{s3}, [x{ad}]"),
+                    4 => writeln!(self.s, "\tstr w{s3}, [x{ad}]"),
+                    _ => writeln!(self.s, "\tstr x{s3}, [x{ad}]"),
                 };
             }
             _ => {
                 _ = match self.a.tt.size(t) {
-                    1 => writeln!(self.s, "\tstrb w{reg}, [x1]"),
-                    2 => writeln!(self.s, "\tstrh w{reg}, [x1]"),
-                    4 => writeln!(self.s, "\tstr w{reg}, [x1]"),
-                    _ => writeln!(self.s, "\tstr x{reg}, [x1]"),
+                    1 => writeln!(self.s, "\tstrb w{reg}, [x{ad}]"),
+                    2 => writeln!(self.s, "\tstrh w{reg}, [x{ad}]"),
+                    4 => writeln!(self.s, "\tstr w{reg}, [x{ad}]"),
+                    _ => writeln!(self.s, "\tstr x{reg}, [x{ad}]"),
                 };
             }
         }
@@ -1221,18 +1241,23 @@ impl Cg<'_> {
     // Copy `sz` bytes: src (x0) → dst (x1), forward. Leaves the dst address in x0 (the
     // rvalue of a struct assignment = the destination address). Shared: AST-path + IR Inst::Memcpy.
     fn blk_copy(&mut self, sz: u32) {
-        self.s += "\tmov x4, x1\n";
+        // Funnel (base-relative): src = x{s} (x0/x10), dst = x{d} (x1/x11), count = x{c},
+        // byte = w{by}, saved-dst = x{sv}.
+        let (s, d, c, by, sv) = (self.fnl, self.fnl + 1, self.fnl + 2, self.fnl + 3, self.fnl + 4);
+        _ = writeln!(self.s, "\tmov x{sv}, x{d}");
         if sz > 0 {
             let n = self.labels(1);
-            self.imm("x2", sz as i64);
+            self.imm(&format!("x{c}"), sz as i64);
             _ = writeln!(self.s, "L{n}:");
-            self.s += "\tldrb w3, [x0], #1\n\tstrb w3, [x1], #1\n\tsubs x2, x2, #1\n";
+            _ = writeln!(self.s, "\tldrb w{by}, [x{s}], #1\n\tstrb w{by}, [x{d}], #1\n\tsubs x{c}, x{c}, #1");
             _ = writeln!(self.s, "\tb.ne L{n}");
         }
-        self.s += "\tmov x0, x4\n"; // value = dst address
+        _ = writeln!(self.s, "\tmov x{s}, x{sv}"); // value = dst address
     }
-    // Convert the canonical value in x0: from → to
+    // Convert the canonical value in the funnel register x{fnl} (x0/x10): from → to. d0/s0 are
+    // FP scratch (never homes); the GP carrier is base-relative.
     fn cast_op(&mut self, from: TypeId, to: TypeId) {
+        let v = self.fnl;
         let tt = &self.a.tt;
         if matches!(
             tt.tys[to as usize],
@@ -1241,7 +1266,7 @@ impl Cg<'_> {
             return;
         }
         match (tt.is_float(from), tt.is_float(to)) {
-            (false, false) => self.ext(to),
+            (false, false) => self.ext_r(v, to),
             (false, true) => {
                 let cvt = if tt.is_unsigned(from) {
                     "ucvtf"
@@ -1250,37 +1275,37 @@ impl Cg<'_> {
                 };
                 // int32 value contract (see ir_bin_r): a <8-byte int lives in w-form — its high
                 // 32 bits are DON'T-CARE, NOT sign-extended. Convert from the SOURCE-width
-                // register: `scvtf d0, w0` reads the low 32 with the correct sign, whereas
-                // `scvtf d0, x0` would convert the garbage high bits too (proven: torture
-                // pr59643's `(double)((i&7)-4)` turned −4 into 4294967292.0). 8-byte stays x0.
+                // register: `scvtf d0, w{v}` reads the low 32 with the correct sign, whereas
+                // `scvtf d0, x{v}` would convert the garbage high bits too (proven: torture
+                // pr59643's `(double)((i&7)-4)` turned −4 into 4294967292.0). 8-byte stays x{v}.
                 let sr = if tt.size(from) < 8 { "w" } else { "x" };
-                _ = writeln!(self.s, "\t{cvt} d0, {sr}0");
+                _ = writeln!(self.s, "\t{cvt} d0, {sr}{v}");
                 if tt.size(to) == 4 {
                     self.s += "\tfcvt s0, d0\n\tfcvt d0, s0\n";
                 }
-                self.s += "\tfmov x0, d0\n";
+                _ = writeln!(self.s, "\tfmov x{v}, d0");
             }
             (true, false) => {
                 if matches!(tt.tys[to as usize], Ty::Bool) {
-                    self.s += "\tfmov d0, x0\n\tfcmp d0, #0.0\n\tcset x0, ne\n";
+                    _ = writeln!(self.s, "\tfmov d0, x{v}\n\tfcmp d0, #0.0\n\tcset x{v}, ne");
                     return;
                 }
-                self.s += "\tfmov d0, x0\n";
+                _ = writeln!(self.s, "\tfmov d0, x{v}");
                 let cvt = if self.a.tt.is_unsigned(to) {
                     "fcvtzu"
                 } else {
                     "fcvtzs"
                 };
                 if self.a.tt.size(to) == 8 {
-                    _ = writeln!(self.s, "\t{cvt} x0, d0");
+                    _ = writeln!(self.s, "\t{cvt} x{v}, d0");
                 } else {
-                    _ = writeln!(self.s, "\t{cvt} w0, d0");
-                    self.ext(to);
+                    _ = writeln!(self.s, "\t{cvt} w{v}, d0");
+                    self.ext_r(v, to);
                 }
             }
             (true, true) => {
                 if tt.size(to) == 4 {
-                    self.s += "\tfmov d0, x0\n\tfcvt s0, d0\n\tfcvt d0, s0\n\tfmov x0, d0\n";
+                    _ = writeln!(self.s, "\tfmov d0, x{v}\n\tfcvt s0, d0\n\tfcvt d0, s0\n\tfmov x{v}, d0");
                 }
             }
         }
@@ -1292,30 +1317,33 @@ impl Cg<'_> {
     // section (musl libc_start_main_stage2 → jumps into __syscall3). Local within the same
     // TU → adrp/add directly.
     fn emit_funaddr(&mut self, name: &str) {
+        let v = self.fnl; // funnel result register (x0/x10)
         let sy = sym(name);
         if self.a.funcs.iter().any(|f| f.name == name && f.is_static) {
-            _ = writeln!(self.s, "\tadrp x0, {0}\n\tadd x0, x0, :lo12:{0}", sy);
+            _ = writeln!(self.s, "\tadrp x{v}, {0}\n\tadd x{v}, x{v}, :lo12:{0}", sy);
         } else {
-            _ = writeln!(self.s, "\tadrp x0, :got:{0}\n\tldr x0, [x0, :got_lo12:{0}]", sy);
+            _ = writeln!(self.s, "\tadrp x{v}, :got:{0}\n\tldr x{v}, [x{v}, :got_lo12:{0}]", sy);
         }
     }
-    // memset(x0, 0, sz): zero sz bytes starting at the address in x0. Shared by the
+    // memset(x{fnl}, 0, sz): zero sz bytes starting at the funnel address. Shared by the
     // AST-walk (Node::Zero) and IR (Inst::Zero). sz==0 → no-op.
     fn emit_zero(&mut self, sz: u32) {
         if sz == 0 {
             return;
         }
-        self.imm("x2", sz as i64);
+        let (ad, c) = (self.fnl, self.fnl + 2); // address (x0/x10), count scratch (x2/x12)
+        self.imm(&format!("x{c}"), sz as i64);
         let n = self.labels(1);
         _ = writeln!(self.s, "L{n}:");
-        self.s += "\tstrb wzr, [x0], #1\n\tsubs x2, x2, #1\n";
+        _ = writeln!(self.s, "\tstrb wzr, [x{ad}], #1\n\tsubs x{c}, x{c}, #1");
         _ = writeln!(self.s, "\tb.ne L{n}");
     }
-    // EXT(gcc): &&label (computed-goto) → x0. A local label within the current function.
+    // EXT(gcc): &&label (computed-goto) → x{fnl}. A local label within the current function.
     fn emit_labeladdr(&mut self, name: &str) {
+        let v = self.fnl;
         _ = writeln!(
             self.s,
-            "\tadrp x0, lg_{0}.{1}\n\tadd x0, x0, :lo12:lg_{0}.{1}",
+            "\tadrp x{v}, lg_{0}.{1}\n\tadd x{v}, x{v}, :lo12:lg_{0}.{1}",
             self.fname, name
         );
     }
@@ -1343,14 +1371,15 @@ impl Cg<'_> {
     // va_start: x0 = &ap. Fill the AAPCS va_list from the prologue state (va=gp,fp,stk,frame).
     // Shared by the AST-walk (Node::VaStart) + IR (Inst::VaStart).
     fn emit_vastart(&mut self) {
+        let ap = self.fnl; // &ap funnel address (x0/x10); x9 is the fixed value scratch (not a home)
         let (gp, fp, stk, frame) = self.va;
         self.imm("x9", (16 + stk) as i64);
-        self.s += "\tadd x9, x29, x9\n\tstr x9, [x0]\n"; // __stack
+        _ = writeln!(self.s, "\tadd x9, x29, x9\n\tstr x9, [x{ap}]"); // __stack
         self.imm("x9", frame as i64);
-        self.s += "\tsub x9, x29, x9\n\tstr x9, [x0, #8]\n"; // __gr_top
-        self.s += "\tsub x9, x9, #64\n\tstr x9, [x0, #16]\n"; // __vr_top
-        _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #24]", (gp as i64 - 8) * 8);
-        _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x0, #28]", (fp as i64 - 8) * 16);
+        _ = writeln!(self.s, "\tsub x9, x29, x9\n\tstr x9, [x{ap}, #8]"); // __gr_top
+        _ = writeln!(self.s, "\tsub x9, x9, #64\n\tstr x9, [x{ap}, #16]"); // __vr_top
+        _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x{ap}, #24]", (gp as i64 - 8) * 8);
+        _ = writeln!(self.s, "\tmov x9, #{}\n\tstr w9, [x{ap}, #28]", (fp as i64 - 8) * 16);
     }
     // va_arg(*(&ap) in x0, type t, scratch-local tmp for HFA gather) → result in x0.
     // Shared by the AST-walk (Node::VaArg) + IR (Inst::VaArg). AAPCS details below.
@@ -1460,12 +1489,11 @@ impl<'a> Cg<'a> {
     // the callee-only file. `gp_ncaller()` reports the split so csave / verify agree.
     fn gpp(&self, idx: u32) -> u32 {
         if self.gp_wide {
-            // caller colors 0–5 → x10–x15, 6–7 → x6,x7 (arg regs, used last); callee 8–17 → x19–x28.
-            match idx {
-                0..=5 => 10 + idx,
-                6 | 7 => idx,
-                _ => 19 + (idx - GP_BUDGET_WIDE.ncaller),
-            }
+            // caller colors 0–7 → x0–x7 (the ARGUMENT/result registers — enables value-placement
+            // targeting: an arg temp homed at x{i} makes its marshal `mov x{i},x{i}` vanish, a
+            // call result homed at x0 makes its capture `mov home,x0` vanish); callee 8–17 →
+            // x19–x28. The funnel scratch that used to live in x0–x5 now lives in x9–x14 (disjoint).
+            if idx < GP_BUDGET_WIDE.ncaller { idx } else { 19 + (idx - GP_BUDGET_WIDE.ncaller) }
         } else {
             19 + idx
         }
@@ -1608,39 +1636,42 @@ impl<'a> Cg<'a> {
     // x0 = lhs, x1 = rhs → x0 = lhs ⟨op⟩ rhs, canonical per ct. A semantic copy of
     // Node::Bin (shared once the AST path was removed); the Op enum replaces punctuation.
     fn ir_bin(&mut self, op: Op, ct: TypeId) {
+        // Funnel registers (base-relative — see `fnl`): v = value (x0/x10), a = 2nd operand
+        // (x1/x11), q = rem-quotient scratch (x2/x12). d0/d1 are FP scratch (never homes).
+        let (v, a, q) = (self.fnl, self.fnl + 1, self.fnl + 2);
         if self.a.tt.is_float(ct) {
-            self.s += "\tfmov d0, x0\n\tfmov d1, x1\n";
+            _ = writeln!(self.s, "\tfmov d0, x{v}\n\tfmov d1, x{a}");
             match op {
-                Op::Add => self.s += "\tfadd d0, d0, d1\n\tfmov x0, d0\n",
-                Op::Sub => self.s += "\tfsub d0, d0, d1\n\tfmov x0, d0\n",
-                Op::Mul => self.s += "\tfmul d0, d0, d1\n\tfmov x0, d0\n",
-                Op::Div => self.s += "\tfdiv d0, d0, d1\n\tfmov x0, d0\n",
+                Op::Add => _ = writeln!(self.s, "\tfadd d0, d0, d1\n\tfmov x{v}, d0"),
+                Op::Sub => _ = writeln!(self.s, "\tfsub d0, d0, d1\n\tfmov x{v}, d0"),
+                Op::Mul => _ = writeln!(self.s, "\tfmul d0, d0, d1\n\tfmov x{v}, d0"),
+                Op::Div => _ = writeln!(self.s, "\tfdiv d0, d0, d1\n\tfmov x{v}, d0"),
                 _ => {
                     let cond = match op {
                         Op::Eq => "eq", Op::Ne => "ne", Op::Lt => "mi",
                         Op::Le => "ls", Op::Gt => "gt", Op::Ge => "ge",
                         _ => unreachable!(),
                     };
-                    _ = writeln!(self.s, "\tfcmp d0, d1\n\tcset x0, {cond}");
+                    _ = writeln!(self.s, "\tfcmp d0, d1\n\tcset x{v}, {cond}");
                 }
             }
             return;
         }
         let u = self.a.tt.is_unsigned(ct);
         match op {
-            Op::Add => self.s += "\tadd x0, x0, x1\n",
-            Op::Sub => self.s += "\tsub x0, x0, x1\n",
-            Op::Mul => self.s += "\tmul x0, x0, x1\n",
-            Op::Div if u => self.s += "\tudiv x0, x0, x1\n",
-            Op::Div => self.s += "\tsdiv x0, x0, x1\n",
-            Op::Rem if u => self.s += "\tudiv x2, x0, x1\n\tmsub x0, x2, x1, x0\n",
-            Op::Rem => self.s += "\tsdiv x2, x0, x1\n\tmsub x0, x2, x1, x0\n",
-            Op::And => self.s += "\tand x0, x0, x1\n",
-            Op::Or => self.s += "\torr x0, x0, x1\n",
-            Op::Xor => self.s += "\teor x0, x0, x1\n",
-            Op::Shl => self.s += "\tlsl x0, x0, x1\n",
-            Op::Shr if u => self.s += "\tlsr x0, x0, x1\n",
-            Op::Shr => self.s += "\tasr x0, x0, x1\n",
+            Op::Add => _ = writeln!(self.s, "\tadd x{v}, x{v}, x{a}"),
+            Op::Sub => _ = writeln!(self.s, "\tsub x{v}, x{v}, x{a}"),
+            Op::Mul => _ = writeln!(self.s, "\tmul x{v}, x{v}, x{a}"),
+            Op::Div if u => _ = writeln!(self.s, "\tudiv x{v}, x{v}, x{a}"),
+            Op::Div => _ = writeln!(self.s, "\tsdiv x{v}, x{v}, x{a}"),
+            Op::Rem if u => _ = writeln!(self.s, "\tudiv x{q}, x{v}, x{a}\n\tmsub x{v}, x{q}, x{a}, x{v}"),
+            Op::Rem => _ = writeln!(self.s, "\tsdiv x{q}, x{v}, x{a}\n\tmsub x{v}, x{q}, x{a}, x{v}"),
+            Op::And => _ = writeln!(self.s, "\tand x{v}, x{v}, x{a}"),
+            Op::Or => _ = writeln!(self.s, "\torr x{v}, x{v}, x{a}"),
+            Op::Xor => _ = writeln!(self.s, "\teor x{v}, x{v}, x{a}"),
+            Op::Shl => _ = writeln!(self.s, "\tlsl x{v}, x{v}, x{a}"),
+            Op::Shr if u => _ = writeln!(self.s, "\tlsr x{v}, x{v}, x{a}"),
+            Op::Shr => _ = writeln!(self.s, "\tasr x{v}, x{v}, x{a}"),
             _ => {
                 let cond = match (op, u) {
                     (Op::Eq, _) => "eq", (Op::Ne, _) => "ne",
@@ -1650,12 +1681,12 @@ impl<'a> Cg<'a> {
                     (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
                     _ => unreachable!(),
                 };
-                _ = writeln!(self.s, "\tcmp x0, x1\n\tcset x0, {cond}");
+                _ = writeln!(self.s, "\tcmp x{v}, x{a}\n\tcset x{v}, {cond}");
                 return; // 0/1, no ext needed
             }
         }
         if self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4 {
-            self.ext(ct);
+            self.ext_r(v, ct);
         }
     }
 
@@ -1664,8 +1695,9 @@ impl<'a> Cg<'a> {
     // rd=ra=0,rb=1 it emits BYTE-IDENTICAL asm to `ir_bin` (the x0-funnel), so the -O0 path
     // (all temps spilled ⟹ rd=ra=0,rb=1) is unchanged; only the register-resident path skips
     // the copies. Correctness = ir_bin's (same mnemonic per Op); validated by opt-parity.
-    // x2 is a fixed scratch for rem's quotient (never a home: the home set is x10–x15 ∪ x19–x28,
-    // WIDE or NARROW — x2 lies outside both budgets); msub reads
+    // The rem quotient uses the fnl+2 funnel scratch (x2 NARROW / x12 WIDE) — never a home: the
+    // WIDE home set is x0–x7 ∪ x19–x28, NARROW is x19–x28, and x12 (WIDE) / x2 (NARROW) lie
+    // outside both. msub reads
     // all sources before writing rd, so rd may alias ra/rb (the allocator only coalesces when
     // the aliased source is dead here). No ext on the compare path (cset yields a clean 0/1).
     fn ir_bin_r(&mut self, op: Op, ct: TypeId, rd: u32, ra: u32, rb: u32) {
@@ -1687,10 +1719,12 @@ impl<'a> Cg<'a> {
             Op::Div if u => _ = writeln!(self.s, "\tudiv {r}{rd}, {r}{ra}, {r}{rb}"),
             Op::Div => _ = writeln!(self.s, "\tsdiv {r}{rd}, {r}{ra}, {r}{rb}"),
             Op::Rem if u => {
-                _ = writeln!(self.s, "\tudiv {r}2, {r}{ra}, {r}{rb}\n\tmsub {r}{rd}, {r}2, {r}{rb}, {r}{ra}")
+                let q = self.fnl + 2;
+                _ = writeln!(self.s, "\tudiv {r}{q}, {r}{ra}, {r}{rb}\n\tmsub {r}{rd}, {r}{q}, {r}{rb}, {r}{ra}")
             }
             Op::Rem => {
-                _ = writeln!(self.s, "\tsdiv {r}2, {r}{ra}, {r}{rb}\n\tmsub {r}{rd}, {r}2, {r}{rb}, {r}{ra}")
+                let q = self.fnl + 2;
+                _ = writeln!(self.s, "\tsdiv {r}{q}, {r}{ra}, {r}{rb}\n\tmsub {r}{rd}, {r}{q}, {r}{rb}, {r}{ra}")
             }
             Op::And => _ = writeln!(self.s, "\tand {r}{rd}, {r}{ra}, {r}{rb}"),
             Op::Or => _ = writeln!(self.s, "\torr {r}{rd}, {r}{ra}, {r}{rb}"),
@@ -2037,25 +2071,28 @@ impl<'a> Cg<'a> {
         for (&(val, _), &sl) in args.iter().zip(&plan) {
             match sl {
                 ASlot::S(o, sz, fl) => {
-                    self.ld_val(val, "x0");
+                    // Stage through x9 (never a home): with x0–x7 now allocatable homes, staging
+                    // an arg through x0 would clobber a following arg homed at x0. x8 is the sret
+                    // reg (set only after the pop phase), free as scratch here.
+                    self.ld_val(val, "x9");
                     if fl && sz == 16 {
-                        _ = writeln!(self.s, "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #{o}]");
+                        _ = writeln!(self.s, "\tfmov d0, x9\n\tbl __extenddftf2\n\tstr q0, [sp, #{o}]");
                     } else if fl && sz == 4 {
-                        _ = writeln!(self.s, "\tfmov d7, x0\n\tfcvt s7, d7\n\tstr s7, [sp, #{o}]");
+                        _ = writeln!(self.s, "\tfmov d7, x9\n\tfcvt s7, d7\n\tstr s7, [sp, #{o}]");
                     } else {
                         _ = match sz {
-                            1 => writeln!(self.s, "\tstrb w0, [sp, #{o}]"),
-                            2 => writeln!(self.s, "\tstrh w0, [sp, #{o}]"),
-                            4 => writeln!(self.s, "\tstr w0, [sp, #{o}]"),
-                            _ => writeln!(self.s, "\tstr x0, [sp, #{o}]"),
+                            1 => writeln!(self.s, "\tstrb w9, [sp, #{o}]"),
+                            2 => writeln!(self.s, "\tstrh w9, [sp, #{o}]"),
+                            4 => writeln!(self.s, "\tstr w9, [sp, #{o}]"),
+                            _ => writeln!(self.s, "\tstr x9, [sp, #{o}]"),
                         };
                     }
                 }
                 ASlot::StS(o, sz) => {
-                    self.ld_val(val, "x0"); // x0 = struct address
+                    self.ld_val(val, "x9"); // x9 = struct address (home-safe staging)
                     let mut k = 0;
                     while k < sz {
-                        _ = writeln!(self.s, "\tldr x8, [x0, #{k}]\n\tstr x8, [sp, #{}]", o + k);
+                        _ = writeln!(self.s, "\tldr x8, [x9, #{k}]\n\tstr x8, [sp, #{}]", o + k);
                         k += 8;
                     }
                 }
@@ -2063,8 +2100,8 @@ impl<'a> Cg<'a> {
             }
         }
         if let Callee::Ptr(p) = callee {
-            self.ld_val(*p, "x0");
-            self.s += "\tstr x0, [sp, #-16]!\n";
+            self.ld_val(*p, "x9");
+            self.s += "\tstr x9, [sp, #-16]!\n";
         }
         let regargs: Vec<(Val, ASlot)> = args
             .iter()
@@ -2073,11 +2110,11 @@ impl<'a> Cg<'a> {
             .map(|(&(v, _), &sl)| (v, sl))
             .collect();
         for &(val, sl) in &regargs {
-            self.ld_val(val, "x0"); // struct: x0 = address
+            self.ld_val(val, "x9"); // struct: x9 = address (home-safe staging, see ASlot::S)
             if matches!(sl, ASlot::Q(_)) {
-                self.s += "\tfmov d0, x0\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
+                self.s += "\tfmov d0, x9\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
             } else {
-                self.s += "\tstr x0, [sp, #-16]!\n";
+                self.s += "\tstr x9, [sp, #-16]!\n";
             }
         }
         for &(_, sl) in regargs.iter().rev() {
@@ -2342,6 +2379,9 @@ impl<'a> Cg<'a> {
     }
 
     fn emit_inst(&mut self, i: &Inst) {
+        // Funnel-scratch base (0 NARROW / 10 WIDE): the spilled/imm fallback register and the
+        // x0-funnel helper carriers relocate here so WIDE homes (x0–x7) survive across them.
+        let f = self.fnl;
         match i {
             // φ is an SSA-internal node; out_of_ssa (Stage 3) lowers every φ to copies
             // on the predecessor edges before codegen. Reaching the backend = a bug.
@@ -2358,11 +2398,11 @@ impl<'a> Cg<'a> {
                         self.ld_val(*a, &format!("x{rd}"));
                     }
                 } else {
-                    let ra = self.src_gp(*a, 0);
-                    if ra != 0 {
-                        _ = writeln!(self.s, "\tmov x0, x{ra}");
+                    let ra = self.src_gp(*a, f);
+                    if ra != f {
+                        _ = writeln!(self.s, "\tmov x{f}, x{ra}");
                     }
-                    self.tmp_store(*d, "x0");
+                    self.tmp_store(*d, &format!("x{f}"));
                 }
             }
             // B4 if-conversion: dst = (cond ≠ 0) ? a : b. Home-independent x0/x1/x2 funnel
@@ -2373,56 +2413,56 @@ impl<'a> Cg<'a> {
                 // Read cond/a/b from homes (scratch x0/x1/x2 only for spilled/imm), csel into
                 // d's home, ext in place — no x0 funnel (§residence). The loads before cmp are
                 // flag-neutral (mov/ldr/movz), so the compare's flags survive to the csel.
-                let rc = self.src_gp(*c, 0);
+                let rc = self.src_gp(*c, f);
                 // ISA: a 0 select-arm reads the zero register (csel Rn/Rm=31 → xzr), no mov.
-                let ra = if matches!(a, Val::Imm(0)) { 31 } else { self.src_gp(*a, 1) };
-                let rb = if matches!(b, Val::Imm(0)) { 31 } else { self.src_gp(*b, 2) };
-                let rd = self.gp_home(*d).unwrap_or(0);
+                let ra = if matches!(a, Val::Imm(0)) { 31 } else { self.src_gp(*a, f + 1) };
+                let rb = if matches!(b, Val::Imm(0)) { 31 } else { self.src_gp(*b, f + 2) };
+                let rd = self.gp_home(*d).unwrap_or(f);
                 _ = writeln!(self.s, "\tcmp x{rc}, #0\n\tcsel {}, {}, {}, ne", xr(rd), xr(ra), xr(rb));
                 self.ext_r(rd, *ty);
                 if self.gp_home(*d).is_none() {
-                    self.tmp_store(*d, "x0");
+                    self.tmp_store(*d, &format!("x{f}"));
                 }
             }
             Inst::Bin(d, op, ty, a, b) => {
                 if self.a.tt.is_float(*ty) {
-                    self.ld_val(*a, "x0");
-                    self.ld_val(*b, "x1");
+                    self.ld_val(*a, &format!("x{f}"));
+                    self.ld_val(*b, &format!("x{}", f + 1));
                     self.ir_bin(*op, *ty);
-                    self.tmp_store(*d, "x0");
+                    self.tmp_store(*d, &format!("x{f}"));
                 } else if let Some((mnem, mag)) = add_sub_imm12(*op, *b) {
                     // Add/Sub-immediate peephole (Side-II: AAPCS64 imm12 field, unsigned
                     // 0..4096): fold a small constant operand into the instruction instead of
                     // materializing it (`mov x1,#k; add` → `add xD,xA,#k`). Pressure-free —
                     // one fewer scratch live per loop increment; validated by opt-parity.
-                    let ra = self.src_gp(*a, 0);
-                    let rd = self.gp_home(*d).unwrap_or(0);
+                    let ra = self.src_gp(*a, f);
+                    let rd = self.gp_home(*d).unwrap_or(f);
                     // int32 value contract (see ir_bin_r): 4-byte int in w-form (auto-zeroes
                     // high bits, low-32 correct) → no trailing sxtw. 8-byte/ptr stays x-form.
                     let is4 = self.a.tt.is_integer(*ty) && self.a.tt.size(*ty) == 4;
                     let r = if is4 { 'w' } else { 'x' };
                     _ = writeln!(self.s, "\t{mnem} {r}{rd}, {r}{ra}, #{mag}");
                     if self.gp_home(*d).is_none() {
-                        self.tmp_store(*d, "x0");
+                        self.tmp_store(*d, &format!("x{f}"));
                     }
                 } else {
                     // Tier-1 #1: read operands from their homes, compute into d's home.
                     // Sources first (x0/x1 scratch for spilled/imm), THEN pick rd — if d is
                     // spilled, rd=0 (x0) and the result is stored after; a/b are already
                     // consumed into their own scratch/home so x0-as-rd cannot clobber them.
-                    let ra = self.src_gp(*a, 0);
-                    let rd = self.gp_home(*d).unwrap_or(0);
+                    let ra = self.src_gp(*a, f);
+                    let rd = self.gp_home(*d).unwrap_or(f);
                     // Immediate-operand instruction-selection fold (§4): a compare/shift/logical
                     // with a constant right operand folds the constant into the instruction's
                     // imm field instead of materializing it into a scratch (`mov x1,#k; op` →
                     // `op …,#k`) — byte-equivalent since imm() would load exactly #k. Kills the
                     // ~14k `mov xR,#N` that feed cmp/shift/bitmask. opt-parity certifies.
                     if !self.try_bin_imm(*op, *ty, rd, ra, *b) {
-                        let rb = self.src_gp(*b, 1);
+                        let rb = self.src_gp(*b, f + 1);
                         self.ir_bin_r(*op, *ty, rd, ra, rb);
                     }
                     if self.gp_home(*d).is_none() {
-                        self.tmp_store(*d, "x0");
+                        self.tmp_store(*d, &format!("x{f}"));
                     }
                 }
             }
@@ -2431,12 +2471,12 @@ impl<'a> Cg<'a> {
                 // Tier-1 #1 compute-into-home path: read a from its home, write d's home,
                 // ext in place. rd=ra=0 ⟹ byte-identical to the old `neg x0,x0; ext` path.
                 if matches!(u, Un::Neg) && self.a.tt.is_float(*ty) {
-                    self.ld_val(*a, "x0");
-                    self.s += "\tfmov d0, x0\n\tfneg d0, d0\n\tfmov x0, d0\n";
-                    self.tmp_store(*d, "x0");
+                    self.ld_val(*a, &format!("x{f}"));
+                    _ = writeln!(self.s, "\tfmov d0, x{f}\n\tfneg d0, d0\n\tfmov x{f}, d0");
+                    self.tmp_store(*d, &format!("x{f}"));
                 } else {
-                    let ra = self.src_gp(*a, 0);
-                    let rd = self.gp_home(*d).unwrap_or(0);
+                    let ra = self.src_gp(*a, f);
+                    let rd = self.gp_home(*d).unwrap_or(f);
                     // int32 value contract (see ir_bin_r): 4-byte int in w-form (low-32 correct,
                     // high auto-zeroed) needs no sxtw. Sub-word (size<4) still canonicalizes via
                     // ext_r (sxtb/sxth). 8-byte/ptr is x-form, already canonical.
@@ -2450,43 +2490,43 @@ impl<'a> Cg<'a> {
                         self.ext_r(rd, *ty); // sub-word: canonicalize to its width
                     }
                     if self.gp_home(*d).is_none() {
-                        self.tmp_store(*d, "x0");
+                        self.tmp_store(*d, &format!("x{f}"));
                     }
                 }
             }
             Inst::Load(d, ty, a) => {
                 if self.simple_gp_load_ty(*ty) {
                     // Tier-1 #2 groundwork: address from its home, load into d's home.
-                    let ra = self.src_gp(*a, 0);
-                    let rd = self.gp_home(*d).unwrap_or(0);
+                    let ra = self.src_gp(*a, f);
+                    let rd = self.gp_home(*d).unwrap_or(f);
                     self.load_gp(rd, ra, *ty);
                     if self.gp_home(*d).is_none() {
-                        self.tmp_store(*d, "x0");
+                        self.tmp_store(*d, &format!("x{f}"));
                     }
                 } else {
-                    self.ld_val(*a, "x0");
+                    self.ld_val(*a, &format!("x{f}"));
                     self.load(*ty);
-                    self.tmp_store(*d, "x0");
+                    self.tmp_store(*d, &format!("x{f}"));
                 }
             }
             Inst::Store(ty, a, v) => {
-                // Read the value from its home (no `mov x0,vHome` funnel) — store() is now
-                // clobber-free so passing a live home is safe. Address still funnels to x1
-                // (store hardcodes [x1]); loading it there cannot clobber a spilled v in x0.
+                // Read the value from its home (no `mov x{f},vHome` funnel) — store() is now
+                // clobber-free so passing a live home is safe. Address funnels to x{f+1}
+                // (store reads [x{f+1}]); loading it there cannot clobber a spilled v in x{f}.
                 // ISA: a Store of constant 0 uses the zero register directly (str wzr/xzr),
                 // never `mov xN,#0; str xN` (AArch64 XZR/WZR = 0; Rt=31 → zero, not sp).
                 if matches!(v, Val::Imm(0)) && self.simple_gp_store_ty(*ty) {
-                    self.ld_val(*a, "x1");
+                    self.ld_val(*a, &format!("x{}", f + 1));
                     self.store_z(*ty);
                 } else {
-                    let rv = self.src_gp(*v, 0);
-                    self.ld_val(*a, "x1");
+                    let rv = self.src_gp(*v, f);
+                    self.ld_val(*a, &format!("x{}", f + 1));
                     self.store(rv, *ty);
                 }
             }
             Inst::Memcpy(d, s, sz) => {
-                self.ld_val(*s, "x0"); // src
-                self.ld_val(*d, "x1"); // dst
+                self.ld_val(*s, &format!("x{f}")); // src
+                self.ld_val(*d, &format!("x{}", f + 1)); // dst
                 self.blk_copy(*sz);
             }
             Inst::Lea(d, p) => {
@@ -2497,29 +2537,29 @@ impl<'a> Cg<'a> {
                     // keeps the x0 path + tmp_store — byte-identical to the -O0 all-spill baseline.
                     Place::Local(off) => {
                         let rd = self.gp_home(*d);
-                        let reg = rd.map(|r| format!("x{r}")).unwrap_or_else(|| "x0".into());
+                        let reg = rd.map(|r| format!("x{r}")).unwrap_or_else(|| format!("x{f}"));
                         self.lea_local(&reg, *off);
                         if rd.is_none() {
-                            self.tmp_store(*d, "x0");
+                            self.tmp_store(*d, &format!("x{f}"));
                         }
                     }
                     Place::Global(name, off) => {
                         let rd = self.gp_home(*d);
-                        self.lea_global(rd.unwrap_or(0), name, *off);
+                        self.lea_global(rd.unwrap_or(f), name, *off);
                         if rd.is_none() {
-                            self.tmp_store(*d, "x0");
+                            self.tmp_store(*d, &format!("x{f}"));
                         }
                     }
                     Place::Str(i) => {
                         let rd = self.gp_home(*d);
-                        let reg = rd.unwrap_or(0);
+                        let reg = rd.unwrap_or(f);
                         _ = writeln!(
                             self.s,
                             "\tadrp x{reg}, l_str{0}\n\tadd x{reg}, x{reg}, :lo12:l_str{0}",
                             i
                         );
                         if rd.is_none() {
-                            self.tmp_store(*d, "x0");
+                            self.tmp_store(*d, &format!("x{f}"));
                         }
                     }
                 }
@@ -2533,8 +2573,8 @@ impl<'a> Cg<'a> {
                     && !tt.is_float(*to)
                     && !matches!(tt.tys[*to as usize], Ty::Void | Ty::Struct(_) | Ty::Array(..));
                 if int_cast {
-                    let ra = self.src_gp(*a, 0);
-                    let rd = self.gp_home(*d).unwrap_or(0);
+                    let ra = self.src_gp(*a, f);
+                    let rd = self.gp_home(*d).unwrap_or(f);
                     // int32 value contract (see ir_bin_r): a 4-byte int now lives in w-form —
                     // its high 32 bits are DON'T-CARE, NOT the old sign-extended canonical form.
                     // So a WIDENING cast can no longer assume the source is already extended: it
@@ -2548,12 +2588,12 @@ impl<'a> Cg<'a> {
                     let ext_ty = if tt.size(*to) > tt.size(*from) { *from } else { *to };
                     self.ext_rd(rd, ra, ext_ty);
                     if self.gp_home(*d).is_none() {
-                        self.tmp_store(*d, "x0");
+                        self.tmp_store(*d, &format!("x{f}"));
                     }
                 } else {
-                    self.ld_val(*a, "x0");
+                    self.ld_val(*a, &format!("x{f}"));
                     self.cast_op(*from, *to);
-                    self.tmp_store(*d, "x0");
+                    self.tmp_store(*d, &format!("x{f}"));
                 }
             }
             Inst::Call(dst, callee, args, _nfix) => self.ir_call(dst, callee, args),
@@ -2564,18 +2604,18 @@ impl<'a> Cg<'a> {
             Inst::Asm(tpl, ops) => self.ir_asm(tpl, ops),
             Inst::FunAddr(d, name) => {
                 self.emit_funaddr(name);
-                self.tmp_store(*d, "x0");
+                self.tmp_store(*d, &format!("x{f}"));
             }
             Inst::LabelAddr(d, name) => {
                 self.emit_labeladdr(name);
-                self.tmp_store(*d, "x0");
+                self.tmp_store(*d, &format!("x{f}"));
             }
             Inst::Zero(a, sz) => {
-                self.ld_val(*a, "x0"); // address → x0
+                self.ld_val(*a, &format!("x{f}")); // address → funnel
                 self.emit_zero(*sz);
             }
             Inst::VaStart(a) => {
-                self.ld_val(*a, "x0"); // &ap → x0
+                self.ld_val(*a, &format!("x{f}")); // &ap → funnel
                 self.emit_vastart();
             }
             Inst::VaArg(d, a, t, tmp) => {
@@ -2595,22 +2635,23 @@ impl<'a> Cg<'a> {
                 self.tmp_store(*d, "x0");
             }
             Inst::VaArea(d, off) => {
-                _ = writeln!(self.s, "\tadd x0, x29, #{off}");
-                self.tmp_store(*d, "x0");
+                _ = writeln!(self.s, "\tadd x{f}, x29, #{off}");
+                self.tmp_store(*d, &format!("x{f}"));
             }
             Inst::Param(d, i) => {
                 // Deliver a promoted GP parameter's incoming value into temp d's home. The
                 // value contract keeps every scalar canonical to its width in a 64-bit
                 // register (sxtw for int, etc.), so canonicalize via ext_rd/ext_r. When d has
-                // a REGISTER home, canonicalize the arg register STRAIGHT into the home (no x0
-                // funnel) — homes are x10–x15/x19–x28, always disjoint from the arg registers
-                // x0–x7, so there is never a read/write alias. A spilled d funnels through x0
-                // then tmp_store. Emitted at entry-top, before any arg-register clobber.
+                // a REGISTER home, canonicalize the arg register STRAIGHT into the home (no
+                // funnel) — a PARAM temp is barred from the arg-register colors (ClassBudget.narg
+                // excludes them), so its home is always x19–x28, disjoint from the arg registers
+                // x0–x7 ⟹ never a read/write alias. A spilled d funnels through x{f} then
+                // tmp_store. Emitted at entry-top, before any arg-register clobber.
                 let ty = self.ir_temps[*d as usize];
                 let reg_home = matches!(self.talloc.get(*d as usize).copied().flatten(), Some((false, _)));
                 let dst = match self.talloc.get(*d as usize).copied().flatten() {
                     Some((false, idx)) => self.gpp(idx),
-                    _ => 0, // spilled (or, defensively, an unexpected fp home) → via x0
+                    _ => f, // spilled (or, defensively, an unexpected fp home) → via the funnel
                 };
                 match self.param_loc[*i as usize] {
                     ParamLoc::Gp(n) => self.ext_rd(dst, n, ty), // x{dst} = canon(x{n})
@@ -2621,17 +2662,17 @@ impl<'a> Cg<'a> {
                     ParamLoc::None => unreachable!("Inst::Param for a non-scalar/absent param"),
                 }
                 if !reg_home {
-                    self.tmp_store(*d, "x0"); // spilled: land the x0-funneled value in its slot
+                    self.tmp_store(*d, &format!("x{f}")); // spilled: land the funneled value in its slot
                 }
             }
             Inst::GotoPtr(a) => {
-                self.ld_val(*a, "x0");
-                self.s += "\tbr x0\n";
+                self.ld_val(*a, &format!("x{f}"));
+                _ = writeln!(self.s, "\tbr x{f}");
             }
             Inst::Alloca(d, size) => {
-                self.ld_val(*size, "x0"); // byte count
-                self.s += "\tadd x0, x0, #15\n\tand x0, x0, #0xfffffffffffffff0\n\tsub sp, sp, x0\n\tmov x0, sp\n";
-                self.tmp_store(*d, "x0");
+                self.ld_val(*size, &format!("x{f}")); // byte count
+                _ = writeln!(self.s, "\tadd x{f}, x{f}, #15\n\tand x{f}, x{f}, #0xfffffffffffffff0\n\tsub sp, sp, x{f}\n\tmov x{f}, sp");
+                self.tmp_store(*d, &format!("x{f}"));
             }
         }
     }
@@ -2668,7 +2709,7 @@ impl<'a> Cg<'a> {
     fn emit_cbr(&mut self, op: Op, ct: TypeId, a: Val, b: Val, tb: u32, eb: u32, ft: Option<u32>) {
         let u = self.a.tt.is_unsigned(ct);
         let cc = rel_cond(op, u).unwrap();
-        let ra = self.src_gp(a, 0);
+        let ra = self.src_gp(a, self.fnl);
         // int32 value contract (see ir_bin_r): a 4-byte int lives in w-form — its high bits are
         // DON'T-CARE (e.g. a `sub w,w,#1` that underflows to -1 leaves high=0, NOT sign). So the
         // compare MUST read the low 32 bits (w-form); an x-form `cmp` here would see that -1 as a
@@ -2685,7 +2726,7 @@ impl<'a> Cg<'a> {
         {
             _ = writeln!(self.s, "\tcmn {cr}{ra}, #{}", -k);
         } else {
-            let rb = self.src_gp(b, 1);
+            let rb = self.src_gp(b, self.fnl + 1);
             _ = writeln!(self.s, "\tcmp {cr}{ra}, {cr}{rb}");
         }
         let (lt, le) = (self.ir_label(tb), self.ir_label(eb));
@@ -2729,7 +2770,7 @@ impl<'a> Cg<'a> {
                 // src_gp returns c's home when GP-resident (no `mov x0,xHome`), else
                 // materializes into x0 (rc=0). A C branch condition is integer truthiness
                 // (never FP-homed), satisfying src_gp's precondition. Pressure-free.
-                let rc = self.src_gp(*c, 0);
+                let rc = self.src_gp(*c, self.fnl);
                 let (lt, le) = (self.ir_label(*tb), self.ir_label(*eb));
                 if ft == Some(*eb) {
                     // else-edge falls through: c==0 → next block (jump-to-adjacent = fall),
@@ -2875,11 +2916,24 @@ impl<'a> Cg<'a> {
         // conversion is in the epilogue with no home live — none of those need the gate.)
         let tt = &self.a.tt;
         let heavy = irf.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            matches!(i, Inst::Overflow(..) | Inst::Sync(..) | Inst::VaArg(..))
+            // Asm joins the heavy set: ir_asm's output write-back funnels through x0/x1/x2 +
+            // store() with no home-disjoint relocation, and an inline-asm body may clobber the
+            // caller-saved file arbitrarily — force NARROW so x0–x7 hold no home across it.
+            matches!(i, Inst::Overflow(..) | Inst::Sync(..) | Inst::VaArg(..) | Inst::Asm(..))
                 || matches!(i, Inst::Load(_, ty, _) | Inst::Store(ty, _, _)
                     if matches!(tt.tys[*ty as usize], Ty::LDouble))
+                // A CallX marshalling a long-double arg/ret emits `bl __extenddftf2`/`__trunctfdf2`
+                // MID-marshalling; that bl clobbers the whole caller-saved file (x0–x7 included),
+                // destroying a not-yet-staged arg still homed there (torture 20020413-1). Force
+                // NARROW so no home lives in x0–x7 across the marshalling bl.
+                || matches!(i, Inst::CallX(_, _, args, ret, _)
+                    if matches!(tt.tys[*ret as usize], Ty::LDouble)
+                        || args.iter().any(|(_, t)| matches!(tt.tys[*t as usize], Ty::LDouble)))
         });
         self.gp_wide = self.regalloc && !heavy;
+        // Funnel base moves in lockstep: WIDE homes occupy x0–x7, so the x0-funnel scratch
+        // relocates to x10–x15 (heavy ⟹ NARROW ⟹ 0 ⟹ historical x0–x5, byte-identical).
+        self.fnl = if self.gp_wide { 10 } else { 0 };
         let gpb = if self.gp_wide { &GP_BUDGET_WIDE } else { &GP_BUDGET };
         self.talloc = if self.regalloc {
             crate::opt::abi_alloc(&self.a.tt, irf, gpb, &FP_BUDGET, self.coalesce)
@@ -4016,6 +4070,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         talloc: Vec::new(),
         spill_off: Vec::new(),
         gp_wide: false,
+        fnl: 0,
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
         use_count: Vec::new(),
