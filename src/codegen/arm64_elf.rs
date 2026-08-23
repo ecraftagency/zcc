@@ -1101,7 +1101,13 @@ impl Cg<'_> {
                 } else {
                     "scvtf"
                 };
-                _ = writeln!(self.s, "\t{cvt} d0, x0");
+                // int32 value contract (see ir_bin_r): a <8-byte int lives in w-form — its high
+                // 32 bits are DON'T-CARE, NOT sign-extended. Convert from the SOURCE-width
+                // register: `scvtf d0, w0` reads the low 32 with the correct sign, whereas
+                // `scvtf d0, x0` would convert the garbage high bits too (proven: torture
+                // pr59643's `(double)((i&7)-4)` turned −4 into 4294967292.0). 8-byte stays x0.
+                let sr = if tt.size(from) < 8 { "w" } else { "x" };
+                _ = writeln!(self.s, "\t{cvt} d0, {sr}0");
                 if tt.size(to) == 4 {
                     self.s += "\tfcvt s0, d0\n\tfcvt d0, s0\n";
                 }
@@ -1172,6 +1178,19 @@ impl Cg<'_> {
         let a_sg = !self.a.tt.is_unsigned(ta);
         let b_sg = !self.a.tt.is_unsigned(tb);
         let (r_sg, rw) = (!self.a.tt.is_unsigned(rt), self.a.tt.size(rt));
+        // int32 value contract (see ir_bin_r): a <8-byte operand arrives in w-form with its
+        // high 32 bits DON'T-CARE. overflow_emit embeds each operand as a 128-bit two's-
+        // complement value by reading the FULL x0/x1 and sign/zero-extending from bit 63
+        // (`asr xhi,x,#63` / `mov xhi,#0`) — that embedding is only correct if x0/x1 already
+        // hold the canonical-64 form. Canonicalize here (sxtw for signed, `mov w` for
+        // unsigned) so the 128-bit product is faithful (proven: torture pr84169's
+        // `mul_overflow((unsigned char)h, -16, …)` turned −64 into (4<<32)−64).
+        if self.a.tt.size(ta) < 8 {
+            self.ext_rd(0, 0, ta);
+        }
+        if self.a.tt.size(tb) < 8 {
+            self.ext_rd(1, 1, tb);
+        }
         crate::ext::overflow_emit(&mut self.s, op, a_sg, b_sg, r_sg, rw);
     }
     // va_start: x0 = &ap. Fill the AAPCS va_list from the prologue state (va=gp,fp,stk,frame).
@@ -1499,24 +1518,34 @@ impl<'a> Cg<'a> {
     // the aliased source is dead here). No ext on the compare path (cset yields a clean 0/1).
     fn ir_bin_r(&mut self, op: Op, ct: TypeId, rd: u32, ra: u32, rb: u32) {
         let u = self.a.tt.is_unsigned(ct);
+        // Value contract (int32): a 4-byte integer lives in the LOW 32 bits of its home; the
+        // high bits are DON'T-CARE. So its arithmetic is emitted in w-form — every w-write
+        // auto-zeroes bits 32..63, and a w-op reads only the low 32, which are always the
+        // correct int value regardless of the operands' high bits. This drops the eager
+        // `sxtw` that used to re-canonicalize after EVERY int op (the ~21k-on-sqlite bloat):
+        // sign-extension is now emitted only where the high bits are actually observed — an
+        // explicit widening Cast (ext_rd reads w{ra}, sxtw) or address-index scaling — never
+        // between two int operations. 8-byte ints / pointers stay x-form (already canonical).
+        let is4 = self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4;
+        let r = if is4 { 'w' } else { 'x' };
         match op {
-            Op::Add => _ = writeln!(self.s, "\tadd x{rd}, x{ra}, x{rb}"),
-            Op::Sub => _ = writeln!(self.s, "\tsub x{rd}, x{ra}, x{rb}"),
-            Op::Mul => _ = writeln!(self.s, "\tmul x{rd}, x{ra}, x{rb}"),
-            Op::Div if u => _ = writeln!(self.s, "\tudiv x{rd}, x{ra}, x{rb}"),
-            Op::Div => _ = writeln!(self.s, "\tsdiv x{rd}, x{ra}, x{rb}"),
+            Op::Add => _ = writeln!(self.s, "\tadd {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Sub => _ = writeln!(self.s, "\tsub {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Mul => _ = writeln!(self.s, "\tmul {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Div if u => _ = writeln!(self.s, "\tudiv {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Div => _ = writeln!(self.s, "\tsdiv {r}{rd}, {r}{ra}, {r}{rb}"),
             Op::Rem if u => {
-                _ = writeln!(self.s, "\tudiv x2, x{ra}, x{rb}\n\tmsub x{rd}, x2, x{rb}, x{ra}")
+                _ = writeln!(self.s, "\tudiv {r}2, {r}{ra}, {r}{rb}\n\tmsub {r}{rd}, {r}2, {r}{rb}, {r}{ra}")
             }
             Op::Rem => {
-                _ = writeln!(self.s, "\tsdiv x2, x{ra}, x{rb}\n\tmsub x{rd}, x2, x{rb}, x{ra}")
+                _ = writeln!(self.s, "\tsdiv {r}2, {r}{ra}, {r}{rb}\n\tmsub {r}{rd}, {r}2, {r}{rb}, {r}{ra}")
             }
-            Op::And => _ = writeln!(self.s, "\tand x{rd}, x{ra}, x{rb}"),
-            Op::Or => _ = writeln!(self.s, "\torr x{rd}, x{ra}, x{rb}"),
-            Op::Xor => _ = writeln!(self.s, "\teor x{rd}, x{ra}, x{rb}"),
-            Op::Shl => _ = writeln!(self.s, "\tlsl x{rd}, x{ra}, x{rb}"),
-            Op::Shr if u => _ = writeln!(self.s, "\tlsr x{rd}, x{ra}, x{rb}"),
-            Op::Shr => _ = writeln!(self.s, "\tasr x{rd}, x{ra}, x{rb}"),
+            Op::And => _ = writeln!(self.s, "\tand {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Or => _ = writeln!(self.s, "\torr {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Xor => _ = writeln!(self.s, "\teor {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Shl => _ = writeln!(self.s, "\tlsl {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Shr if u => _ = writeln!(self.s, "\tlsr {r}{rd}, {r}{ra}, {r}{rb}"),
+            Op::Shr => _ = writeln!(self.s, "\tasr {r}{rd}, {r}{ra}, {r}{rb}"),
             _ => {
                 let cond = match (op, u) {
                     (Op::Eq, _) => "eq", (Op::Ne, _) => "ne",
@@ -1526,13 +1555,13 @@ impl<'a> Cg<'a> {
                     (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
                     _ => unreachable!(),
                 };
-                _ = writeln!(self.s, "\tcmp x{ra}, x{rb}\n\tcset x{rd}, {cond}");
+                // int compare: w-form (low-32 signed/unsigned NZCV) is exactly the int semantics.
+                let cr = if self.a.tt.is_integer(ct) && self.a.tt.size(ct) <= 4 { 'w' } else { 'x' };
+                _ = writeln!(self.s, "\tcmp {cr}{ra}, {cr}{rb}\n\tcset x{rd}, {cond}");
                 return; // 0/1, no ext needed
             }
         }
-        if self.a.tt.is_integer(ct) && self.a.tt.size(ct) == 4 {
-            self.ext_r(rd, ct);
-        }
+        // No trailing ext_r: the w-op already left a canonical int32 (low-32 value, high-32 zero).
     }
 
     // Fold a constant right operand into the instruction's immediate field (§4 instruction
@@ -1564,11 +1593,14 @@ impl<'a> Cg<'a> {
                     (Op::Ge, true) => "hs", (Op::Ge, false) => "ge",
                     _ => unreachable!(),
                 };
-                _ = writeln!(self.s, "\t{mnem} x{ra}, #{mag}\n\tcset x{rd}, {cond}");
+                // int32: compare the low 32 bits (w-form) — high bits are don't-care (ir_bin_r).
+                let cr = if is4 { 'w' } else { 'x' };
+                _ = writeln!(self.s, "\t{mnem} {cr}{ra}, #{mag}\n\tcset x{rd}, {cond}");
                 true // 0/1 result, no ext
             }
             Op::Shl | Op::Shr => {
-                if !(0..64).contains(&k) {
+                let bits = if is4 { 32 } else { 64 };
+                if !(0..bits).contains(&k) {
                     return false;
                 }
                 let mnem = match op {
@@ -1576,10 +1608,11 @@ impl<'a> Cg<'a> {
                     Op::Shr if u => "lsr",
                     _ => "asr",
                 };
-                _ = writeln!(self.s, "\t{mnem} x{rd}, x{ra}, #{k}");
-                if is4 {
-                    self.ext_r(rd, ct);
-                }
+                // int32 MUST shift in w-form: a right shift (lsr/asr) in x-form would pull the
+                // don't-care high bits into the low-32 result. w-form shifts exactly 32 bits and
+                // auto-zeroes high — canonical, no trailing sxtw.
+                let r = if is4 { 'w' } else { 'x' };
+                _ = writeln!(self.s, "\t{mnem} {r}{rd}, {r}{ra}, #{k}");
                 true
             }
             Op::And | Op::Or | Op::Xor => {
@@ -1592,11 +1625,10 @@ impl<'a> Cg<'a> {
                     _ => "eor",
                 };
                 // print the 64-bit pattern (k may be negative); the register form would have
-                // loaded exactly this pattern via imm(), so the fold is byte-equivalent.
+                // loaded exactly this pattern via imm(), so the fold is byte-equivalent. x-form
+                // is fine for int32: the low 32 bits of the result are the correct int value
+                // (op is bitwise), and high bits stay don't-care — no trailing sxtw needed.
                 _ = writeln!(self.s, "\t{mnem} x{rd}, x{ra}, #{}", k as u64);
-                if is4 {
-                    self.ext_r(rd, ct);
-                }
                 true
             }
             _ => false,
@@ -2127,10 +2159,11 @@ impl<'a> Cg<'a> {
                     // one fewer scratch live per loop increment; validated by opt-parity.
                     let ra = self.src_gp(*a, 0);
                     let rd = self.gp_home(*d).unwrap_or(0);
-                    _ = writeln!(self.s, "\t{mnem} x{rd}, x{ra}, #{mag}");
-                    if self.a.tt.is_integer(*ty) && self.a.tt.size(*ty) == 4 {
-                        self.ext_r(rd, *ty);
-                    }
+                    // int32 value contract (see ir_bin_r): 4-byte int in w-form (auto-zeroes
+                    // high bits, low-32 correct) → no trailing sxtw. 8-byte/ptr stays x-form.
+                    let is4 = self.a.tt.is_integer(*ty) && self.a.tt.size(*ty) == 4;
+                    let r = if is4 { 'w' } else { 'x' };
+                    _ = writeln!(self.s, "\t{mnem} {r}{rd}, {r}{ra}, #{mag}");
                     if self.gp_home(*d).is_none() {
                         self.tmp_store(*d, "x0");
                     }
@@ -2166,11 +2199,18 @@ impl<'a> Cg<'a> {
                 } else {
                     let ra = self.src_gp(*a, 0);
                     let rd = self.gp_home(*d).unwrap_or(0);
+                    // int32 value contract (see ir_bin_r): 4-byte int in w-form (low-32 correct,
+                    // high auto-zeroed) needs no sxtw. Sub-word (size<4) still canonicalizes via
+                    // ext_r (sxtb/sxth). 8-byte/ptr is x-form, already canonical.
+                    let sz = self.a.tt.size(*ty);
+                    let r = if self.a.tt.is_integer(*ty) && sz <= 4 { 'w' } else { 'x' };
                     match u {
-                        Un::Neg => _ = writeln!(self.s, "\tneg x{rd}, x{ra}"),
-                        Un::BNot => _ = writeln!(self.s, "\tmvn x{rd}, x{ra}"),
+                        Un::Neg => _ = writeln!(self.s, "\tneg {r}{rd}, {r}{ra}"),
+                        Un::BNot => _ = writeln!(self.s, "\tmvn {r}{rd}, {r}{ra}"),
                     }
-                    self.ext_r(rd, *ty);
+                    if self.a.tt.is_integer(*ty) && sz < 4 {
+                        self.ext_r(rd, *ty); // sub-word: canonicalize to its width
+                    }
                     if self.gp_home(*d).is_none() {
                         self.tmp_store(*d, "x0");
                     }
@@ -2250,7 +2290,18 @@ impl<'a> Cg<'a> {
                 if int_cast {
                     let ra = self.src_gp(*a, 0);
                     let rd = self.gp_home(*d).unwrap_or(0);
-                    self.ext_rd(rd, ra, *to);
+                    // int32 value contract (see ir_bin_r): a 4-byte int now lives in w-form —
+                    // its high 32 bits are DON'T-CARE, NOT the old sign-extended canonical form.
+                    // So a WIDENING cast can no longer assume the source is already extended: it
+                    // must sign/zero-extend the low `from` bits to fill the register, per the
+                    // SOURCE's signedness (ext_rd(from): sxtw for signed, mov w for unsigned).
+                    // This is the genuine widening sxtw gcc also emits (~641), moved here from
+                    // the old eager after-every-op site. Narrowing/same-width canonicalizes to
+                    // the TARGET width as before (w-form / sxtb / sxth). Without this split a
+                    // negative int widened to long reads high=0 → a live miscompile (proven: a
+                    // non-foldable runtime `(long)(a*b)` returned the low-32 as a positive value).
+                    let ext_ty = if tt.size(*to) > tt.size(*from) { *from } else { *to };
+                    self.ext_rd(rd, ra, ext_ty);
                     if self.gp_home(*d).is_none() {
                         self.tmp_store(*d, "x0");
                     }
@@ -2373,18 +2424,24 @@ impl<'a> Cg<'a> {
         let u = self.a.tt.is_unsigned(ct);
         let cc = rel_cond(op, u).unwrap();
         let ra = self.src_gp(a, 0);
+        // int32 value contract (see ir_bin_r): a 4-byte int lives in w-form — its high bits are
+        // DON'T-CARE (e.g. a `sub w,w,#1` that underflows to -1 leaves high=0, NOT sign). So the
+        // compare MUST read the low 32 bits (w-form); an x-form `cmp` here would see that -1 as a
+        // large positive and take the wrong branch (proven: torture loop-1's `for(i=2;i>=0;i--)`
+        // never terminated). Matches the compare lowering in ir_bin_r / try_bin_imm exactly.
+        let cr = if self.a.tt.is_integer(ct) && self.a.tt.size(ct) <= 4 { 'w' } else { 'x' };
         // b: fold small ±imm12 into cmp/cmn (byte-identical to try_bin_imm), else a register.
         if let Val::Imm(k) = b
             && (0..4096).contains(&k)
         {
-            _ = writeln!(self.s, "\tcmp x{ra}, #{k}");
+            _ = writeln!(self.s, "\tcmp {cr}{ra}, #{k}");
         } else if let Val::Imm(k) = b
             && (-4095..=0).contains(&k)
         {
-            _ = writeln!(self.s, "\tcmn x{ra}, #{}", -k);
+            _ = writeln!(self.s, "\tcmn {cr}{ra}, #{}", -k);
         } else {
             let rb = self.src_gp(b, 1);
-            _ = writeln!(self.s, "\tcmp x{ra}, x{rb}");
+            _ = writeln!(self.s, "\tcmp {cr}{ra}, {cr}{rb}");
         }
         let (lt, le) = (self.ir_label(tb), self.ir_label(eb));
         let ncc = inv_cond(cc);
@@ -3491,7 +3548,6 @@ fn report_cost_square(log: &[(String, [usize; 5])]) {
         );
     }
 }
-
 /// Backend entry point — the SOLE path: lower(AST) → IR → passes → asm. Covers the
 /// full suite/csmith/musl; the AST-walk emit() has been removed. The backend simulates per-inst.
 pub fn emit_ir(ast: &Ast) -> String {
