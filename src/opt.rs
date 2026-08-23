@@ -16,7 +16,7 @@ use crate::ir::{
     canon, eval_bin, eval_cast, inst_def, inst_uses, term_targets, term_uses, Block, BlockId, Callee,
     Inst, IrFunc, Op, Place, Term, Tmp, Un, Val,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 // A walker that MUTATES every operand (each READ Val) of an instruction — used by
 // copy/CSE to substitute uses. Does NOT touch the destination temporary (def).
@@ -875,27 +875,34 @@ pub fn interference(f: &IrFunc, lv: &Liveness) -> Vec<HashSet<Tmp>> {
     let mut adj: Vec<HashSet<Tmp>> = vec![HashSet::new(); nt];
     let mut buf = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
-        let mut live = lv.live_out[bi].clone();
+        // `live` is the SPARSE set of currently-live temps (iterate only members, never a
+        // full 0..nt scan): at a def we add an edge to each ALREADY-live temp, so the cost
+        // is Σ live-set-size ≈ O(edges), not O(defs·nt). The full-nt bitvector scan was the
+        // O(nt²) compile-time pathology — an SSA temp dies at its last use, so the live set
+        // stays SMALL even in a fuzz-generated mega-block with hundreds of thousands of
+        // temps (⟦·⟧ is unchanged: same edge set, sparser walk).
+        let mut live: HashSet<Tmp> =
+            lv.live_out[bi].iter().enumerate().filter_map(|(t, &a)| a.then_some(t as u32)).collect();
         // the terminator's operands are live at the block's tail
         buf.clear();
         term_uses(&b.term, &mut buf);
         for &u in &buf {
-            live[u as usize] = true;
+            live.insert(u);
         }
         for i in b.insts.iter().rev() {
             if let Some(d) = inst_def(i) {
-                for (t, &alive) in live.iter().enumerate() {
-                    if alive && t as u32 != d {
-                        adj[d as usize].insert(t as u32);
-                        adj[t].insert(d);
+                for &t in &live {
+                    if t != d {
+                        adj[d as usize].insert(t);
+                        adj[t as usize].insert(d);
                     }
                 }
-                live[d as usize] = false;
+                live.remove(&d);
             }
             buf.clear();
             inst_uses(i, &mut buf);
             for &u in &buf {
-                live[u as usize] = true;
+                live.insert(u);
             }
         }
     }
@@ -954,22 +961,42 @@ pub fn color_abi(
         .collect();
     let mut removed = vec![false; nt];
     let mut stack: Vec<Tmp> = Vec::new();
-    for _ in 0..nt {
-        // SIMPLIFY: prefer a class-degree<k node (certainly colorable); else max-degree (potential spill)
-        let low = (0..nt).find(|&v| in_class[v] && !removed[v] && degree[v] < k);
-        let v = match low.or_else(|| {
-            (0..nt)
-                .filter(|&v| in_class[v] && !removed[v])
-                .max_by_key(|&v| degree[v])
-        }) {
-            Some(v) => v,
-            None => break,
+    // SIMPLIFY worklist. `low` holds every class-degree<k node ordered by index (Reverse ⇒
+    // min-heap), so the removal order — hence the SELECT stack order, hence the emitted
+    // coloring — is BYTE-IDENTICAL to the old lowest-index linear scan, but produced in
+    // O(nt log nt) rather than O(nt²) (the per-step `(0..nt).find`/`max_by_key` was the
+    // residual compile-time quadratic on a fuzz mega-block). Class degree only DECREASES
+    // during simplify, so a node crosses below k AT MOST ONCE — push it exactly then; a
+    // heap entry is retired only by being popped (guarded against a stale duplicate).
+    use std::cmp::Reverse;
+    let mut low: std::collections::BinaryHeap<Reverse<Tmp>> =
+        (0..nt as u32).filter(|&v| in_class[v as usize] && degree[v as usize] < k).map(Reverse).collect();
+    let mut left = in_class.iter().filter(|&&c| c).count();
+    while left > 0 {
+        let v = if let Some(Reverse(v)) = low.pop() {
+            if removed[v as usize] {
+                continue; // stale (already retired) — skip
+            }
+            v as usize
+        } else {
+            // no degree<k node remains → OPTIMISTIC SPILL: pick the max class-degree node
+            // (the same fallback as before; rare on the sparse graphs that stress compile
+            // time, so its O(remaining) scan does not reintroduce the quadratic there).
+            match (0..nt).filter(|&v| in_class[v] && !removed[v]).max_by_key(|&v| degree[v]) {
+                Some(v) => v,
+                None => break,
+            }
         };
         removed[v] = true;
+        left -= 1;
         stack.push(v as u32);
         for &nb in &adj[v] {
-            if in_class[nb as usize] && !removed[nb as usize] {
-                degree[nb as usize] -= 1;
+            let u = nb as usize;
+            if in_class[u] && !removed[u] {
+                if degree[u] == k {
+                    low.push(Reverse(nb)); // crosses k → k-1 (<k) this step; enqueue once
+                }
+                degree[u] -= 1;
             }
         }
     }
@@ -1012,6 +1039,19 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coa
     let mut home: Vec<AbiHome> = vec![None; nt];
     if f.blocks.iter().flat_map(|b| &b.insts).any(|i| matches!(i, Inst::Asm(..))) {
         return home; // conservative all-spill
+    }
+    // PERF BACKSTOP (Article-E policy constant, dated 2026-08 — a convenience ceiling, NOT
+    // a spec number; one env-var from tuning, guarded by opt-parity + torture). The
+    // allocator's dominant costs were made ~linear (sparse `interference`, worklist
+    // `color_abi`); this cap bounds the RESIDUAL super-linear paths (liveness fixpoint over
+    // a deep CFG; the optimistic-spill max-degree scan on a genuinely DENSE graph) so no
+    // fuzz-generated mega-function can CTIMEOUT. 60000 is >6× any plausible real function's
+    // temp count yet well below the fuzz tail; above it we return the ALL-SPILL baseline
+    // (the proven pre-Stage-5b memory model, sound by construction — same as inline-asm).
+    let max_temps: usize =
+        std::env::var("ZCC_MAXTEMPS").ok().and_then(|v| v.parse().ok()).unwrap_or(60000);
+    if nt > max_temps {
+        return home; // conservative all-spill — pathological function, keep compile bounded
     }
     let lv = liveness(f);
     let adj = interference(f, &lv);
@@ -1617,55 +1657,91 @@ fn val_eq(a: Val, b: Val) -> bool {
     }
 }
 
+/// Chase a value through the trivial-φ substitution to its final representative. `subst`
+/// never maps a temp to itself (self-refs are excluded when a φ collapses) and forms a DAG,
+/// so the walk terminates; the self-map guard is pure defence.
+fn resolve_subst(mut r: Val, subst: &HashMap<Tmp, Val>) -> Val {
+    while let Val::Tmp(t) = r {
+        match subst.get(&t) {
+            Some(&nv) => {
+                if matches!(nv, Val::Tmp(t2) if t2 == t) {
+                    break;
+                }
+                r = nv;
+            }
+            None => break,
+        }
+    }
+    r
+}
+
+/// Remove trivial φs (Braun §3.1). A φ whose non-self arms all resolve to a SINGLE value v
+/// collapses to v. The old code re-scanned ALL insts to find one trivial φ then rewrote ALL
+/// uses each time — O(#φ · #insts), the yarpgen s0940 compile-time pathology (loop nests
+/// spawn thousands of φs). Here triviality is decided against the growing substitution and
+/// the whole substitution is applied in ONE final pass. The fixpoint is computed by rounds
+/// over the φ set IN PROGRAM ORDER — deterministic, and complete because `subst` grows
+/// monotonically until a full round adds nothing (a φ made trivial by a later collapse is
+/// caught on the next round; `resolve_subst` chases the collapse chains). ⟦·⟧ is unchanged:
+/// the surviving-φ set and the resolved operands are exactly the repeated-scan result,
+/// reached without the per-collapse O(#insts) rewrite. (A worklist keyed on φ-users would be
+/// asymptotically tighter but must track substitution chains transitively; the round loop is
+/// the same fixpoint, inner cost O(#φ) per round with the round count = φ-collapse depth.)
 fn remove_trivial_phis(f: &mut IrFunc) {
+    let mut phis: Vec<Tmp> = Vec::new(); // deterministic program order
+    let mut phi_arms: HashMap<Tmp, Vec<Val>> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Phi(d, _, arms) = i {
+                phis.push(*d);
+                phi_arms.insert(*d, arms.iter().map(|(_, v)| *v).collect());
+            }
+        }
+    }
+    let mut subst: HashMap<Tmp, Val> = HashMap::new();
     loop {
-        // Find one trivial φ: its arms, minus self-references, reduce to a single value.
-        let mut trivial: Option<(Tmp, Val)> = None;
-        'scan: for b in &f.blocks {
-            for i in &b.insts {
-                if let Inst::Phi(d, _, arms) = i {
-                    let mut uniq: Option<Val> = None;
-                    let mut same = true;
-                    for (_, v) in arms {
-                        if matches!(v, Val::Tmp(t) if *t == *d) {
-                            continue; // a self-reference does not count
-                        }
-                        match uniq {
-                            None => uniq = Some(*v),
-                            Some(u) => {
-                                if !val_eq(u, *v) {
-                                    same = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // uniq==None ⟹ only self-refs (undefined / unreachable): leave it.
-                    if same {
-                        if let Some(u) = uniq {
-                            trivial = Some((*d, u));
-                            break 'scan;
+        let mut changed = false;
+        for &d in &phis {
+            if subst.contains_key(&d) {
+                continue;
+            }
+            let mut uniq: Option<Val> = None;
+            let mut trivial = true;
+            for &v in &phi_arms[&d] {
+                let r = resolve_subst(v, &subst);
+                if matches!(r, Val::Tmp(t) if t == d) {
+                    continue; // self-reference does not count
+                }
+                match uniq {
+                    None => uniq = Some(r),
+                    Some(u) => {
+                        if !val_eq(u, r) {
+                            trivial = false;
+                            break;
                         }
                     }
                 }
             }
-        }
-        let Some((d, v)) = trivial else { break };
-        for b in f.blocks.iter_mut() {
-            b.insts.retain(|i| !matches!(i, Inst::Phi(dd, ..) if *dd == d));
-            for i in b.insts.iter_mut() {
-                each_use_mut(i, |x| {
-                    if matches!(x, Val::Tmp(t) if *t == d) {
-                        *x = v;
-                    }
-                });
+            // uniq==None ⟹ only self-refs (undefined / unreachable): leave the φ in place.
+            if trivial && let Some(u) = uniq {
+                subst.insert(d, u);
+                changed = true;
             }
-            each_use_term_mut(&mut b.term, |x| {
-                if matches!(x, Val::Tmp(t) if *t == d) {
-                    *x = v;
-                }
-            });
         }
+        if !changed {
+            break; // fixpoint: no φ collapsed this round
+        }
+    }
+    if subst.is_empty() {
+        return;
+    }
+    // ONE final pass: drop the collapsed φs; chase every remaining use through `subst`.
+    for b in f.blocks.iter_mut() {
+        b.insts.retain(|i| !matches!(i, Inst::Phi(d, ..) if subst.contains_key(d)));
+        for i in b.insts.iter_mut() {
+            each_use_mut(i, |x| *x = resolve_subst(*x, &subst));
+        }
+        each_use_term_mut(&mut b.term, |x| *x = resolve_subst(*x, &subst));
     }
 }
 
@@ -1747,7 +1823,11 @@ pub fn out_of_ssa(f: &mut IrFunc) {
     let succ_cnt: Vec<usize> = successors(f).iter().map(|s| s.len()).collect();
 
     // Copies to append at the END of a single-successor predecessor (before its term).
-    let mut append_to: HashMap<BlockId, Vec<(Tmp, TypeId, Val)>> = HashMap::new();
+    // BTreeMap (not HashMap): the apply loop mints cycle-breaking fresh temps sequentially
+    // from a shared counter, so iterating predecessors in hash order would number those
+    // temps differently across runs (→ different coloring, different .s). Sorted-by-block-id
+    // iteration makes φ-destruction DETERMINISTIC (the out_of_ssa half of the determinism seal).
+    let mut append_to: BTreeMap<BlockId, Vec<(Tmp, TypeId, Val)>> = BTreeMap::new();
     // Critical edges to split: (pred, φ-block, the parallel copy set on that edge).
     let mut splits: Vec<(BlockId, BlockId, Vec<(Tmp, TypeId, Val)>)> = Vec::new();
 
@@ -2305,9 +2385,13 @@ fn back_edges(f: &IrFunc, dom: &[HashSet<BlockId>]) -> Vec<(BlockId, BlockId)> {
 
 /// The natural loop of back-edge (tail→header): {header} ∪ {nodes that reach `tail`
 /// without passing through `header`} — backward reachability from tail (Aho Alg. 9.45).
-fn natural_loop(f: &IrFunc, tail: BlockId, header: BlockId) -> HashSet<BlockId> {
+// Returns a BTreeSet (sorted, DETERMINISTIC iteration) — LICM's hoist `'scan` picks the
+// FIRST candidate in body-iteration order, so a hash-order body made the emitted coloring
+// nondeterministic across runs (same input, different .s). Sorted-by-block-id iteration is
+// a stable, reproducible order; membership tests (`.contains`) are order-agnostic already.
+fn natural_loop(f: &IrFunc, tail: BlockId, header: BlockId) -> BTreeSet<BlockId> {
     let preds = predecessors(f);
-    let mut body = HashSet::from([header]);
+    let mut body = BTreeSet::from([header]);
     let mut stack = Vec::new();
     if tail != header && body.insert(tail) {
         stack.push(tail);
@@ -2329,7 +2413,7 @@ fn natural_loop(f: &IrFunc, tail: BlockId, header: BlockId) -> HashSet<BlockId> 
 /// `Jmp(header)` entry block; otherwise inserts a fresh empty block on the entry edge
 /// (⟦·⟧-preserving, exactly like a critical-edge split) and moves the header's φ-arm
 /// for the entry predecessor onto the preheader.
-fn ensure_preheader(f: &mut IrFunc, header: BlockId, body: &HashSet<BlockId>) -> Option<BlockId> {
+fn ensure_preheader(f: &mut IrFunc, header: BlockId, body: &BTreeSet<BlockId>) -> Option<BlockId> {
     let preds = predecessors(f);
     let entries: Vec<BlockId> =
         preds[header as usize].iter().copied().filter(|p| !body.contains(p)).collect();
@@ -2373,7 +2457,7 @@ fn operands_avail(i: &Inst, avail: &[bool]) -> bool {
 /// set, a Side-II constant threaded from the backend budget), so a point with pressure > k
 /// forces a spill. Computed by the standard backward live-set walk (the transfer function
 /// abi_alloc's crossing scan uses), each block seeded with live-out ∪ terminator-uses.
-fn loop_gp_pressure(tt: &TyTab, f: &IrFunc, lv: &Liveness, body: &HashSet<BlockId>) -> u32 {
+fn loop_gp_pressure(tt: &TyTab, f: &IrFunc, lv: &Liveness, body: &BTreeSet<BlockId>) -> u32 {
     let nt = f.temps.len();
     let is_fp: Vec<bool> = f.temps.iter().map(|&ty| tt.is_float(ty)).collect();
     let gp_count = |live: &[bool]| (0..nt).filter(|&t| live[t] && !is_fp[t]).count() as u32;
@@ -2783,7 +2867,7 @@ fn decompose_addr(
     tt: &TyTab,
     def_of: &[Option<(BlockId, usize)>],
     v: &Val,
-    body: &HashSet<BlockId>,
+    body: &BTreeSet<BlockId>,
     biv_of: &HashMap<Tmp, (Val, i64)>,
     inv: &[bool],
     base: &mut Vec<Val>,
@@ -2836,7 +2920,7 @@ fn set_dst(i: &mut Inst, d: Tmp) {
 fn clone_inv_to_ph(
     f: &mut IrFunc,
     ph: BlockId,
-    body: &HashSet<BlockId>,
+    body: &BTreeSet<BlockId>,
     t: Tmp,
     def_of: &[Option<(BlockId, usize)>],
     memo: &mut HashMap<Tmp, Tmp>,
@@ -4753,6 +4837,35 @@ mod tests {
         assert!(!adj[2].contains(&0) && !adj[2].contains(&1));
     }
 
+    // Guards the SPARSE interference walk (iterate only live members, not a full 0..nt scan):
+    // t0 is defined first and used only at the tail, so it is live ACROSS the defs of t1,t2,t3
+    // and must interfere with every one of them. A sparse walk that forgot a long-lived temp
+    // would drop these edges (a coloring bug); a dense scan and a sparse scan must agree.
+    #[test]
+    fn interference_long_live_range() {
+        let f = mk(
+            "g",
+            vec![INT, INT, INT, INT, INT],
+            vec![],
+            0,
+            INT,
+            vec![Block {
+                insts: vec![
+                    Inst::Copy(0, INT, Val::Imm(1)),
+                    Inst::Copy(1, INT, Val::Imm(2)),
+                    Inst::Copy(2, INT, Val::Imm(3)),
+                    Inst::Copy(3, INT, Val::Imm(4)),
+                    Inst::Bin(4, Op::Add, INT, Val::Tmp(0), Val::Tmp(3)), // t0 live to here
+                ],
+                term: Term::Ret(Some(Val::Tmp(4))),
+            }],
+        );
+        let adj = interference(&f, &liveness(&f));
+        for t in [1u32, 2, 3] {
+            assert!(adj[0].contains(&t) && adj[t as usize].contains(&0), "t0 must interfere with t{t}");
+        }
+    }
+
     // Stage 5b — the ABI budgets the backend uses (arm64_elf.rs): GP = 10 callee-saved
     // (x19–x28), NO caller-saved (the emitter's scratch spans x0–x15); FP = 16 caller
     // (v16–v31) ⊕ 8 callee (v8–v15).
@@ -4850,6 +4963,31 @@ mod tests {
             home.iter().all(|h| h.is_none()),
             "a function containing inline asm must fall back to all-spill"
         );
+    }
+
+    // PERF backstop (abi_alloc's 60000-temp ceiling): a function above the cap must return
+    // the all-spill baseline — no super-linear allocator path runs — and that baseline is
+    // trivially verify_abi-valid (no colored temp ⟹ the interference invariant cannot be
+    // violated). Certifies the Side-II policy constant at the middle (Law 3), not the binary.
+    #[test]
+    fn abi_alloc_size_backstop_all_spills() {
+        let tt = TyTab::new();
+        let n = 60_001; // one over the default ZCC_MAXTEMPS ceiling
+        let f = mk(
+            "big",
+            vec![INT; n],
+            vec![],
+            0,
+            INT,
+            vec![Block {
+                insts: vec![Inst::Copy(0, INT, Val::Imm(1))],
+                term: Term::Ret(Some(Val::Tmp(0))),
+            }],
+        );
+        let home = abi_alloc(&tt, &f, &gp_budget(), &fp_budget(), true);
+        assert_eq!(home.len(), n);
+        assert!(home.iter().all(|h| h.is_none()), "above the backstop every temp must spill");
+        verify_abi(&tt, &f, &home, &gp_budget(), &fp_budget()).expect("all-spill must verify");
     }
 
     fn count_insts(ir: &[IrFunc]) -> usize {

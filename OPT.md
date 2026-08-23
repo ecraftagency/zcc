@@ -72,10 +72,38 @@ AND a native AWS Graviton4 (Debian-13, environment-matched). The old Path-A/Path
 
 **Also shipped (default-ON):** add/sub-imm12 peephole (`mov #k;add`→`add #k`; pressure-free).
 
-**OPEN (compile-time perf, NOT correctness):** yarpgen `s0940` compiles CORRECT (PARITY everywhere) but
-the optimizer takes ~2.6min CPU on it (`ZCC_O0` = 2s) — a super-linear compile path, offending pass not
-yet isolated (pointer_iv vs another). Tracked separately; motivates a compile-timeout in the fuzz gate.
-Does NOT affect this correctness seal.
+**RESOLVED (compile-time perf + latent correctness, 2026-08-23 seal):** yarpgen `s0940` (& the fuzz
+mega-function tail) compiled CORRECT but the optimizer took ~2.6min CPU on it — a super-linear path in
+the allocator + φ-cleanup. Three algorithmic fixes, each ⟦·⟧-preserving (same result, faster walk):
+(1) `interference` — full-`nt` bitvector scan per def → SPARSE live set (Σ live-set-size ≈ O(edges));
+(2) `color_abi` SIMPLIFY — per-step `(0..nt).find`/`max_by_key` → min-heap worklist (O(nt log nt));
+(3) `remove_trivial_phis` — O(#φ×#insts) repeated full-scan → round-based fixpoint (same unique fixpoint).
+s0940 2.6min→~13s; yarpgen 250 = 0 CTIMEOUT (was the CTIMEOUT source). The speedup EXPOSED a latent
+backend bug: giant-frame functions emit >imm19 (±262144-insn) spans, so a near-form `cb(n)z`/`b.cc` fell
+out of range → GNU-as rejected the build (s0025/s0035/s0228 OPT-COMPILE-FAIL). Fixed with a **two-pass
+emit-measure-re-emit** in `emit_ir_body` (measure the near-form body; if its newline count — an
+over-approximation of insns — could exceed imm19, discard and re-emit with far forms) + far-safe forms in
+`emit_cbr`'s fall-through arms. All three now PARITY; GNU-as accepts.
+
+**DETERMINISM SEAL (2026-08-23):** while proving byte-identity of the above, discovered zcc was
+**nondeterministic across runs** (pre-existing): `LICM natural_loop` returned `HashSet<BlockId>`, and the
+hoist `'scan` picked the first candidate in Rust's per-process-random hash order → different hoist → a
+different (still-correct) `.s` each run. A commuting-square BYTE-proof is impossible over a
+nondeterministic transform, and size-progress toward 1× is unmeasurable if each build differs — so
+determinism is a **precondition** for the size campaign, not a nicety. Fixed by returning
+`BTreeSet<BlockId>` (program-order, theorem-clean — "process the loop body top-to-bottom", no heuristic).
+A read-only audit of every HashMap/HashSet iteration in `opt.rs`+`arm64_elf.rs` (~30 sets) then found ONE
+more latent hole: `out_of_ssa`'s `append_to: HashMap<BlockId,…>` was iterated to mint cycle-breaking
+fresh temps from a shared counter → hash-order predecessor iteration numbered those temps differently
+across runs (unobserved on the corpus — needs ≥2 cycle-breaking preds — but real). Fixed → `BTreeMap`
+(sorted-by-block-id). Every other site is lookup-only or re-sorted before use (e.g. φ-materialization
+sorts by temp id at `opt.rs:1637`).
+Proof: same zcc + same input.c → byte-identical `.s` (md5-stable, 3 runs) on a 16-file diverse sweep
+(sqlite, shell, 6 yarpgen incl. s0940, 8 csmith) = 0 nondeterministic. Cost: sqlite obj
++0.46% (the deterministic program-order hoist set differs from the old lucky hash-order subset) — a
+noise-level, honest deterministic cost, reclaimed many times over by the size campaign. NB: determinism ≠
+absence of heuristics — register allocation stays a HEURISTIC (coloring is NP-complete, `opt.rs` §C2); a
+heuristic is deterministic + commuting-square-certified, not theorem-optimal.
 
 ---
 

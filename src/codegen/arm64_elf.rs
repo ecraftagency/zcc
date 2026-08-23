@@ -2389,9 +2389,23 @@ impl<'a> Cg<'a> {
         let (lt, le) = (self.ir_label(tb), self.ir_label(eb));
         let ncc = inv_cond(cc);
         if ft == Some(eb) {
-            _ = writeln!(self.s, "\tb.{cc} {lt}"); // else falls through: take THEN on cc
+            // else falls through. NEAR: take THEN on cc, else fall to eb. FAR: `b.cc {lt}` may
+            // exceed imm19 — skip an unconditional `b {lt}` on ¬cc to an adjacent label that
+            // itself falls into eb (the b reaches ±128MB).
+            if self.near_branch {
+                _ = writeln!(self.s, "\tb.{cc} {lt}");
+            } else {
+                let n = self.labels(1);
+                _ = writeln!(self.s, "\tb.{ncc} L{n}\n\tb {lt}\nL{n}:");
+            }
         } else if ft == Some(tb) {
-            _ = writeln!(self.s, "\tb.{ncc} {le}"); // then falls through: take ELSE on ¬cc
+            // then falls through. NEAR: take ELSE on ¬cc. FAR: skip `b {le}` on cc.
+            if self.near_branch {
+                _ = writeln!(self.s, "\tb.{ncc} {le}");
+            } else {
+                let n = self.labels(1);
+                _ = writeln!(self.s, "\tb.{cc} L{n}\n\tb {le}\nL{n}:");
+            }
         } else if self.near_branch {
             _ = writeln!(self.s, "\tb.{cc} {lt}\n\tb {le}");
         } else {
@@ -2561,6 +2575,17 @@ impl<'a> Cg<'a> {
                 }
             });
         }
+        // Two-pass branch-range guard (the correct-but-deferred fix promised above). The
+        // `est` heuristic can under-count a giant-frame function (each spilled access lowers
+        // to ~4 insns, an expansion `est` does not model), leaving a cb(n)z/b.cc in NEAR form
+        // whose imm19 target (±262144 insns reach) is out of range → GNU-as rejects the build.
+        // Emit the body once; if the near-form stream is large enough that any branch COULD
+        // exceed imm19, discard it and re-emit with far forms. The measure is a newline count,
+        // an over-approximation of emitted insns (insns ≤ newlines), so a body left in near
+        // form provably has < THRESHOLD insns ⟹ every branch reaches. Re-emit is bounded to
+        // the rare pathological function; the common path measures once and keeps near.
+        let body_start = self.s.len();
+        loop {
         for (bi, blk) in irf.blocks.iter().enumerate() {
             _ = writeln!(self.s, "{}:", self.ir_label(bi as u32));
             // EXT(gcc): a C label at this block → emit `lg_fname.name:` for computed-goto
@@ -2603,6 +2628,17 @@ impl<'a> Cg<'a> {
             } else {
                 self.emit_term(&blk.term, ft);
             }
+        }
+        // imm19 reaches ±2^18 = 262144 insns; 240k leaves margin and is ≤ that bound, so
+        // any body kept in near form has < 240k newlines ≥ its insn count < 262144 → sound.
+        if self.near_branch
+            && self.s[body_start..].bytes().filter(|&c| c == b'\n').count() >= 240_000
+        {
+            self.near_branch = false;
+            self.s.truncate(body_start);
+            continue; // re-emit this body with far branch forms
+        }
+        break;
         }
     }
 }
