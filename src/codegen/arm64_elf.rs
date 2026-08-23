@@ -605,10 +605,27 @@ impl Cg<'_> {
         let pos = total.checked_sub(off)?;
         (pos % sz == 0 && pos <= sz * 4095).then_some(pos)
     }
+    // x29−off re-expressed as a POSITIVE sp+pos for a bare ADDRESS computation (add reg,sp,#pos,
+    // one instruction, no x16 materialization). Same base-validity as sp_slot — fixed frame, sp
+    // at its base — but the imm is add-immediate's UNSCALED imm12 (0..4095, no size scaling: this
+    // is an address, not a scaled memory access). The slots that need it are exactly those with
+    // off>4095 (deep in the frame, near sp) — for which pos=total−off is SMALL and fits imm12:
+    // sp+pos = (x29−total)+(total−off) = x29−off, the identical byte (translation-validation).
+    fn sp_add_slot(&self, off: u32) -> Option<u32> {
+        if self.fhasvla || self.fdynstack || !self.sp_at_base {
+            return None;
+        }
+        let total = self.fframe + if self.fvariadic { 192 } else { 0 } + self.ir_tspill;
+        let pos = total.checked_sub(off)?;
+        (pos <= 4095).then_some(pos)
+    }
     // reg = x29 - off (off may exceed imm12)
     fn lea_local(&mut self, reg: &str, off: u32) {
         if off <= 4095 {
             _ = writeln!(self.s, "\tsub {reg}, x29, #{off}");
+        } else if let Some(pos) = self.sp_add_slot(off) {
+            // Deep-frame slot: one `add reg,sp,#pos` instead of `mov x16,#off; sub reg,x29,x16`.
+            _ = writeln!(self.s, "\tadd {reg}, sp, #{pos}");
         } else {
             // Large-offset scratch is x16 (IP0), NOT x10: x10–x15 are caller-saved allocation
             // homes in the wide GP budget (§3), so this frame-address path must not clobber
