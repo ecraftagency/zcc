@@ -144,8 +144,8 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 0 | csel→sxtw dead-extend elim | 3,246 sites | HI | — | S | ✅ DONE `c7cf2f3` | **−3,381** |
 | 1 | `ubfx`/`sbfiz` fuse (shift+mask→1) | 730 sites (gcc has, zcc 0) | HI | LOW | S+P | ✅ DONE | **−252** (260 ubfx; 35% of ceil) |
 | 2 | redundant-sxtw peephole (ldrsw→sxtw, double, bitwise) | ~350 + tail | HI | LOW | S+P | ✅ DONE | **−410** (>100% of ceil) |
-| 3 | `smull`/`umull` fuse (ext+mul→1) | 98 sites | HI | LOW | S+P | ⬜ TODO | — |
-| 4 | scaled-index residual (extend `ExtFold`) | ~376 sites | MED | LOW-MED | S+P | ⬜ TODO | — |
+| 3 | `smull`/`umull` fuse (ext+mul→1) | 98 sites | HI | LOW | S+P | ⛔ ABANDONED (fundamental-limit) | **0** (see note ▼) |
+| 4 | immediate-offset addr forwarding (`t=base+#off`, all-mem uses → `[base,#off]`, drop add) | 1,088 sound (pred) | HI | LOW-MED | S | ✅ DONE `4fa83c8+` | **−1,664** (>150% of pred; pair_ldst 2nd-order) |
 | 5 | pre/post-index for sequential pointer loops | fixes sieve/matmul | MED | MED | S+P | ⬜ TODO | — |
 | — | **▲▲▲ LOCK LINE — 1→6 to death; everything above ships before anything below ▲▲▲** | | | | | | |
 | 6 | **w-form arithmetic** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,744 + ldrsw 4,116 ≈ **12.8k** | MED | MED-HIGH | S+P | ⬜ TODO | — |
@@ -153,6 +153,34 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 8 | coalescing extension (marshalling/param movs) | part of mov **+38k** | LO | HIGH | S | ☐ conditional | — |
 | 9 | compare-branch fusion / flag residency | cmp **+8.8k** | LO | MED | S+P | ☐ conditional | — |
 | 10 | SSA global register allocator (the rewrite / fork) | true 1× | — | HIGHEST | S | ☐ conditional | — |
+
+**LEVER 3 — ABANDONED, fundamental-limit (Law-4 cat-(a)), measured 2026-08-23 @ `4fa83c8`.**
+Block-local canonical-operand scan of all **1,579** x-form `mul`s in the sqlite stream:
+**both-operand-canonical = 0, one-operand-canonical = 0, none = 1,579.** `smull xD,wA,wB`
+computes `sxtw(wA)·sxtw(wB)`; it is semantics-preserving for `mul xD,xA,xB` **only if both xA,xB
+are sign-canonical** (`xN == sxtw(wN)`). The fork's value contract (commit `db9cb93`) makes int32
+homes **high-bits-don't-care** (w-form), so a lone int32 operand is *provably not* sign-canonical —
+the fusion can never fire safely. gcc's 98 smull come from gcc's **opposite** contract (values kept
+sign-extended); zcc instead already emits `int·int` as 32-bit `mul w,w,w` (no widen, no sxtw), which
+is *strictly better* than smull for the 32-bit-result case. This is a real consequence of the w-form
+design, not a convenience truncation → nothing to implement, nothing to revert, **0 banked, advance
+to Lever 4.** (Any future smull yield is downstream of Lever 6's contract, not a separate lever.)
+
+**LEVER 4 — DONE, immediate-offset address forwarding, `4fa83c8`→committed 2026-08-23.**
+The scoped "extend ExtFold" residual was near-exhausted (register-offset single-use miss = 10,
+pattern A = 2 — ExtFold already does its job). The real addressing residual (probe: 5,269 unfolded
+address-add+mem candidates) was dominated by **base+immediate, use_count≥2** (2,413) — a *different*
+transform than ExtFold: `try_fuse_addr`'s imm arm only fires for a single ADJACENT use. Generalized
+to a `compute_ext_folds`-style pre-pass (`compute_imm_folds`): an `Add(base,#off)` (addr type) whose
+EVERY use is a simple-GP Load/Store of the add-dest (scaled-reachable off, all in the defining
+block, `seen==use_count`) folds into each mem operand as `[base,#off]` and deletes the shared add.
+Soundness = base register-homed + `index_live_at(base, last_use)` (deleting the add extends base's
+range to the fold sites — the home must still hold base). Model-predicted **1,088** sound deletable
+adds; **realized −1,664** (pair_ldst pairs the freed `[base,#off]` accesses 2nd-order). Byte-identical
+output to `try_fuse_addr`'s imm arm. **Residual (Law-4):** spilled-base cases (reg=false, ~2,450) are
+category-(a)-ish — loading base to a register costs the add they'd save (no win); cross-block
+base-liveness declined by the block-local `index_live_at` is category-(b) but marginal. Lever
+over-performed its projection → no push round needed; banked, advance to Lever 5.
 
 **Session-start ritual (every time):** (1) re-read this §0; (2) state which numbered lever is next
 and its ceiling+confidence; (3) work it under the gate; (4) record real banked yield here; (5)

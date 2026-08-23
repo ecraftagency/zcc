@@ -242,6 +242,8 @@ struct Cg<'a> {
     // (a use at/after it ⟹ the allocator kept its home intact) — see compute_ext_folds.
     ext_fold: std::collections::HashMap<Tmp, ExtFold>,
     ext_skip: std::collections::HashSet<Tmp>,
+    // Immediate-offset address forwarding (Tier-1 #2c): add-dest → (base_home, byte_off).
+    imm_fold: std::collections::HashMap<Tmp, (u32, u32)>,
     // Backend addressing-fold: local slots normally address as `sub x9,x29,#off; [x9]`.
     // When the frame is fixed (no VLA) AND sp sits at its base (not displaced by call-arg
     // marshalling), the same slot is `[sp,#pos]` with pos = frame_total−off — one folded
@@ -897,11 +899,12 @@ impl Cg<'_> {
         };
     }
     fn store_gp_off(&mut self, rv: u32, rbase: u32, off: u32, t: TypeId) {
+        let (w, x) = (wr(rv), xr(rv)); // rv==31 → wzr/xzr (const-0 store); rv<31 → w{rv}/x{rv}
         _ = match self.a.tt.size(t) {
-            1 => writeln!(self.s, "\tstrb w{rv}, [x{rbase}, #{off}]"),
-            2 => writeln!(self.s, "\tstrh w{rv}, [x{rbase}, #{off}]"),
-            4 => writeln!(self.s, "\tstr w{rv}, [x{rbase}, #{off}]"),
-            _ => writeln!(self.s, "\tstr x{rv}, [x{rbase}, #{off}]"),
+            1 => writeln!(self.s, "\tstrb {w}, [x{rbase}, #{off}]"),
+            2 => writeln!(self.s, "\tstrh {w}, [x{rbase}, #{off}]"),
+            4 => writeln!(self.s, "\tstr {w}, [x{rbase}, #{off}]"),
+            _ => writeln!(self.s, "\tstr {x}, [x{rbase}, #{off}]"),
         };
     }
     // ARMv8 scaled-immediate reachability for an access of `size` bytes: off is a non-negative
@@ -2539,6 +2542,17 @@ impl<'a> Cg<'a> {
                 }
             }
             Inst::Load(d, ty, a) => {
+                // Tier-1 #2c: address forwarded to `[base, #off]` (the shared add was skipped).
+                if let Val::Tmp(t) = a {
+                    if let Some((rbase, off)) = self.imm_fold.get(t).copied() {
+                        let rd = self.gp_home(*d).unwrap_or(f);
+                        self.load_gp_off(rd, rbase, off, *ty);
+                        if self.gp_home(*d).is_none() {
+                            self.tmp_store(*d, &format!("x{f}"));
+                        }
+                        return;
+                    }
+                }
                 if self.simple_gp_load_ty(*ty) {
                     // Tier-1 #2 groundwork: address from its home, load into d's home.
                     let ra = self.src_gp(*a, f);
@@ -2554,6 +2568,15 @@ impl<'a> Cg<'a> {
                 }
             }
             Inst::Store(ty, a, v) => {
+                // Tier-1 #2c: address forwarded to `[base, #off]` (shared add skipped). imm-0 →
+                // wzr/xzr (rv=31); else the value from its home.
+                if let Val::Tmp(t) = a {
+                    if let Some((rbase, off)) = self.imm_fold.get(t).copied() {
+                        let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, f) };
+                        self.store_gp_off(rv, rbase, off, *ty);
+                        return;
+                    }
+                }
                 // Read the value from its home (no `mov x{f},vHome` funnel) — store() is now
                 // clobber-free so passing a live home is safe. Address funnels to x{f+1}
                 // (store reads [x{f+1}]); loading it there cannot clobber a spilled v in x{f}.
@@ -2940,6 +2963,58 @@ impl<'a> Cg<'a> {
         (folds, skip)
     }
 
+    // Immediate-offset address forwarding (Tier-1 #2c). See the call site for the theorem. Returns
+    // (add-dest → (base_home, byte_off), the add-dest temps to skip-emit). Runs AFTER coloring.
+    fn compute_imm_folds(&self, irf: &IrFunc) -> (std::collections::HashMap<Tmp, (u32, u32)>, std::collections::HashSet<Tmp>) {
+        use std::collections::{HashMap, HashSet};
+        let mut folds = HashMap::new();
+        let mut skip = HashSet::new();
+        let mut buf = Vec::new();
+        for blk in &irf.blocks {
+            let body = &blk.insts;
+            for (j, ins) in body.iter().enumerate() {
+                let Inst::Bin(t, Op::Add, ct, a, b) = ins else { continue };
+                if !self.is_addr_arith(*ct) { continue; }
+                let (base, off) = match (a, b) {
+                    (Val::Tmp(bs), Val::Imm(n)) | (Val::Imm(n), Val::Tmp(bs)) => {
+                        let Ok(o) = u32::try_from(*n) else { continue };
+                        (*bs, o)
+                    }
+                    _ => continue,
+                };
+                let Some(rbase) = self.gp_home(base) else { continue };
+                // Every use of t (in this block) must be a simple-GP mem access of t as address,
+                // at a scaled-reachable off; the tally must equal the global use_count (else a
+                // use escapes to a successor block or a non-mem consumer — decline).
+                let uc = self.use_count.get(*t as usize).copied().unwrap_or(0);
+                let mut seen = 0u32;
+                let mut ok = true;
+                let mut last_pos = j;
+                for (k, u) in body[j + 1..].iter().enumerate() {
+                    buf.clear();
+                    ir::inst_uses(u, &mut buf);
+                    if !buf.contains(t) { continue; }
+                    let good = match u {
+                        Inst::Load(_, lty, Val::Tmp(x)) if x == t =>
+                            self.simple_gp_load_ty(*lty) && self.scaled_off(off, self.a.tt.size(*lty)),
+                        // exclude a store whose VALUE is t itself (would need t materialized)
+                        Inst::Store(sty, Val::Tmp(x), v) if x == t && !matches!(v, Val::Tmp(y) if y == t) =>
+                            self.simple_gp_store_ty(*sty) && self.scaled_off(off, self.a.tt.size(*sty)),
+                        _ => false,
+                    };
+                    if !good { ok = false; break; }
+                    seen += 1;
+                    last_pos = j + 1 + k;
+                }
+                if ok && seen == uc && seen >= 1 && index_live_at(body, &blk.term, base, last_pos) {
+                    folds.insert(*t, (rbase, off));
+                    skip.insert(*t);
+                }
+            }
+        }
+        (folds, skip)
+    }
+
     fn emit_ir_body(&mut self, irf: &IrFunc) {
         // IR temps live BELOW the C frame (and below the 192B variadic-save region if
         // present, which emit_params already subtracted). Parameters already sit in frame
@@ -3064,6 +3139,18 @@ impl<'a> Cg<'a> {
         let (folds, skip) = self.compute_ext_folds(irf);
         self.ext_fold = folds;
         self.ext_skip = skip;
+        // Tier-1 #2c — immediate-offset address forwarding. An `Add(base, #off)` (address type)
+        // whose EVERY use is a simple-GP Load/Store of the add-dest (at a scaled-reachable off,
+        // all in the DEFINING block) is folded into each mem operand as `[base, #off]`, deleting
+        // the shared add — the multi-use / non-adjacent generalization of try_fuse_addr's imm arm
+        // (which only fires for a single adjacent use). Soundness: base register-homed AND live at
+        // the last use of t (index_live_at — so deleting the add, which extends base's live range
+        // to the fold sites, never reads a recycled home); `seen == use_count` proves no
+        // out-of-block or non-mem use escapes the rewrite. Byte-identical to try_fuse_addr's imm
+        // output (load_gp_off/store_gp_off/store_z). Machine translation-validation; opt-parity 0.
+        let (imm_folds, imm_skip) = self.compute_imm_folds(irf);
+        self.imm_fold = imm_folds;
+        self.ext_skip.extend(imm_skip);
         // Two-pass branch-range guard (the correct-but-deferred fix promised above). The
         // `est` heuristic can under-count a giant-frame function (each spilled access lowers
         // to ~4 insns, an expansion `est` does not model), leaving a cb(n)z/b.cc in NEAR form
@@ -4277,6 +4364,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         use_count: Vec::new(),
         ext_fold: std::collections::HashMap::new(),
         ext_skip: std::collections::HashSet::new(),
+        imm_fold: std::collections::HashMap::new(),
         sp_at_base: true,
         fdynstack: false,
         near_branch: false,
