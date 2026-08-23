@@ -142,6 +142,32 @@ fn is_logical_imm(val: u64) -> bool {
 
 const EPILOGUE: &str = "\tmov sp, x29\n\tldp x29, x30, [sp], #16\n\tret\n";
 
+// index32 is LIVE at the Add (body position `add_pos`) iff some later instruction in the
+// same block, or the terminator, reads it — proving the allocator kept its home holding
+// index32 across the Add, so the extended operand reads the right value.
+fn index_live_at(body: &[Inst], term: &Term, src: Tmp, add_pos: usize) -> bool {
+    let mut buf = Vec::new();
+    for ins in &body[add_pos + 1..] {
+        buf.clear();
+        ir::inst_uses(ins, &mut buf);
+        if buf.contains(&src) {
+            return true;
+        }
+    }
+    buf.clear();
+    ir::term_uses(term, &mut buf);
+    buf.contains(&src)
+}
+
+// One scaled-indexed-with-extend memory operand `[x{base}, w{index_w}, <sxtw|uxtw> #shift]`.
+#[derive(Clone, Copy)]
+struct ExtFold {
+    base: u32,    // home register of the address base
+    index_w: u32, // home register of the 32-bit index (read as its w-half)
+    signed: bool, // sxtw (signed source) vs uxtw (unsigned source)
+    shift: u32,   // 0, or log2(access size) — the only two ARM-encodable amounts
+}
+
 struct Cg<'a> {
     s: String,
     a: &'a Ast,
@@ -189,6 +215,15 @@ struct Cg<'a> {
     // per function via the authoritative opt::each_use visitor. A temp used exactly once is
     // safe to fold-and-delete (its sole use is the Load whose address it computes).
     use_count: Vec<u32>,
+    // Scaled-indexed addressing with extend (batch#2). ARM64 `[Xn, Wm, sxtw{#s}]` folds a
+    // 32-bit index's sign/zero-extend + address-add into the memory operand itself. `ext_fold`
+    // maps an `Add(base, widen(index32))` dest temp → the (base, w-index, extend, shift) to
+    // emit; `ext_skip` names the widening Cast (and any scaling Shl) temps whose value is now
+    // absorbed into the operand and must NOT be emitted. Sound iff the Add feeds ONE simple-GP
+    // mem access (single-use), the widen/shift are single-use, and index32 is LIVE at the Add
+    // (a use at/after it ⟹ the allocator kept its home intact) — see compute_ext_folds.
+    ext_fold: std::collections::HashMap<Tmp, ExtFold>,
+    ext_skip: std::collections::HashSet<Tmp>,
     // Backend addressing-fold: local slots normally address as `sub x9,x29,#off; [x9]`.
     // When the frame is fixed (no VLA) AND sp sits at its base (not displaced by call-arg
     // marshalling), the same slot is `[sp,#pos]` with pos = frame_total−off — one folded
@@ -769,6 +804,14 @@ impl Cg<'_> {
             Ty::Bool | Ty::Float | Ty::LDouble | Ty::Bitfield(..)
         )
     }
+    // An `Add` computes an ADDRESS (so its result feeds a mem operand and its operands are
+    // 64-bit) iff its type is a pointer/array, or a plain 8-byte scalar (a `long` used as an
+    // address). This gates every base+index addressing fold. Array-typed pointer arithmetic
+    // (`is[j]` on a global array — ct = the array type, size ≫ 8) is address arithmetic too;
+    // the old `size(ct)==8` gate wrongly rejected it, so array indexing never folded.
+    fn is_addr_arith(&self, ct: TypeId) -> bool {
+        matches!(self.a.tt.tys[ct as usize], Ty::Ptr(_) | Ty::Array(..)) || self.a.tt.size(ct) == 8
+    }
     fn load_gp_sp(&mut self, rd: u32, pos: u32, t: TypeId) {
         let u = self.a.tt.is_unsigned(t);
         _ = match (self.a.tt.size(t), u) {
@@ -861,6 +904,45 @@ impl Cg<'_> {
             _ => writeln!(self.s, "\tldr x{rd}, [x{rbase}, x{rindex}]"),
         };
     }
+    // Extended-register forms (batch#2): `[Xn, Wm, sxtw|uxtw {#s}]` — the index is a 32-bit
+    // Wm, extended (sign/zero) and optionally shifted by log2(access), all inside the operand.
+    // `#0` is elided (bare `sxtw`); s is 0 or log2(size), the only ARM-encodable amounts.
+    fn ext_suffix(f: &ExtFold) -> String {
+        let e = if f.signed { "sxtw" } else { "uxtw" };
+        if f.shift == 0 { format!(", {e}") } else { format!(", {e} #{}", f.shift) }
+    }
+    fn load_idx_ext(&mut self, rd: u32, f: &ExtFold, t: TypeId) {
+        let (sfx, u) = (Self::ext_suffix(f), self.a.tt.is_unsigned(t));
+        let (b, w) = (f.base, f.index_w);
+        _ = match (self.a.tt.size(t), u) {
+            (1, false) => writeln!(self.s, "\tldrsb x{rd}, [x{b}, w{w}{sfx}]"),
+            (1, true) => writeln!(self.s, "\tldrb w{rd}, [x{b}, w{w}{sfx}]"),
+            (2, false) => writeln!(self.s, "\tldrsh x{rd}, [x{b}, w{w}{sfx}]"),
+            (2, true) => writeln!(self.s, "\tldrh w{rd}, [x{b}, w{w}{sfx}]"),
+            (4, false) => writeln!(self.s, "\tldrsw x{rd}, [x{b}, w{w}{sfx}]"),
+            (4, true) => writeln!(self.s, "\tldr w{rd}, [x{b}, w{w}{sfx}]"),
+            _ => writeln!(self.s, "\tldr x{rd}, [x{b}, w{w}{sfx}]"),
+        };
+    }
+    fn store_idx_ext(&mut self, rv: u32, f: &ExtFold, t: TypeId) {
+        let (sfx, b, w) = (Self::ext_suffix(f), f.base, f.index_w);
+        _ = match self.a.tt.size(t) {
+            1 => writeln!(self.s, "\tstrb w{rv}, [x{b}, w{w}{sfx}]"),
+            2 => writeln!(self.s, "\tstrh w{rv}, [x{b}, w{w}{sfx}]"),
+            4 => writeln!(self.s, "\tstr w{rv}, [x{b}, w{w}{sfx}]"),
+            _ => writeln!(self.s, "\tstr x{rv}, [x{b}, w{w}{sfx}]"),
+        };
+    }
+    // Register-offset store (the plain `[Xn, Xm]` form — the store counterpart of load_idx,
+    // which was missing). Both 64-bit; value read first (store never clobbers its inputs).
+    fn store_idx(&mut self, rv: u32, rbase: u32, rindex: u32, t: TypeId) {
+        _ = match self.a.tt.size(t) {
+            1 => writeln!(self.s, "\tstrb w{rv}, [x{rbase}, x{rindex}]"),
+            2 => writeln!(self.s, "\tstrh w{rv}, [x{rbase}, x{rindex}]"),
+            4 => writeln!(self.s, "\tstr w{rv}, [x{rbase}, x{rindex}]"),
+            _ => writeln!(self.s, "\tstr x{rv}, [x{rbase}, x{rindex}]"),
+        };
+    }
     // Tier-1 #2 — addressing-mode fold (BURS / maximal munch). Recognize the tree
     // `Load(Add(base, index))` when the Add's result feeds ONLY that Load and both operands
     // are register-resident, and emit ONE register-offset load — deleting the separate `add`.
@@ -875,7 +957,7 @@ impl Cg<'_> {
         let Inst::Bin(t, Op::Add, ct, a, b) = &insts[i] else {
             return None;
         };
-        if self.a.tt.size(*ct) != 8 {
+        if !self.is_addr_arith(*ct) {
             return None;
         }
         // the address temp must feed exactly one Load, which must be simple-GP-widthed
@@ -902,6 +984,10 @@ impl Cg<'_> {
         let rd = self.gp_home(*d).unwrap_or(0);
         if let Some((rbase, off)) = imm_form {
             self.load_gp_off(rd, rbase, off, *lty);
+        } else if let Some(f) = self.ext_fold.get(t).copied() {
+            // batch#2: `ldr rd, [base, w-index, extend #s]` — the widening Cast that produced
+            // the index is skipped in the emit loop (ext_skip).
+            self.load_idx_ext(rd, &f, *lty);
         } else {
             // base + index register form: `ldr [base, index]`
             let (Val::Tmp(ta), Val::Tmp(tb)) = (a, b) else {
@@ -935,7 +1021,7 @@ impl Cg<'_> {
         let Inst::Bin(t, Op::Add, ct, a, b) = &insts[i] else {
             return None;
         };
-        if self.a.tt.size(*ct) != 8 {
+        if !self.is_addr_arith(*ct) {
             return None;
         }
         let Some(Inst::Store(sty, Val::Tmp(ta), v)) = insts.get(i + 1) else {
@@ -947,19 +1033,34 @@ impl Cg<'_> {
         if self.use_count.get(*t as usize).copied().unwrap_or(0) != 1 {
             return None;
         }
-        let (base, n) = match (a, b) {
-            (Val::Tmp(base), Val::Imm(n)) | (Val::Imm(n), Val::Tmp(base)) => (*base, *n),
-            _ => return None,
-        };
-        let (Some(rbase), Ok(off)) = (self.gp_home(base), u32::try_from(n)) else {
-            return None;
-        };
-        if !self.scaled_off(off, self.a.tt.size(*sty)) {
-            return None;
+        // base + immediate byte-offset: `str rv, [base, #off]` (struct-field write).
+        if let (Val::Tmp(base), Val::Imm(n)) | (Val::Imm(n), Val::Tmp(base)) = (a, b) {
+            let (Some(rbase), Ok(off)) = (self.gp_home(*base), u32::try_from(*n)) else {
+                return None;
+            };
+            if !self.scaled_off(off, self.a.tt.size(*sty)) {
+                return None;
+            }
+            let rv = self.src_gp(*v, 0);
+            self.store_gp_off(rv, rbase, off, *sty);
+            return Some(2);
         }
-        // read the value from its home (store_gp_off never clobbers it); rbase read as base.
+        // batch#2: `str rv, [base, w-index, extend #s]` (the widening Cast is skipped).
+        if let Some(f) = self.ext_fold.get(t).copied() {
+            let rv = self.src_gp(*v, 0);
+            self.store_idx_ext(rv, &f, *sty);
+            return Some(2);
+        }
+        // base + index register form: `str rv, [base, index]` (the store counterpart of
+        // load_idx, previously missing — the sieve `is[j]=0` inner store).
+        let (Val::Tmp(ta), Val::Tmp(tb)) = (a, b) else {
+            return None;
+        };
+        let (Some(rbase), Some(rindex)) = (self.gp_home(*ta), self.gp_home(*tb)) else {
+            return None;
+        };
         let rv = self.src_gp(*v, 0);
-        self.store_gp_off(rv, rbase, off, *sty);
+        self.store_idx(rv, rbase, rindex, *sty);
         Some(2)
     }
     fn try_fuse_madd(&mut self, insts: &[Inst], i: usize) -> Option<usize> {
@@ -2571,6 +2672,91 @@ impl<'a> Cg<'a> {
         }
     }
 
+    // batch#2 recognition: find every `Add(base, widen(index32))` (optionally scaled by a
+    // Shl) that feeds ONE simple-GP mem access, and that can fold into a `[base, w-index,
+    // extend #s]` operand. Returns (Add-dest → ExtFold, the Cast/Shl temps to skip). Runs
+    // AFTER coloring (needs gp_home). SOUNDNESS obligations, all discharged here:
+    //   • the Add is single-use and immediately feeds the mem access (adjacency) — deleting
+    //     it + reusing the address changes no observation;
+    //   • the widening Cast (and the scaling Shl, if any) are single-use — suppressing them
+    //     drops now-dead values;
+    //   • index32 is LIVE at the Add: it has a use at/after the Add in the same block (or in
+    //     the terminator) ⟹ the allocator never reused its home between the Cast and the Add,
+    //     so reading its w-register at the operand yields index32's value. If the only later
+    //     use is in a successor block we conservatively DECLINE (block-local check) — sound,
+    //     just misses some. base and index32 must both be register-homed.
+    fn compute_ext_folds(&self, irf: &IrFunc) -> (std::collections::HashMap<Tmp, ExtFold>, std::collections::HashSet<Tmp>) {
+        use std::collections::{HashMap, HashSet};
+        // def map: temp → its defining Inst; a multiply-defined temp is poisoned (removed) so
+        // we never fold across a non-unique definition.
+        let mut def: HashMap<Tmp, &Inst> = HashMap::new();
+        let mut poison: HashSet<Tmp> = HashSet::new();
+        for blk in &irf.blocks {
+            for ins in &blk.insts {
+                if let Some(d) = ir::inst_def(ins) {
+                    if def.insert(d, ins).is_some() { poison.insert(d); }
+                }
+            }
+        }
+        for p in &poison { def.remove(p); }
+        // classify offset temp `o` (single-use): Cast(index32) [shift 0] or Shl(Cast(index32),k)
+        // [shift k==log2(asize)] → (index32, signed, shift). asize = the access byte width.
+        let classify = |o: Tmp, asize: u32| -> Option<(Tmp, bool, u32, Option<Tmp>)> {
+            let widen = |c: &Inst| -> Option<(Tmp, bool)> {
+                match c {
+                    Inst::Cast(_, from, to, Val::Tmp(src))
+                        if self.a.tt.size(*from) == 4 && self.a.tt.size(*to) == 8 =>
+                        Some((*src, !self.a.tt.is_unsigned(*from))),
+                    _ => None,
+                }
+            };
+            match def.get(&o)? {
+                // scale 1: the index IS the byte offset (char array / already scaled). shift 0
+                // is always encodable, for any access width.
+                c @ Inst::Cast(..) => widen(c).map(|(src, s)| (src, s, 0, None)),
+                // scale 2^k: Shl(widen(index), k) with k == log2(asize). The inner Cast (w) is
+                // also suppressed; require it single-use.
+                Inst::Bin(_, Op::Shl, _, Val::Tmp(w), Val::Imm(k))
+                    if *k > 0 && (1u32 << *k) == asize
+                        && self.use_count.get(*w as usize).copied().unwrap_or(0) == 1 =>
+                {
+                    widen(def.get(w)?).map(|(src, s)| (src, s, *k as u32, Some(*w)))
+                }
+                _ => None,
+            }
+        };
+        let mut folds = HashMap::new();
+        let mut skip = HashSet::new();
+        for blk in &irf.blocks {
+            let body = &blk.insts;
+            for (j, ins) in body.iter().enumerate() {
+                let Inst::Bin(t, Op::Add, ct, Val::Tmp(x), Val::Tmp(y)) = ins else { continue };
+                if !self.is_addr_arith(*ct) || self.use_count.get(*t as usize).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                // the Add must be IMMEDIATELY followed by a simple-GP Load/Store of Tmp(t)
+                let access = match body.get(j + 1) {
+                    Some(Inst::Load(_, lty, Val::Tmp(la))) if la == t && self.simple_gp_load_ty(*lty) => *lty,
+                    Some(Inst::Store(sty, Val::Tmp(ta), _)) if ta == t && self.simple_gp_store_ty(*sty) => *sty,
+                    _ => continue,
+                };
+                let asize = self.a.tt.size(access);
+                // try each operand as the (single-use) index, the other as base
+                for (bb, oo) in [(*x, *y), (*y, *x)] {
+                    if self.use_count.get(oo as usize).copied().unwrap_or(0) != 1 { continue; }
+                    let Some((src, signed, shift, inner)) = classify(oo, asize) else { continue };
+                    let (Some(rbase), Some(rindex)) = (self.gp_home(bb), self.gp_home(src)) else { continue };
+                    if !index_live_at(body, &blk.term, src, j) { continue; }
+                    folds.insert(*t, ExtFold { base: rbase, index_w: rindex, signed, shift });
+                    skip.insert(oo);
+                    if let Some(w) = inner { skip.insert(w); }
+                    break;
+                }
+            }
+        }
+        (folds, skip)
+    }
+
     fn emit_ir_body(&mut self, irf: &IrFunc) {
         // IR temps live BELOW the C frame (and below the 192B variadic-save region if
         // present, which emit_params already subtracted). Parameters already sit in frame
@@ -2678,6 +2864,10 @@ impl<'a> Cg<'a> {
                 }
             });
         }
+        // batch#2 scaled-indexed-with-extend fold: needs use_count (above) + homes (talloc).
+        let (folds, skip) = self.compute_ext_folds(irf);
+        self.ext_fold = folds;
+        self.ext_skip = skip;
         // Two-pass branch-range guard (the correct-but-deferred fix promised above). The
         // `est` heuristic can under-count a giant-frame function (each spilled access lowers
         // to ~4 insns, an expansion `est` does not model), leaving a cb(n)z/b.cc in NEAR form
@@ -2712,6 +2902,14 @@ impl<'a> Cg<'a> {
             let body = &blk.insts[..body_len];
             let mut ii = 0;
             while ii < body_len {
+                // batch#2: the widening Cast / scaling Shl whose value was absorbed into a
+                // `[base, w-index, extend]` operand is now dead — skip emitting it.
+                if let Some(d) = ir::inst_def(&body[ii]) {
+                    if self.ext_skip.contains(&d) {
+                        ii += 1;
+                        continue;
+                    }
+                }
                 if let Some(n) = self
                     .try_fuse_addr(body, ii)
                     .or_else(|| self.try_fuse_store_addr(body, ii))
@@ -3723,6 +3921,8 @@ pub fn emit_ir(ast: &Ast) -> String {
         csave_gp: Vec::new(),
         csave_fp: Vec::new(),
         use_count: Vec::new(),
+        ext_fold: std::collections::HashMap::new(),
+        ext_skip: std::collections::HashSet::new(),
         sp_at_base: true,
         fdynstack: false,
         near_branch: false,
