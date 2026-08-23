@@ -33,7 +33,7 @@
 > + push "release candidate 1".** Progress checkboxes below are the resume pointer — update them
 > as each phase completes (a phase is done only when its gate is green + result recorded here).
 
-- **Phase A — LEVER 7 (w-form arithmetic, THE HINGE), 3 grind rounds.** ⬜ IN PROGRESS
+- **Phase A — LEVER 7 (w-form arithmetic, THE HINGE), 3 grind rounds.** ✅ DONE (banked, committed `ff14371`)
   - Goal: eliminate the residual `sxtw`/`ldrsw` re-canonicalization (measured ~8.3k sxtw + ldrsw
     ≈ 12.8k) that the partial w-form contract still emits. Root: int32 kept sign-canonical in
     64-bit homes; w-form makes high bits don't-care so most sxtw are dead.
@@ -41,9 +41,14 @@
     widening (Cast int→long, address-index — KEEP) vs redundant re-canon (DROP); (3) kill the
     biggest redundant class; (4) FULL GATE (cargo + opt-parity + torture + csmith300 + yarpgen300);
     (5) any DIVERGE → `git reset --hard` that round, mark the class BLOCKED, advance. Bank每 positive.
-  - Round ledger: R1 ⬜  · R2 ⬜  · R3 ⬜  — record Δinsn + commit hash each.
-  - Exit Phase A when 3 rounds done OR sxtw residual = genuine-widening-only (exhausted). Record
-    final sqlite insn count + ratio. **Whether it banks or not, PROCEED to Phase B.**
+  - Round ledger: **R1 ✅ −1,287** (demand-side `drop_wform_sxtw`: forward scan, x-form read→KEEP,
+    redef-first→DROP; in-place sxtw 4,438→3,271) · **R2 ✅ −192** (dead in-place sxtw in
+    `drop_dead_moves` backward-liveness, catches across-boundary cases R1 keeps) · **R3 = declared
+    EXHAUSTED** (residual ~3,200 in-place sxtw are x-form-demanded or live-across-boundary =
+    fundamental-limit for an intra-block asm peephole; cross-block dataflow = lever 11).
+  - **Result: sqlite 298,070 → 296,591 (−1,479, −0.50%); ratio 1.916×→1.879× gcc-O1.** Ceiling was
+    ~12.8k projected; realized 1,479 (11.5%) — structural projection realizes 5–10%, as expected.
+    Gate all-green. +6 inline lever-7 tests (cargo 122→128). **PROCEEDING to Phase B.**
 - **Phase B — AUDIT PASS 1 (Law-1 Side I: every LOC ↔ theorem space, NO exception).** ⬜ TODO
   - Walk `src/*.rs` file by file (fan out to subagents to keep context clean; write findings to
     `AUDIT-RC1.md`). For each function/block: does it realize a THEORY.md Part-I theorem
