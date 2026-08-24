@@ -146,14 +146,14 @@
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ✅ BANKED — composite-marshal no-hazard fast path (skip stack round-trip). See note ⓴ |
 | 21 | **many-arg marshalling** (5.4) | BOTH | ✅ BANKED — GP parallel-move for the >8-arg hazard path (was spill-all/pop-reverse). See note ㉑ |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
-| 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⬜ re-eval under speed metric (was size-negative → parked; speed lever now) |
+| 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⚠️ re-eval DONE → stays OFF, deferred → #25 (geo40 +0.31% sub-threshold + size-negative; j2 win needs hotness gating). See note ㉓ |
 | 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
 | 25 | ☢ **NUCLEAR — SSA global register allocator** (GP+FP class, coalescing, spill-cost model) — subsumes 4.3, kills the uniform residency floor | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #23 (LICM / invariant-setup hoist, re-eval under speed).
-#22 ⚠️ DEFERRED → #25 (FP residency = FP arm of nuclear regalloc). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
+only path to size *and* speed ≈ 1.0×. **RESUME = #24 (SCEV final-value + loop-DCE, NEW infra).
+#23 ⚠️ re-eval DONE → LICM stays OFF → #25. #22 ⚠️ DEFERRED → #25 (FP residency). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
 
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
@@ -298,6 +298,19 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #23 (LICM / invariant-setup 
 > (kills the round-trips) — both = the register-primary rewrite, NOT a bounded lever. The one bounded
 > transform (block-local narrow-widen elimination) was Law-3-refuted before shipping (Δ≈0, cross-block
 > anchor). No positive to bank; tree unchanged. NO-PIVOT: quarantine-mark-advance. **RESUME = #23.**
+
+> **㉓ #23 LICM / INVARIANT-SETUP HOIST — re-eval under speed metric (session 2026-08-24). ⚠️ stays OFF → #25.**
+> Same-session geo40 exec A/B (the arbiter): LICM off **1.5548×**, `ZCC_OPT_ON=licm` **1.5500×** = +0.31%
+> — below the ≥0.5% bank threshold, and within single-run noise. Per-program best-of-9 shows the win is
+> real but ISOLATED: **j2_histogram 88→76ms (−13.6%)** (invariant global-address `adrp;add` hoisted out
+> of the accumulate loop), while d2/h1/j5 are flat (memory-bound; the hoisted ALU insns hid in the load
+> shadow — the same floor #17/#18/#22 measured). Size stays negative (sqlite +340, per the LICM-close
+> ledger): the pass already hoists only the narrow `adrp;add`, yet preheader cost across sqlite's many
+> COLD loops outweighs it — the regression is inherent to hoisting without hotness/iteration-count info.
+> So the re-eval CONFIRMS the historical verdict (stays OFF): +0.31% geo40 is sub-threshold and buys a
+> size regression on the other ultimatum axis. The j2-class hot-loop win is real but needs a
+> hotness/pressure cost-model to hoist selectively (net-positive on BOTH axes) — that is #25's regalloc
+> cost model, not a bounded flip. NO-PIVOT: measured, sub-threshold, deferred. **RESUME = #24.**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 
