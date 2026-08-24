@@ -195,11 +195,13 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
         crosses_call: crosses_call.clone(),
         phys_conflict: Vec::new(),
     };
+    let mut lu = LastUse::new(sp);
     for bi in 0..f.blocks.len() {
         if !cfg.reachable(bi as MBlockId) {
             continue;
         }
-        let last = last_use(f, sp, &pre, bi);
+        last_use_into(f, sp, &pre, bi, &mut lu);
+        let last = &lu.at;
         let mut live: BTreeSet<usize> = live_in[bi].clone();
         for &p in &f.blocks[bi].params {
             live.insert(sp.idx(p));
@@ -254,20 +256,62 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
 /// inside this block). Both the spiller and the colourer walk a block forward
 /// maintaining a live set, and this is what tells them when to drop a value —
 /// without it a "live set" only ever grows and every pressure reading is wrong.
-pub fn last_use(f: &MFunc, sp: Space, lv: &Liveness, b: usize) -> Vec<Option<usize>> {
+/// For each value, the index of its LAST use inside block `b` — `usize::MAX`
+/// when it escapes through `live_out`, `None` when it is not used here at all.
+///
+/// COMPLEXITY: the result is indexed by value, but it is written into a buffer
+/// the CALLER owns and only the entries this block touches are reset. Allocating
+/// and zeroing a fresh `Vec<Option<usize>>` of every value in the function, once
+/// per block, is quadratic — invisible on a small function and the dominant cost
+/// on a real one.
+pub fn last_use_into(f: &MFunc, sp: Space, lv: &Liveness, b: usize, buf: &mut LastUse) {
+    buf.reset();
     let blk = &f.blocks[b];
-    let mut last: Vec<Option<usize>> = vec![None; sp.len()];
+    let mut set = |buf: &mut LastUse, i: usize, at: usize| {
+        if buf.at[i].is_none() {
+            buf.touched.push(i);
+        }
+        buf.at[i] = Some(at);
+    };
     for (i, inst) in blk.insts.iter().enumerate() {
+        let mut hits: Vec<usize> = Vec::new();
         inst.visit(&mut |r, c| {
             if matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
-                last[sp.idx(r)] = Some(i);
+                hits.push(sp.idx(r));
             }
         });
+        for h in hits {
+            set(buf, h, i);
+        }
     }
     let n = blk.insts.len();
-    blk.term.visit(&mut |r, _| last[sp.idx(r)] = Some(n));
-    for &i in &lv.live_out[b] {
-        last[i] = Some(usize::MAX);
+    let mut hits: Vec<usize> = Vec::new();
+    blk.term.visit(&mut |r, _| hits.push(sp.idx(r)));
+    for h in hits {
+        set(buf, h, n);
     }
-    last
+    for &i in &lv.live_out[b] {
+        set(buf, i, usize::MAX);
+    }
+}
+
+/// A reusable last-use buffer (see `last_use_into`).
+pub struct LastUse {
+    pub at: Vec<Option<usize>>,
+    touched: Vec<usize>,
+}
+
+impl LastUse {
+    pub fn new(sp: Space) -> LastUse {
+        LastUse {
+            at: vec![None; sp.len()],
+            touched: Vec::new(),
+        }
+    }
+    fn reset(&mut self) {
+        for &i in &self.touched {
+            self.at[i] = None;
+        }
+        self.touched.clear();
+    }
 }

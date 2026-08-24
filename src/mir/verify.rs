@@ -191,6 +191,32 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
                 return Err(format!("integer ALU at width {:?}", w));
             }
         }
+        MInst::StackAlloc { dst, size } => {
+            want(*dst, Class::Gpr, "dst")?;
+            want(*size, Class::Gpr, "size")?;
+        }
+        MInst::LdAxr { dst, addr, .. } => {
+            want(*dst, Class::Gpr, "dst")?;
+            want(*addr, Class::Gpr, "addr")?;
+        }
+        MInst::StlXr {
+            status, src, addr, ..
+        } => {
+            want(*status, Class::Gpr, "status")?;
+            want(*src, Class::Gpr, "src")?;
+            want(*addr, Class::Gpr, "addr")?;
+        }
+        MInst::Stlr { src, addr, .. } => {
+            want(*src, Class::Gpr, "src")?;
+            want(*addr, Class::Gpr, "addr")?;
+        }
+        MInst::Mrs { dst } | MInst::SpAddr { dst, .. } => want(*dst, Class::Gpr, "dst")?,
+        MInst::AddTprel { dst, base, .. } => {
+            want(*dst, Class::Gpr, "dst")?;
+            want(*base, Class::Gpr, "base")?;
+        }
+        // opaque by construction: the template's registers are already physical
+        MInst::Dmb | MInst::Asm { .. } => {}
         MInst::Alu3 { dst, a, b, c, .. } => {
             for (r, n) in [(dst, "dst"), (a, "a"), (b, "b"), (c, "c")] {
                 want(*r, Class::Gpr, n)?;
@@ -312,6 +338,9 @@ fn check_addr(f: &MFunc, m: &AddrMode) -> Result<(), String> {
                 Ok(())
             }
         }
+        // AAPCS64 §6.4: the outgoing area is sp-relative by definition — it has
+        // no register operand to check.
+        AddrMode::SpArg { .. } => Ok(()),
     }
 }
 

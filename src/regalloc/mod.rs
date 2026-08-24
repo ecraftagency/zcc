@@ -24,16 +24,20 @@ use crate::cfg::DomTree;
 use crate::mir::*;
 
 pub fn allocate(f: &mut MFunc) -> Result<(), String> {
+    use crate::compile::phase;
     prune_unreachable(f);
     destruct::split_critical_edges(f);
-    spill::spill(f)?;
-    let cfg = crate::mir::verify::cfg(f);
-    let lv = live::compute(f, &cfg);
-    let dt = DomTree::new(&cfg, f.entry);
-    let col = color::color(f, &lv, &dt)?;
-    destruct::apply_colors(f, &col.color)?;
-    destruct::destruct(f);
-    destruct::sequentialize(f);
+    phase("  spill", || spill::spill(f))?;
+    let cfg = phase("  cfg", || crate::mir::verify::cfg(f));
+    let lv = phase("  liveness", || live::compute(f, &cfg));
+    let dt = phase("  domtree", || DomTree::new(&cfg, f.entry));
+    let col = phase("  colour", || color::color(f, &lv, &dt))?;
+    phase("  destruct", || {
+        destruct::apply_colors(f, &col.color)?;
+        destruct::destruct(f);
+        destruct::sequentialize(f);
+        Ok::<(), String>(())
+    })?;
     // The prologue must preserve exactly the callee-saved registers this
     // function actually writes — no more (AAPCS64 §6.1.1). `frame` reads this.
     let mut saved = RegSet::default();

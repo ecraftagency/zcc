@@ -26,7 +26,7 @@ pub fn as_rhs(op: AluOp, k: i64, w: Width) -> Option<Rhs> {
                 None
             }
         }
-        AluOp::Mul | AluOp::SDiv | AluOp::UDiv => None,
+        AluOp::Mul | AluOp::SDiv | AluOp::UDiv | AluOp::SMulH | AluOp::UMulH => None,
     }
 }
 

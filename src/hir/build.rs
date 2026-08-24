@@ -92,6 +92,16 @@ struct Loop {
     cont: BlockId,
 }
 
+/// A bit-field access window, decoded once from `Ty::Bitfield`.
+#[derive(Clone, Copy)]
+struct Bf {
+    /// the container's HIR type — the width actually loaded and stored
+    ct: Ty,
+    unsigned: bool,
+    boff: u32,
+    w: u32,
+}
+
 struct B<'a> {
     ast: &'a Ast,
     f: Func,
@@ -149,6 +159,7 @@ impl<'a> B<'a> {
             return b;
         }
         let b = self.f.new_block();
+        self.f.blocks[b as usize].is_label = true;
         self.labels.insert(name.to_string(), b);
         b
     }
@@ -181,6 +192,509 @@ impl<'a> B<'a> {
         });
     }
 
+    // ── bit-fields (C99 6.7.2.1) ───────────────────────────────────────────
+    // A bit-field lvalue is an ordinary lvalue of its CONTAINER type plus a
+    // (bit offset, bit width) window: `Ty::Bitfield(container, boff, w)` with
+    // the member's byte offset already pointing at the container. Access is the
+    // two shift theorems, done at the promoted width so the HIR invariant
+    // "no arithmetic at I8/I16" (see `promote`) is never broken:
+    //   read  ⟦f⟧ = (x << (N−boff−w)) >>ₛ (N−w)      s = signed ? ashr : lshr
+    //   write ⟦f⟧ = (x & ~M) | ((v << boff) & M),  M = ((1<<w)−1) << boff
+    // The write is a read-modify-write of the whole container: C99 6.7.2.1p10
+    // leaves the other bits of the addressable unit unspecified to touch, and
+    // the neighbours' bits must survive — which is exactly what `~M` preserves.
+    /// C99 long double on ELF: the object in memory is binary128, so an access
+    /// is never a plain load/store (see `IntrinKind::LdLoad`).
+    fn is_ld(&self, t: TypeId) -> bool {
+        matches!(self.tt().tys[t as usize], ast::Ty::LDouble)
+    }
+
+    fn ld_load(&mut self, addr: Operand) -> Operand {
+        self.def(Ty::F64, |dst| Inst::Intrinsic {
+            dst: Some(dst),
+            kind: IntrinKind::LdLoad,
+            args: vec![addr],
+        })
+    }
+
+    fn ld_store(&mut self, addr: Operand, v: Operand) {
+        self.push(Inst::Intrinsic {
+            dst: None,
+            kind: IntrinKind::LdStore,
+            args: vec![addr, v],
+        });
+    }
+
+    fn bf_of(&self, t: TypeId) -> Option<Bf> {
+        match self.tt().tys[t as usize] {
+            ast::Ty::Bitfield(b, boff, w) => Some(Bf {
+                ct: hty(self.tt(), b),
+                unsigned: self.tt().is_unsigned(b),
+                boff,
+                w,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The width the shifts run at: a container narrower than `int` is promoted,
+    /// which is also the width C99 6.3.1.1 gives the field's value.
+    fn bf_wide(bf: &Bf) -> Ty {
+        if bf.ct.bits() <= 32 { Ty::I32 } else { Ty::I64 }
+    }
+
+    /// Extract the field from a container-width value already in a register.
+    fn bf_extract(&mut self, x: Operand, bf: &Bf) -> Operand {
+        let cw = Self::bf_wide(bf);
+        let n = cw.bits();
+        let x = if bf.ct == cw {
+            x
+        } else {
+            self.conv(CvtOp::Zext, bf.ct, cw, x)
+        };
+        let lsh = n - bf.boff - bf.w;
+        let x = if lsh > 0 {
+            self.bin(BinOp::Shl, cw, x, Operand::Imm(lsh as i64))
+        } else {
+            x
+        };
+        let rsh = n - bf.w;
+        let x = if rsh > 0 {
+            let op = if bf.unsigned { BinOp::LShr } else { BinOp::AShr };
+            self.bin(op, cw, x, Operand::Imm(rsh as i64))
+        } else {
+            x
+        };
+        if bf.ct == cw {
+            x
+        } else {
+            self.conv(CvtOp::Trunc, cw, bf.ct, x)
+        }
+    }
+
+    fn bf_load(&mut self, addr: Operand, bf: Bf, vol: bool) -> Operand {
+        let raw = self.load(bf.ct, addr, vol);
+        self.bf_extract(raw, &bf)
+    }
+
+    /// `lv = v` on a bit-field. Returns the value of the assignment expression,
+    /// which C99 6.5.16p3 defines as the value STORED — i.e. after truncation to
+    /// `w` bits, so `(v.a = 5)` on `int a:3` is −3, not 5.
+    fn bf_store(&mut self, addr: Operand, bf: Bf, v: Operand, vol: bool) -> Operand {
+        let cw = Self::bf_wide(&bf);
+        let field: i64 = if bf.w >= 64 { -1 } else { (1i64 << bf.w) - 1 };
+        let mask = trunc(cw, field << bf.boff);
+        let raw = self.load(bf.ct, addr, vol);
+        let old = if bf.ct == cw {
+            raw
+        } else {
+            self.conv(CvtOp::Zext, bf.ct, cw, raw)
+        };
+        let vv = if bf.ct == cw {
+            v
+        } else {
+            self.conv(CvtOp::Zext, bf.ct, cw, v)
+        };
+        let ins = self.bin(BinOp::And, cw, vv, Operand::Imm(trunc(cw, field)));
+        let ins = if bf.boff > 0 {
+            self.bin(BinOp::Shl, cw, ins, Operand::Imm(bf.boff as i64))
+        } else {
+            ins
+        };
+        let kept = self.bin(BinOp::And, cw, old, Operand::Imm(trunc(cw, !mask)));
+        let new = self.bin(BinOp::Or, cw, kept, ins);
+        let st = if bf.ct == cw {
+            new
+        } else {
+            self.conv(CvtOp::Trunc, cw, bf.ct, new)
+        };
+        self.store(bf.ct, addr, st, vol);
+        // the stored field, read back without a second memory access
+        self.bf_extract(st, &bf)
+    }
+
+    // ── EXT(gcc) __sync_* (ARM DDI 0487 B2.9) ──────────────────────────────
+    // Every read-modify-write is the same theorem: take the exclusive monitor
+    // with `ldaxr`, compute, release it with `stlxr`, and retry while the store
+    // reports failure. The loop is written HERE, in ordinary HIR control flow,
+    // rather than hidden inside one machine instruction — which is what makes
+    // it visible to the verifier and executable by ⟦hir⟧.
+    fn sync(&mut self, op: ast::SyncOp, args: &[NodeId], size: u32) -> Operand {
+        use ast::SyncOp::*;
+        let t = if size == 8 { Ty::I64 } else { Ty::I32 };
+        if matches!(op, Barrier) {
+            self.push(Inst::Intrinsic {
+                dst: None,
+                kind: IntrinKind::Dmb,
+                args: vec![],
+            });
+            return Operand::Imm(0);
+        }
+        let p = self.expr(args[0]);
+        if matches!(op, Release) {
+            self.push(Inst::Intrinsic {
+                dst: None,
+                kind: IntrinKind::Stlr(t),
+                args: vec![p, Operand::Imm(0)],
+            });
+            return Operand::Imm(0);
+        }
+        // `__sync_*_compare_and_swap(ptr, expected, desired)`: the SECOND
+        // argument is the value compared against, the third the one stored.
+        let a1 = self.expr(args[1]);
+        let (cmpv, v) = if matches!(op, ValCas | BoolCas) {
+            (Some(a1), self.expr(args[2]))
+        } else {
+            (None, a1)
+        };
+        let (head, body, join) = (self.f.new_block(), self.f.new_block(), self.f.new_block());
+        // the loop carries nothing; the result leaves through `join`'s parameter
+        let jp = self.f.new_value(t, Def::Param(join, 0));
+        self.f.blocks[join as usize].params.push(jp);
+        // a compare-and-swap also reports whether it fired
+        let okp = self.f.new_value(Ty::I32, Def::Param(join, 1));
+        self.f.blocks[join as usize].params.push(okp);
+        self.goto(head);
+
+        let old = self.def(t, |dst| Inst::Intrinsic {
+            dst: Some(dst),
+            kind: IntrinKind::LdAxr(t),
+            args: vec![p],
+        });
+        match cmpv {
+            // §B.2.9: a failed comparison abandons the monitor and reports 0
+            Some(want) => {
+                let eq = self.def(Ty::I32, |dst| Inst::Cmp {
+                    dst,
+                    op: CmpOp::Eq,
+                    ty: t,
+                    a: old,
+                    b: want,
+                });
+                self.seal(Term::Br(
+                    eq,
+                    Target { block: body, args: vec![] },
+                    Target {
+                        block: join,
+                        args: vec![old, Operand::Imm(0)],
+                    },
+                ));
+            }
+            None => self.seal(Term::Jmp(Target { block: body, args: vec![] })),
+        }
+        self.cur = body;
+        let new = match op {
+            FetchAdd | AddFetch => self.bin(BinOp::Add, t, old, v),
+            FetchSub | SubFetch => self.bin(BinOp::Sub, t, old, v),
+            FetchAnd => self.bin(BinOp::And, t, old, v),
+            FetchOr => self.bin(BinOp::Or, t, old, v),
+            FetchXor => self.bin(BinOp::Xor, t, old, v),
+            TestSet | ValCas | BoolCas => v,
+            Release | Barrier => unreachable!(),
+        };
+        let st = self.def(Ty::I32, |dst| Inst::Intrinsic {
+            dst: Some(dst),
+            kind: IntrinKind::StlXr(t),
+            args: vec![p, new],
+        });
+        let result = match op {
+            AddFetch | SubFetch => new,
+            _ => old,
+        };
+        self.seal(Term::Br(
+            st,
+            Target { block: head, args: vec![] },
+            Target {
+                block: join,
+                args: vec![result, Operand::Imm(1)],
+            },
+        ));
+        self.cur = join;
+        // `__sync_*` are FULL barriers, which acquire/release alone are not
+        self.push(Inst::Intrinsic {
+            dst: None,
+            kind: IntrinKind::Dmb,
+            args: vec![],
+        });
+        if matches!(op, BoolCas) {
+            Operand::Val(okp)
+        } else {
+            Operand::Val(jp)
+        }
+    }
+
+    // ── EXT(gcc) __builtin_{add,sub,mul}_overflow ──────────────────────────
+    // ℤ semantics: compute at infinite precision, store the truncation, report
+    // whether the exact value was representable. For a result narrower than 64
+    // bits the 64-bit computation IS the infinite-precision one, so the test is
+    // simply "does the truncation read back unchanged"; at 64 bits the carry /
+    // sign rules of DDI 0487 C6.2 and the high half of the product take over.
+    fn overflow(&mut self, op: u8, a: NodeId, b: NodeId, r: NodeId) -> Operand {
+        let rt = self
+            .tt()
+            .pointee(self.ty(r))
+            .expect("__builtin_*_overflow: third argument is a pointer");
+        let n = self.tt().size(rt) * 8;
+        let uns = self.tt().is_unsigned(rt);
+        let dt = hty(self.tt(), rt);
+        let wide = |b: &mut Self, e: NodeId| -> Operand {
+            let t = b.ty(e);
+            let ht = hty(b.tt(), t);
+            let v = b.expr(e);
+            if ht == Ty::I64 {
+                v
+            } else {
+                let cv = if b.tt().is_unsigned(t) { CvtOp::Zext } else { CvtOp::Sext };
+                b.conv(cv, ht, Ty::I64, v)
+            }
+        };
+        let x = wide(self, a);
+        let y = wide(self, b);
+        let dst = self.expr(r);
+        let bop = match op {
+            0 => BinOp::Add,
+            1 => BinOp::Sub,
+            _ => BinOp::Mul,
+        };
+        let s = self.bin(bop, Ty::I64, x, y);
+        let ov = if n < 64 {
+            // representable ⟺ the value survives the round trip through `rt`
+            let narrow = self.conv(CvtOp::Trunc, Ty::I64, dt, s);
+            let back = self.conv(
+                if uns { CvtOp::Zext } else { CvtOp::Sext },
+                dt,
+                Ty::I64,
+                narrow,
+            );
+            self.def(Ty::I32, |d| Inst::Cmp {
+                dst: d,
+                op: CmpOp::Ne,
+                ty: Ty::I64,
+                a: s,
+                b: back,
+            })
+        } else if op == 2 {
+            let hi = self.bin(
+                if uns { BinOp::UMulHi } else { BinOp::SMulHi },
+                Ty::I64,
+                x,
+                y,
+            );
+            let want = if uns {
+                Operand::Imm(0)
+            } else {
+                self.bin(BinOp::AShr, Ty::I64, s, Operand::Imm(63))
+            };
+            self.def(Ty::I32, |d| Inst::Cmp {
+                dst: d,
+                op: CmpOp::Ne,
+                ty: Ty::I64,
+                a: hi,
+                b: want,
+            })
+        } else if uns {
+            // add: the sum wrapped ⟺ it is below either operand; sub: x < y
+            let (p, q, c) = if op == 0 {
+                (s, x, CmpOp::Ult)
+            } else {
+                (x, y, CmpOp::Ult)
+            };
+            self.def(Ty::I32, |d| Inst::Cmp {
+                dst: d,
+                op: c,
+                ty: Ty::I64,
+                a: p,
+                b: q,
+            })
+        } else {
+            // signed: the classic sign-agreement test
+            let m = if op == 0 {
+                let u = self.bin(BinOp::Xor, Ty::I64, x, s);
+                let v = self.bin(BinOp::Xor, Ty::I64, y, s);
+                self.bin(BinOp::And, Ty::I64, u, v)
+            } else {
+                let u = self.bin(BinOp::Xor, Ty::I64, x, y);
+                let v = self.bin(BinOp::Xor, Ty::I64, x, s);
+                self.bin(BinOp::And, Ty::I64, u, v)
+            };
+            self.def(Ty::I32, |d| Inst::Cmp {
+                dst: d,
+                op: CmpOp::Slt,
+                ty: Ty::I64,
+                a: m,
+                b: Operand::Imm(0),
+            })
+        };
+        let narrow = if dt == Ty::I64 {
+            s
+        } else {
+            self.conv(CvtOp::Trunc, Ty::I64, dt, s)
+        };
+        self.store(dt, dst, narrow, false);
+        ov
+    }
+
+    // ── EXT(gcc) inline asm ────────────────────────────────────────────────
+    // The template is opaque; only its OPERANDS are the compiler's business.
+    // Each is evaluated to a value (or an address, for `"m"`), and isel pins it
+    // to a register from a reserved pool — so the whole feature costs one MIR
+    // instruction and no allocator special case.
+    fn asm(&mut self, tmpl: String, ops: &[ast::AsmOp]) {
+        let mut vals = Vec::with_capacity(ops.len());
+        let mut descs = Vec::with_capacity(ops.len());
+        for o in ops {
+            let t = self.ty(o.e);
+            let ht = hty(self.tt(), t);
+            if o.mem {
+                let a = self.addr(o.e);
+                vals.push(a);
+            } else if o.out {
+                let a = self.addr(o.e);
+                vals.push(a);
+                if o.rw {
+                    let v = self.load(ht, a, false);
+                    vals.push(v);
+                }
+            } else {
+                let v = self.expr(o.e);
+                vals.push(v);
+            }
+            descs.push(AsmOperand {
+                out: o.out,
+                rw: o.rw,
+                mem: o.mem,
+                fp: o.fp,
+                tied: o.tied,
+                pin: o.pin,
+                ty: ht,
+            });
+        }
+        self.push(Inst::Intrinsic {
+            dst: None,
+            kind: IntrinKind::Asm { tmpl, ops: descs },
+            args: vals,
+        });
+    }
+
+    // ── va_arg (AAPCS64 §B.6, the `va_list` walk) ──────────────────────────
+    // `va_list` is the five-field struct the psABI defines (parser.rs seeds it):
+    //   0 __stack · 8 __gr_top · 16 __vr_top · 24 __gr_offs · 28 __vr_offs
+    // The two `*_offs` are NEGATIVE byte offsets from the corresponding `*_top`,
+    // counting UP to zero as registers are consumed; zero or above means the
+    // save area is exhausted and the argument is on the caller's stack. All of
+    // that is a software convention over the layout `isel` builds, so the walk
+    // is expressible in target-independent HIR — the only thing HIR does not
+    // know is where the areas ARE, which is what `va_start` (an isel intrinsic)
+    // records.
+    fn va_arg(&mut self, ap: NodeId, ty: TypeId, tmp: u32) -> Operand {
+        let apa = self.addr(ap);
+        let pt = param_ty(self.tt(), ty);
+        let size = self.tt().size(ty);
+        let align = self.tt().align(ty);
+        // (save area is the VR one, bytes consumed there, HFA shape, indirect)
+        let (vr, need, hfa, indirect) = match &pt {
+            PTy::S(t) if t.is_float() => (true, 16, None, false),
+            PTy::S(_) => (false, 8, None, false),
+            PTy::LDouble => (true, 16, None, false),
+            PTy::Agg { hfa: Some((dbl, n)), .. } => (true, 16 * *n, Some((*dbl, *n)), false),
+            // §6.8.2 B.4: over 16 bytes the slot holds a POINTER to the object
+            PTy::Agg { size, .. } if *size > 16 => (false, 8, None, true),
+            PTy::Agg { size, .. } => (false, 8 * size.div_ceil(8).max(1), None, false),
+        };
+        let (offs_at, top_at) = if vr { (28i64, 16i64) } else { (24i64, 8i64) };
+        let (regb, stkb, joinb) = (self.f.new_block(), self.f.new_block(), self.f.new_block());
+        let jp = self.f.new_value(Ty::I64, Def::Param(joinb, 0));
+        self.f.blocks[joinb as usize].params.push(jp);
+
+        let oa = self.addk(apa, offs_at);
+        let o = self.load(Ty::I32, oa, false);
+        let newo = self.bin(BinOp::Add, Ty::I32, o, Operand::Imm(need as i64));
+        let fits = self.def(Ty::I32, |dst| Inst::Cmp {
+            dst,
+            op: CmpOp::Sle,
+            ty: Ty::I32,
+            a: newo,
+            b: Operand::Imm(0),
+        });
+        self.seal(Term::Br(
+            fits,
+            Target { block: regb, args: vec![] },
+            Target { block: stkb, args: vec![] },
+        ));
+
+        // ── the register path ──────────────────────────────────────────────
+        self.cur = regb;
+        let oa = self.addk(apa, offs_at);
+        self.store(Ty::I32, oa, newo, false);
+        let ta = self.addk(apa, top_at);
+        let top = self.load(Ty::I64, ta, false);
+        let ox = self.conv(CvtOp::Sext, Ty::I32, Ty::I64, o);
+        let base = self.bin(BinOp::Add, Ty::I64, top, ox);
+        // §5.9.5: an HFA is SCATTERED one element per 16-byte register slot, so
+        // the register path must gather it into the contiguous scratch object
+        // the parser reserved.
+        let rv = match hfa {
+            Some((dbl, n)) if n > 1 || size != if dbl { 8 } else { 4 } => {
+                let esz = if dbl { 8 } else { 4 };
+                let et = if dbl { Ty::F64 } else { Ty::F32 };
+                let d = {
+                    let off = (self.frame - tmp) as i64;
+                    self.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off })
+                };
+                for i in 0..n {
+                    let src = self.addk(base, (16 * i) as i64);
+                    let v = self.load(et, src, false);
+                    let dst = self.addk(d, (esz * i) as i64);
+                    self.store(et, dst, v, false);
+                }
+                d
+            }
+            _ => base,
+        };
+        self.seal(Term::Jmp(Target {
+            block: joinb,
+            args: vec![rv],
+        }));
+
+        // ── the stack path ─────────────────────────────────────────────────
+        self.cur = stkb;
+        // once one argument has overflowed, every later one is on the stack too
+        let oa = self.addk(apa, offs_at);
+        self.store(Ty::I32, oa, Operand::Imm(0), false);
+        let st = self.load(Ty::I64, apa, false);
+        let st = if align > 8 {
+            // C.13: the NSAA is rounded to the type's natural alignment
+            let a = self.bin(BinOp::Add, Ty::I64, st, Operand::Imm(align as i64 - 1));
+            self.bin(BinOp::And, Ty::I64, a, Operand::Imm(!(align as i64 - 1)))
+        } else {
+            st
+        };
+        // C.16: the slot is at least 8 bytes, and composites round up to 8
+        let bump = if indirect { 8 } else { (size.max(1)).div_ceil(8) * 8 };
+        let next = self.bin(BinOp::Add, Ty::I64, st, Operand::Imm(bump as i64));
+        self.store(Ty::I64, apa, next, false);
+        self.seal(Term::Jmp(Target {
+            block: joinb,
+            args: vec![st],
+        }));
+
+        self.cur = joinb;
+        let a = Operand::Val(jp);
+        let a = if indirect {
+            self.load(Ty::I64, a, false)
+        } else {
+            a
+        };
+        if self.is_ld(ty) {
+            self.ld_load(a)
+        } else if scalar(self.tt(), ty) {
+            let t = hty(self.tt(), ty);
+            self.load(t, a, false)
+        } else {
+            a
+        }
+    }
+
     // ── addresses ──────────────────────────────────────────────────────────
     fn addr(&mut self, n: NodeId) -> Operand {
         match self.node(n) {
@@ -189,7 +703,13 @@ impl<'a> B<'a> {
                 self.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off })
             }
             Node::GVar(i) => {
-                let sym = Sym::Global(*i);
+                // EXT(gcc) `__thread`: a thread-local object is not at a link-time
+                // address at all — it is at an offset from the thread pointer.
+                let sym = if self.ast.globals[*i as usize].is_tls {
+                    Sym::Tls(*i)
+                } else {
+                    Sym::Global(*i)
+                };
                 self.def(Ty::I64, |dst| Inst::SymAddr { dst, sym })
             }
             Node::Str(i) => {
@@ -242,6 +762,13 @@ impl<'a> B<'a> {
             // An aggregate or function expression evaluates to its address.
             Node::Var(_) | Node::GVar(_) | Node::Member(..) | Node::Deref(_) => {
                 let a = self.addr(n);
+                if let Some(bf) = self.bf_of(nty) {
+                    let vol = self.tt().is_volatile(nty);
+                    return self.bf_load(a, bf, vol);
+                }
+                if self.is_ld(nty) {
+                    return self.ld_load(a);
+                }
                 if scalar(self.tt(), nty) {
                     let t = self.hty(n);
                     let vol = self.tt().is_volatile(nty);
@@ -289,12 +816,12 @@ impl<'a> B<'a> {
             }
             Node::Call(name, args, nreg) => {
                 let (name, args, nreg) = (name.clone(), args.clone(), *nreg);
-                self.call(Callee::Direct(name), &args, nreg, nty)
+                self.call(Callee::Direct(name), &args, nreg, nty, None)
             }
             Node::CallPtr(fp, args, nreg) => {
                 let (fp, args, nreg) = (*fp, args.clone(), *nreg);
                 let p = self.expr(fp);
-                self.call(Callee::Indirect(p), &args, nreg, nty)
+                self.call(Callee::Indirect(p), &args, nreg, nty, None)
             }
             Node::LabelAddr(name) => {
                 let b = self.label(&name.clone());
@@ -316,8 +843,22 @@ impl<'a> B<'a> {
             }
             // Statements appearing in expression position (EXT statement-expr, and
             // the statement forms the parser nests inside a `for` init/step).
-            Node::Block(_)
-            | Node::Ret(_)
+            // EXT(gcc) statement expression: every statement but the last runs
+            // for effect, and the last one IS the value (parser.rs types the
+            // node after it).
+            Node::Block(items) => {
+                let items = items.clone();
+                match items.split_last() {
+                    Some((&last, init)) => {
+                        for &s in init {
+                            self.stmt(s);
+                        }
+                        self.expr(last)
+                    }
+                    None => Operand::Imm(0),
+                }
+            }
+            Node::Ret(_)
             | Node::If(..)
             | Node::While(..)
             | Node::For(..)
@@ -332,10 +873,79 @@ impl<'a> B<'a> {
                 self.stmt(n);
                 Operand::Imm(0)
             }
-            Node::SRet(..) => todo!("R1.1: struct return ≤16B"),
-            Node::Alloca(_) => todo!("R1.1: VLA / alloca"),
-            Node::VaArea(_) | Node::VaStart(_) | Node::VaArg(..) => todo!("R1.2: varargs"),
-            Node::Sync(..) | Node::Overflow(..) | Node::Asm(..) => todo!("R1.3: EXT builtins"),
+            // A call returning a composite: the parser has already reserved the
+            // destination temporary, so lowering only has to name it. AAPCS64
+            // §6.9 (registers vs the x8 indirection) is isel's job, not HIR's.
+            Node::SRet(c, off, _) => {
+                let (c, off) = (*c, *off);
+                let o = (self.frame - off) as i64;
+                let a = self.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off: o });
+                let cty = self.ty(c);
+                match self.node(c) {
+                    Node::Call(name, args, nreg) => {
+                        let (name, args, nreg) = (name.clone(), args.clone(), *nreg);
+                        self.call(Callee::Direct(name), &args, nreg, cty, Some(a));
+                    }
+                    Node::CallPtr(fp, args, nreg) => {
+                        let (fp, args, nreg) = (*fp, args.clone(), *nreg);
+                        let p = self.expr(fp);
+                        self.call(Callee::Indirect(p), &args, nreg, cty, Some(a));
+                    }
+                    _ => panic!("hir::build: SRet does not wrap a call"),
+                }
+                a
+            }
+            // C99 6.7.5.2 / EXT(gcc) alloca: `sub sp` by the rounded byte count;
+            // the value is the new stack pointer. `Effect::Call` keeps it from
+            // being moved, duplicated or removed by any pass.
+            Node::Alloca(e) => {
+                let e = *e;
+                let n = self.expr(e);
+                self.def(Ty::I64, |dst| Inst::Alloca {
+                    dst,
+                    size: n,
+                    // AAPCS64 §6.2.2: sp stays 16-byte aligned.
+                    align: 16,
+                })
+            }
+            // EXT(gcc) `__va_area__`: the first UNNAMED stack argument. `va_off`
+            // counts from the caller's frame link (x29+16 in the classic frame),
+            // so the offset into the argument area proper is `va_off − 16`.
+            Node::VaArea(off) => {
+                let off = *off as i64 - 16;
+                self.def(Ty::I64, |dst| Inst::Intrinsic {
+                    dst: Some(dst),
+                    kind: IntrinKind::VaArea,
+                    args: vec![Operand::Imm(off)],
+                })
+            }
+            Node::VaStart(ap) => {
+                let ap = *ap;
+                let a = self.addr(ap);
+                self.push(Inst::Intrinsic {
+                    dst: None,
+                    kind: IntrinKind::VaStart,
+                    args: vec![a],
+                });
+                Operand::Imm(0)
+            }
+            Node::VaArg(ap, ty, tmp) => {
+                let (ap, ty, tmp) = (*ap, *ty, *tmp);
+                self.va_arg(ap, ty, tmp)
+            }
+            Node::Sync(op, args, size) => {
+                let (op, args, size) = (*op, args.clone(), *size);
+                self.sync(op, &args, size)
+            }
+            Node::Overflow(op, a, b, r) => {
+                let (op, a, b, r) = (*op, *a, *b, *r);
+                self.overflow(op, a, b, r)
+            }
+            Node::Asm(tmpl, ops) => {
+                let (tmpl, ops) = (tmpl.clone(), ops.clone());
+                self.asm(tmpl, &ops);
+                Operand::Imm(0)
+            }
         }
     }
 
@@ -352,13 +962,17 @@ impl<'a> B<'a> {
             });
             return d;
         }
-        if let ast::Ty::Bitfield(..) = self.tt().tys[lty as usize] {
-            todo!("R1.1: bitfield store");
-        }
         let t = hty(self.tt(), lty);
         let vol = self.tt().is_volatile(lty);
         let a = self.addr(l);
         let v = self.expr(r);
+        if let Some(bf) = self.bf_of(lty) {
+            return self.bf_store(a, bf, v, vol);
+        }
+        if self.is_ld(lty) {
+            self.ld_store(a, v);
+            return v;
+        }
         self.store(t, a, v, vol);
         v
     }
@@ -570,7 +1184,13 @@ impl<'a> B<'a> {
         let uns = self.tt().is_unsigned(lty);
         let vol = self.tt().is_volatile(lty);
         let a = self.addr(lv);
-        let old = self.load(t, a, vol);
+        let bf = self.bf_of(lty);
+        let ld = self.is_ld(lty);
+        let old = match bf {
+            Some(bf) => self.bf_load(a, bf, vol),
+            None if ld => self.ld_load(a),
+            None => self.load(t, a, vol),
+        };
         // C99 6.5.2.4: x++ is x = x + 1 with the usual promotion, then the
         // conversion back — which keeps the HIR "no narrow arithmetic" invariant.
         let (v, at) = self.promote(old, t, uns);
@@ -592,11 +1212,25 @@ impl<'a> B<'a> {
         } else {
             self.conv(CvtOp::Trunc, at, t, new)
         };
-        self.store(t, a, new, vol);
+        match bf {
+            // the increment wraps inside the field (`int a:3`, 3+1 → −4)
+            Some(bf) => {
+                self.bf_store(a, bf, new, vol);
+            }
+            None if ld => self.ld_store(a, new),
+            None => self.store(t, a, new, vol),
+        }
         old
     }
 
-    fn call(&mut self, callee: Callee, args: &[NodeId], nreg: u32, nty: TypeId) -> Operand {
+    fn call(
+        &mut self,
+        callee: Callee,
+        args: &[NodeId],
+        nreg: u32,
+        nty: TypeId,
+        sret: Option<Operand>,
+    ) -> Operand {
         let mut sig = Sig {
             params: Vec::with_capacity(args.len()),
             ret: None,
@@ -613,14 +1247,15 @@ impl<'a> B<'a> {
         if !void {
             sig.ret = Some(param_ty(self.tt(), nty));
         }
-        if void {
+        if void || sret.is_some() {
             self.push(Inst::Call {
                 dst: None,
                 sig,
                 callee,
                 args: ops,
+                sret,
             });
-            Operand::Imm(0)
+            sret.unwrap_or(Operand::Imm(0))
         } else {
             let t = hty(self.tt(), nty);
             self.def(t, |dst| Inst::Call {
@@ -628,6 +1263,7 @@ impl<'a> B<'a> {
                 sig,
                 callee,
                 args: ops,
+                sret: None,
             })
         }
     }
@@ -938,6 +1574,7 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
         entry: 0,
         is_static: af.is_static,
         is_weak: af.is_weak || af.is_inline,
+        has_vla: af.has_vla,
     };
     let entry = f.new_block();
     let mut b = B {
@@ -955,13 +1592,25 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
     // parser-assigned frame slot the body reads. R2.2 promotes both in one step,
     // at which point these stores disappear rather than being special-cased.
     for (k, &(off, t)) in af.params.iter().enumerate() {
-        if !scalar(&ast.tt, t) {
-            todo!("R1.2: aggregate parameter passed by value");
+        let o = (af.frame - off) as i64;
+        if !scalar(&ast.tt, t) || matches!(ast.tt.tys[t as usize], ast::Ty::LDouble) {
+            // AAPCS64 §6.8.2: a composite parameter is delivered either in
+            // registers, on the stack, or (over 16 bytes) as a pointer to the
+            // caller's copy. All three become one thing at this level — the
+            // ADDRESS of the incoming object, which isel materializes — and the
+            // parameter's own object is the frame slot the body reads.
+            let v = b.f.new_value(Ty::I64, Def::FuncParam(k as u32));
+            let a = b.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off: o });
+            b.push(Inst::MemCpy {
+                dst: a,
+                src: Operand::Val(v),
+                len: ast.tt.size64(t),
+            });
+            continue;
         }
         let ht = hty(&ast.tt, t);
         let v = b.f.new_value(ht, Def::FuncParam(k as u32));
-        let off = (af.frame - off) as i64;
-        let a = b.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off });
+        let a = b.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off: o });
         let vol = ast.tt.is_volatile(t);
         b.store(ht, a, Operand::Val(v), vol);
     }
@@ -971,6 +1620,11 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
     if matches!(b.f.blocks[b.cur as usize].term, Term::Unreachable) {
         let r = if af.name == "main" {
             Some(Operand::Imm(0))
+        } else if matches!(b.f.sig.ret, Some(PTy::Agg { .. }) | Some(PTy::LDouble)) {
+            // C99 6.9.1p12: falling off a composite-returning function is
+            // undefined. Returning NO value leaves the destination untouched,
+            // which is the least destructive realization of ⊥.
+            None
         } else if b.f.sig.ret.is_some() {
             Some(match b.f.sig.ret.as_ref().unwrap() {
                 PTy::S(t) if t.is_float() => Operand::Fimm(0),

@@ -54,6 +54,13 @@ pub fn alloc_order(c: Class) -> &'static [u8] {
     }
 }
 
+/// The allocatable registers of a class, as a bit mask. `k(class)` is its
+/// population count; a clobber set intersected with it is the number of colours
+/// a call actually takes away.
+pub fn alloc_mask(c: Class) -> u32 {
+    alloc_order(c).iter().fold(0u32, |m, &n| m | 1 << n)
+}
+
 /// `k` for the coloring theorem: the number of assignable colors in a class.
 pub fn k(c: Class) -> usize {
     alloc_order(c).len()
@@ -102,6 +109,7 @@ pub fn sp_name() -> &'static str {
 pub fn fpr_name(n: u8, w: Width) -> String {
     match w {
         Width::S => format!("s{}", n),
+        Width::Q => format!("q{}", n),
         _ => format!("d{}", n),
     }
 }

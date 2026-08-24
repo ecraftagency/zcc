@@ -74,12 +74,27 @@ fn cc_of(op: CmpOp) -> CC {
     }
 }
 
+/// One end of a composite move: an address in a register, or a fixed offset in
+/// the outgoing-argument area (which has no base register — it is always sp).
+#[derive(Clone, Copy)]
+enum Place {
+    At(Reg),
+    Out(u32),
+    Slot(SlotId),
+}
+
 struct L<'a> {
     h: &'a hir::Func,
     f: MFunc,
     /// HIR value → the virtual register holding it
     vmap: Vec<Reg>,
     cur: MBlockId,
+    /// this function's own AAPCS64 assignment (its parameters and result)
+    asn: abi::Assign,
+    /// §6.9: the caller's x8, saved at entry because a call would clobber it
+    sret_ptr: Option<Reg>,
+    in_args_slot: Option<SlotId>,
+    va_slot: Option<SlotId>,
 }
 
 impl<'a> L<'a> {
@@ -262,6 +277,29 @@ impl<'a> L<'a> {
                     off: *off as i32,
                 });
             }
+            // THEORY II-4: local-exec TLS — thread pointer, then the two halves
+            // of the tprel offset. No GOT, no call.
+            Inst::SymAddr {
+                dst,
+                sym: sym @ hir::Sym::Tls(_),
+            } => {
+                let d = self.dst_of(*dst);
+                let t = self.tmp(Width::W64);
+                self.push(MInst::Mrs { dst: t });
+                let u = self.tmp(Width::W64);
+                self.push(MInst::AddTprel {
+                    dst: u,
+                    base: t,
+                    sym: sym.clone(),
+                    hi: true,
+                });
+                self.push(MInst::AddTprel {
+                    dst: d,
+                    base: u,
+                    sym: sym.clone(),
+                    hi: false,
+                });
+            }
             Inst::SymAddr { dst, sym } => {
                 let d = self.dst_of(*dst);
                 let page = self.tmp(Width::W64);
@@ -296,7 +334,8 @@ impl<'a> L<'a> {
                 sig,
                 callee,
                 args,
-            } => self.call(*dst, sig, callee, args),
+                sret,
+            } => self.call(*dst, sig, callee, args, *sret),
             Inst::MemCpy { dst, src, len } => {
                 let (d, s) = (self.reg(*dst, hir::Ty::I64), self.reg(*src, hir::Ty::I64));
                 let n = self.reg(Operand::Imm(*len as i64), hir::Ty::I64);
@@ -308,8 +347,16 @@ impl<'a> L<'a> {
                 let n = self.reg(Operand::Imm(*len as i64), hir::Ty::I64);
                 self.libcall("memset", &[d, b, n]);
             }
-            Inst::Alloca { .. } => todo!("R1.1: VLA / alloca"),
-            Inst::Intrinsic { .. } => todo!("R1.3: EXT intrinsics"),
+            // C99 6.7.5.2: one instruction, because the sp move and the address
+            // it produces are a single indivisible step — splitting them would
+            // let a pass schedule something between sp's two meanings.
+            Inst::Alloca { dst, size, .. } => {
+                let n = self.reg_nonzr(*size, hir::Ty::I64);
+                let d = self.dst_of(*dst);
+                self.push(MInst::StackAlloc { dst: d, size: n });
+                self.f.dyn_stack = true;
+            }
+            Inst::Intrinsic { dst, kind, args } => self.intrinsic(*dst, kind, args),
         }
     }
 
@@ -411,6 +458,8 @@ impl<'a> L<'a> {
             BinOp::Add => AluOp::Add,
             BinOp::Sub => AluOp::Sub,
             BinOp::Mul => AluOp::Mul,
+            BinOp::SMulHi => AluOp::SMulH,
+            BinOp::UMulHi => AluOp::UMulH,
             BinOp::SDiv => AluOp::SDiv,
             BinOp::UDiv => AluOp::UDiv,
             BinOp::And => AluOp::And,
@@ -541,6 +590,445 @@ impl<'a> L<'a> {
         }
     }
 
+    // ── composites (AAPCS64 §6.8.2) ────────────────────────────────────────
+    // A composite travels as an ADDRESS in HIR, so every rule below is a
+    // load/store between that address and the registers or stack slots the ABI
+    // names. The chunking never reads or writes outside the object: a struct may
+    // sit at the end of a page, and an 8-byte access to a 5-byte object would
+    // fault where the C program does not.
+    fn chunk_addr(&self, p: Place, off: i32) -> AddrMode {
+        match p {
+            Place::At(base) => AddrMode::BaseImm { base, off },
+            Place::Out(o) => AddrMode::SpArg {
+                off: (o as i32 + off) as u32,
+            },
+            Place::Slot(slot) => AddrMode::Slot { slot, off },
+        }
+    }
+
+    /// The AAPCS64 register save area of a variadic function: 192 bytes laid out
+    /// as §B.6 requires — v0–v7 in 16-byte slots at [0,128), x0–x7 at [128,192).
+    /// `__vr_top` is therefore base+128 and `__gr_top` base+192, and the
+    /// negative `*_offs` count back from those two points.
+    fn va_area(&mut self) -> SlotId {
+        if let Some(s) = self.va_slot {
+            return s;
+        }
+        let s = self.f.new_slot(192, 16, SlotKind::Local);
+        self.va_slot = Some(s);
+        s
+    }
+
+    fn intrinsic(&mut self, dst: Option<ValueId>, kind: &hir::IntrinKind, args: &[Operand]) {
+        match kind {
+            hir::IntrinKind::VaArea => {
+                let off = match args[0] {
+                    Operand::Imm(k) => k as i32,
+                    _ => unreachable!("__va_area__ offset is a constant"),
+                };
+                let d = self.dst_of(dst.expect("__va_area__ has a value"));
+                let slot = self.in_args();
+                self.push(MInst::SlotAddr { dst: d, slot, off });
+            }
+            // §B.6: the five fields, from the three counters the ABI walk left.
+            hir::IntrinKind::VaStart => {
+                let ap = self.reg(args[0], hir::Ty::I64);
+                let (ngrn, nsrn, nsaa) = (self.asn.ngrn, self.asn.nsrn, self.asn.nsaa);
+                let va = self.va_area();
+                let ia = self.in_args();
+                let mut field = |l: &mut Self, off: i32, slot: SlotId, at: i32| {
+                    let t = l.tmp(Width::W64);
+                    l.push(MInst::SlotAddr { dst: t, slot, off: at });
+                    l.push(MInst::Store {
+                        op: MemOp::X,
+                        src: t,
+                        mem: AddrMode::BaseImm { base: ap, off },
+                        vol: false,
+                    });
+                };
+                field(self, 0, ia, nsaa as i32);
+                field(self, 8, va, 192);
+                field(self, 16, va, 128);
+                for (off, k) in [
+                    (24, -8 * (8 - ngrn as i64)),
+                    (28, -16 * (8 - nsrn as i64)),
+                ] {
+                    let t = self.tmp(Width::W32);
+                    self.push(MInst::MovImm {
+                        w: Width::W32,
+                        dst: t,
+                        imm: k,
+                    });
+                    self.push(MInst::Store {
+                        op: MemOp::W,
+                        src: t,
+                        mem: AddrMode::BaseImm { base: ap, off },
+                        vol: false,
+                    });
+                }
+            }
+            // THEORY II-2: memory holds binary128, a register holds the
+            // canonical f64. libgcc's soft-float pair is the bridge, and a quad
+            // never stays live across another call (AAPCS64 §6.1.2 preserves
+            // only the low half of v8–v15, so a live quad has no home).
+            hir::IntrinKind::LdLoad => {
+                let a = self.reg(args[0], hir::Ty::I64);
+                let q = self.tmp(Width::Q);
+                self.push(MInst::Load {
+                    op: MemOp::Q,
+                    dst: q,
+                    mem: AddrMode::BaseImm { base: a, off: 0 },
+                    vol: false,
+                });
+                self.push(MInst::ParallelCopy(vec![(Reg::P(PReg::fpr(0)), q, Width::Q)]));
+                self.fp_libcall("__trunctfdf2");
+                let d = self.dst_of(dst.expect("long double load has a value"));
+                self.push(MInst::FMov {
+                    dw: Width::D,
+                    sw: Width::D,
+                    dst: d,
+                    src: Reg::P(PReg::fpr(0)),
+                });
+            }
+            hir::IntrinKind::LdStore => {
+                let a = self.reg(args[0], hir::Ty::I64);
+                let v = self.reg(args[1], hir::Ty::F64);
+                self.push(MInst::ParallelCopy(vec![(Reg::P(PReg::fpr(0)), v, Width::D)]));
+                self.fp_libcall("__extenddftf2");
+                self.push(MInst::Store {
+                    op: MemOp::Q,
+                    src: Reg::P(PReg::fpr(0)),
+                    mem: AddrMode::BaseImm { base: a, off: 0 },
+                    vol: false,
+                });
+            }
+            // ARM DDI 0487 B2.9 — the three exclusive-access primitives. The
+            // retry loop around them was built in HIR, so each is 1:1 here.
+            hir::IntrinKind::LdAxr(t) => {
+                let a = self.reg(args[0], hir::Ty::I64);
+                let d = self.dst_of(dst.expect("ldaxr has a value"));
+                self.push(MInst::LdAxr {
+                    w: wid(*t),
+                    dst: d,
+                    addr: a,
+                });
+            }
+            hir::IntrinKind::StlXr(t) => {
+                let a = self.reg(args[0], hir::Ty::I64);
+                let v = self.reg(args[1], *t);
+                let d = self.dst_of(dst.expect("stlxr reports its status"));
+                self.push(MInst::StlXr {
+                    w: wid(*t),
+                    status: d,
+                    src: v,
+                    addr: a,
+                });
+            }
+            hir::IntrinKind::Stlr(t) => {
+                let a = self.reg(args[0], hir::Ty::I64);
+                let v = self.reg(args[1], *t);
+                self.push(MInst::Stlr {
+                    w: wid(*t),
+                    src: v,
+                    addr: a,
+                });
+            }
+            hir::IntrinKind::Dmb => self.push(MInst::Dmb),
+            hir::IntrinKind::Asm { tmpl, ops } => self.asm(tmpl, ops, args),
+            _ => todo!("R1.3: EXT intrinsics"),
+        }
+    }
+
+    /// EXT(gcc) inline asm. Operands are PINNED to a reserved pool — x9–x15 and
+    /// v16–v22, all caller-saved and none of them the parallel-copy scratch —
+    /// rather than left to the allocator, because a `"+r"` operand needs its
+    /// input and output in ONE register and the SSA constraint model has no way
+    /// to say that. The pool is the whole surface real code (musl, xxhash) uses.
+    fn asm(&mut self, tmpl: &str, ops: &[hir::AsmOperand], args: &[Operand]) {
+        const GP_POOL: [u8; 7] = [9, 10, 11, 12, 13, 14, 15];
+        const FP_POOL: [u8; 7] = [16, 17, 18, 19, 20, 21, 22];
+        let (mut ngp, mut nfp) = (0usize, 0usize);
+        let mut slots: Vec<AsmSlot> = Vec::with_capacity(ops.len());
+        let mut ins: Vec<(Reg, Reg, Width)> = Vec::new();
+        let mut outs: Vec<(PReg, Reg, hir::Ty)> = Vec::new();
+        let mut at = 0usize;
+        for (i, o) in ops.iter().enumerate() {
+            let fp = o.fp || (!o.mem && o.ty.is_float());
+            let reg = match (o.pin, o.tied) {
+                (Some(n), _) => PReg::gpr(n),
+                (None, Some(k)) => slots[k as usize].reg,
+                (None, None) if fp => {
+                    let p = PReg::fpr(FP_POOL[nfp.min(FP_POOL.len() - 1)]);
+                    nfp += 1;
+                    p
+                }
+                (None, None) => {
+                    let p = PReg::gpr(GP_POOL[ngp.min(GP_POOL.len() - 1)]);
+                    ngp += 1;
+                    p
+                }
+            };
+            let w = if o.mem {
+                Width::W64
+            } else {
+                wid(o.ty)
+            };
+            let read = !o.out || o.rw || o.mem;
+            slots.push(AsmSlot {
+                reg,
+                out: o.out && !o.mem,
+                read,
+                mem: o.mem,
+                w,
+            });
+            // the argument list runs in operand order (see `IntrinKind::Asm`)
+            if o.mem {
+                let a = self.reg(args[at], hir::Ty::I64);
+                at += 1;
+                ins.push((Reg::P(reg), a, Width::W64));
+            } else if o.out {
+                let a = self.reg(args[at], hir::Ty::I64);
+                at += 1;
+                if o.rw {
+                    let v = self.reg(args[at], o.ty);
+                    at += 1;
+                    ins.push((Reg::P(reg), v, w));
+                }
+                outs.push((reg, a, o.ty));
+            } else {
+                let v = self.reg(args[at], o.ty);
+                at += 1;
+                ins.push((Reg::P(reg), v, w));
+            }
+            let _ = i;
+        }
+        if !ins.is_empty() {
+            self.push(MInst::ParallelCopy(ins));
+        }
+        self.push(MInst::Asm {
+            tmpl: tmpl.to_string(),
+            ops: slots,
+        });
+        // an output leaves through memory, which is where the C lvalue is
+        for (p, a, t) in outs {
+            self.push(MInst::Store {
+                op: memop(t),
+                src: Reg::P(p),
+                mem: AddrMode::BaseImm { base: a, off: 0 },
+                vol: false,
+            });
+        }
+    }
+
+    /// A libgcc soft-float call: argument and result both in v0, which is where
+    /// the quad already is — so there is nothing to marshal, only the call.
+    fn fp_libcall(&mut self, name: &str) {
+        self.push(MInst::Call {
+            callee: CallTarget::Direct(name.to_string()),
+            uses: vec![(Reg::P(PReg::fpr(0)), PReg::fpr(0))],
+            defs: vec![(Reg::P(PReg::fpr(0)), PReg::fpr(0))],
+            clobbers: isa::caller_saved(),
+            stack_bytes: 0,
+            tail: false,
+        });
+    }
+
+    /// The binary128 image of a double, parked in a 16-byte stack temporary.
+    fn ld_extend(&mut self, v: Reg) -> SlotId {
+        let slot = self.f.new_slot(16, 16, SlotKind::Local);
+        self.push(MInst::ParallelCopy(vec![(Reg::P(PReg::fpr(0)), v, Width::D)]));
+        self.fp_libcall("__extenddftf2");
+        self.push(MInst::Store {
+            op: MemOp::Q,
+            src: Reg::P(PReg::fpr(0)),
+            mem: AddrMode::Slot { slot, off: 0 },
+            vol: false,
+        });
+        slot
+    }
+
+    /// The marker slot standing for the caller's argument area (`SlotKind::InArgs`,
+    /// whose offset `pass/frame.rs` fixes at the end of this frame).
+    fn in_args(&mut self) -> SlotId {
+        if let Some(s) = self.in_args_slot {
+            return s;
+        }
+        let s = self.f.new_slot(0, 8, SlotKind::InArgs);
+        self.in_args_slot = Some(s);
+        s
+    }
+
+    /// The `n ≤ 8` bytes at `p + off`, assembled into one 64-bit register.
+    fn load_chunk(&mut self, p: Place, off: i32, n: u32) -> Reg {
+        let mut acc: Option<Reg> = None;
+        let (mut at, mut rem) = (0u32, n);
+        while rem > 0 {
+            let step = if rem >= 8 {
+                8
+            } else if rem >= 4 {
+                4
+            } else if rem >= 2 {
+                2
+            } else {
+                1
+            };
+            let d = self.tmp(Width::W64);
+            let mem = self.chunk_addr(p, off + at as i32);
+            self.push(MInst::Load {
+                op: match step {
+                    8 => MemOp::X,
+                    4 => MemOp::W,
+                    2 => MemOp::H,
+                    _ => MemOp::B,
+                },
+                dst: d,
+                mem,
+                vol: false,
+            });
+            // a narrow load zero-extends, so the pieces simply OR together
+            let piece = if at == 0 {
+                d
+            } else {
+                let sh = self.tmp(Width::W64);
+                self.push(MInst::Alu {
+                    op: AluOp::Lsl,
+                    w: Width::W64,
+                    dst: sh,
+                    a: d,
+                    b: Rhs::Imm((at * 8) as i64),
+                    flags: None,
+                });
+                sh
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(a) => {
+                    let o = self.tmp(Width::W64);
+                    self.push(MInst::Alu {
+                        op: AluOp::Orr,
+                        w: Width::W64,
+                        dst: o,
+                        a,
+                        b: Rhs::Reg(piece),
+                        flags: None,
+                    });
+                    o
+                }
+            });
+            at += step;
+            rem -= step;
+        }
+        acc.unwrap()
+    }
+
+    /// The dual: write the low `n ≤ 8` bytes of `src` to `p + off`.
+    fn store_chunk(&mut self, p: Place, off: i32, n: u32, src: Reg) {
+        let (mut at, mut rem) = (0u32, n);
+        let mut cur = src;
+        while rem > 0 {
+            let step = if rem >= 8 {
+                8
+            } else if rem >= 4 {
+                4
+            } else if rem >= 2 {
+                2
+            } else {
+                1
+            };
+            if at > 0 {
+                let sh = self.tmp(Width::W64);
+                self.push(MInst::Alu {
+                    op: AluOp::Lsr,
+                    w: Width::W64,
+                    dst: sh,
+                    a: src,
+                    b: Rhs::Imm((at * 8) as i64),
+                    flags: None,
+                });
+                cur = sh;
+            }
+            let mem = self.chunk_addr(p, off + at as i32);
+            self.push(MInst::Store {
+                op: match step {
+                    8 => MemOp::X,
+                    4 => MemOp::W,
+                    2 => MemOp::H,
+                    _ => MemOp::B,
+                },
+                src: cur,
+                mem,
+                vol: false,
+            });
+            at += step;
+            rem -= step;
+        }
+    }
+
+    /// Copy a whole composite between two places, 8 bytes at a time.
+    fn copy_agg(&mut self, dst: Place, src: Place, size: u32) {
+        let mut at = 0u32;
+        while at < size {
+            let n = (size - at).min(8);
+            let v = self.load_chunk(src, at as i32, n);
+            self.store_chunk(dst, at as i32, n, v);
+            at += n;
+        }
+    }
+
+    /// Move one composite between its address and the `n` consecutive registers
+    /// AAPCS64 assigns it (§6.8.2 for x-registers, §5.9.5 for an HFA's v-registers).
+    fn agg_regs(
+        &mut self,
+        base: Reg,
+        first: PReg,
+        n: u32,
+        esz: u32,
+        size: u32,
+        out: bool,
+    ) -> Vec<(Reg, Reg, Width)> {
+        let mut pairs = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let off = (i * esz) as i32;
+            let p = PReg {
+                class: first.class,
+                num: first.num + i as u8,
+            };
+            if first.class == Class::Fpr {
+                let (w, op) = if esz == 8 {
+                    (Width::D, MemOp::D)
+                } else {
+                    (Width::S, MemOp::S)
+                };
+                if out {
+                    let d = self.tmp(w);
+                    self.push(MInst::Load {
+                        op,
+                        dst: d,
+                        mem: AddrMode::BaseImm { base, off },
+                        vol: false,
+                    });
+                    pairs.push((Reg::P(p), d, w));
+                } else {
+                    self.push(MInst::Store {
+                        op,
+                        src: Reg::P(p),
+                        mem: AddrMode::BaseImm { base, off },
+                        vol: false,
+                    });
+                }
+            } else {
+                let rem = size.saturating_sub(i * esz).min(esz).max(1);
+                if out {
+                    let d = self.load_chunk(Place::At(base), off, rem);
+                    pairs.push((Reg::P(p), d, Width::W64));
+                } else {
+                    self.store_chunk(Place::At(base), off, rem, Reg::P(p));
+                }
+            }
+        }
+        pairs
+    }
+
     fn libcall(&mut self, name: &str, args: &[Reg]) {
         let pairs: Vec<(Reg, Reg, Width)> = args
             .iter()
@@ -567,8 +1055,10 @@ impl<'a> L<'a> {
         sig: &hir::Sig,
         callee: &hir::Callee,
         args: &[Operand],
+        sret: Option<Operand>,
     ) {
         let asn = abi::classify(sig);
+        self.f.outgoing = self.f.outgoing.max(asn.stack_bytes);
         // Hack 2007 §4: a constrained instruction is preceded by ONE parallel
         // copy that puts every operand where the ABI wants it. The allocator
         // then sees no fixed constraint at all — the argument registers are
@@ -576,16 +1066,86 @@ impl<'a> L<'a> {
         // among them (f(b, a) where a is in x1 and b in x0) is resolved by the
         // same windmill sequentialization every block edge uses.
         let mut pairs = Vec::with_capacity(args.len());
+        // long double arguments are converted FIRST (each conversion is itself a
+        // call) and only loaded into their v register once every conversion is
+        // done — see `ld_extend`.
+        let mut quads: Vec<(Loc, SlotId)> = Vec::new();
         for ((o, p), loc) in args.iter().zip(&sig.params).zip(&asn.args) {
-            let t = match p {
-                hir::PTy::S(t) => *t,
-                _ => todo!("R1.2: composite argument"),
-            };
-            let r = self.reg(*o, t);
-            match loc {
-                Loc::Reg(p, w) => pairs.push((Reg::P(*p), r, *w)),
-                Loc::Stack(..) => todo!("R1.2: stack arguments"),
+            match (p, loc) {
+                (hir::PTy::S(t), Loc::Reg(pr, w)) => {
+                    let r = self.reg(*o, *t);
+                    pairs.push((Reg::P(*pr), r, *w));
+                }
+                (hir::PTy::S(t), Loc::Stack(off, _)) => {
+                    let r = self.reg(*o, *t);
+                    self.push(MInst::Store {
+                        op: memop(*t),
+                        src: r,
+                        mem: AddrMode::SpArg { off: *off },
+                        vol: false,
+                    });
+                }
+                // §6.8.2 B.4: a composite over 16 bytes is already a pointer
+                (hir::PTy::Agg { .. }, Loc::Reg(pr, w)) => {
+                    let r = self.reg(*o, hir::Ty::I64);
+                    pairs.push((Reg::P(*pr), r, *w));
+                }
+                (hir::PTy::Agg { .. }, Loc::Stack(off, _)) => {
+                    let r = self.reg(*o, hir::Ty::I64);
+                    self.push(MInst::Store {
+                        op: MemOp::X,
+                        src: r,
+                        mem: AddrMode::SpArg { off: *off },
+                        vol: false,
+                    });
+                }
+                (
+                    hir::PTy::Agg { size, .. },
+                    Loc::Regs {
+                        first, n, esz, ..
+                    },
+                ) => {
+                    let a = self.reg(*o, hir::Ty::I64);
+                    let mut ps = self.agg_regs(a, *first, *n, *esz, *size, true);
+                    pairs.append(&mut ps);
+                }
+                (hir::PTy::Agg { size, .. }, Loc::StackAgg { off, .. }) => {
+                    let a = self.reg(*o, hir::Ty::I64);
+                    self.copy_agg(Place::Out(*off), Place::At(a), *size);
+                }
+                (hir::PTy::LDouble, _) => {
+                    let v = self.reg(*o, hir::Ty::F64);
+                    let slot = self.ld_extend(v);
+                    quads.push((*loc, slot));
+                }
+                (hir::PTy::S(_), Loc::Regs { .. } | Loc::StackAgg { .. }) => {
+                    unreachable!("scalar in a composite location")
+                }
             }
+        }
+        for (loc, slot) in quads {
+            let q = self.tmp(Width::Q);
+            self.push(MInst::Load {
+                op: MemOp::Q,
+                dst: q,
+                mem: AddrMode::Slot { slot, off: 0 },
+                vol: false,
+            });
+            match loc {
+                Loc::Reg(pr, _) => pairs.push((Reg::P(pr), q, Width::Q)),
+                Loc::Stack(off, _) => self.push(MInst::Store {
+                    op: MemOp::Q,
+                    src: q,
+                    mem: AddrMode::SpArg { off },
+                    vol: false,
+                }),
+                _ => unreachable!("binary128 in a composite location"),
+            }
+        }
+        // §6.9: the indirect result register is an ordinary fixed argument.
+        if asn.sret {
+            let a = self.reg(sret.expect("composite return without a destination"), hir::Ty::I64);
+            pairs.push((Reg::P(PReg::gpr(8)), a, Width::W64));
         }
         let target = match callee {
             hir::Callee::Direct(n) => CallTarget::Direct(n.clone()),
@@ -594,16 +1154,37 @@ impl<'a> L<'a> {
         if !pairs.is_empty() {
             self.push(MInst::ParallelCopy(pairs));
         }
-        let uses = asn
+        let mut uses: Vec<(Reg, PReg)> = asn
             .args
             .iter()
-            .filter_map(|l| match l {
-                Loc::Reg(p, _) => Some((Reg::P(*p), *p)),
-                Loc::Stack(..) => None,
+            .flat_map(|l| match l {
+                Loc::Reg(p, _) => vec![(Reg::P(*p), *p)],
+                Loc::Regs { first, n, .. } => (0..*n)
+                    .map(|i| {
+                        let p = PReg {
+                            class: first.class,
+                            num: first.num + i as u8,
+                        };
+                        (Reg::P(p), p)
+                    })
+                    .collect(),
+                Loc::Stack(..) | Loc::StackAgg { .. } => vec![],
             })
             .collect();
+        if asn.sret {
+            uses.push((Reg::P(PReg::gpr(8)), PReg::gpr(8)));
+        }
         let defs = match asn.ret {
             Some(Loc::Reg(p, _)) if dst.is_some() => vec![(Reg::P(p), p)],
+            Some(Loc::Regs { first, n, .. }) if sret.is_some() => (0..n)
+                .map(|i| {
+                    let p = PReg {
+                        class: first.class,
+                        num: first.num + i as u8,
+                    };
+                    (Reg::P(p), p)
+                })
+                .collect(),
             _ => vec![],
         };
         self.push(MInst::Call {
@@ -615,18 +1196,48 @@ impl<'a> L<'a> {
             tail: false,
         });
         // and one copy out of the result register
-        if let (Some(v), Some(Loc::Reg(p, w))) = (dst, asn.ret) {
+        if let (Some(v), Some(hir::PTy::LDouble)) = (dst, sig.ret.as_ref()) {
+            // the quad is already in v0, which is where __trunctfdf2 wants it
+            self.fp_libcall("__trunctfdf2");
             let d = self.dst_of(v);
-            if p.class == Class::Fpr {
-                self.push(MInst::FMov {
-                    dw: w,
-                    sw: w,
-                    dst: d,
-                    src: Reg::P(p),
-                });
-            } else {
-                self.push(MInst::Copy { w, dst: d, src: Reg::P(p) });
+            self.push(MInst::FMov {
+                dw: Width::D,
+                sw: Width::D,
+                dst: d,
+                src: Reg::P(PReg::fpr(0)),
+            });
+            return;
+        }
+        match (dst, sret, asn.ret) {
+            (Some(v), _, Some(Loc::Reg(p, w))) => {
+                let d = self.dst_of(v);
+                if p.class == Class::Fpr {
+                    self.push(MInst::FMov {
+                        dw: w,
+                        sw: w,
+                        dst: d,
+                        src: Reg::P(p),
+                    });
+                } else {
+                    self.push(MInst::Copy { w, dst: d, src: Reg::P(p) });
+                }
             }
+            // §6.9: a composite of 16 bytes or fewer comes back in registers and
+            // is written to the destination the caller reserved.
+            (
+                _,
+                Some(o),
+                Some(Loc::Regs {
+                    first,
+                    n,
+                    esz,
+                    size,
+                }),
+            ) => {
+                let a = self.reg(o, hir::Ty::I64);
+                self.agg_regs(a, first, n, esz, size, false);
+            }
+            _ => {}
         }
     }
 
@@ -670,27 +1281,61 @@ impl<'a> L<'a> {
                 }
             }
             Term::Ret(v) => {
-                if let Some(o) = v {
-                    let ty = match self.h.sig.ret.as_ref() {
-                        Some(hir::PTy::S(t)) => *t,
-                        Some(_) => todo!("R1.2: composite return"),
-                        None => hir::Ty::I64,
-                    };
-                    let r = self.reg(*o, ty);
-                    if ty.is_float() {
-                        self.push(MInst::FMov {
-                            dw: wid(ty),
-                            sw: wid(ty),
-                            dst: Reg::P(PReg::fpr(0)),
-                            src: r,
-                        });
-                    } else {
-                        self.push(MInst::Copy {
-                            w: wid(ty),
-                            dst: Reg::P(PReg::gpr(0)),
-                            src: r,
-                        });
+                let rt = self.h.sig.ret.clone();
+                match (rt, v) {
+                    (Some(hir::PTy::Agg { size, .. }), Some(o)) => {
+                        let a = self.reg(*o, hir::Ty::I64);
+                        match self.asn.ret {
+                            // §6.9: ≤16 bytes (or an HFA) go back in registers
+                            Some(Loc::Regs { first, n, esz, size }) => {
+                                let ps = self.agg_regs(a, first, n, esz, size, true);
+                                self.push(MInst::ParallelCopy(ps));
+                            }
+                            // …anything larger through the caller's x8, whose
+                            // value AAPCS64 also returns in x0
+                            _ => {
+                                let p = self.sret_ptr.expect("indirect result без x8");
+                                let n = self.reg(Operand::Imm(size as i64), hir::Ty::I64);
+                                self.libcall("memcpy", &[p, a, n]);
+                                self.push(MInst::Copy {
+                                    w: Width::W64,
+                                    dst: Reg::P(PReg::gpr(0)),
+                                    src: p,
+                                });
+                            }
+                        }
                     }
+                    (Some(hir::PTy::LDouble), Some(o)) => {
+                        let v = self.reg(*o, hir::Ty::F64);
+                        self.push(MInst::ParallelCopy(vec![(
+                            Reg::P(PReg::fpr(0)),
+                            v,
+                            Width::D,
+                        )]));
+                        self.fp_libcall("__extenddftf2");
+                    }
+                    (Some(hir::PTy::S(ty)), Some(o)) => {
+                        let r = self.reg(*o, ty);
+                        if ty.is_float() {
+                            self.push(MInst::FMov {
+                                dw: wid(ty),
+                                sw: wid(ty),
+                                dst: Reg::P(PReg::fpr(0)),
+                                src: r,
+                            });
+                        } else {
+                            self.push(MInst::Copy {
+                                w: wid(ty),
+                                dst: Reg::P(PReg::gpr(0)),
+                                src: r,
+                            });
+                        }
+                    }
+                    // a value returned by a void function, or none at all
+                    (None, Some(o)) => {
+                        let _ = self.reg(*o, hir::Ty::I64);
+                    }
+                    (_, None) => {}
                 }
                 MTerm::Ret
             }
@@ -759,9 +1404,13 @@ fn lower_func(h: &hir::Func) -> MFunc {
         is_static: h.is_static,
         is_weak: h.is_weak,
         order: Vec::new(),
-    laid_out: false,
-    frame_size: 0,
+        laid_out: false,
+        frame_size: 0,
         saved: RegSet::default(),
+        dyn_stack: false,
+        has_vla: h.has_vla,
+        outgoing: 0,
+        fp_slot: 0,
         physical: false,
     };
     for s in &h.slots {
@@ -778,41 +1427,177 @@ fn lower_func(h: &hir::Func) -> MFunc {
     }
     for (bi, b) in h.blocks.iter().enumerate() {
         f.blocks[bi].weight = b.weight;
+        f.blocks[bi].is_label = b.is_label;
         f.blocks[bi].params = b.params.iter().map(|p| vmap[*p as usize]).collect();
     }
+    // AAPCS64 entry: each parameter arrives where the ABI names it, and the
+    // entry block moves it into its virtual register. Everything that READS an
+    // incoming physical register does so inside ONE parallel copy — otherwise a
+    // temporary the allocator happens to colour x1 could destroy the second
+    // argument before it has been read.
+    let asn = abi::classify(&h.sig);
     let mut l = L {
         h,
         f,
         vmap,
         cur: h.entry,
+        asn,
+        sret_ptr: None,
+        in_args_slot: None,
+        va_slot: None,
     };
-    // AAPCS64 entry: each parameter arrives in the register the ABI names, and
-    // the entry block copies it into its virtual register. The copies are what
-    // the allocator later coalesces away when the value happens to stay put.
-    let asn = abi::classify(&h.sig);
-    // The incoming arguments arrive together, so they leave together: ONE
-    // parallel copy, for the same reason as at a call site.
     let mut pairs = Vec::new();
+    // (destination value, the registers holding the composite, its shape)
+    let mut agg_regs: Vec<(Reg, Vec<(Reg, Width)>, u32, u32, u32)> = Vec::new();
+    // (destination value, the in-argument-area offset, load width) for scalars
+    let mut from_stack: Vec<(Reg, u32, hir::Ty)> = Vec::new();
+    let mut agg_stack: Vec<(Reg, u32)> = Vec::new();
+    if l.asn.sret {
+        let p = l.f.new_vreg(Width::W64);
+        pairs.push((p, Reg::P(PReg::gpr(8)), Width::W64));
+        l.sret_ptr = Some(p);
+    }
     for (i, vi) in h.values.iter().enumerate() {
-        if let hir::Def::FuncParam(k) = vi.def {
-            let d = l.vmap[i];
-            match asn.args.get(k as usize) {
-                Some(Loc::Reg(p, w)) => pairs.push((d, Reg::P(*p), *w)),
-                Some(Loc::Stack(..)) => todo!("R1.2: incoming stack arguments"),
-                None => {}
+        let hir::Def::FuncParam(k) = vi.def else {
+            continue;
+        };
+        let d = l.vmap[i];
+        let (p, loc) = match (h.sig.params.get(k as usize), l.asn.args.get(k as usize)) {
+            (Some(p), Some(loc)) => (p.clone(), *loc),
+            _ => continue,
+        };
+        match (&p, loc) {
+            (hir::PTy::S(_) | hir::PTy::Agg { .. }, Loc::Reg(pr, w)) => {
+                pairs.push((d, Reg::P(pr), w))
+            }
+            (hir::PTy::S(t), Loc::Stack(off, _)) => from_stack.push((d, off, *t)),
+            (hir::PTy::Agg { .. }, Loc::Stack(off, _)) => {
+                from_stack.push((d, off, hir::Ty::I64))
+            }
+            (hir::PTy::Agg { size, align, .. }, Loc::Regs { first, n, esz, .. }) => {
+                let mut rs = Vec::with_capacity(n as usize);
+                for j in 0..n {
+                    let pr = PReg {
+                        class: first.class,
+                        num: first.num + j as u8,
+                    };
+                    let w = match (first.class, esz) {
+                        (Class::Fpr, 8) => Width::D,
+                        (Class::Fpr, _) => Width::S,
+                        _ => Width::W64,
+                    };
+                    let v = l.f.new_vreg(w);
+                    pairs.push((v, Reg::P(pr), w));
+                    rs.push((v, w));
+                }
+                agg_regs.push((d, rs, esz, *size, *align));
+            }
+            (hir::PTy::Agg { .. }, Loc::StackAgg { off, .. }) => agg_stack.push((d, off)),
+            // a quad parameter is an OBJECT to the body (memory is binary128),
+            // so it follows the composite path: park the register, hand over the
+            // address
+            (hir::PTy::LDouble, Loc::Reg(pr, _)) => {
+                let v = l.f.new_vreg(Width::Q);
+                pairs.push((v, Reg::P(pr), Width::Q));
+                agg_regs.push((d, vec![(v, Width::Q)], 16, 16, 16));
+            }
+            (hir::PTy::LDouble, Loc::Stack(off, _)) => agg_stack.push((d, off)),
+            (hir::PTy::LDouble, _) => unreachable!("binary128 in a composite location"),
+            (hir::PTy::S(_), Loc::Regs { .. } | Loc::StackAgg { .. }) => {
+                unreachable!("scalar in a composite location")
             }
         }
     }
-    let mut prologue: Vec<MInst> = if pairs.is_empty() {
-        Vec::new()
-    } else {
-        vec![MInst::ParallelCopy(pairs)]
-    };
+    // AAPCS64 §B.6: a variadic function preserves the argument registers the
+    // named parameters did NOT consume, so `va_arg` can read them back. They are
+    // taken in the same parallel copy as the parameters — a temporary the
+    // allocator happened to colour x3 would otherwise destroy one first.
+    let mut va_save: Vec<(Reg, u32, MemOp)> = Vec::new();
+    if h.sig.variadic {
+        let (ngrn, nsrn) = (l.asn.ngrn, l.asn.nsrn);
+        let va = l.va_area();
+        for i in ngrn..8 {
+            let v = l.f.new_vreg(Width::W64);
+            pairs.push((v, Reg::P(PReg::gpr(i as u8)), Width::W64));
+            va_save.push((v, 128 + 8 * i, MemOp::X));
+        }
+        for i in nsrn..8 {
+            let v = l.f.new_vreg(Width::Q);
+            pairs.push((v, Reg::P(PReg::fpr(i as u8)), Width::Q));
+            va_save.push((v, 16 * i, MemOp::Q));
+        }
+        let _ = va;
+    }
+    l.cur = h.entry;
+    if !pairs.is_empty() {
+        l.push(MInst::ParallelCopy(pairs));
+    }
+    for (v, off, op) in va_save {
+        let slot = l.va_area();
+        l.push(MInst::Store {
+            op,
+            src: v,
+            mem: AddrMode::Slot {
+                slot,
+                off: off as i32,
+            },
+            vol: false,
+        });
+    }
+    // A composite delivered in registers has no address of its own, so one is
+    // made: the registers are written to a scratch object and the parameter's
+    // "incoming address" is that object. R2.2's SROA is what removes the copy.
+    for (d, rs, esz, size, align) in agg_regs {
+        let slot = l.f.new_slot(size.max(1), align.max(8), SlotKind::Local);
+        for (j, (v, w)) in rs.iter().enumerate() {
+            let off = (j as u32 * esz) as i32;
+            if w.class() == Class::Fpr {
+                let op = match w {
+                    Width::Q => MemOp::Q,
+                    Width::D => MemOp::D,
+                    _ => MemOp::S,
+                };
+                l.push(MInst::Store {
+                    op,
+                    src: *v,
+                    mem: AddrMode::Slot { slot, off },
+                    vol: false,
+                });
+            } else {
+                let n = size.saturating_sub(j as u32 * esz).min(esz).max(1);
+                l.store_chunk(Place::Slot(slot), off, n, *v);
+            }
+        }
+        l.push(MInst::SlotAddr { dst: d, slot, off: 0 });
+    }
+    // A composite the caller left on the stack is already an object: its address
+    // is simply a point in the caller's argument area — no copy at all.
+    for (d, off) in agg_stack {
+        let slot = l.in_args();
+        l.push(MInst::SlotAddr {
+            dst: d,
+            slot,
+            off: off as i32,
+        });
+    }
+    for (d, off, t) in from_stack {
+        let slot = l.in_args();
+        l.push(MInst::Load {
+            op: memop(t),
+            dst: d,
+            mem: AddrMode::Slot {
+                slot,
+                off: off as i32,
+            },
+            vol: false,
+        });
+    }
+    let mut prologue: Vec<MInst> = std::mem::take(&mut l.f.blocks[h.entry as usize].insts);
     for (bi, b) in h.blocks.iter().enumerate() {
         l.cur = bi as MBlockId;
         if bi == h.entry as usize {
             let p = std::mem::take(&mut prologue);
-            l.f.blocks[bi].insts.extend(p);
+            l.f.blocks[bi].insts = p;
         }
         for i in &b.insts {
             l.inst(i);

@@ -94,19 +94,23 @@ pub enum Width {
     W64,
     S,
     D,
+    /// the full 128-bit `q` form of a v register — AAPCS64 §5.1.2's Quad-precision
+    /// `long double` (binary128) and the 16-byte slots of the variadic save area
+    Q,
 }
 
 impl Width {
     pub fn class(self) -> Class {
         match self {
             Width::W32 | Width::W64 => Class::Gpr,
-            Width::S | Width::D => Class::Fpr,
+            Width::S | Width::D | Width::Q => Class::Fpr,
         }
     }
     pub fn bytes(self) -> u32 {
         match self {
             Width::W32 | Width::S => 4,
             Width::W64 | Width::D => 8,
+            Width::Q => 16,
         }
     }
     /// the `x` vs `w` bit of an A64 ALU encoding
@@ -206,6 +210,11 @@ pub enum AddrMode {
     PostIdx { base: Reg, wb: Reg, off: i32 },
     /// a stack object; `frame` rewrites this into `BaseImm` on sp or x29
     Slot { slot: SlotId, off: i32 },
+    /// AAPCS64 §6.4 outgoing-argument area: `[sp, #off]`. ALWAYS sp-relative —
+    /// the area is defined to start at sp when the `bl` executes, which is also
+    /// what keeps it correct in a dynamic frame (a `StackAlloc` moves sp and the
+    /// area moves with it).
+    SpArg { off: u32 },
     /// `[sym + :lo12:]` after an `adrp` into `base`
     SymLo12 { base: Reg, sym: Sym },
 }
@@ -268,6 +277,10 @@ pub enum AluOp {
     Mul,
     SDiv,
     UDiv,
+    /// the high 64 bits of a 64×64 product — the only way to see a 64-bit
+    /// multiplication overflow (EXT(gcc) `__builtin_mul_overflow`)
+    SMulH,
+    UMulH,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -295,9 +308,10 @@ pub enum MemOp {
     W,
     SW,
     X,
-    /// FP forms: `ldr s` / `ldr d`
+    /// FP forms: `ldr s` / `ldr d` / `ldr q`
     S,
     D,
+    Q,
 }
 
 impl MemOp {
@@ -307,11 +321,12 @@ impl MemOp {
             MemOp::H | MemOp::SH => 2,
             MemOp::W | MemOp::SW | MemOp::S => 4,
             MemOp::X | MemOp::D => 8,
+            MemOp::Q => 16,
         }
     }
     pub fn class(self) -> Class {
         match self {
-            MemOp::S | MemOp::D => Class::Fpr,
+            MemOp::S | MemOp::D | MemOp::Q => Class::Fpr,
             _ => Class::Gpr,
         }
     }
@@ -504,12 +519,83 @@ pub enum MInst {
         dst: Reg,
         w: Width,
     },
-    /// address of a stack object (`alloca`, an aggregate local)
+    /// Address of a stack object (`alloca`, an aggregate local). Like `MovImm`
+    /// this is a COST EXCEPTION: `add dst, base, #off` covers an imm12 (or one
+    /// shifted by 12), and a larger frame offset needs the `movz/movk` chain
+    /// first. `isa::add_imm` and `isa::mov_chain` give the exact count before
+    /// anything is emitted, so the cost square stays computable (REARCH §10).
     SlotAddr {
         dst: Reg,
         slot: SlotId,
         off: i32,
     },
+    /// The same, for the outgoing-argument area: `dst = sp + off`.
+    SpAddr { dst: Reg, off: u32 },
+    /// EXT(gcc) `__sync_*` (ARM DDI 0487 B2.9): the load/store-exclusive pair
+    /// an atomic read-modify-write is built from. `LdAxr` takes the exclusive
+    /// monitor, `StlXr` releases it and reports 0 on success; the retry loop
+    /// around them is ordinary HIR control flow, not a hidden expansion.
+    LdAxr {
+        w: Width,
+        dst: Reg,
+        addr: Reg,
+    },
+    StlXr {
+        w: Width,
+        /// 0 = the store succeeded (always a `w` register)
+        status: Reg,
+        src: Reg,
+        addr: Reg,
+    },
+    /// `stlr src, [addr]` — a release store with no monitor
+    Stlr {
+        w: Width,
+        src: Reg,
+        addr: Reg,
+    },
+    /// `dmb ish` — the full barrier `__sync_synchronize` asks for
+    Dmb,
+    /// `mrs dst, tpidr_el0` — the thread pointer (EXT(gcc) `__thread`)
+    Mrs { dst: Reg },
+    /// `add dst, base, #:tprel_hi12:sym, lsl #12` (hi) or `#:tprel_lo12_nc:sym`
+    /// (lo): the local-exec offset of a thread-local object, in two halves
+    /// exactly as the relocation pair splits it.
+    AddTprel {
+        dst: Reg,
+        base: Reg,
+        sym: Sym,
+        hi: bool,
+    },
+    /// EXT(gcc) inline asm. Every operand is pinned to a physical register from
+    /// a reserved pool before the instruction, exactly as a call's arguments
+    /// are: the template is printed verbatim with `%n` replaced by the register
+    /// the operand landed in, so the allocator needs no notion of "asm".
+    Asm {
+        tmpl: String,
+        ops: Vec<AsmSlot>,
+    },
+    /// C99 6.7.5.2 VLA / EXT(gcc) `alloca`: move sp down by `size` rounded up to
+    /// 16 (AAPCS64 §6.2.2) and define `dst` as the base of the new block. This is
+    /// the ONE instruction that changes sp inside a body, and its presence is
+    /// what makes a function's frame dynamic (`MFunc::dyn_stack`): every static
+    /// stack object then has to be addressed from the frame pointer instead.
+    StackAlloc {
+        dst: Reg,
+        size: Reg,
+    },
+}
+
+/// One inline-asm operand after register assignment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AsmSlot {
+    pub reg: PReg,
+    /// belongs to the output section (`=`/`+`)
+    pub out: bool,
+    /// read before the template runs (an input, or an `+`/`0` output)
+    pub read: bool,
+    /// `"m"`/`"Q"`: the register holds an ADDRESS and prints as `[xN]`
+    pub mem: bool,
+    pub w: Width,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -658,7 +744,7 @@ macro_rules! visit_addr {
                 $f(base, Constraint::Use);
                 $f(wb, Constraint::Def);
             }
-            AddrMode::Slot { .. } => {}
+            AddrMode::Slot { .. } | AddrMode::SpArg { .. } => {}
             AddrMode::SymLo12 { base, .. } => $f(base, Constraint::Use),
         }
     };
@@ -670,7 +756,13 @@ impl MInst {
             MInst::Load { vol: true, .. } | MInst::Store { vol: true, .. } => MemEffect::Barrier,
             MInst::Load { .. } | MInst::Reload { .. } => MemEffect::Read,
             MInst::Store { .. } | MInst::Spill { .. } => MemEffect::Write,
-            MInst::Call { .. } => MemEffect::Barrier,
+            MInst::Call { .. }
+            | MInst::StackAlloc { .. }
+            | MInst::LdAxr { .. }
+            | MInst::StlXr { .. }
+            | MInst::Stlr { .. }
+            | MInst::Dmb
+            | MInst::Asm { .. } => MemEffect::Barrier,
             _ => MemEffect::None,
         }
     }
@@ -769,7 +861,40 @@ impl MInst {
             }
             MInst::Spill { src, .. } => g(src, Constraint::Use),
             MInst::Reload { dst, .. } => g(dst, Constraint::Def),
-            MInst::SlotAddr { dst, .. } => g(dst, Constraint::Def),
+            MInst::SlotAddr { dst, .. } | MInst::SpAddr { dst, .. } => g(dst, Constraint::Def),
+            MInst::StackAlloc { dst, size } => {
+                g(size, Constraint::Use);
+                g(dst, Constraint::Def);
+            }
+            MInst::LdAxr { dst, addr, .. } => {
+                g(addr, Constraint::Use);
+                g(dst, Constraint::Def);
+            }
+            MInst::StlXr {
+                status, src, addr, ..
+            } => {
+                g(src, Constraint::Use);
+                g(addr, Constraint::Use);
+                g(status, Constraint::Def);
+            }
+            MInst::Stlr { src, addr, .. } => {
+                g(src, Constraint::Use);
+                g(addr, Constraint::Use);
+            }
+            MInst::Dmb => {}
+            MInst::Mrs { dst } => g(dst, Constraint::Def),
+            MInst::AddTprel { dst, base, .. } => {
+                g(base, Constraint::Use);
+                g(dst, Constraint::Def);
+            }
+            MInst::Asm { ops, .. } => {
+                for o in ops.iter().filter(|o| o.read) {
+                    g(&Reg::P(o.reg), Constraint::UseFixed(o.reg));
+                }
+                for o in ops.iter().filter(|o| o.out) {
+                    g(&Reg::P(o.reg), Constraint::DefFixed(o.reg));
+                }
+            }
         }
     }
 
@@ -866,7 +991,34 @@ impl MInst {
             }
             MInst::Spill { src, .. } => f(src, Constraint::Use),
             MInst::Reload { dst, .. } => f(dst, Constraint::Def),
-            MInst::SlotAddr { dst, .. } => f(dst, Constraint::Def),
+            MInst::SlotAddr { dst, .. } | MInst::SpAddr { dst, .. } => f(dst, Constraint::Def),
+            MInst::StackAlloc { dst, size } => {
+                f(size, Constraint::Use);
+                f(dst, Constraint::Def);
+            }
+            MInst::LdAxr { dst, addr, .. } => {
+                f(addr, Constraint::Use);
+                f(dst, Constraint::Def);
+            }
+            MInst::StlXr {
+                status, src, addr, ..
+            } => {
+                f(src, Constraint::Use);
+                f(addr, Constraint::Use);
+                f(status, Constraint::Def);
+            }
+            MInst::Stlr { src, addr, .. } => {
+                f(src, Constraint::Use);
+                f(addr, Constraint::Use);
+            }
+            MInst::Dmb => {}
+            MInst::Mrs { dst } => f(dst, Constraint::Def),
+            MInst::AddTprel { dst, base, .. } => {
+                f(base, Constraint::Use);
+                f(dst, Constraint::Def);
+            }
+            // the operands are already physical: there is nothing to rewrite
+            MInst::Asm { .. } => {}
         }
     }
 
@@ -933,6 +1085,10 @@ pub enum SlotKind {
     Spill,
     /// the outgoing stack-argument area (AAPCS64 NSAA)
     OutArgs,
+    /// The CALLER's stack-argument area, seen from inside the callee: a
+    /// zero-sized marker slot whose offset `frame` fixes at `frame_size`, so
+    /// `Slot{in_args, off}` names sp-on-entry + off with no new addressing mode.
+    InArgs,
 }
 
 #[derive(Clone, Debug)]
@@ -941,6 +1097,8 @@ pub struct MBlock {
     pub insts: Vec<MInst>,
     pub term: MTerm,
     pub weight: u32,
+    /// carried from HIR: a C `goto` label lands here (see `hir::Block::is_label`)
+    pub is_label: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -963,6 +1121,17 @@ pub struct MFunc {
     /// filled by `frame`: total frame size and the callee-saved registers used
     pub frame_size: u32,
     pub saved: RegSet,
+    /// `StackAlloc` occurs in this function: sp moves inside the body, so the
+    /// frame is addressed from x29 and the epilogue restores sp from it.
+    pub dyn_stack: bool,
+    /// the source function declared a VLA (C99 6.7.5.2) — a `goto` label then
+    /// deallocates back to the frame base
+    pub has_vla: bool,
+    /// bytes of the outgoing stack-argument area, at the BOTTOM of the frame so
+    /// it stays addressable from sp even after a `StackAlloc` moves it
+    pub outgoing: u32,
+    /// where the caller's x29 is preserved in a dynamic frame (see `pass/frame`)
+    pub fp_slot: SlotId,
     /// true once `regalloc` has run — the verifier switches obligations on it
     pub physical: bool,
 }
@@ -988,6 +1157,7 @@ impl MFunc {
             insts: Vec::new(),
             term: MTerm::Unreachable,
             weight: 1,
+            is_label: false,
         });
         (self.blocks.len() - 1) as MBlockId
     }

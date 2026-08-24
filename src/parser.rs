@@ -1781,7 +1781,12 @@ impl P<'_> {
                 } else if !fl && gp < 8 {
                     gp += 1;
                 } else {
-                    boff = alup(boff, sz) + sz;
+                    // AAPCS64 C.13/C.14 + C.16: the NSAA is rounded to the larger
+                    // of 8 and the natural alignment, and an argument narrower
+                    // than 8 bytes still OCCUPIES 8 (verified against gcc: char,
+                    // short, int, char at [sp,0], [sp,8], [sp,16], [sp,24]).
+                    // Byte-identical with `isel/abi.rs` — edit both (Article E).
+                    boff = alup(boff, if sz > 8 { 16 } else { 8 }) + sz.max(8);
                 }
             }
         }

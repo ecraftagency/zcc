@@ -56,7 +56,8 @@ pub fn new_machine<'a>(m: &'a Module, ast: &Ast) -> Machine<'a> {
 impl<'a> Machine<'a> {
     pub fn sym_addr(&self, s: &Sym) -> u64 {
         match s {
-            Sym::Global(i) => self.lay.globals[*i as usize],
+            // ⟦·⟧ has one thread, so a thread-local object is just an object
+            Sym::Global(i) | Sym::Tls(i) => self.lay.globals[*i as usize],
             Sym::Str(i) => self.lay.strs[*i as usize],
             // A function address is its index + a tag; only comparison and
             // indirect call use it, both of which go back through this map.
@@ -77,6 +78,19 @@ impl<'a> Machine<'a> {
     }
 
     fn call_index(&mut self, fi: usize, args: &[Bits]) -> Result<Option<Bits>, Trap> {
+        self.call_sret(fi, args, None)
+    }
+
+    /// `sret` = (destination address, byte count) when the callee returns a
+    /// COMPOSITE. Its `ret` yields the address of an object in its OWN frame, so
+    /// the copy has to happen before that frame is popped — which is exactly
+    /// what AAPCS64 §6.9 does with registers or the x8 indirection.
+    fn call_sret(
+        &mut self,
+        fi: usize,
+        args: &[Bits],
+        sret: Option<(u64, u64)>,
+    ) -> Result<Option<Bits>, Trap> {
         let f = &self.m.funcs[fi];
         let frame: u64 = f.slots.iter().map(|s| ((s.size + 15) & !15) as u64).sum();
         let base = self.mem.push_frame(frame)?;
@@ -87,6 +101,13 @@ impl<'a> Machine<'a> {
             at += ((s.size + 15) & !15) as u64;
         }
         let r = self.run_body(fi, args, &slot_addr);
+        if let (Ok(Some(src)), Some((dst, n))) = (&r, sret) {
+            let src = *src;
+            for i in 0..n {
+                let b = self.mem.load(src + i, 1)?;
+                self.mem.store(dst + i, 1, b)?;
+            }
+        }
         self.mem.pop_frame(frame);
         r
     }
@@ -241,12 +262,19 @@ impl<'a> Machine<'a> {
                 callee,
                 args,
                 sig,
+                sret,
             } => {
                 let xs: Vec<Bits> = args.iter().map(|a| get(a, vals)).collect();
-                let _ = sig;
+                let sr = sret.map(|o| {
+                    let n = match sig.ret {
+                        Some(crate::hir::PTy::Agg { size, .. }) => size as u64,
+                        _ => 0,
+                    };
+                    (get(&o, vals), n)
+                });
                 let r = match callee {
                     Callee::Direct(name) => match self.by_name.get(name.as_str()) {
-                        Some(&i) => self.call_index(i, &xs)?,
+                        Some(&i) => self.call_sret(i, &xs, sr)?,
                         None => self.builtin(name, &xs)?,
                     },
                     Callee::Indirect(o) => {
@@ -255,7 +283,7 @@ impl<'a> Machine<'a> {
                         if a & FUNC_TAG == 0 || i >= self.m.funcs.len() {
                             return Err(Trap::BadAddress(a));
                         }
-                        self.call_index(i, &xs)?
+                        self.call_sret(i, &xs, sr)?
                     }
                 };
                 if let Some(d) = dst {
@@ -364,6 +392,9 @@ fn eval_bin(op: BinOp, ty: Ty, x: u64, y: u64) -> Result<u64, Trap> {
         Add => sx.wrapping_add(sy) as u64,
         Sub => sx.wrapping_sub(sy) as u64,
         Mul => sx.wrapping_mul(sy) as u64,
+        // defined only at I64, where the low half alone cannot show an overflow
+        SMulHi => (((sx as i128).wrapping_mul(sy as i128)) >> 64) as u64,
+        UMulHi => (((ux as u128).wrapping_mul(uy as u128)) >> 64) as u64,
         SDiv => {
             if sy == 0 {
                 return Err(Trap::DivZero);

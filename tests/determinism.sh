@@ -35,6 +35,12 @@ for c in "$ROOT"/tests/cases/*.c "$ROOT"/tests/bench/*.c "$ROOT"/tests/refactor_
   [ "$ok" = 1 ] && [ -n "$first" ] && progs=$((progs+1))
 done
 rm -rf "$OUT"
+# Article E (clean-input): a green verdict is valid only with a mechanical
+# evidence trail. Zero programs compiled means the compiler was never run — a
+# missing $ZCC, not a determinism result — so it is a FAILURE, not a pass.
+if [ "$progs" = 0 ]; then
+  echo "❌ determinism.sh compiled NO program (ZCC=$ZCC missing or rejecting every input)"; exit 1
+fi
 if [ "$bad" = 0 ]; then
   echo "✅ DETERMINISTIC ($progs programs x $N fresh processes)"; exit 0
 fi

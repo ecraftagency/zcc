@@ -38,6 +38,10 @@ pub struct Machine<'a> {
     mem: Mem,
     gpr: [u64; 32],
     fpr: [u64; 32],
+    /// The upper half of each v register. A `q` form (binary128 `long double`,
+    /// the variadic save area) is the only thing that reads it; every other
+    /// width leaves it alone, exactly as the hardware does not.
+    fpr_hi: [u64; 32],
     nzcv: u64,
     steps: u64,
 }
@@ -56,6 +60,7 @@ pub fn new_machine<'a>(m: &'a MModule, ast: &Ast) -> Machine<'a> {
         mem,
         gpr: [0; 32],
         fpr: [0; 32],
+        fpr_hi: [0; 32],
         nzcv: 0,
         steps: 0,
     }
@@ -65,14 +70,20 @@ pub fn new_machine<'a>(m: &'a MModule, ast: &Ast) -> Machine<'a> {
 /// objects landed.
 struct Frame {
     vals: Vec<u64>,
+    /// the upper half of a `q`-width virtual register (see `Machine::fpr_hi`)
+    hi: Vec<u64>,
     slot_addr: Vec<u64>,
+    /// bytes taken by `StackAlloc` in this call, reclaimed when it returns —
+    /// the interpreter's counterpart of the epilogue's `mov sp, x29`
+    dyn_bytes: u64,
+    outgoing: u64,
 }
 
 impl<'a> Machine<'a> {
     pub fn sym_addr(&self, s: &crate::hir::Sym) -> u64 {
         use crate::hir::Sym;
         match s {
-            Sym::Global(i) => self.lay.globals[*i as usize],
+            Sym::Global(i) | Sym::Tls(i) => self.lay.globals[*i as usize],
             Sym::Str(i) => self.lay.strs[*i as usize],
             Sym::Func(name) => match self.by_name.get(name.as_str()) {
                 Some(i) => FUNC_TAG | *i as u64,
@@ -118,6 +129,27 @@ impl<'a> Machine<'a> {
         }
     }
 
+    fn get_hi(&self, fr: &Frame, r: Reg) -> u64 {
+        match r {
+            Reg::V(v) => fr.hi[v as usize],
+            Reg::P(p) => match p.class {
+                Class::Fpr => self.fpr_hi[p.num as usize],
+                _ => 0,
+            },
+        }
+    }
+
+    fn set_hi(&mut self, fr: &mut Frame, r: Reg, v: u64) {
+        match r {
+            Reg::V(x) => fr.hi[x as usize] = v,
+            Reg::P(p) => {
+                if p.class == Class::Fpr {
+                    self.fpr_hi[p.num as usize] = v;
+                }
+            }
+        }
+    }
+
     fn set(&mut self, fr: &mut Frame, r: Reg, v: u64) {
         match r {
             Reg::V(x) => fr.vals[x as usize] = v,
@@ -160,21 +192,35 @@ impl<'a> Machine<'a> {
             Vec::new()
         };
         let f = &self.m.funcs[fi];
+        // sp as the CALLER left it: the base of the incoming argument area
+        // (AAPCS64's NSAA seen from this side of the `bl`).
+        let entry_sp = self.mem.sp;
         // Before `frame` runs, each stack object is its own region; afterwards
-        // `frame_size` is the whole frame and slots carry offsets into it.
+        // `frame_size` is the whole frame and slots carry offsets into it. The
+        // outgoing-argument area is reserved at the bottom in BOTH phases —
+        // otherwise a pre-frame run would let an outgoing argument and slot 0
+        // occupy the same bytes.
+        let out = f.outgoing as u64;
         let (frame_bytes, per_slot): (u64, bool) = if f.laid_out {
             (f.frame_size as u64, false)
         } else {
             (
-                f.slots.iter().map(|s| ((s.size + 15) & !15) as u64).sum(),
+                out + f
+                    .slots
+                    .iter()
+                    .filter(|s| s.kind != SlotKind::InArgs)
+                    .map(|s| ((s.size + 15) & !15) as u64)
+                    .sum::<u64>(),
                 true,
             )
         };
         let base = self.mem.push_frame(frame_bytes)?;
         let mut slot_addr = Vec::with_capacity(f.slots.len());
-        let mut at = base;
+        let mut at = base + if per_slot { out } else { 0 };
         for s in &f.slots {
-            if per_slot {
+            if s.kind == SlotKind::InArgs {
+                slot_addr.push(entry_sp);
+            } else if per_slot {
                 slot_addr.push(at);
                 at += ((s.size + 15) & !15) as u64;
             } else {
@@ -183,10 +229,13 @@ impl<'a> Machine<'a> {
         }
         let mut fr = Frame {
             vals: vec![0; f.vregs.len()],
+            hi: vec![0; f.vregs.len()],
             slot_addr,
+            dyn_bytes: 0,
+            outgoing: out,
         };
         let r = self.run(fi, &mut fr);
-        self.mem.pop_frame(frame_bytes);
+        self.mem.pop_frame(frame_bytes + fr.dyn_bytes);
         for (p, v) in saved {
             match p.class {
                 Class::Fpr => self.fpr[p.num as usize] = v,
@@ -300,6 +349,9 @@ impl<'a> Machine<'a> {
                 (fr.slot_addr[*slot as usize] as i64 + *off as i64) as u64,
                 None,
             ),
+            // The outgoing-argument area rides at the CURRENT sp — that is what
+            // makes it survive a `StackAlloc` (REARCH §5.2).
+            AddrMode::SpArg { off } => (self.mem.sp + *off as u64, None),
             AddrMode::SymLo12 { base, .. } => {
                 let _ = size;
                 (self.get(fr, *base), None)
@@ -376,6 +428,15 @@ impl<'a> Machine<'a> {
             }
             MInst::Load { op, dst, mem, .. } => {
                 let (a, wb) = self.addr(fr, mem, op.bytes())?;
+                if *op == MemOp::Q {
+                    let (lo, hi) = (self.mem.load(a, 8)?, self.mem.load(a + 8, 8)?);
+                    self.set(fr, *dst, lo);
+                    self.set_hi(fr, *dst, hi);
+                    if let Some((r, x)) = wb {
+                        self.set(fr, r, x);
+                    }
+                    return Ok(());
+                }
                 let raw = self.mem.load(a, op.bytes())?;
                 let v = match op {
                     MemOp::SB => raw as u8 as i8 as i64 as u64,
@@ -391,7 +452,13 @@ impl<'a> Machine<'a> {
             MInst::Store { op, src, mem, .. } => {
                 let (a, wb) = self.addr(fr, mem, op.bytes())?;
                 let v = self.get(fr, *src);
-                self.mem.store(a, op.bytes(), v)?;
+                if *op == MemOp::Q {
+                    let hi = self.get_hi(fr, *src);
+                    self.mem.store(a, 8, v)?;
+                    self.mem.store(a + 8, 8, hi)?;
+                } else {
+                    self.mem.store(a, op.bytes(), v)?;
+                }
                 if let Some((r, x)) = wb {
                     self.set(fr, r, x);
                 }
@@ -613,27 +680,104 @@ impl<'a> Machine<'a> {
             }
             MInst::Copy { dst, src, w } => {
                 let v = trunc(self.get(fr, *src), *w);
+                if *w == Width::Q {
+                    let h = self.get_hi(fr, *src);
+                    self.set_hi(fr, *dst, h);
+                }
                 self.set(fr, *dst, v);
             }
             MInst::ParallelCopy(pairs) => {
-                let vs: Vec<u64> = pairs.iter().map(|(_, s, w)| trunc(self.get(fr, *s), *w)).collect();
-                for ((d, _, _), v) in pairs.iter().zip(vs) {
+                let vs: Vec<(u64, u64)> = pairs
+                    .iter()
+                    .map(|(_, s, w)| (trunc(self.get(fr, *s), *w), self.get_hi(fr, *s)))
+                    .collect();
+                for ((d, _, w), (v, h)) in pairs.iter().zip(vs) {
                     self.set(fr, *d, v);
+                    if *w == Width::Q {
+                        self.set_hi(fr, *d, h);
+                    }
                 }
             }
             MInst::Spill { slot, src, w } => {
                 let a = fr.slot_addr[*slot as usize];
                 let v = self.get(fr, *src);
-                self.mem.store(a, w.bytes(), v)?;
+                if *w == Width::Q {
+                    let h = self.get_hi(fr, *src);
+                    self.mem.store(a, 8, v)?;
+                    self.mem.store(a + 8, 8, h)?;
+                } else {
+                    self.mem.store(a, w.bytes(), v)?;
+                }
             }
             MInst::Reload { slot, dst, w } => {
                 let a = fr.slot_addr[*slot as usize];
+                if *w == Width::Q {
+                    let (lo, hi) = (self.mem.load(a, 8)?, self.mem.load(a + 8, 8)?);
+                    self.set(fr, *dst, lo);
+                    self.set_hi(fr, *dst, hi);
+                } else {
+                    let v = self.mem.load(a, w.bytes())?;
+                    self.set(fr, *dst, v);
+                }
+            }
+            // B2.9: single-threaded, an exclusive pair is an ordinary
+            // load/store and the store always succeeds — which is exactly the
+            // behaviour ⟦·⟧ must model, since the interpreter has one thread.
+            MInst::LdAxr { w, dst, addr } => {
+                let a = self.get(fr, *addr);
                 let v = self.mem.load(a, w.bytes())?;
                 self.set(fr, *dst, v);
             }
+            MInst::StlXr {
+                w,
+                status,
+                src,
+                addr,
+            } => {
+                let (a, v) = (self.get(fr, *addr), self.get(fr, *src));
+                self.mem.store(a, w.bytes(), v)?;
+                self.set(fr, *status, 0);
+            }
+            MInst::Stlr { w, src, addr } => {
+                let (a, v) = (self.get(fr, *addr), self.get(fr, *src));
+                self.mem.store(a, w.bytes(), v)?;
+            }
+            MInst::Dmb => {}
+            // ⟦·⟧ has one thread, so the thread pointer is the origin and the
+            // two halves of the tprel pair simply re-add up to the object's
+            // address — the same value the linker's relocation produces.
+            MInst::Mrs { dst } => self.set(fr, *dst, 0),
+            MInst::AddTprel {
+                dst,
+                base,
+                sym,
+                hi,
+            } => {
+                let a = self.sym_addr(sym);
+                let part = if *hi { a & !0xfff } else { a & 0xfff };
+                let b = self.get(fr, *base);
+                self.set(fr, *dst, b.wrapping_add(part));
+            }
+            // an asm template is opaque: no semantics to give it
+            MInst::Asm { .. } => return Err(Trap::Unreachable),
             MInst::SlotAddr { dst, slot, off } => {
                 let a = (fr.slot_addr[*slot as usize] as i64 + *off as i64) as u64;
                 self.set(fr, *dst, a);
+            }
+            MInst::SpAddr { dst, off } => {
+                let a = self.mem.sp + *off as u64;
+                self.set(fr, *dst, a);
+            }
+            // C99 6.7.5.2: sp drops by the rounded byte count and the value is
+            // the base of the new block. ⟦·⟧ keeps the count so the return can
+            // reclaim it, which is what the epilogue's `mov sp, x29` does.
+            MInst::StackAlloc { dst, size } => {
+                let n = (self.get(fr, *size) + 15) & !15;
+                let a = self.mem.push_frame(n)?;
+                fr.dyn_bytes += n;
+                // the new object starts ABOVE the outgoing-argument area, which
+                // has moved down with sp and must stay reachable
+                self.set(fr, *dst, a + fr.outgoing);
             }
         }
         Ok(())
@@ -709,7 +853,10 @@ impl<'a> Machine<'a> {
 /// truth, and the one place ⟦mir⟧ deliberately differs from ⟦hir⟧'s
 /// sign-extended carrier.
 fn trunc(v: u64, w: Width) -> u64 {
-    if w.is64() { v } else { v & 0xffff_ffff }
+    match w {
+        Width::W32 | Width::S => v & 0xffff_ffff,
+        _ => v,
+    }
 }
 fn sign(v: u64, w: Width) -> i64 {
     if w.is64() {
@@ -738,6 +885,18 @@ fn alu(op: AluOp, w: Width, x: u64, y: u64) -> (u64, u64) {
             let v = ((x ^ y) & (x ^ s)) >> (bits - 1) & 1 != 0;
             (s, c, v)
         }
+        // DDI 0487 C6.2.199/244: the high half of the full 128-bit product,
+        // defined only in the 64-bit form.
+        AluOp::SMulH => (
+            (((x as i64 as i128).wrapping_mul(y as i64 as i128)) >> 64) as u64,
+            false,
+            false,
+        ),
+        AluOp::UMulH => (
+            (((x as u128).wrapping_mul(y as u128)) >> 64) as u64,
+            false,
+            false,
+        ),
         AluOp::And => (x & y, false, false),
         AluOp::Orr => (x | y, false, false),
         AluOp::Eor => (x ^ y, false, false),

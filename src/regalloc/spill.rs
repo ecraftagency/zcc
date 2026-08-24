@@ -25,6 +25,15 @@ use crate::mir::*;
 use std::collections::BTreeSet;
 
 /// Bring every program point to pressure ≤ k. Returns the number of values spilled.
+///
+/// COMPLEXITY (the reason this is written as a sweep rather than a loop over
+/// single victims): each round costs ONE liveness computation, ONE next-use
+/// index and ONE rewrite, so the whole spiller is O(rounds · |f|) with `rounds`
+/// the number of times a spill decision changes liveness enough to expose new
+/// pressure — one or two on real code. Choosing one victim per liveness
+/// recomputation, and answering "when is this used next?" by re-scanning the
+/// function, made it O(spills · |f|²) — invisible on small functions and fatal
+/// on a real translation unit.
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
     let mut spilled = 0;
     // Termination bound, derived rather than picked: a victim is never a value
@@ -37,100 +46,185 @@ pub fn spill(f: &mut MFunc) -> Result<usize, String> {
     loop {
         let cfg = crate::mir::verify::cfg(f);
         let lv = live::compute(f, &cfg);
-        let Some((victim, class)) = worst_point(f, &lv, &cfg)? else {
+        let vs = victims(f, &lv, &cfg)?;
+        if vs.is_empty() {
             return Ok(spilled);
-        };
-        if class == Class::Flags {
-            // Flags are never spilled: their producer is pure, so the answer is
-            // to rematerialize the compare. Reaching here means isel let two
-            // flag values overlap — a Law-2 Side-I defect, not a spill problem.
-            return Err(format!(
-                "{}: two NZCV values live at once; the compare must be rematerialized",
-                f.name
-            ));
         }
-        spill_value(f, victim);
-        spilled += 1;
+        spilled += vs.len();
         if spilled > bound {
             return Err(format!(
                 "{}: spilling retired more values ({}) than the function has virtual registers ({})",
                 f.name, spilled, bound
             ));
         }
+        spill_values(f, &vs);
     }
 }
 
-/// The value to spill next: at the first point whose pressure exceeds k, the
-/// live value whose next use is furthest away (Belady's rule, applied globally
-/// rather than per working set).
-fn worst_point(
+/// Every value this sweep decides to spill: walk each program point once and,
+/// while its pressure exceeds k, evict the live value whose next use is
+/// furthest away (Belady's rule). A value chosen here is treated as gone for the
+/// rest of the sweep, which is what lets one liveness computation serve the
+/// whole round.
+fn victims(
     f: &MFunc,
     lv: &live::Liveness,
     cfg: &crate::cfg::Cfg,
-) -> Result<Option<(VReg, Class)>, String> {
+) -> Result<Vec<VReg>, String> {
     // Linearize in reverse postorder so "next use" has a meaning. `base[b]` is
     // the absolute position of block b's first instruction, so a position is a
     // real instruction index — not a block index scaled by an assumed maximum
     // block length, which would mis-rank the moment a block grew past it.
     let base = linear_positions(f, cfg);
+    let uses = use_positions(f, lv, cfg, &base);
+    let mut chosen: Vec<VReg> = Vec::new();
+    let mut lu = live::LastUse::new(lv.sp);
+    let mut gone: BTreeSet<usize> = BTreeSet::new();
+    let masks = [
+        isa::alloc_mask(Class::Gpr),
+        isa::alloc_mask(Class::Fpr),
+        0u32,
+    ];
     for &b in &cfg.rpo {
         let bi = b as usize;
         let blk = &f.blocks[bi];
-        let mut live: BTreeSet<usize> = lv.live_in[bi].clone();
-        let last = live::last_use(f, lv.sp, lv, bi);
+        // The live set, plus the per-class COUNTS that go with it. Counting
+        // incrementally is what keeps the sweep linear: rebuilding the member
+        // list of each class at each instruction is O(live) per instruction,
+        // which is the whole function squared on a large one.
+        let mut st = LiveSet::new(f, lv);
+        for &x in lv.live_in[bi].iter().filter(|x| !gone.contains(x)) {
+            st.insert(f, lv, x);
+        }
+        live::last_use_into(f, lv.sp, lv, bi, &mut lu);
+        let last = &lu.at;
         for (i, inst) in blk.insts.iter().enumerate() {
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
-                    live.insert(lv.sp.idx(*r));
+                    let x = lv.sp.idx(*r);
+                    if !gone.contains(&x) {
+                        st.insert(f, lv, x);
+                    }
                 }
             }
-            for class in [Class::Gpr, Class::Fpr, Class::Flags] {
-                let members: Vec<usize> = live
-                    .iter()
-                    .copied()
-                    .filter(|&x| class_of(f, lv.sp.reg(x)) == class)
-                    .collect();
-                if members.len() <= isa::k(class) {
-                    continue;
-                }
-                // never evict something this instruction is about to read or has
-                // just defined, and never a physical register
-                let mut here = BTreeSet::new();
-                for (r, _) in &ops {
-                    here.insert(lv.sp.idx(*r));
-                }
-                let cand = members
-                    .iter()
-                    .filter(|x| **x < lv.sp.nv && !here.contains(x))
-                    .max_by_key(|&&x| next_use(f, cfg, &base, lv.sp.reg(x), bi, i));
-                match cand {
-                    Some(&x) => return Ok(Some((x as VReg, class))),
-                    // Every live value at this point is pinned by the very
-                    // instruction that overflows: the instruction itself needs
-                    // more registers than the class has. On A64 no instruction
-                    // reads more than four, so this is a Law-2 defect in isel.
-                    None => {
+            // REARCH §7.3: a call's clobber set counts as FIXED DEFINITIONS
+            // live across the instruction. That single rule is the whole of the
+            // "value crosses a call" theory — with it, pressure at a call is
+            // (values live across) + (clobbered colours of the class), so the
+            // spiller fires exactly when more values live across the call than
+            // the class has callee-saved registers, and the colourer's
+            // caller-saved exclusion can never fail afterwards. Only ALLOCATABLE
+            // clobbers count, and only those not already live, so the number is
+            // the spec's and not an over-estimate.
+            let extra = match inst {
+                MInst::Call { clobbers, .. } => [
+                    (clobbers.gpr & masks[0] & !st.phys.gpr).count_ones() as usize,
+                    (clobbers.fpr & masks[1] & !st.phys.fpr).count_ones() as usize,
+                    0,
+                ],
+                _ => [0, 0, 0],
+            };
+            let at = base[bi] + i;
+            for (ci, class) in [Class::Gpr, Class::Fpr, Class::Flags].into_iter().enumerate() {
+                while st.count[ci] + extra[ci] > isa::k(class) {
+                    if class == Class::Flags {
+                        // Flags are never spilled: their producer is pure, so the
+                        // answer is to rematerialize the compare. Reaching here
+                        // means isel let two flag values overlap — a Law-2
+                        // Side-I defect, not a spill problem.
                         return Err(format!(
-                            "{}: {:?} pressure exceeds k with nothing evictable at bb{}[{}]",
-                            f.name, class, bi, i
+                            "{}: two NZCV values live at once; the compare must be rematerialized",
+                            f.name
                         ));
+                    }
+                    // never evict something this instruction is about to read or
+                    // has just defined, and never a physical register
+                    let cand = st
+                        .set
+                        .iter()
+                        .copied()
+                        .filter(|&x| x < lv.sp.nv && class_of(f, lv.sp.reg(x)) == class)
+                        .filter(|&x| !ops.iter().any(|(r, _)| lv.sp.idx(*r) == x))
+                        .max_by_key(|&x| next_use(&uses, x, at));
+                    match cand {
+                        Some(x) => {
+                            chosen.push(x as VReg);
+                            gone.insert(x);
+                            st.remove(f, lv, x);
+                        }
+                        // Every live value at this point is pinned by the very
+                        // instruction that overflows: the instruction itself needs
+                        // more registers than the class has. On A64 no instruction
+                        // reads more than four, so this is a Law-2 defect in isel.
+                        None => {
+                            return Err(format!(
+                                "{}: {:?} pressure exceeds k with nothing evictable at bb{}[{}]",
+                                f.name, class, bi, i
+                            ));
+                        }
                     }
                 }
             }
             // values whose last use is this instruction die here
-            let dead: Vec<usize> = live
+            let dead: Vec<usize> = st
+                .set
                 .iter()
                 .copied()
                 .filter(|&x| last[x] == Some(i))
                 .collect();
             for x in dead {
-                live.remove(&x);
+                st.remove(f, lv, x);
             }
         }
     }
-    Ok(None)
+    Ok(chosen)
+}
+
+/// The live set carried through a block, with its per-class population and the
+/// physical part kept as a bit mask — everything the pressure test needs in O(1).
+struct LiveSet {
+    set: BTreeSet<usize>,
+    count: [usize; 3],
+    phys: RegSet,
+}
+
+impl LiveSet {
+    fn new(_f: &MFunc, _lv: &live::Liveness) -> LiveSet {
+        LiveSet {
+            set: BTreeSet::new(),
+            count: [0; 3],
+            phys: RegSet::default(),
+        }
+    }
+    fn slot(f: &MFunc, lv: &live::Liveness, x: usize) -> usize {
+        match class_of(f, lv.sp.reg(x)) {
+            Class::Gpr => 0,
+            Class::Fpr => 1,
+            Class::Flags => 2,
+        }
+    }
+    fn insert(&mut self, f: &MFunc, lv: &live::Liveness, x: usize) {
+        if self.set.insert(x) {
+            self.count[Self::slot(f, lv, x)] += 1;
+            if let Reg::P(p) = lv.sp.reg(x) {
+                self.phys.add(p);
+            }
+        }
+    }
+    fn remove(&mut self, f: &MFunc, lv: &live::Liveness, x: usize) {
+        if self.set.remove(&x) {
+            self.count[Self::slot(f, lv, x)] -= 1;
+            if let Reg::P(p) = lv.sp.reg(x) {
+                match p.class {
+                    Class::Gpr => self.phys.gpr &= !(1 << p.num),
+                    Class::Fpr => self.phys.fpr &= !(1 << p.num),
+                    Class::Flags => {}
+                }
+            }
+        }
+    }
 }
 
 /// Absolute position of each block's first instruction, in reverse postorder.
@@ -146,21 +240,16 @@ fn linear_positions(f: &MFunc, cfg: &crate::cfg::Cfg) -> Vec<usize> {
     base
 }
 
-/// The next position at which `r` is read, on or after the given point;
-/// `usize::MAX` when the value is never used again. Belady's rule evicts the
-/// value whose next use is furthest away, so this number IS the policy — an
-/// approximation here is a quality loss, not a correctness one, but it must at
-/// least be a monotone function of real distance.
-fn next_use(
+/// Every position at which each value is READ, ascending — built once per
+/// sweep. Belady's rule needs "the next use after this point", and with this
+/// index that is a binary search instead of a scan of the whole function.
+fn use_positions(
     f: &MFunc,
+    lv: &live::Liveness,
     cfg: &crate::cfg::Cfg,
     base: &[usize],
-    r: Reg,
-    from_block: usize,
-    from_inst: usize,
-) -> usize {
-    let from = base[from_block] + from_inst;
-    let mut best = usize::MAX;
+) -> Vec<Vec<usize>> {
+    let mut uses = vec![Vec::new(); lv.sp.len()];
     for &b in &cfg.rpo {
         let bi = b as usize;
         if base[bi] == usize::MAX {
@@ -168,34 +257,31 @@ fn next_use(
         }
         for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
             let at = base[bi] + i;
-            if at <= from {
-                continue;
-            }
-            let mut hit = false;
-            inst.visit(&mut |q, c| {
-                if q == r && matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
-                    hit = true;
+            inst.visit(&mut |r, c| {
+                if matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
+                    uses[lv.sp.idx(r)].push(at);
                 }
             });
-            if hit {
-                best = best.min(at);
-                break;
-            }
         }
         let at = base[bi] + f.blocks[bi].insts.len();
-        if at > from {
-            let mut hit = false;
-            f.blocks[bi].term.visit(&mut |q, _| {
-                if q == r {
-                    hit = true;
-                }
-            });
-            if hit {
-                best = best.min(at);
-            }
-        }
+        f.blocks[bi].term.visit(&mut |r, _| uses[lv.sp.idx(r)].push(at));
     }
-    best
+    for u in uses.iter_mut() {
+        u.sort_unstable();
+        u.dedup();
+    }
+    uses
+}
+
+/// The next position at which value `x` is read, strictly after `from`;
+/// `usize::MAX` when it is never used again. Belady's rule evicts the value
+/// whose next use is furthest away, so this number IS the policy.
+fn next_use(uses: &[Vec<usize>], x: usize, from: usize) -> usize {
+    let u = &uses[x];
+    match u.partition_point(|&p| p <= from) {
+        i if i < u.len() => u[i],
+        _ => usize::MAX,
+    }
 }
 
 fn class_of(f: &MFunc, r: Reg) -> Class {
@@ -205,69 +291,87 @@ fn class_of(f: &MFunc, r: Reg) -> Class {
     }
 }
 
-/// Store `v` once at its definition; reload it into a fresh register before each
-/// use. The fresh registers are what makes this a live-range SPLIT rather than
-/// rc3's one-home-per-value.
-fn spill_value(f: &mut MFunc, v: VReg) {
-    let w = f.vregs[v as usize].width;
-    let slot = f.new_slot(w.bytes().max(8), 8, SlotKind::Spill);
-    let target = Reg::V(v);
+/// Store every victim once at its definition and reload it into a FRESH
+/// register before each use. The fresh registers are what makes this a live-range
+/// SPLIT rather than rc3's one-home-per-value. All victims of a round are
+/// rewritten in ONE pass over the function — a pass per victim would make the
+/// spiller quadratic in the number of spills.
+fn spill_values(f: &mut MFunc, vs: &[VReg]) {
+    let mut slot_of: std::collections::HashMap<VReg, (SlotId, Width)> =
+        std::collections::HashMap::new();
+    for &v in vs {
+        let w = f.vregs[v as usize].width;
+        // a `q` spill needs 16 bytes AND 16-byte alignment (DDI 0487 C3.2: the
+        // unsigned offset form scales by the access size)
+        let slot = f.new_slot(w.bytes().max(8), w.bytes().max(8), SlotKind::Spill);
+        slot_of.insert(v, (slot, w));
+    }
+    let hit = |r: Reg| -> Option<(SlotId, Width)> { r.vreg().and_then(|v| slot_of.get(&v).copied()) };
     for b in 0..f.blocks.len() {
         let mut out: Vec<MInst> = Vec::with_capacity(f.blocks[b].insts.len() + 2);
         // a block parameter is defined at the block's entry
-        if f.blocks[b].params.contains(&target) {
-            out.push(MInst::Spill {
-                slot,
-                src: target,
-                w,
-            });
+        let params = f.blocks[b].params.clone();
+        for p in params {
+            if let Some((slot, w)) = hit(p) {
+                out.push(MInst::Spill { slot, src: p, w });
+            }
         }
         let insts = std::mem::take(&mut f.blocks[b].insts);
         for mut inst in insts {
-            let mut uses_it = false;
+            let mut reloads: Vec<(Reg, Reg)> = Vec::new();
             inst.visit(&mut |r, c| {
-                if r == target && matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
-                    uses_it = true;
+                if matches!(c, Constraint::Use | Constraint::UseFixed(_))
+                    && hit(r).is_some()
+                    && !reloads.iter().any(|(o, _)| *o == r)
+                {
+                    reloads.push((r, r));
                 }
             });
-            if uses_it {
+            for (orig, fresh) in reloads.iter_mut() {
+                let (slot, w) = hit(*orig).unwrap();
                 let d = f.new_vreg(w);
                 out.push(MInst::Reload { slot, dst: d, w });
+                *fresh = d;
+            }
+            if !reloads.is_empty() {
                 inst.visit_mut(&mut |r, c| {
-                    if *r == target && matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
-                        *r = d;
+                    if matches!(c, Constraint::Use | Constraint::UseFixed(_))
+                        && let Some((_, d)) = reloads.iter().find(|(o, _)| o == r)
+                    {
+                        *r = *d;
                     }
                 });
             }
-            let mut defines_it = false;
+            let mut defs: Vec<Reg> = Vec::new();
             inst.visit(&mut |r, c| {
-                if r == target && matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
-                    defines_it = true;
+                if matches!(c, Constraint::Def | Constraint::DefFixed(_)) && hit(r).is_some() {
+                    defs.push(r);
                 }
             });
             out.push(inst);
-            if defines_it {
-                out.push(MInst::Spill {
-                    slot,
-                    src: target,
-                    w,
-                });
+            for d in defs {
+                let (slot, w) = hit(d).unwrap();
+                out.push(MInst::Spill { slot, src: d, w });
             }
         }
         // the terminator's operands (including edge arguments)
         let mut term = f.blocks[b].term.clone();
-        let mut uses_it = false;
+        let mut reloads: Vec<(Reg, Reg)> = Vec::new();
         term.visit(&mut |r, _| {
-            if r == target {
-                uses_it = true;
+            if hit(r).is_some() && !reloads.iter().any(|(o, _)| *o == r) {
+                reloads.push((r, r));
             }
         });
-        if uses_it {
+        for (orig, fresh) in reloads.iter_mut() {
+            let (slot, w) = hit(*orig).unwrap();
             let d = f.new_vreg(w);
             out.push(MInst::Reload { slot, dst: d, w });
+            *fresh = d;
+        }
+        if !reloads.is_empty() {
             term.visit_mut(&mut |r, _| {
-                if *r == target {
-                    *r = d;
+                if let Some((_, d)) = reloads.iter().find(|(o, _)| o == r) {
+                    *r = *d;
                 }
             });
             f.blocks[b].term = term;

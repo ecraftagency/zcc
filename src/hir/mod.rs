@@ -80,6 +80,9 @@ impl Operand {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Sym {
     Global(u32),
+    /// EXT(gcc) `__thread`: the same global, reached through the thread pointer
+    /// instead of the page/lo12 pair (THEORY II-4, local-exec model).
+    Tls(u32),
     Str(u32),
     Func(String),
     /// EXT(gcc) `&&label` — the address of a block, for computed goto.
@@ -106,6 +109,10 @@ pub enum BinOp {
     FSub,
     FMul,
     FDiv,
+    /// The high half of a full 64×64 product — the only witness to a 64-bit
+    /// multiplication overflow (EXT(gcc) `__builtin_mul_overflow`).
+    SMulHi,
+    UMulHi,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -250,6 +257,13 @@ pub enum Inst {
         sig: Sig,
         callee: Callee,
         args: Vec<Operand>,
+        /// Where a COMPOSITE result is deposited. An aggregate is never an HIR
+        /// value (it has no scalar `Ty`), so a struct-returning call names the
+        /// destination address instead of defining a value. isel then realizes
+        /// AAPCS64 §6.9 either way: ≤16 bytes come back in registers and are
+        /// stored here, larger results are written by the callee through the x8
+        /// this address supplies.
+        sret: Option<Operand>,
     },
     /// Dynamic stack allocation (C99 VLA / EXT alloca). `dst : I64` is the base.
     Alloca {
@@ -284,22 +298,60 @@ pub enum Callee {
 
 #[derive(Clone, Debug)]
 pub enum IntrinKind {
+    /// `__builtin_va_start(ap, last)`: fill the five AAPCS64 `va_list` fields.
+    /// Expanded by isel, because the two register counters it records are the
+    /// ABI's, and the ABI lives in one place (`isel/abi.rs`).
     VaStart,
     VaArg(Ty),
+    /// EXT(gcc) `__va_area__`: the address of the first UNNAMED stack argument.
+    /// `args[0]` is its byte offset into the caller's argument area.
     VaArea,
-    /// EXT(gcc) `__sync_*`; `u32` = access width in bytes.
-    Sync(crate::ast::SyncOp, u32),
+    /// EXT(gcc) `__sync_*` (ARM DDI 0487 B2.9), as the three primitives the
+    /// retry loop is built from. The loop itself is ordinary HIR control flow —
+    /// see `build::sync`.
+    LdAxr(Ty),
+    /// `args = [addr, value]`; `dst : I32` is 0 when the store succeeded
+    StlXr(Ty),
+    /// `args = [addr, value]` — a release store
+    Stlr(Ty),
+    /// `dmb ish`
+    Dmb,
     /// EXT(gcc) `__builtin_{add,sub,mul}_overflow`: op 0=+ 1=- 2=*.
     Overflow {
         op: u8,
         ty: Ty,
         signed: bool,
     },
-    /// EXT(gcc) inline asm; operand descriptors ride along from the AST.
+    /// C99 long double on ELF: MEMORY is binary128, the value in a register is
+    /// canonical f64 (THEORY II-2 — `float.h` declares `LDBL_MANT_DIG` 53, so
+    /// the model is self-consistent), and the two are bridged at every
+    /// load/store/ABI boundary by the libgcc soft-float pair. `LdLoad(addr) →
+    /// F64` is `__trunctfdf2`; `LdStore(addr, F64)` is `__extenddftf2` followed
+    /// by the 16-byte store. isel owns the expansion because the quad only
+    /// exists in a machine register.
+    LdLoad,
+    LdStore,
+    /// EXT(gcc) inline asm. The template is opaque; the operands are not. The
+    /// argument list runs in operand order: a `"m"` operand contributes its
+    /// ADDRESS, an output its destination address, a `"+"` output the address
+    /// AND its current value, an input its value.
     Asm {
         tmpl: String,
-        ops: Vec<crate::ast::AsmOp>,
+        ops: Vec<AsmOperand>,
     },
+}
+
+/// One inline-asm operand as HIR sees it: the constraint bits from the AST plus
+/// the scalar type, which is what decides the register class and the store width.
+#[derive(Clone, Copy, Debug)]
+pub struct AsmOperand {
+    pub out: bool,
+    pub rw: bool,
+    pub mem: bool,
+    pub fp: bool,
+    pub tied: Option<u8>,
+    pub pin: Option<u8>,
+    pub ty: Ty,
 }
 
 /// Effect class — the single table DCE / CSE / GVN / LICM / sinking consult
@@ -378,11 +430,14 @@ impl Inst {
                 f(*a);
                 f(*b);
             }
-            Inst::Call { callee, args, .. } => {
+            Inst::Call { callee, args, sret, .. } => {
                 if let Callee::Indirect(o) = callee {
                     f(*o);
                 }
                 args.iter().for_each(|a| f(*a));
+                if let Some(o) = sret {
+                    f(*o);
+                }
             }
             Inst::Alloca { size, .. } => f(*size),
             Inst::MemCpy { dst, src, .. } => {
@@ -415,11 +470,14 @@ impl Inst {
                 f(a);
                 f(b);
             }
-            Inst::Call { callee, args, .. } => {
+            Inst::Call { callee, args, sret, .. } => {
                 if let Callee::Indirect(o) = callee {
                     f(o);
                 }
-                args.iter_mut().for_each(f);
+                args.iter_mut().for_each(&mut f);
+                if let Some(o) = sret {
+                    f(o);
+                }
             }
             Inst::Alloca { size, .. } => f(size),
             Inst::MemCpy { dst, src, .. } => {
@@ -532,6 +590,10 @@ pub struct Block {
     pub params: Vec<ValueId>,
     pub insts: Vec<Inst>,
     pub term: Term,
+    /// This block is the target of a C `goto` label. C99 6.8.6.1: a jump into
+    /// the block must leave the stack at the function's base, so a function with
+    /// a VLA deallocates here (`emit`). Nothing else reads it.
+    pub is_label: bool,
     /// Static execution-frequency estimate (Ball & Larus 1993). Advisory only:
     /// it drives block layout and spill next-use weighting and carries NO
     /// semantic obligation, so no pass needs a commuting square for it.
@@ -572,6 +634,10 @@ pub struct Func {
     pub entry: BlockId,
     pub is_static: bool,
     pub is_weak: bool,
+    /// C99 6.7.5.2: this function declares a variable-length array. Only the
+    /// label-deallocation rule above reads it; a bare `alloca` does NOT set it
+    /// (it has no scope to leave), which is exactly gcc's distinction.
+    pub has_vla: bool,
 }
 
 impl Func {
@@ -594,6 +660,7 @@ impl Func {
             insts: Vec::new(),
             term: Term::Unreachable,
             weight: 1,
+            is_label: false,
         });
         (self.blocks.len() - 1) as BlockId
     }

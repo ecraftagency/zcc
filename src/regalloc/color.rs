@@ -45,6 +45,7 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, String>
     let sp = lv.sp;
     let mut color: Vec<Option<PReg>> = vec![None; sp.nv];
     let mut used = RegSet::default();
+    let mut lu = super::live::LastUse::new(sp);
 
     for &b in &dt.preorder {
         let bi = b as usize;
@@ -60,7 +61,8 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, String>
             }
         }
 
-        let last = super::live::last_use(f, sp, lv, bi);
+        super::live::last_use_into(f, sp, lv, bi, &mut lu);
+        let last = &lu.at;
 
         // block parameters are defined at the block's entry
         for &p in &blk.params {

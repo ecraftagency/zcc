@@ -60,9 +60,21 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
         let _ = writeln!(s, "\t.globl {}", name);
     }
     let _ = writeln!(s, "\t.type {}, %function\n{}:", name, name);
-    // One frame adjustment, by construction (§8): nothing else moves sp.
+    // One frame adjustment, by construction (§8): nothing else moves sp — except
+    // `StackAlloc`, and a function containing one takes a frame pointer so that
+    // every static object keeps a fixed address regardless of where sp went.
     if f.frame_size > 0 {
         adjust_sp(s, -(f.frame_size as i64));
+    }
+    if f.dyn_stack {
+        // x29 is saved through sp, because at this instant it still holds the
+        // CALLER's frame pointer — the one instruction pair that cannot be an
+        // ordinary `Spill` (whose base would already be this frame's x29).
+        let _ = writeln!(
+            s,
+            "\tstr x29, [sp, #{}]\n\tmov x29, sp",
+            f.slots[f.fp_slot as usize].off
+        );
     }
     let order: Vec<MBlockId> = if f.order.is_empty() {
         (0..f.blocks.len() as MBlockId).collect()
@@ -71,6 +83,13 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
     };
     for (i, &b) in order.iter().enumerate() {
         let _ = writeln!(s, ".L{}_{}:", name, b);
+        // C99 6.8.6.1: a `goto` may leave a VLA's scope, and the object must be
+        // deallocated — sp returns to the frame base at every label. A jump INTO
+        // a VLA scope is forbidden by the same clause, so the target's depth is
+        // never greater than the current one and this is always safe.
+        if f.blocks[b as usize].is_label && f.has_vla && f.dyn_stack {
+            s.push_str("\tmov sp, x29\n");
+        }
         for inst in &f.blocks[b as usize].insts {
             emit_inst(s, ast, f, inst);
         }
@@ -78,6 +97,13 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
         emit_term(s, f, &name, &f.blocks[b as usize].term, next);
     }
     let _ = writeln!(s, "\t.size {}, .-{}", name, name);
+}
+
+/// The register every static stack object is addressed from: sp in an ordinary
+/// function (`-fomit-frame-pointer` by construction), x29 when a `StackAlloc`
+/// has made sp move inside the body.
+fn frame_base(f: &MFunc) -> &'static str {
+    if f.dyn_stack { "x29" } else { "sp" }
 }
 
 /// `sub sp, sp, #n` — the immediate is limited to imm12(<<12), so a very large
@@ -98,6 +124,29 @@ fn adjust_sp(s: &mut String, delta: i64) {
         None => {
             mov_imm(s, isa::SCRATCH_GPR, n, true);
             let _ = writeln!(s, "\t{} sp, sp, x{}", op, isa::SCRATCH_GPR.num);
+        }
+    }
+}
+
+/// `add dst, base, #n` when the immediate fits, otherwise the two-add or
+/// `movz/movk`+`add` form. The count is what `isa::add_imm`/`isa::mov_chain`
+/// predict, which is why `SlotAddr` stays a computable cost (REARCH §10).
+fn add_imm_to(s: &mut String, dst: String, base: &str, n: i64) {
+    match isa::add_imm(n) {
+        Some((v, 0)) => {
+            let _ = writeln!(s, "\tadd {}, {}, #{}", dst, base, v);
+        }
+        Some((v, sh)) => {
+            let _ = writeln!(s, "\tadd {}, {}, #{}, lsl #{}", dst, base, v, sh);
+        }
+        None if n > 0 && n < (1 << 24) => {
+            let (hi, lo) = (n >> 12, n & 0xfff);
+            let _ = writeln!(s, "\tadd {}, {}, #{}, lsl #12", dst, base, hi);
+            let _ = writeln!(s, "\tadd {}, {}, #{}", dst, dst, lo);
+        }
+        None => {
+            mov_imm(s, isa::SCRATCH_GPR, n, true);
+            let _ = writeln!(s, "\tadd {}, {}, x{}", dst, base, isa::SCRATCH_GPR.num);
         }
     }
 }
@@ -179,7 +228,7 @@ fn ext_name(e: ExtKind) -> &'static str {
 fn sym_text(ast: &Ast, s: &crate::hir::Sym, fname: &str) -> String {
     use crate::hir::Sym;
     match s {
-        Sym::Global(i) => sym_name(&ast.globals[*i as usize].name),
+        Sym::Global(i) | Sym::Tls(i) => sym_name(&ast.globals[*i as usize].name),
         Sym::Str(i) => format!(".LC{}", i),
         Sym::Func(n) => sym_name(n),
         Sym::Label(b) => format!(".L{}_{}", fname, b),
@@ -230,14 +279,21 @@ fn addr(ast: &Ast, f: &MFunc, m: &AddrMode) -> String {
         AddrMode::PostIdx { base, off, .. } => {
             format!("[{}], #{}", reg(*base, Width::W64), off)
         }
-        // Every stack object is addressed from sp: there is no frame pointer
-        // (`-fomit-frame-pointer` by construction).
         AddrMode::Slot { slot, off } => {
-            let o = f.slots[*slot as usize].off + off;
+            let (b, o) = (frame_base(f), f.slots[*slot as usize].off + off);
             if o == 0 {
+                format!("[{}]", b)
+            } else {
+                format!("[{}, #{}]", b, o)
+            }
+        }
+        // AAPCS64 §6.4: the outgoing-argument area begins at sp when the `bl`
+        // executes, so it is named from sp even in a frame-pointer function.
+        AddrMode::SpArg { off } => {
+            if *off == 0 {
                 "[sp]".to_string()
             } else {
-                format!("[sp, #{}]", o)
+                format!("[sp, #{}]", off)
             }
         }
         AddrMode::SymLo12 { base, sym } => {
@@ -253,7 +309,8 @@ fn mem_mnemonic(op: MemOp, load: bool) -> &'static str {
         (MemOp::H, true) => "ldrh",
         (MemOp::SH, true) => "ldrsh",
         (MemOp::SW, true) => "ldrsw",
-        (MemOp::W, true) | (MemOp::X, true) | (MemOp::S, true) | (MemOp::D, true) => "ldr",
+        (MemOp::W, true) | (MemOp::X, true) | (MemOp::S, true) | (MemOp::D, true)
+        | (MemOp::Q, true) => "ldr",
         (MemOp::B, false) | (MemOp::SB, false) => "strb",
         (MemOp::H, false) | (MemOp::SH, false) => "strh",
         (_, false) => "str",
@@ -267,11 +324,78 @@ fn mem_width(op: MemOp, r: Reg, f: &MFunc) -> Width {
         MemOp::X => Width::W64,
         MemOp::S => Width::S,
         MemOp::D => Width::D,
+        MemOp::Q => Width::Q,
         MemOp::SB | MemOp::SH | MemOp::SW => match r {
             Reg::V(v) => f.vregs[v as usize].width,
             Reg::P(_) => Width::W64,
         },
         _ => Width::W32,
+    }
+}
+
+/// EXT(gcc): substitute `%n` (with an optional width letter) by the register the
+/// operand was pinned to. `%%` is a literal percent; a `"m"` operand prints as
+/// `[xN]`, which is the whole of the memory-constraint contract zcc supports.
+fn asm_text(tmpl: &str, ops: &[AsmSlot]) -> String {
+    let mut out = String::with_capacity(tmpl.len());
+    let b: Vec<char> = tmpl.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != '%' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            break;
+        }
+        if b[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        let modifier = if b[i].is_ascii_digit() { None } else { Some(b[i]) };
+        if modifier.is_some() {
+            i += 1;
+        }
+        let mut n = 0usize;
+        let mut any = false;
+        while i < b.len() && b[i].is_ascii_digit() {
+            n = n * 10 + b[i] as usize - '0' as usize;
+            i += 1;
+            any = true;
+        }
+        if !any || n >= ops.len() {
+            out.push('%');
+            if let Some(m) = modifier {
+                out.push(m);
+            }
+            continue;
+        }
+        let o = ops[n];
+        if o.mem {
+            out.push_str(&format!("[{}]", isa::reg_name(o.reg, Width::W64)));
+            continue;
+        }
+        let w = match modifier {
+            Some('w') => Width::W32,
+            Some('x') => Width::W64,
+            Some('s') => Width::S,
+            Some('d') => Width::D,
+            Some('q') => Width::Q,
+            _ => o.w,
+        };
+        out.push_str(&isa::reg_name(o.reg, w));
+    }
+    out
+}
+
+/// The `Vn` spelling of a v register, for the vector aliases (`mov Vd.16b, Vn.16b`).
+fn vec_name(r: Reg) -> String {
+    match r {
+        Reg::P(p) => format!("v{}", p.num),
+        Reg::V(v) => format!("<v{}>", v),
     }
 }
 
@@ -322,6 +446,8 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
                 (AluOp::Mul, _) => "mul",
                 (AluOp::SDiv, _) => "sdiv",
                 (AluOp::UDiv, _) => "udiv",
+                (AluOp::SMulH, _) => "smulh",
+                (AluOp::UMulH, _) => "umulh",
             };
             let _ = writeln!(
                 s,
@@ -499,7 +625,13 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
             let _ = writeln!(s, "\t{} {}, {}", m, reg(*dst, *dw), reg(*src, *sw));
         }
         MInst::FMov { dw, sw, dst, src } => {
-            let _ = writeln!(s, "\tfmov {}, {}", reg(*dst, *dw), reg(*src, *sw));
+            // DDI 0487 C7: `fmov` has no 128-bit form — a whole v register moves
+            // as a 16-byte vector (`mov Vd.16b, Vn.16b`, the ORR alias).
+            if *dw == Width::Q || *sw == Width::Q {
+                let _ = writeln!(s, "\tmov {}.16b, {}.16b", vec_name(*dst), vec_name(*src));
+            } else {
+                let _ = writeln!(s, "\tfmov {}, {}", reg(*dst, *dw), reg(*src, *sw));
+            }
         }
         MInst::Call { callee, tail, .. } => {
             let m = if *tail { "b" } else { "bl" };
@@ -517,6 +649,9 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
                 }
             }
         }
+        MInst::Copy { w, dst, src } if *w == Width::Q => {
+            let _ = writeln!(s, "\tmov {}.16b, {}.16b", vec_name(*dst), vec_name(*src));
+        }
         MInst::Copy { w, dst, src } => {
             let _ = writeln!(s, "\tmov {}, {}", reg(*dst, *w), reg(*src, *w));
         }
@@ -525,15 +660,93 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
         }
         MInst::Spill { slot, src, w } => {
             let o = f.slots[*slot as usize].off;
-            let _ = writeln!(s, "\tstr {}, [sp, #{}]", reg(*src, *w), o);
+            let _ = writeln!(s, "\tstr {}, [{}, #{}]", reg(*src, *w), frame_base(f), o);
         }
         MInst::Reload { slot, dst, w } => {
             let o = f.slots[*slot as usize].off;
-            let _ = writeln!(s, "\tldr {}, [sp, #{}]", reg(*dst, *w), o);
+            let _ = writeln!(s, "\tldr {}, [{}, #{}]", reg(*dst, *w), frame_base(f), o);
         }
         MInst::SlotAddr { dst, slot, off } => {
             let o = f.slots[*slot as usize].off + off;
-            let _ = writeln!(s, "\tadd {}, sp, #{}", reg(*dst, Width::W64), o);
+            add_imm_to(s, reg(*dst, Width::W64), frame_base(f), o as i64);
+        }
+        MInst::SpAddr { dst, off } => {
+            add_imm_to(s, reg(*dst, Width::W64), "sp", *off as i64);
+        }
+        MInst::LdAxr { w, dst, addr } => {
+            let _ = writeln!(
+                s,
+                "\tldaxr {}, [{}]",
+                reg(*dst, *w),
+                reg(*addr, Width::W64)
+            );
+        }
+        MInst::StlXr {
+            w,
+            status,
+            src,
+            addr,
+        } => {
+            let _ = writeln!(
+                s,
+                "\tstlxr {}, {}, [{}]",
+                reg(*status, Width::W32),
+                reg(*src, *w),
+                reg(*addr, Width::W64)
+            );
+        }
+        MInst::Stlr { w, src, addr } => {
+            let _ = writeln!(
+                s,
+                "\tstlr {}, [{}]",
+                reg(*src, *w),
+                reg(*addr, Width::W64)
+            );
+        }
+        MInst::Dmb => s.push_str("\tdmb ish\n"),
+        MInst::Mrs { dst } => {
+            let _ = writeln!(s, "\tmrs {}, tpidr_el0", reg(*dst, Width::W64));
+        }
+        MInst::AddTprel { dst, base, sym, hi } => {
+            let n = sym_text(ast, sym, &f.name);
+            let _ = if *hi {
+                writeln!(
+                    s,
+                    "\tadd {}, {}, #:tprel_hi12:{}, lsl #12",
+                    reg(*dst, Width::W64),
+                    reg(*base, Width::W64),
+                    n
+                )
+            } else {
+                writeln!(
+                    s,
+                    "\tadd {}, {}, #:tprel_lo12_nc:{}",
+                    reg(*dst, Width::W64),
+                    reg(*base, Width::W64),
+                    n
+                )
+            };
+        }
+        MInst::Asm { tmpl, ops } => {
+            s.push('\t');
+            s.push_str(&asm_text(tmpl, ops));
+            s.push('\n');
+        }
+        // AAPCS64 §6.2.2: sp must stay 16-byte aligned, so the byte count is
+        // rounded up before it is subtracted. The new object starts ABOVE the
+        // outgoing-argument area, which stays pinned at sp for the next call.
+        MInst::StackAlloc { dst, size } => {
+            let (ip, d) = (isa::SCRATCH_GPR.num, reg(*dst, Width::W64));
+            let _ = writeln!(
+                s,
+                "\tadd x{ip}, {}, #15\n\tand x{ip}, x{ip}, #0xfffffffffffffff0\n\tsub sp, sp, x{ip}",
+                reg(*size, Width::W64)
+            );
+            if f.outgoing == 0 {
+                let _ = writeln!(s, "\tmov {}, sp", d);
+            } else {
+                let _ = writeln!(s, "\tadd {}, sp, #{}", d, f.outgoing);
+            }
         }
     }
 }
@@ -585,6 +798,14 @@ fn emit_term(s: &mut String, f: &MFunc, name: &str, t: &MTerm, next: Option<MBlo
             let _ = writeln!(s, "\t<switch table not lowered>");
         }
         MTerm::Ret => {
+            if f.dyn_stack {
+                // reclaim everything a `StackAlloc` took, then the caller's x29
+                let _ = writeln!(
+                    s,
+                    "\tmov sp, x29\n\tldr x29, [sp, #{}]",
+                    f.slots[f.fp_slot as usize].off
+                );
+            }
             if f.frame_size > 0 {
                 adjust_sp(s, f.frame_size as i64);
             }
