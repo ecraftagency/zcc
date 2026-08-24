@@ -1,455 +1,366 @@
-# zcc IR — Reference Semantics ⟦·⟧
+# zcc — Reference Semantics ⟦·⟧ for HIR and MIR
 
-**Status.** This document is a *mechanized reference semantics*: a formal
-denotational semantics for the CORE intermediate representation, realized by the
-interpreter `src/ir.rs::tests::interp` and validated by structural exhaustion in
-`src/opt/tests.rs::commuting_square_structural_exhaustion`. It is **not** a
-machine-checked proof. By Rice's theorem, semantic equivalence of programs is
-undecidable in general, so every theorem stated below is quantified over a
-*finite class of program shapes* (a decidable fragment) and is *checked
-mechanically*, not proved universally. This artifact is the foundation on which
-translation validation and per-pass machine-checked proofs are intended to build.
+**Status.** This is a *mechanized reference semantics*: a denotational semantics
+for the two intermediate representations, realized by `src/hir/interp.rs` and
+`src/mir/interp.rs` and exercised by the batteries in `src/*/tests.rs`. It is
+**not** a machine-checked proof. By Rice's theorem semantic equivalence of
+programs is undecidable in general, so every theorem below is quantified over a
+*finite class of program shapes* and *checked mechanically*, never proved
+universally. What it buys is Law 3: each layer is certified where the question is
+still decidable, instead of deferring everything to the final binary and the
+suite.
 
-This document is the *mathematical definition of every `Inst`*. It is a
-*specification of the code*, not an aspiration: each rule maps one-to-one onto an
-arm of `ir.rs::tests::interp`, or onto one of the atomic semantic functions
-(`eval_bin` / `eval_cast` / `canon`) that live in the **non-test** part of
-`ir.rs` and are shared with the constant folder — establishing *faithfulness*
-(the folder and the interpreter are one and the same denotation function).
+This document is the *mathematical definition of every instruction*. Each rule
+maps one-to-one onto an arm of one interpreter — and, crucially, onto the SAME
+arm a future constant folder will use, so the folder and the semantics are one
+denotation function rather than two that must be kept in agreement.
 
-See also: `OPT.md` §7 (the IR contract), `THEORY.md` §A7 (denotational
-semantics), and `tests/alg.sh` (the source-level fold-vs-runtime commuting
-square that this document lifts to the IR level).
+Scope after the re-architecture (`REARCH.md`): the old single IR is gone. There
+are now two levels, and the interpreters share ONE memory model
+(`src/mem.rs`) — which is what makes `⟦hir⟧ = ⟦mir⟧` a meaningful equation
+rather than a comparison of two different worlds.
+
+See also: `THEORY.md` A6/A6b/A7 (the theorem catalogue), `REARCH.md` §10 (the
+proof map), `tests/alg.sh` (the source-level fold-vs-runtime square this document
+lifts to the IR level).
+
+---
+
+## 0. The two levels, and what each is for
+
+```
+HIR   target-independent SSA, block parameters, closed scalar type domain.
+      ⟦hir⟧ is the meaning of the C program.               src/hir/interp.rs
+
+MIR   AArch64 machine instructions, SSA over virtual registers (VIRTUAL phase)
+      or physical registers (PHYSICAL phase). ONE interpreter for both, so
+      instruction selection, register allocation and frame lowering are each an
+      equality between two runs of the same function.      src/mir/interp.rs
+```
 
 ---
 
 ## 1. Value domain
 
-A *machine value* `Val` is a canonical 64-bit word, matching the "canonical
-register" contract of `ast.rs`:
+### 1.1 HIR
+
+The type domain is CLOSED — six scalar types, and nothing else is ever a value:
 
 ```
-𝕍 = { canon_τ(z) : z ∈ ℤ }        for an integer type τ (width w = size(τ)·8, signedness s)
-   ∪ { bits(x)   : x ∈ 𝔽₆₄ }      for a floating type (stored as the f64 BIT PATTERN;
-                                     32-bit float is widened to f64 in registers)
+Ty = I8 | I16 | I32 | I64 | F32 | F64          (pointers are I64; LP64)
 ```
 
-- **Integers.** A value lives in ℤ/2^w with signedness s. `canon_τ` (see
-  `ir.rs::canon`) normalizes any `z ∈ ℤ` to its canonical representative: mask
-  the low w bits, then sign-extend when s is signed. This is exactly the
-  backend's register normalization — "integer arithmetic wraps at w bits"
-  (two's-complement is arithmetic modulo 2^w).
-- **Floats.** A value is the IEEE-754 f64 bit pattern. A 32-bit C `float` is
-  widened to f64 when loaded into a register (`Load` with size 4 performs
-  `f32→f64`) and narrowed when stored (`Store` with size 4). The bit pattern is
-  preserved verbatim; floating-point addition is not associative, so folds must
-  not reassociate float operands.
+Signedness is **not** part of the type. It lives in the opcode (`sdiv`/`udiv`,
+`icmp.slt`/`icmp.ult`, `sext`/`zext`), which is what makes ⟦·⟧ a closed
+definition needing no lookup into the frontend's type table.
 
-A `TypeId τ` carries the *algebraic structure*: an `Op` is a pure symbol, while
-the interpretation — ℤ/2^w (integer, with signedness) versus ℝ (approximated by
-f64, floating) — is determined by τ. This separates "operation" from
-"structure".
+A value is carried in a 64-bit word `Bits`:
+
+- **Integers.** For `I32`/`I64` the carrier holds the value *sign-extended*, so a
+  constant operand and a computed value of the same C value compare equal. For
+  `I8`/`I16` only the low 8/16 bits are significant: `load` yields the raw bytes
+  zero-extended, and every consumer of a narrow value reads exactly those bits
+  (a `store`, a `zext`/`sext`, a narrow `trunc`). This is consistent because
+  **HIR performs no arithmetic or comparison at I8/I16** — C99 6.3.1.1 promotes
+  first, and `hir::build` makes that invariant explicit (`promote`).
+- **Floats.** A value is the IEEE-754 bit pattern *of its own type*: `F32` is an
+  `f32` pattern in the low 32 bits, `F64` an `f64` pattern. (The old IR widened
+  every float to `f64` in registers; the closed type domain makes that
+  unnecessary and removes the rounding hazard it created.) Bit patterns, not
+  reals: NaN payloads and −0.0 are preserved, and no fold may reassociate.
+
+### 1.2 MIR
+
+Values are machine registers. The one deliberate difference from HIR:
+
+> **A64 `w`-form results are ZERO-extended into the 64-bit register** (DDI 0487
+> B1.2.1). ⟦mir⟧ models this exactly (`trunc(v, w)`), so a 32-bit value may
+> differ bit-for-bit from ⟦hir⟧'s sign-extended carrier while denoting the same
+> C value. Every square that crosses the boundary therefore compares **at the C
+> return type**, not bitwise — this is not laxity, it is the statement that the
+> two carriers are two encodings of one value.
+
+Register classes: `Gpr` (x0–x30), `Fpr` (v0–v31), and `Flags` — NZCV as a class
+of size k = 1, packed N=8, Z=4, C=2, V=1 as in PSTATE.
 
 ---
 
 ## 2. Machine state Σ
 
+### 2.1 HIR
+
 ```
-Σ  =  ⟨ ρ , μ ⟩
-ρ  :  Tmp → 𝕍              register file (ρ[t] is the canonical value of temporary t)
-μ  :  [0, frame) → Byte    flat local memory (a byte array the size of the stack frame)
+Σ = ⟨ ν , μ , stack ⟩
+ν : ValueId → Bits          the SSA value environment of the current call
+μ : Addr → Byte             flat little-endian LP64 memory (src/mem.rs)
 ```
 
-**Physical realization of ρ (Stage 5b, ABI-aware regalloc).** The interpreter's ρ
-is an abstract, unbounded map; the backend realizes each `ρ[t]` in *one physical
-home* chosen by `opt::abi_alloc` — either a machine register (Chaitin color: GP
-x19–x28/x14–x15, FP v8–v15/v16–v31) or, on spill, its own frame slot (the
-pre-Stage-5b behaviour, verbatim). The realization is a **rename-bisimulation** of
-ρ: it preserves ⟦·⟧ iff two invariants hold, both checked mechanically rather than
-assumed — (i) the *interference invariant* (`verify_coloring`): simultaneously-live
-temps get distinct homes, so no live `ρ[t]` is overwritten; (ii) *call-clobber
-set-disjointness*: the allocatable set is disjoint from the backend's per-instruction
-scratch registers (no mid-instruction corruption of a home), and any temp live across
-a `bl` is confined to a callee-saved register (its value survives the call). A home in
-a callee-saved register obliges the prologue/epilogue to save/restore it. Floats keep
-the §1 contract — the home holds the f64 bit pattern, transferred to/from a GPR via
-`fmov` at each access.
+μ has two regions, and address 0 is unmapped so a null dereference **traps**
+rather than silently reading a global:
 
-**Memory model** (see `interp`). Only the local frame is modeled. A local
-address is `x29 − off`; flat-memory index 0 corresponds to `x29 − frame`, hence
-`index(off) = frame − off` (`Lea Local`). `load_mem` / `store_mem` perform
-little-endian byte serialization (LP64, AArch64 little-endian). Global and
-string addresses are **not** modeled and evaluate to ⊥ (§4): a function that
-touches them lies outside the CORE space.
+- `[GLOBAL_BASE, …)` — globals and string literals, materialized from their
+  initializers. A string literal's array includes its terminating null
+  (C99 6.4.5p6), which the parser does not store and the layout adds back.
+- a downward-growing stack; each call reserves its function's stack objects.
 
-**Parameter seeding.** The i-th parameter `(off, τ)` is seeded as
-`canon_τ(argᵢ)`, written into `μ` at `index(off)` with width `size(τ)`. There are
-no parameter temporaries: the body reads every variable (parameters included)
-through `Var→Load`, giving a uniform unoptimized (-O0) model.
+Block parameters replace φ: taking an edge assigns the target's parameters from
+the edge's arguments, simultaneously, before the target's first instruction.
 
-**Observable.** The observable is the return value — `⟦Func⟧(args) ∈ 𝕍`. (I/O
-traces are omitted: CORE is pure computation; a function with external
-side effects, such as a call to an external symbol or inline assembly, is
-exotic and evaluates to ⊥.)
+### 2.2 MIR
+
+```
+Σ = ⟨ ν , φ , nzcv , μ , sp ⟩
+ν : VReg → Bits             per call (empty once the function is physical)
+φ : PReg → Bits             the PHYSICAL register file — PERSISTENT across calls
+```
+
+φ is persistent on purpose: an AAPCS64 argument written by the caller is the
+*same object* the callee reads, so the calling convention is executed rather than
+assumed. `sp` is a real address; every stack object is addressed from it (there
+is no frame pointer — `mir/pass/frame.rs`).
+
+**The callee-saved contract.** AAPCS64 §6.1.1 promises x19–x28, v8–v15 and x30
+survive a call. Before frame lowering nothing in a function preserves them — yet
+the allocator already relied on the promise when it put long-lived values there.
+So ⟦mir⟧ honors the promise on behalf of any function that has **not** been
+through `pass/frame.rs`, and honors nothing for one that has, where real
+`Spill`/`Reload` instructions keep it. The difference between those two runs is
+exactly the obligation of frame lowering (§6.4).
 
 ---
 
 ## 3. Atomic denotations — the faithfulness keystone
 
-The three functions below live in the **non-test** part of `ir.rs` and are
-called by *both* the interpreter (semantics side) and the constant folder
-(`opt/`, release side). A single definition guarantees that the folder and the
-interpreter cannot diverge: `⟦fold(e)⟧ = ⟦e⟧` holds *by construction*
-(term-rewriting soundness).
+These are the functions both the interpreter and (later) the constant folder
+call, so there is one denotation and not two.
 
-### 3.1 `canon_τ : ℤ → 𝕍`  (`ir.rs::canon`)
+### 3.1 Carrier normalization
 ```
-canon_τ(v) = v                          if float(τ) ∨ w ≥ 64
-           = sext_w( v mod 2^w )         if τ is a signed integer
-           = ( v mod 2^w )               if τ is an unsigned integer
-where w = width(τ):  a bitfield `b:k` has w = k (its DECLARED width, per the
-container b's signedness — C99 6.7.2.1); every other integer type has w = size(τ)·8.
-```
-A bitfield's value is truncated to its declared width, not the storage width — `(l.m = v)`
-denotes `v` after that truncation. Mirrors the backend `ext` (`lsl #(64−w); asr/lsr #(64−w)`);
-without it, promoting the field's source to a constant lets const-fold read an un-truncated
-value (GCC torture 921016-1, 20031211-2).
-
-### 3.2 `⟦op⟧_τ : 𝕍 × 𝕍 → 𝕍 ∪ {⊥}`  (`ir.rs::eval_bin`)
-- **float(τ):** decode bits to f64, apply op ∈ {+, −, ×, ÷} in 𝔽₆₄ (IEEE-754);
-  comparisons yield {0, 1}. (Float ÷ is not ⊥: it follows IEEE-754 for
-  ±∞ / NaN.)
-- **int(τ):** arithmetic in ℤ/2^w with signedness s, canonicalized by `canon_τ`:
-  - `+, −, ×` are wrapping (modulo 2^w).
-  - `÷, %` : **`y = 0 ⟹ ⊥`** (undefined behavior — the folder must decline to
-    fold, leaving the instruction for the target). Otherwise division truncates
-    toward zero (signed `wrapping_div`; unsigned via `u64`).
-  - `& | ^` are bitwise; `<<` is `wrapping_shl`; `>>` is arithmetic (signed) or
-    logical (unsigned).
-  - `== != < ≤ > ≥` yield {0, 1}, compared according to s.
-
-### 3.3 `⟦cast⟧_{σ→τ} : 𝕍 → 𝕍`  (`ir.rs::eval_cast`), per C99 6.3.1.2 / 6.3.1.4
-```
-int→int    : _Bool ⟹ (v ≠ 0);   otherwise canon_τ(v)        (truncate / extend)
-int→float  : fnarrow_τ((float)v)  (unsigned uses u64→f64; fnarrow if size(τ)=4)
-float→int  : _Bool ⟹ (f ≠ 0);   otherwise canon_τ(⌊f⌋)      (truncate toward zero)
-float→float: fnarrow_τ(v)         (f64 in-register; rounds to f32 if size(τ)=4)
-
-where  fnarrow_τ(v) = bits((f32)f64(v))  if size(τ)=4 else v   — a float(size 4)
-destination rounds its result to f32 (C99 6.3.1.5 / FLT_EVAL_METHOD=0); the
-backend realizes it as `fcvt s,d; fcvt d,s`.
+mask_τ(v)  =  sign-extend the low bits_τ bits into 64          (I8/I16/I32; identity at I64)
+zext_τ(v)  =  the low bits_τ bits, zero-filled
+sext_τ(v)  =  mask_τ(v) read as a signed integer
 ```
 
----
+### 3.2 `⟦binop⟧_τ : Bits × Bits → Bits ∪ {⊥}`
 
-## 4. Instruction semantics ⟦Inst⟧ : Σ → Σ  (CORE, big-step)
+Integer operations are arithmetic in ℤ/2^bits(τ), with the operands read signed
+or unsigned according to the OPCODE:
 
-This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
-`Tmp t ↦ ρ[t]`, `Imm x ↦ x`, `FImm b ↦ b`, and `ρ[d ↦ u]` for register update.
+| opcode | denotation | note |
+|---|---|---|
+| `add`, `sub`, `mul` | wrapping in ℤ/2^w | C99 leaves signed overflow undefined; ⟦·⟧ *defines* it as wrapping, which REFINES ⊥ and is therefore legal (§7) |
+| `sdiv`, `srem` | truncation toward zero | C99 6.5.5p6. Divisor 0 ⟹ **⊥** |
+| `udiv`, `urem` | unsigned | divisor 0 ⟹ **⊥** |
+| `and`, `or`, `xor` | bitwise | |
+| `shl`, `lshr`, `ashr` | shift by `count mod w` | C99 6.5.7p3 leaves `count ≥ w` undefined; the A64 shifts take it modulo the width, and that is what ⟦·⟧ defines |
+| `fadd`, `fsub`, `fmul`, `fdiv` | IEEE-754 at the operand type | not associative; no fold may reassociate |
 
-| Inst | ⟦·⟧ : Σ → Σ |
+### 3.3 `⟦cmp⟧_τ : Bits × Bits → {0,1}`
+
+Integer predicates read their operands signed (`slt/sle/sgt/sge`) or unsigned
+(`ult/ule/ugt/uge`); `eq`/`ne` are signedness-free.
+
+Floating predicates split on ordering, and the distinction is load-bearing:
+
+| predicate | true when |
 |---|---|
-| `Bin(d,op,τ,a,b)` | `ρ' = ρ[d ↦ ⟦op⟧_τ(⟨a⟩ρ, ⟨b⟩ρ)]`   (⊥ if op is ⊥) |
-| `Un(d,⊝,τ,a)` | `ρ[d ↦ canon_τ(−⟨a⟩)]` (Neg int) / `bits(−f)` (Neg float) / `canon_τ(¬⟨a⟩)` (BNot) |
-| `Copy(d,τ,a)` | `ρ[d ↦ canon_τ(⟨a⟩ρ)]` |
-| `Load(d,τ,a)` | `ρ[d ↦ decode_τ(μ, ⟨a⟩ρ)]`   (read size(τ) bytes; f32→f64 when float, size 4) |
-| `Store(τ,a,v)` | `μ' = μ[⟨a⟩ρ ↦ encode_τ(⟨v⟩ρ)]`   (write size(τ) bytes; f64→f32 when size 4) |
-| `Memcpy(d,s,n)` | `μ' = μ[⟨d⟩ρ ..+n ↦ μ(⟨s⟩ρ ..+n)]`   (copy n bytes forward; struct assignment, C99 6.5.16) |
-| `Lea(d, Local off)` | `ρ[d ↦ frame − off]`   (`Global` / `Str` ↦ ⊥) |
-| `Cast(d,σ,τ,a)` | `ρ[d ↦ ⟦cast⟧_{σ→τ}(⟨a⟩ρ)]` |
-| `Call(Some d, Sym g, ā, _)` | `ρ[d ↦ canon_{τd}( ⟦g⟧(⟨ā⟩ρ) )]`   (recursive big-step; `Ptr` / depth > 500 ↦ ⊥) |
-| `Phi(d,τ,[(bᵢ,vᵢ)])` `[ssa-qbe]` | `ρ[d ↦ canon_τ(⟨v_k⟩ρ)]` where `b_k = π` (the predecessor edge just taken); no arm for `π`, or `π` undefined at entry ↦ ⊥ |
+| `foeq`, `folt`, `fole`, `fogt`, `foge` | ORDERED: false if either operand is NaN |
+| `fune` | `!(a == b)` — **true when unordered** |
+| `funo` | either operand is NaN |
 
-> **φ and the predecessor π.** The φ-node (SSA form, present only between `to_ssa`
-> and `out_of_ssa`) extends Σ with an auxiliary `π ∈ BlockId ⊎ {⊥}` — the block
-> the current edge came from — threaded by §4b (each `goto` sets `π :=` the block
-> being left). φ-nodes are *parallel* at a join, but SSA freshness (a φ dst is a
-> new temp never named by a sibling φ arm) makes left-to-right evaluation over `ρ`
-> faithful. This is the `Inst::Phi` arm of `interp` and the `prev` variable.
->
-> **`to_ssa` (Stage 2, `opt::to_ssa`, Braun 2013).** These φ are now *produced* by
-> mem2reg: a local is PROMOTABLE ⟺ scalar (int/float/pointer, LP64) ∧ type-consistent
-> ∧ not a parameter (params live in ABI-seeded frame slots) ∧ not address-taken (every
-> `Lea` of it feeds only Load/Store addresses — no escape). A promotable local's
-> `Store` becomes `writeVariable`, its `Load` a `Copy` of `readVariable`, its `Lea`
-> is dropped, and joins get φ; everything else stays in memory. The transform carries
-> no new denotation — its whole content is the theorem **`⟦f⟧ = ⟦to_ssa(f)⟧`** (§4
-> semantics unchanged), gated mechanically by `equiv`, never trusted.
->
-> **Float(size 4) promotion — the store∘load round-trip is not identity.** For an
-> integer cell, `⟦Store⟧` then `⟦Load⟧` = identity (values are kept `canon_τ`), so a
-> promoted `Load` is a plain `Copy`. But for a `float` cell of size 4, `Store` narrows
-> f64→f32 and `Load` widens f32→f64 (§4), so the round-trip is `fnarrow` (round to f32),
-> **not** identity. Eliding both — as naive mem2reg does — would drop that rounding and
-> leave illegal f64 precision in the promoted temp. So a promoted `Load` of a float(size 4)
-> cell becomes a self-`Cast(d,τ,τ,·)` (which `fnarrow`s, §3.3), not a `Copy`. This is
-> what preserves `⟦f⟧ = ⟦to_ssa(f)⟧` on float locals (`opt/ssa.rs` `Act::Load`).
->
-> **Two soundness preconditions on the CFG and on definedness** (`opt::cfg_complete`,
-> `read_var`). (a) *CFG-completeness.* Braun's construction — and every dominance /
-> reachability pass (`gvn`, `sccp`) — trusts the block-terminator CFG. A computed goto
-> (`GotoPtr`, EXT gcc) jumps to a data-dependent address-taken label, an edge NO terminator
-> models, so a loop closed only by `goto *p` looks acyclic; promoting a loop-carried local
-> across that invisible back-edge would drop its φ. These passes therefore **bail** (identity
-> transform, all locals stay in memory) whenever the function contains a `GotoPtr` — the
-> naive -O0 backend consumes it unchanged (GCC torture 920302-1, 920501-3). (b) *Undefined
-> reads.* When `readVariable` recurses to a block with no predecessor (the entry, or an
-> unreachable block) without finding a definition, the variable is read before any write
-> on that path — UB (C99 6.3.2.1p2, an address-not-taken object with an indeterminate
-> value). Building a φ there would be malformed (a φ needs a predecessor edge); instead
-> `read_var` yields a deterministic `Imm(0)` (as LLVM lowers `undef`), keeping the SSA
-> well-formed. Any value is legal under the UB (GCC torture pr43629).
->
-> **`out_of_ssa` (Stage 3, `opt::out_of_ssa`, φ-destruction).** The inverse: a φ has
-> no machine form, so before the backend runs each `Phi(d,τ,[(bᵢ,vᵢ)])` becomes an
-> explicit `Copy(d,τ,vᵢ)` on the control edge from `bᵢ`. This makes the auxiliary `π`
-> unnecessary — `interp` reads `d` straight from `ρ`, the value the taken edge deposited.
-> Two classic miscompiles are handled by construction: (1) a *critical edge* (the
-> predecessor `bᵢ` has ≥2 successors and the φ-block has ≥2 preds) is SPLIT — a fresh
-> block on the edge holds the copies, so they never leak onto `bᵢ`'s other edge;
-> (2) the *swap / lost-copy* problem — φ at a join are PARALLEL, so on one edge the
-> copy set `{d ← v}` may be mutually referential (`{a←b, b←a}`); `seq_pcopy`
-> (Boissinot sequentialization) emits a leaf whose dst no pending copy reads, and
-> breaks a residual cycle by saving one value to a fresh temp. Its whole content is
-> the theorem **`⟦to_ssa(f)⟧ = ⟦out_of_ssa(to_ssa(f))⟧`**, gated by `equiv`. The
-> result is φ-free (backend-consumable) but no longer single-assignment.
->
-> **`sccp` (Stage 4, `opt::sccp`, Wegman–Zadeck).** An SSA pass (between `to_ssa` and
-> `out_of_ssa`). A per-temp lattice `⊤ ⊒ Const(c) ⊒ ⊥` and a CFG-reachability set are
-> raised together in one monotone fixpoint: a temp is `Const(c)` only if it is `c` on
-> every REACHABLE path, and a `Br` on a proven constant marks only the taken edge
-> reachable — so a φ merging (reachable-const, dead-arm) collapses to the constant,
-> which plain const-folding cannot see. The transfer function reuses interp's own
-> `eval_bin/eval_cast/canon` (faithfulness) and declines div/rem-by-0 (→ `⊥`, keeping
-> the instruction). It carries no new denotation — its content is **`⟦f⟧ = ⟦sccp(f)⟧`**,
-> gated by `equiv`. Uses of a `Const` temp become `Imm`; a constant `Br` becomes `Jmp`
-> (a later DCE reclaims the pruned block).
->
-> **`gvn` (Stage 4, `opt::gvn`, dominator-based value numbering).** The SSA-global
-> generalization of block-local `cse` (§ Pass 4). A pure `(op, τ, operand-value-numbers)`
-> is a value number; in SSA a temp has ONE definition, so its value is invariant along
-> any path — hence two instructions with the same value number compute the same value.
-> A redundant one is replaced by a `Copy` of the earlier temp ONLY when that temp's
-> defining block DOMINATES the use (`dominators`, the Allen–Cocke iterative fixpoint),
-> so the value is available on every path reaching here. Restricted to arithmetic
-> (Bin/Un/Cast/Lea-Local); Loads keep block-local `cse` (cross-block load reuse needs
-> memory-availability analysis, omitted). Content: **`⟦f⟧ = ⟦gvn(f)⟧`** for f in SSA
-> form, gated by `equiv`.
->
-> **`cfg_simplify` (Phase A, `opt::cfg_simplify`, structural CFG cleanup).** Two graph
-> rewrites that touch NO instruction's value: (1) a block `S` whose sole predecessor `P`
-> ends in `Jmp(S)` is spliced into `P` (append `S`'s instructions, adopt `S`'s
-> terminator) — `P` then `S` was already the exact execution order, with no edge entering
-> or leaving between them; (2) a block unreachable from the entry is deleted and the
-> survivors renumbered. `interp` never visits an unreachable block and executes a spliced
-> pair identically, so the executed instruction SEQUENCE is invariant — content
-> **`⟦f⟧ = ⟦cfg_simplify(f)⟧`**, gated by `equiv`. Guarded by `cfg_complete` (a computed
-> goto leaves the CFG edges unmodeled). It exists to collapse the straight lines and
-> orphaned blocks `sccp` exposes; φ-arms naming a merged/removed predecessor are renamed
-> or pruned to keep the IR well-formed.
->
-> **register coalescing (Phase A, biased coloring in `opt::color_abi`/`abi_alloc`).** NOT
-> a `⟦·⟧` rewrite — it changes only the register ASSIGNMENT, not the IR. A non-interfering
-> move pair (`Copy` dst/src, disjoint live ranges) is biased toward the SAME color, so the
-> copy lowers to a self-move the peephole elides. The bias chooses only among colors
-> already free and legal for the temp, so the coloring stays valid and the correctness
-> theorem is unchanged — the same interference-invariant rename-bisimulation as Stage 5b
-> (`verify_abi`). No node-merge ⟹ k-colorability is never worsened ⟹ no spill risk.
+> C99 6.5.9: `a != b` is `!(a == b)`, so on NaN it is **true**. It is the
+> UNORDERED not-equal (`fune`), not the ordered one. HIR spells both so the
+> distinction cannot be lost in instruction selection — where it matters, because
+> `fune` is a plain `ne` on the A64 flags while ordered `!=` has no single
+> condition code at all.
 
-> **`licm` (Phase B, `opt::licm`, loop-invariant code motion) — TOGGLEABLE, default-OFF.**
-> Loop infra first: `back_edges` finds an edge `t→h` with `h dom t`; `natural_loop`
-> collects the body (nodes reaching `t` without passing `h`); `ensure_preheader` splits
-> a dominating single-entry block onto the header's sole external in-edge. LICM then
-> hoists a body instruction `d := op(a,b)` to the preheader **iff** it is (1) PURE and
-> TRAP-FREE — only `Bin(¬Div,¬Rem)/Un/Copy/Cast/Lea`, never `Load` (a store could alias);
-> (2) INVARIANT — every operand is a constant or defined outside the body; and (3)
-> **SINGLE-DEF** (`defcnt[d]==1`). Clause (3) is the load-bearing fence: zcc IR is only
-> *partial*-SSA (`to_ssa` promotes just address-not-taken scalars), so a multi-def
-> loop-condition temp still exists; hoisting one of its defs FREEZES it and turns a finite
-> loop infinite. That miscompile is invisible to `equiv` (an infinite loop → interp step
-> budget → `Err` → skipped as UB), so it is fenced by construction and pinned by a
-> DIRECT-interp regression test (`licm_multidef_condition_stays_finite`), not by `equiv`
-> alone. Speculation is safe (pure+trap-free) and def-before-use holds (the preheader
-> dominates the body), so **`⟦f⟧ = ⟦licm(f)⟧`** (`licm_semantics_preserved`,
-> `licm_hoists_invariant`, `licm_respects_variance`, `licm_gate_has_teeth`). MEASURED to
-> REGRESS the memory-bound naive-slot backend (every temp spills; hoisting trades a cheap
-> recompute for a reload — matmul 2.44→2.70×), so it ships OFF: only a MEASURED win is
-> default-on. Kept wired behind the `Passes` toggle (`ZCC_OPT_ON=licm`) for a future
-> register-resident backend where hoisting a loop-invariant into a callee-saved register
-> would pay.
+### 3.4 `⟦cvt⟧_{σ→τ}` (C99 6.3.1.2 / 6.3.1.4 / 6.3.1.5)
 
-> **`strength_reduce` (Phase B.5, `opt::strength_reduce`, induction-variable reduction) —
-> TOGGLEABLE, default-OFF.** The textbook loop optimization: a per-iteration MULTIPLY by a
-> constant that rides an induction variable becomes an ADD accumulator. A BASIC induction
-> variable appears as an SSA header φ `i₁ = φ(preheader: i₀, latch: i₂)` with `i₂ = i₁ + c`
-> (c constant), so at the head of iteration k, `i₁ = i₀ + k·c`. A DERIVED IV `j = i₁·d`
-> (d constant) is reduced by introducing a parallel accumulator φ `j₁ = φ(preheader: i₀·d,
-> latch: j₂)` with `j₂ = j₁ + c·d`, and replacing `j := i₁·d` by `j := j₁`. Correctness is
-> an INDUCTION on the trip count: base `j₁ = i₀·d = i₁·d` (i₁=i₀ on entry); step assume
-> `j₁ = i₁·d`, then `j₂ = j₁ + c·d = i₁·d + c·d = (i₁+c)·d = i₂·d`, the next head value.
-> Hence `j₁ = i₁·d` at every head ⟹ every observation of j is unchanged ⟹
-> **`⟦f⟧ = ⟦strength_reduce(f)⟧`**. Distribution `(i₁+c)·d = i₁·d + c·d` holds EXACTLY in
-> ℤ/2ⁿ (two's-complement wrap), so no overflow/UB gap opens at the IR level. Fences:
-> INTEGER-only (float × is non-distributive), CONSTANT c and d (⟹ c·d folds at build), all
-> of i₁/i₂/j SINGLE-DEF (partial-SSA ⟹ checked, not assumed — recomputed PER back-edge so a
-> nested loop's fresh temps are counted), REDUCIBLE single-latch loops only (2-arm header φ),
-> `cfg_complete`-guarded. **ENABLING-PASS dependency:** mem2reg leaves a copy between the
-> header φ and each IV use (`t = copy(i₁); … t·d`), so SR only sees the derived IV AFTER
-> `copy_prop` collapses the copy — SR is NOT independent; copy_prop precedes it in the
-> fixpoint. Proven by `strength_reduce_semantics_preserved` (312×equiv),
-> `strength_reduce_fires`, `strength_reduce_in_pipeline_terminates_correct`,
-> `strength_reduce_gate_has_teeth`. NOTE (the space-gap lesson): the 312-case commuting-square
-> proof did NOT catch a nested-loop stale-`defcnt` panic — the BOX torture (`loop-ivopts-1`)
-> did; the generated proof space is a STRICT SUBSET of the real-program space, so the box gate
-> is not redundant with the unit proof. Same memory-bound backend ⟹ ships OFF (`ZCC_OPT_ON=sr`).
+`sext`/`zext`/`trunc` are the carrier operations of §3.1. `fpext`/`fptrunc`
+convert between `F32` and `F64` with IEEE rounding. `sitofp`/`uitofp` read the
+source as signed/unsigned. `fptosi`/`fptoui` truncate **toward zero**; a value
+out of range is undefined in C and A64 `fcvtzs`/`fcvtzu` SATURATE, so ⟦·⟧
+defines saturation (again a refinement of ⊥). `bitcast` reinterprets the bits.
 
-> **Pass pipeline as an industrial toggle (`opt::Passes`).** `optimize_ssa` no longer
-> hard-codes its pass set; it reads a `Passes` record (19 fields — sccp, const_fold,
-> copy_prop, gvn, cse, load_elim, dce, cfg_simplify, licm, strength_reduce, pointer_iv,
-> coalesce, peephole, ldst_pair, if_convert, inline, remat, sroa, hoist_const).
-> `Passes::default()` = every ⟦·⟧-preserving MEASURED-win pass ON, with `licm` /
-> `strength_reduce` / `remat` OFF (proven but measured-negative on the naive-slot
-> backend). `Passes::from_env()` applies comma lists
-> `ZCC_OPT_OFF=`/`ZCC_OPT_ON=` (the gcc `-fno-<pass>` / LLVM `PassBuilder` idiom) so any
-> element is switched without a rebuild. Every toggle is `⟦·⟧`-neutral by construction —
-> each pass already carries its own commuting-square proof, so any subset composes to the
-> same denotation; the toggle changes only PERFORMANCE, never OBSERVABLE behavior
-> (`passes_toggle_wiring`, `coalesce_off_still_valid`).
-
-> **`peephole_moves` (Phase C, `arm64_elf`, backend redundant-move elimination) —
-> default-ON, the biggest measured win.** This is a MACHINE-level pass (post-codegen text),
-> not an IR ⟦·⟧ rewrite, so it lives in the target file and is validated by machine reasoning
-> + differential execution rather than the IR `equiv` harness. MOTIVE (measured): the emitter
-> is an x0-accumulator machine — every value flows through x0 and is copied to/from its home
-> register, so a store-then-reload `mov xH,x0 ; mov x0,xH` litters the output (matmul: 197 of
-> 398 instructions are reg-reg movs; gcc-O0 emits zero). The pass tracks a per-register 64-bit
-> value-equivalence within a straight-line region and performs exactly ONE rewrite: DROP a
-> `mov xD,xS` when the model already proves `xD ≡ xS` (a verified no-op). SOUNDNESS: every
-> recognized destination-writing instruction assigns its dst a FRESH value-id (breaking stale
-> equivalences), and any branch / call / label / unrecognized mnemonic FLUSHES the whole model
-> — so no equivalence survives a value change or is assumed across control flow. Equivalences
-> are formed only by full-width `mov x,x`, so a 32-bit `w` write (which zero-extends) can never
-> be mistaken for a 64-bit copy; live-out is safe because a redundant reload is dropped only
-> when the target already holds the value. A SECOND pass, `drop_dead_moves`, removes DEAD
-> stores: the coalescer gives many short-lived temps the same home register, so the emitter
-> writes a home and overwrites it before any read. Region-local BACKWARD liveness (live-out at
-> a boundary = the conservative FULL register set) drops a `mov xD,xS` when xD is rewritten
-> before it is read. Read/write attribution is POSITIONAL: a float/vector-destination
-> instruction (`ldr q0,[x0]`, `fmov d0,x0`) writes NO GP register, so its GP operands are
-> READS — mistaking the address x0 for the destination drops the live move feeding it. Measured:
-> bench geomean **1.39×→0.98× vs gcc-O0 — zcc now beats gcc-O0 on average** (loops 0.66×, sieve
-> 0.60×, matmul 2.44→1.68×, fib 1.39×). Gated by 16 machine unit tests + torture (0 FAIL) +
-> opt-parity (0 DIVERGE). Toggle `ZCC_OPT_OFF=peephole`.
->
-> THE DCE-BUG LESSON (measure-before-speaking, again): all unit tests passed and the bench
-> looked excellent, yet BOX torture caught 32 FAIL (stdarg-1 SIGABRT) from the positional-parse
-> bug above. A green PERFORMANCE number on miscompiled output is worthless (clean-input law) —
-> the differential gate, not the unit proof, is what exposed it. A machine peephole's proof is
-> the soundness invariant + unit tests + the differential gate TOGETHER; none alone suffices.
->
-> WHY THE IR PASSES REGRESS BUT THIS WINS (the LICM/phase-ordering answer): the commuting-square
-> proofs establish `⟦f⟧=⟦pass(f)⟧` — identical OUTPUT — and say NOTHING about instruction count
-> or cycles; performance is an ORTHOGONAL axis. On this x0-accumulator backend the true cost is
-> reg-reg move traffic, so LICM/strength-reduction (which add a loop-carried value and its
-> copies) can INCREASE that traffic and regress, while the peephole DIRECTLY deletes it and wins.
-> Optimizations are therefore NOT independent: their profitability is set by the backend and by
-> each other (SR needs `copy_prop` to even fire; LICM would pay only once values stay
-> register-resident). Correctness composes (every subset is ⟦·⟧-equal); PROFIT does not.
-
-**Exotic instructions (⊥ — impure, outside the CORE space):** `FunAddr`,
-`LabelAddr`, `Zero`, `VaStart`, `VaArg`, `Overflow`, `VaArea`, `GotoPtr`,
-`Alloca`, `CallX`, `Sync`, `Asm`. The interpreter returns an error, meaning the
-input has reached a function containing an exotic instruction — an impure
-function — so the commuting square skips it (as it does for undefined behavior).
-This is the CORE / EXOTIC-typed partition of the IR (OPT.md §7): passes touch
-only CORE, so only ⟦·⟧ over CORE is needed to establish that a pass commutes.
-
-## 4b. Terminator semantics ⟦Term⟧ : Σ → (BlockId ⊎ Halt)  (mirrors `match term`)
-
-```
-⟦Jmp b⟧          =  goto b   (π := this block)
-⟦Br c b_t b_e⟧   =  goto (⟨c⟩ρ ≠ 0 ? b_t : b_e)   (π := this block)
-⟦Ret v?⟧         =  Halt(⟨v⟩ρ)    (Halt(0) when None)
-⟦Unreachable⟧    =  ⊥             (reaching it means malformed IR, or genuinely unreachable dead code)
-```
-`π` (the predecessor block) is set by every taken edge and read only by `Phi` (§4).
-
-## 4c. Function big-step ⟦Func⟧ : 𝕍* → 𝕍 ∪ {⊥}
-
-```
-⟦f⟧(ā) evaluates from block 0 with Σ₀ = ⟨ρ = 0̄, μ = seed(ā)⟩; it runs each ⟦inst⟧
-       in order within a block, then ⟦term⟧ selects the next block; it halts at
-       Halt(v), yielding v. Two safety bounds: a step budget (non-termination ↦ ⊥)
-       and a call depth ≤ 500 (host-stack recursion ↦ ⊥).
-```
-
-Here ⊥ (an interpreter error) means "the input lies outside the modeled space":
-undefined behavior (division by zero), an exotic instruction, a global address,
-recursion deeper than the bound, or exceeding the step budget. A difference at ⊥
-is meaningless, so the commuting square skips it.
+`(_Bool)x` is **not** a truncation: it is `x != 0` (C99 6.3.1.2), and on a
+floating operand it uses `fune`, so `(_Bool)NaN` is 1.
 
 ---
 
-## 5. The commuting-square theorem (executable)
+## 4. HIR instruction semantics ⟦Inst⟧ : Σ → Σ
 
-`alg.sh` establishes the fold-vs-runtime commuting square at the **source**
-level (it diffs two binaries, produced by the system compiler and by zcc, over
-an exhaustively enumerated algebraic space). This document lifts that square to
-the **IR + reference semantics** level (in-process, dependency-free, without the
-system compiler):
-
-> **Theorem (metamorphic / structurally-exhaustive translation validation).**
-> For every pass `P ∈ {const_fold, copy_prop, cse, dce, optimize}`, every
-> expression `e` in the generated structural space `𝔼_struct`, and every input
-> `i` in the battery:
-> $$ ⟦lower(e)⟧(i) \ne ⊥ \;\Longrightarrow\; ⟦P(lower(e))⟧(i) = ⟦lower(e)⟧(i). $$
-
-Equivalently, the following square commutes for every `e ∈ 𝔼_struct`:
+Big-step, one rule per instruction; `↓` reads an operand (a value from ν, or a
+constant, which takes its type from the enclosing instruction).
 
 ```
-      lower(e) ───────⟦·⟧──────▶  v
-         │                        ‖
-         P                        ‖   (equal for every i with ⟦·⟧ ≠ ⊥)
-         ▼                        ‖
-     P(lower(e)) ────⟦·⟧──────▶  v
+⟦bin  d, op, τ, a, b⟧      ν' = ν[d ↦ ⟦op⟧_τ(a↓, b↓)]
+⟦un   d, op, τ, a⟧         neg = 0−a in ℤ/2^w · not = bitwise complement ·
+                           fneg = IEEE SIGN FLIP (not 0−x: defined on NaN and −0.0)
+⟦cmp  d, p, τ, a, b⟧       ν' = ν[d ↦ ⟦p⟧_τ(a↓, b↓)]                      d : I32 ∈ {0,1}
+⟦cvt  d, c, σ→τ, a⟧        ν' = ν[d ↦ ⟦c⟧_{σ→τ}(a↓)]
+⟦load d, τ, p⟧             ν' = ν[d ↦ μ[p↓ .. p↓+bytes(τ)]]               unmapped ⟹ ⊥
+⟦store τ, p, v⟧            μ' = μ[p↓ .. ↦ v↓]                             unmapped ⟹ ⊥
+⟦slotaddr d, k, c⟧         ν' = ν[d ↦ base(slot k) + c]
+⟦symaddr d, s⟧             ν' = ν[d ↦ address of s]
+⟦select d, τ, c, a, b⟧     ν' = ν[d ↦ (c↓ ≠ 0 ? a↓ : b↓)]    both arms already evaluated
+⟦call d, sig, f, args⟧     run ⟦f⟧ on the argument values; ν' = ν[d ↦ result]
+⟦alloca d, n, α⟧           reserve n bytes on the stack; ν' = ν[d ↦ base]
+⟦memcpy p, q, n⟧           μ' = μ with n bytes copied
+⟦memset p, b, n⟧           μ' = μ with n bytes set
+⟦intrinsic …⟧              the EXT surface — opaque to every pass (Effect::Call)
 ```
 
-**Mechanical check:** `opt::tests::commuting_square_structural_exhaustion`.
-`𝔼_struct` is the union of **five shape families**, each exhausting the operator
-set over a distinct structure, so together they cover every kind of `Inst`
-(Bin/Un/Copy/Load/Store/Lea/Cast) and both terminators (Jmp/Br):
+An instruction's **effect class** (`Pure | Read | Write | Call`) is a property of
+the instruction, consulted by every pass instead of a hand-written opcode list. A
+*volatile* access is `Call`-class: C99 6.7.3 forbids removing, duplicating or
+reordering it, which is exactly the discipline applied to a call.
 
-| family | shape | size | passes / Inst exercised |
-|---|---|---|---|
-| A | straight-line arithmetic (`POOL³`) | 216 | fold + CSE + copy-prop + DCE, Bin |
-| B | div / mod (`POOL × {/,%}`) | 12 | symmetric UB skip; folder declines div-by-zero |
-| C | shift (`POOL × {<<,>>}`) | 12 | Shl / Shr (arithmetic `>>`) |
-| D | pointer / memory (`POOL²`) | 36 | Lea / Load / Store, **CSE memory-kill** (GCC PR84169) |
-| E | loop / CFG (`POOL²`) | 36 | Br / Jmp back-edge, copy-prop / DCE across blocks |
+## 4b. Terminator semantics ⟦Term⟧ : Σ → (BlockId ⊎ Halt)
 
-Total: **312 expressions × 5 passes = 1560 commuting squares**, all green. Here
-⟦·⟧ is `interp`, and equivalence is checked over the `battery` (small-domain
-exhaustion [−6, 6]ⁿ plus the INT_MAX / INT_MIN boundaries; see `ir.rs::battery`).
-Family E bounds its trip count with `b & 7`, so the interpreter always
-terminates (the check is non-vacuous). A mechanical evidence trail (the
-expression count and the square count) is asserted exactly, forbidding a vacuous
-"passing" run.
+```
+⟦jmp  T⟧               take edge T
+⟦br   c, T, F⟧         c↓ ≠ 0 ? take T : take F                (c : I32)
+⟦switch v, τ, ks, D⟧   the arm whose key equals sext_τ(v↓), else D
+⟦ret  v?⟧              Halt with v↓ (or none)
+⟦unreachable⟧          ⊥
+⟦goto_ptr v, targets⟧  the block whose address is v↓            EXT(gcc)
+```
 
-**Anti-blindness.** `commuting_square_selfproof` injects a mutation (deleting a
-`Store`, removing a memory write) and requires the commuting square to catch it;
-if the equivalence check were blind, every verdict would be worthless.
+*Taking an edge T = (b, args)* assigns b's parameters from `args`,
+**simultaneously**. That single sentence is the whole of the φ semantics the old
+IR needed a predecessor-tracking rule for.
+
+## 4c. Function big-step ⟦Func⟧ : Bits* → Bits ∪ {⊥}
+
+Reserve the function's stack objects; seed the incoming parameters; run blocks
+from the entry until a terminator halts; release the stack. The observable is the
+return value. External symbols resolve to a small builtin table
+(`memcpy`/`memset`/`strlen`/…); anything else is ⊥ — a function that reaches it
+is simply not usable as a proof witness.
 
 ---
 
-## 6. Limitations and the path forward
+## 5. MIR semantics
 
-- ⟦·⟧ models local memory and the return value only; it does not model globals,
-  the heap, I/O, or concurrency, so it can establish preservation only for pure
-  CORE functions. This suffices for the five current passes (all CORE) but not
-  for interprocedural optimization or global alias analysis.
-- Exhausting `𝔼_struct` is *finite structural coverage*, not universal: it
-  catches defects on the generated shapes but does not prove correctness for all
-  programs (Rice's theorem). The reference semantics of §1–§4 is the object to
-  be formalized for the next stages — translation validation (a per-compilation
-  certificate and checker) and per-pass machine-checked proofs — which is why it
-  is stated explicitly and mapped one-to-one onto the code here.
+### 5.1 ALU and NZCV
+
+`⟦alu⟧` is `⟦binop⟧` at the instruction's width, with `w`-form results
+zero-extended (§1.2). The flag-setting forms additionally produce NZCV by the
+manual's `AddWithCarry` (DDI 0487 C6.2): N = sign of the result, Z = result is
+zero, C = carry out (for `sub`, of `a + ¬b + 1`), V = signed overflow. `cmp`,
+`cmn` and `tst` are `subs`, `adds` and `ands` discarding the result.
+
+`⟦cc⟧(nzcv)` is the manual's condition table: `eq`=Z, `ne`=¬Z, `hs`=C, `lo`=¬C,
+`mi`=N, `pl`=¬N, `vs`=V, `vc`=¬V, `hi`=C∧¬Z, `ls`=¬C∨Z, `ge`=N=V, `lt`=N≠V,
+`gt`=¬Z∧N=V, `le`=Z∨N≠V.
+
+`fcmp` sets NZCV per C6.2: **unordered sets C and V and clears N and Z**; equal
+sets Z and C; less sets N; greater sets C. Each ordered predicate of §3.3 has a
+single condition that is false when unordered, which is why `folt` maps to `mi`
+and not `lt`.
+
+### 5.2 Operands
+
+An `Rhs` is a register, a shifted register, an extended register, or an
+immediate; an `AddrMode` is `[base,#off]`, `[base,idx,ext #k]`, pre/post-index
+(which DEFINE a new base register, so the SSA property survives), a stack slot,
+or a symbol's low-12 offset. All of them denote by the manual's definition, and
+`mir/isa.rs` decides which immediates exist at all.
+
+> One encoding fact that is easy to lose and changes meaning: in the ADD/SUB
+> **immediate** form, register 31 encodes **SP**, not ZR. `add w0, wzr, #5` is
+> not an instruction. The shifted-register and logical-immediate forms do read 31
+> as ZR.
+
+### 5.3 Calls
+
+`Call` carries the ABI as fixed operand constraints plus a clobber set. Executing
+it moves each constrained operand into the register the ABI named, runs the
+callee against the same physical file, and moves the results back. Argument
+placement is a `ParallelCopy` immediately before — simultaneous assignment,
+sequentialized after allocation (§6.3).
+
+### 5.4 Stack objects
+
+`Spill`/`Reload`/`SlotAddr` address a stack object by id. Before
+`pass/frame.rs` each object is its own region; after, all of them live at
+assigned offsets inside one frame and `frame_size` is its size — which may
+legitimately be **zero** for a leaf that needs no stack.
+
+---
+
+## 6. The commuting squares (REARCH §10 made concrete)
+
+Each is an equality between two runs, with no assembler, linker or hardware in
+the loop. All are quantified over the battery's program shapes, and all compare
+only inputs on which neither side is ⊥ (§7).
+
+### 6.1 `⟦build(parse(src))⟧ = the value C99 assigns src`
+The lowering battery (`src/hir/tests.rs`). The oracle is the STANDARD,
+transcribed by hand — never "what zcc currently prints".
+
+### 6.2 `⟦f⟧ = ⟦P f⟧` for an HIR pass P
+Not yet exercised: R0 ships no pass. The harness is the one above, run on both
+sides.
+
+### 6.3 `⟦hir⟧ = ⟦mir_v⟧` (instruction selection) and `⟦mir_v⟧ = ⟦mir_p⟧` (allocation)
+`src/isel/tests.rs` and `src/regalloc/tests.rs`. The second is a **renaming
+bisimulation**: allocation renames values and may route some through memory, but
+must not change what the function computes. Alongside it, structural obligations
+the interpreter cannot see — no virtual register survives, every ABI-fixed
+operand is satisfied, every `Reload` is DOMINATED by a `Spill` of its slot, no
+`ParallelCopy` remains.
+
+### 6.4 `⟦mir_p⟧ = ⟦mir_final⟧` (frame lowering and block layout)
+`src/mir/pass/tests.rs`. Because ⟦mir⟧ honors the callee-saved contract for a
+function that has no prologue and not for one that has (§2.2), this equality
+states exactly: *frame lowering realizes, in instructions, the ABI assumption the
+allocator made* — plus *layout reorders blocks and inverts conditions without
+changing an edge*.
+
+### 6.5 Emission
+Identical MIR ⟹ identical bytes, sealed across FRESH processes so a per-process
+hash seed cannot leak into the output (`tests/determinism.sh`). Assembler
+acceptance and end-to-end behaviour are CONFIRMED by the suites — never
+discovered there.
+
+---
+
+## 7. ⊥ and refinement
+
+A trap — C99 undefined behavior reached (division by zero, an out-of-range
+access), a missing external, `unreachable`, or exhausting the step budget — is
+**⊥**. ⊥ is not a wrong answer; it is the absence of one.
+
+A transform may **refine** ⊥ into anything. That is why ⟦·⟧ is free to *define*
+signed overflow as wrapping, shifts as modulo the width, and float-to-int
+conversion as saturating: each refines a ⊥ the standard left open, and each
+matches what the machine does, so the compiler and the semantics agree. It is
+also why every square compares only inputs on which neither side traps —
+comparing at ⊥ would reject a legal transform.
+
+The step budget deserves naming: it makes non-termination ⊥. This is sound (an
+infinite loop has no observable value) but it means a square is silent about
+programs that do not terminate, which is one of the reasons the corpus suites
+still exist.
+
+---
+
+## 8. Limitations, honestly
+
+- **Not machine-checked.** Everything here is validated by execution over a
+  finite class of shapes. The next rung is per-pass machine-checked proof; the
+  rung after is a proof-carrying pipeline.
+- **The modelled space is smaller than the real one.** rc3's history is explicit
+  about this: passes that were *proven* on the commuting-square space still
+  regressed on real programs (inlining, strength reduction), and the box torture
+  caught what the model was blind to. The square is a *discovery* instrument; the
+  suites *confirm*.
+- **Floating point is modelled by the host's `f32`/`f64`.** Correct for the
+  operations defined here, but it says nothing about contraction (`fma`), about
+  excess precision, or about rounding modes.
+- **Concurrency is not modelled.** `volatile` is honored structurally (a
+  `Call`-class effect: never removed, duplicated or reordered), and the
+  `__sync_*` intrinsics are opaque, but there is no memory model.
+- **No I/O trace.** The observable is the return value. A function whose meaning
+  is its output stream is checked by the differential suites, not here.

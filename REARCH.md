@@ -387,10 +387,11 @@ without a prior prediction — is fixed structurally, not by discipline.)
 - `OPT.md §0` spine: row #25 is superseded by §12 here (user "re-plan"). Rows 1–24 remain history on
   `main`. The scoreboard method (paired INSN+EXEC, distribution, gcc-zeroed bucket, corpus25 excess
   histogram) survives verbatim — it is measurement, not architecture.
-- Docs to update when merging to `main`: `THEORY.md` A5/A6/A7 (rewrite around HIR/MIR; add the Hack /
-  Braun-Hack / Boissinot theorems), `SEMANTICS.md` (HIR semantics re-targeted; new MIR semantics
-  section), `MILESTONES.md` (R0–R4), `CLAUDE.md` override paragraph (`[optimizer = main]` block → the
-  layered backend), `src/codegen/arm64_elf.md` deleted, `tests/README.md` (new proof batteries).
+- `THEORY.md` and `SEMANTICS.md` were re-targeted at **R0.9**, not deferred to merge: Law 1 makes them
+  the SOURCE and `src/` the compiled object, so leaving them describing a deleted IR would mean the
+  source and the object disagreed. Still to update at merge: `MILESTONES.md` (R0–R5), the `CLAUDE.md`
+  override paragraph (`[optimizer = main]` → the layered backend; `main` is frozen at rc3 and
+  `mir-rearch` is default), `tests/README.md` (the new proof batteries + `tests/determinism.sh`).
 
 ---
 
@@ -409,7 +410,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R0.6 `isel/lower.rs` naive 1:1 (no munch yet) + `isel/abi.rs` for scalar args/returns + `imm.rs` | ✅ `src/isel/tests.rs` 9 groups, ⟦hir⟧=⟦mir_v⟧ |
 | R0.7 **regalloc, complete**: `live` → `spill` → `color` → `destruct` → `verify` (+ `mir/pass/frame.rs`, since a prologue is what makes callee-saved preservation provable) | ✅ `src/regalloc/tests.rs` 7 groups, ⟦mir_v⟧=⟦mir_p⟧. **Residual**: the spiller is the sound base case (spill-at-def, reload-per-use), NOT Braun-Hack — see R2.2 |
 | R0.8 `mir/pass/frame.rs` + `layout.rs` + `emit.rs`; hello world links and runs in the box | ✅ box: `int main(){int s=0,i;for(i=0;i<10;i++)s+=i;return s;}` → exit 45 |
-| R0.9 audit remediation (user audit, 2026-08-24): frame sentinel + frameless leaf · next-use distance without the `*1000` block-size assumption · every remaining convenience constant justified or removed · §2's Braun claim corrected · emit determinism seal in `tests/` (Article E's byte-identical gate, which the repo lacked) · frame/layout given their own `⟦mir_p⟧=⟦mir_final⟧` square instead of riding on regalloc's · `THEORY.md`/`SEMANTICS.md` re-targeted to HIR/MIR (Law 1: those docs ⊕ the specs ARE the source) | ⬜ |
+| R0.9 ✅ audit remediation (user audit, 2026-08-24): frame sentinel + frameless leaf · next-use distance without the `*1000` block-size assumption · every remaining convenience constant justified or removed · §2's Braun claim corrected · emit determinism seal in `tests/` (Article E's byte-identical gate, which the repo lacked) · frame/layout given their own `⟦mir_p⟧=⟦mir_final⟧` square instead of riding on regalloc's · `THEORY.md`/`SEMANTICS.md` re-targeted to HIR/MIR (Law 1: those docs ⊕ the specs ARE the source) | ✅ 7/7. THEORY A5–A7b rewritten (isel/HIR/MIR/regalloc-on-SSA + the pass ladder marked PLANNED), II-3/II-4/II-5 re-pointed, chordal graphs added to the B1 index; SEMANTICS rewritten around both levels. `cargo test` 40/40, `tests/cases` 61/81 unchanged, determinism 70×6 green |
 | R0 gate | `cargo test` batteries green (36/36: hir 10, mir 10, isel 9, regalloc 7); `tests/cases` **61/81** — the 14 remaining failures are exactly the R1 feature set, each stopped by an explicit `todo!` rather than miscompiled: struct by value/return (`abi_callptr_struct abi_composite_ir addr_of_exotic_ir c89_structval stmt_expr_nested_struct`), >8 arguments on the stack (`c89_decl`), varargs (`c99_ternary_decay_vararg e_stdarg kr7_minprintf m5_printf_args`), VLA (`c99_digraph_vla vla_loop_reset_sp`), long double (`c99_long_double`), bitfields (`m6_bitfield`). **81/81 is R1.4's gate, not R0's** — R0.3 only ever claimed the scalar subset; the original wording of this row was inconsistent with it and is corrected here in place | ✅ |
 
 ### R1 — correctness parity with `rc3` (no HIR optimization passes yet)
