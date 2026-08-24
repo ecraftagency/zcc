@@ -3654,12 +3654,12 @@ fn drop_wform_sxtw(body: &str) -> String {
 /// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores,
 /// THEN bitfield fusion (LEVER 1) + redundant sign-extend elim (LEVER 2) + the demand-side w-form
 /// sign-extend elim (LEVER 7) on the settled stream.
-fn peephole_moves(body: &str, ret_gp: u32) -> String {
+fn peephole_moves(body: &str, exit_live: u64) -> String {
     drop_wform_sxtw(&drop_dead_moves(
         &drop_redundant_uxt(&drop_redundant_sxtw(&fuse_bitfield(&drop_redundant_moves(
             &propagate_copies(body),
         )))),
-        ret_gp,
+        exit_live,
     ))
 }
 
@@ -4325,33 +4325,59 @@ fn cbz_fuse(body: &str) -> String {
 /// Pre/post-index writeback (`[xN],#k` / `[xN,#k]!`) is MODELLED (base read+written, Rt read for
 /// a store / written for a load) instead of forcing a boundary, so the post-index loads in hot
 /// loops no longer poison the analysis (their block stays analyzable).
-fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
+fn drop_dead_moves(body: &str, exit_live: u64) -> String {
     use std::collections::HashMap;
-    const NR: u32 = 31; // regs x0..x30 tracked; bit r ↔ reg r
-    let full: u32 = (1u32 << NR) - 1;
-    let mut exit_live: u32 = 0;
-    for r in 0..ret_gp.min(NR) {
-        exit_live |= 1 << r;
-    }
+    // Tracked register space, one u64 bit each: GP x0..x30 ↔ bits 0..30; FP/SIMD d0..d31 (also
+    // s/h/b/q/v aliases — same physical reg, same slot) ↔ bits 32..63. sp/x31/xzr untracked.
+    const GPN: u32 = 31;
+    let gp_full: u64 = (1u64 << GPN) - 1;
+    let fp_full: u64 = ((1u64 << 32) - 1) << 32;
+    let full: u64 = gp_full | fp_full;
+    let exit_live = exit_live & full;
     let lines: Vec<&str> = body.lines().collect();
 
-    // reads/writes as bitmasks, or None ⟹ opaque (control transfer / unmodelable). Writeback
-    // addressing is modelled here (reg_uses conservatively rejects it as a boundary).
-    let live_rw = |t: &str| -> Option<(u32, u32)> {
-        let mask = |v: Vec<u32>| -> u32 { v.into_iter().filter(|&x| x < NR).fold(0, |m, x| m | (1 << x)) };
+    // FP/SIMD register id (d/s/h/b/q/v N → 32+N), or None for a GP reg / immediate / memory /
+    // label token. `parse::<u32>` on the tail guards against symbol tokens (`sp`, `sym`, `:got:`).
+    let fp_id = |tok: &str| -> Option<u32> {
+        let tok = tok.trim().trim_start_matches('[').trim_end_matches('!').trim_end_matches(']');
+        let tail = ['d', 's', 'h', 'b', 'q', 'v'].iter().find_map(|&c| tok.strip_prefix(c))?;
+        tail.split('.').next()?.parse::<u32>().ok().filter(|&r| r < 32).map(|r| 32 + r)
+    };
+    // reads/writes as u64 bitmasks, or None ⟹ opaque (control transfer / unmodelable). The GP
+    // side is `reg_uses` (which returns None-slots for FP operands); the FP side is supplemented
+    // here by the same def-first / store / two-dest classification. Writeback addressing (which
+    // reg_uses rejects as a boundary) is modelled in the second arm, GP base + GP-or-FP Rt.
+    let live_rw = |t: &str| -> Option<(u64, u64)> {
+        let gp_mask = |v: Vec<u32>| -> u64 { v.into_iter().filter(|&x| x < GPN).fold(0, |m, x| m | (1 << x)) };
+        let mn = t.split_whitespace().next().unwrap_or("");
         if !(t.contains("],") || t.contains("]!")) {
             let (r, w, boundary) = reg_uses(t);
-            return if boundary { None } else { Some((mask(r), mask(w))) };
+            if boundary {
+                return None;
+            }
+            let (mut reads, mut writes) = (gp_mask(r), gp_mask(w));
+            let no_def = mn.starts_with("st") || mn == "fcmp" || mn == "fcmpe" || mn == "fccmp";
+            let two_dest = mn == "ldp";
+            for (idx, tk) in t[mn.len()..].trim_start().split(',').enumerate() {
+                if let Some(fid) = fp_id(tk) {
+                    let is_dest = !no_def && if two_dest { idx < 2 } else { idx == 0 };
+                    if is_dest {
+                        writes |= 1 << fid;
+                    } else {
+                        reads |= 1 << fid;
+                    }
+                }
+            }
+            return Some((reads, writes));
         }
-        let mn = t.split_whitespace().next().unwrap_or("");
         let toks: Vec<&str> = t[mn.len()..].trim_start().split(',').collect();
-        let slot = |tok: &str| -> Option<u32> {
+        let gp_slot = |tok: &str| -> Option<u32> {
             let tok = tok.trim().trim_start_matches('[').trim_end_matches('!').trim_end_matches(']');
-            tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok().filter(|&r| r < NR)
+            tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok().filter(|&r| r < GPN)
         };
-        let base = toks.iter().find(|x| x.contains('[')).and_then(|x| slot(x));
+        let base = toks.iter().find(|x| x.contains('[')).and_then(|x| gp_slot(x));
         let is_store = mn.starts_with("st");
-        let (mut reads, mut writes) = (0u32, 0u32);
+        let (mut reads, mut writes) = (0u64, 0u64);
         if let Some(b) = base {
             reads |= 1 << b; // base += imm : read then written by the writeback
             writes |= 1 << b;
@@ -4360,7 +4386,7 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
             if tk.contains('[') {
                 continue;
             }
-            if let Some(r) = slot(tk) {
+            if let Some(r) = gp_slot(tk).or_else(|| fp_id(tk)) {
                 if is_store {
                     reads |= 1 << r;
                 } else {
@@ -4371,22 +4397,37 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         Some((reads, writes))
     };
 
+    // A pure single-destination def safe to delete when its dest is dead: a reg-reg `mov`, any
+    // `fmov` (reg copy / d↔x bridge / #imm materialize), or an `sxtw` widen (D==S or D≠S). Returns
+    // (dest-id, reads-mask). Loads/arith/etc are NOT here — only side-effect-free single-writes.
+    let pure_def = |t: &str, r: u64, w: u64| -> Option<(u32, u64)> {
+        if let Some((d, s)) = parse_mov_xx(t) {
+            if d < GPN && s < GPN {
+                return Some((d, 1 << s));
+            }
+        }
+        let mn = t.split_whitespace().next().unwrap_or("");
+        if (mn == "fmov" || mn == "sxtw") && w.count_ones() == 1 {
+            return Some((w.trailing_zeros(), r));
+        }
+        None
+    };
+
     // Per-line kind. Labels/targets borrow `body` (via `lines`).
     enum K<'a> {
         Skip,               // directive / blank — no liveness effect
         Label(&'a str),     // block header (name without ':')
         Jump(&'a str),      // b <target>
-        Cond(u32, &'a str), // b.cc / cbz / tbz : (reads-mask, target); + fallthrough
-        Exit(u32),          // ret / br : (reads-mask); no in-body successor
+        Cond(u64, &'a str), // b.cc / cbz / tbz : (reads-mask, target); + fallthrough
+        Exit(u64),          // ret / br : (reads-mask); no in-body successor
         Opaque,             // bl / blr / unmodelable ⟹ block opaque
-        Mov(u32, u32),      // mov xD,xS : (d, s)  — drop candidate
-        Sxtw(u32, u32),     // sxtw xD,wS : (d, reads-mask) — drop candidate (D==S or D≠S)
-        Op(u32, u32),       // everything else : (reads, writes)
+        Pure(u32, u64),     // mov/fmov/sxtw : (dest-id, reads-mask) — drop candidate
+        Op(u64, u64),       // everything else : (reads, writes)
     }
-    let first_reg = |t: &str, mn: &str| -> u32 {
+    let first_reg = |t: &str, mn: &str| -> u64 {
         let f = t[mn.len()..].trim_start().split(',').next().unwrap_or("").trim();
         f.strip_prefix('x').or_else(|| f.strip_prefix('w')).and_then(|s| s.parse::<u32>().ok())
-            .filter(|&r| r < NR).map(|r| 1u32 << r).unwrap_or(0)
+            .filter(|&r| r < GPN).map(|r| 1u64 << r).unwrap_or(0)
     };
     fn last_tok(s: &str) -> &str {
         s.rsplit([',', ' ', '\t']).next().unwrap_or("").trim()
@@ -4422,17 +4463,10 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
             }
             match live_rw(t) {
                 None => K::Opaque,
-                Some((r, w)) => {
-                    if let Some((d, s)) = parse_mov_xx(t) {
-                        if d < NR && s < NR {
-                            return K::Mov(d, s);
-                        }
-                    }
-                    if t.starts_with("sxtw ") && w.count_ones() == 1 {
-                        return K::Sxtw(w.trailing_zeros(), r); // pure widen — dead iff xD dead
-                    }
-                    K::Op(r, w)
-                }
+                Some((r, w)) => match pure_def(t, r, w) {
+                    Some((d, reads)) => K::Pure(d, reads),
+                    None => K::Op(r, w),
+                },
             }
         })
         .collect();
@@ -4501,16 +4535,15 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         .collect();
 
     // Backward transfer of one line over the live-after set `cur`.
-    let step = |i: usize, cur: u32| -> u32 {
+    let step = |i: usize, cur: u64| -> u64 {
         match kinds[i] {
             K::Cond(r, _) | K::Exit(r) => cur | r,
-            K::Mov(d, s) => (cur & !(1 << d)) | (1 << s),
-            K::Sxtw(d, reads) => (cur & !(1 << d)) | reads, // widen: writes d, reads s (=d if in-place)
+            K::Pure(d, reads) => (cur & !(1 << d)) | reads, // single-dest: writes d, reads `reads`
             K::Op(r, w) => (cur & !w) | r,
-            _ => cur, // Skip / Label / Jump / Opaque : no GP effect (opaque block handled apart)
+            _ => cur, // Skip / Label / Jump / Opaque : no reg effect (opaque block handled apart)
         }
     };
-    let live_out = |b: usize, live_in: &[u32]| -> u32 {
+    let live_out = |b: usize, live_in: &[u64]| -> u64 {
         let mut lo = if info[b].full { full } else { 0 };
         if info[b].exit {
             lo |= exit_live;
@@ -4522,7 +4555,7 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
     };
 
     // Fixpoint for live-in per block.
-    let mut live_in = vec![0u32; nb];
+    let mut live_in = vec![0u64; nb];
     loop {
         let mut changed = false;
         for b in (0..nb).rev() {
@@ -4541,8 +4574,8 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         }
     }
 
-    // Drop pass: re-scan each non-opaque block backward from its final live-out, deleting a
-    // `mov`/in-place-`sxtw` whose destination is dead at that point.
+    // Drop pass: re-scan each non-opaque block backward from its final live-out, deleting any
+    // pure single-dest def (mov / fmov / sxtw) whose destination is dead at that point.
     let mut drop = vec![false; lines.len()];
     for b in 0..nb {
         if info[b].opaque {
@@ -4551,8 +4584,7 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         let mut cur = live_out(b, &live_in);
         for &i in blocks[b].iter().rev() {
             match kinds[i] {
-                K::Mov(d, _) if (cur & (1 << d)) == 0 => drop[i] = true,
-                K::Sxtw(d, _) if (cur & (1 << d)) == 0 => drop[i] = true,
+                K::Pure(d, _) if (cur & (1 << d)) == 0 => drop[i] = true,
                 _ => cur = step(i, cur),
             }
         }
@@ -4763,6 +4795,20 @@ fn fmov_residency(body: &str) -> String {
         }
         let mn = t.split_whitespace().next().unwrap_or("");
         let ops = t[mn.len()..].trim_start();
+        // Writeback addressing (`[xB], #k` post-index or `[xB, #k]!` pre-index) MODIFIES the base
+        // register xB (xB += k) with NO first-operand destination — the NO_DEF/DEF_FIRST logic below
+        // would leave eq[xB] stale. Invalidate it here, else a later `mov r,xB`/`mov xB,r` is wrongly
+        // judged redundant. (post_index folds `str Rt,[xB]; add xB,xB,#k` into this form AFTER
+        // drop_redundant_moves ran, so residency is the first value-model to meet the writeback.)
+        if t.contains("]!") || t.contains("], #") {
+            if let Some(lb) = t.rfind('[') {
+                let base_tok = t[lb + 1..].split([',', ']']).next().unwrap_or("");
+                if let Some(r) = rid_def(base_tok) {
+                    next += 1;
+                    eq.insert(r, next);
+                }
+            }
+        }
         // A tracked 64-bit copy: `fmov`/`mov` with two register operands, both x-or-d (rid_copy).
         if mn == "fmov" || mn == "mov" {
             let mut it = ops.split(',');
@@ -5272,17 +5318,25 @@ pub fn emit_ir(ast: &Ast) -> String {
         // GP registers the caller can observe at `ret` — the seed for cross-block dead-move
         // liveness. sret (struct via x8) returns the pointer in x0:x1 (conservative 2); a scalar
         // ≤8B → x0; a 128-bit scalar/struct → x0:x1; void/float/HFA → none (result in v-regs).
-        let ret_gp: u32 = if f.sret != 0 {
-            2
-        } else if matches!(g.a.tt.tys[f.ret as usize], Ty::Void) || g.a.tt.is_float(f.ret) || g.a.tt.hfa(f.ret).is_some() {
+        // Live-out at every `ret`: exactly the caller-visible return register(s), as a u64 mask
+        // over the tracked register space (GP x0.. ↔ bits 0.., FP d0.. ↔ bits 32..). sret →
+        // pointer in x0; void → none; HFA → d0..d(n-1); scalar float → d0; >8B int → x0:x1;
+        // else → x0. Seeds `drop_dead_moves`' backward liveness (its only entry into the function).
+        let exit_live: u64 = if f.sret != 0 {
+            0b1
+        } else if matches!(g.a.tt.tys[f.ret as usize], Ty::Void) {
             0
+        } else if let Some((_, n)) = g.a.tt.hfa(f.ret) {
+            ((1u64 << n) - 1) << 32
+        } else if g.a.tt.is_float(f.ret) {
+            1u64 << 32
         } else if g.a.tt.size(f.ret) > 8 {
-            2
+            0b11
         } else {
-            1
+            0b1
         };
         if g.regalloc && passes.peephole {
-            body = peephole_moves(&body, ret_gp); // redundant/dead reg-moves…
+            body = peephole_moves(&body, exit_live); // redundant/dead reg-moves…
             if !f.has_volatile {
                 // …then fold a loop-IV `mem [xP]; add xP,xP,#k` into a post-index access. Skipped
                 // for volatile functions (the increment's hoist reorders relative to the access).
@@ -5299,6 +5353,10 @@ pub fn emit_ir(ast: &Ast) -> String {
             // …and drop redundant fmov round-trips (d→GP→d spill/reload) via 64-bit x+d
             // value-equivalence (Phase 4.2 FP residency; pure register identity, volatile-safe).
             body = fmov_residency(&body);
+            // …then a SECOND dead-def sweep: residency deletes the reads that kept a write-only FP
+            // home (`fmov d17,x10` never reloaded) alive, so its stores are now provably dead. The
+            // in-peephole pass ran before residency, when the read still stood — re-run to reap them.
+            body = drop_dead_moves(&body, exit_live);
         }
         let c_move = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.ldst_pair && !f.has_volatile {
@@ -5602,6 +5660,25 @@ mod tests {
         assert_eq!(count(&out, "fmov x10, d17"), 1, "branch flushes ⟹ conservative keep");
     }
 
+    // TEETH (pr93908): a post-index store `str Rt,[xB],#k` MODIFIES the base xB (xB += k). The
+    // saved `mov x1,x0` no longer equals x0 afterward, so the restore `mov x0,x1` is NOT redundant
+    // and must survive. Before the writeback-invalidation fix, residency saw str as NO_DEF (base
+    // unchanged), wrongly dropped the restore, and bar() returned base+8 instead of base.
+    #[test]
+    fn fmov_residency_invalidates_writeback_base() {
+        let body = "\tmov x1, x0\n\tstr w10, [x0], #8\n\tmov x0, x1\n";
+        let out = fmov_residency(body);
+        assert_eq!(count(&out, "mov x0, x1"), 1, "x0 changed by the post-index ⟹ restore is live");
+    }
+
+    // Pre-index `[xB, #k]!` equally writes back the base — same invalidation.
+    #[test]
+    fn fmov_residency_invalidates_preindex_base() {
+        let body = "\tmov x1, x0\n\tstr w10, [x0, #8]!\n\tmov x0, x1\n";
+        let out = fmov_residency(body);
+        assert_eq!(count(&out, "mov x0, x1"), 1, "pre-index writeback changes x0 ⟹ keep restore");
+    }
+
     use super::fuse_sxtw_extend;
 
     // Phase 3.1 (sxtw arm): `sxtw xT,wS; add xD,xB,xT,lsl #k` (xD==xT) folds to one extended-add
@@ -5847,6 +5924,48 @@ mod tests {
         let body = "\tsxtw x20, w1\n\tadd x0, x0, x20\n\tret\n";
         let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "sxtw x20, w1"), 1, "x20 is read by the add ⟹ live ⟹ keep");
+    }
+
+    // Phase 4.2 FP DCE: the poly() write-only-home pattern. `fmov x10,d0; fmov d17,x10` stores the
+    // op result into an SSA home d17 that is never reloaded (the next op reads d0 directly). Both
+    // the FP store (d17 dead) and its GP feeder (x10 then dead) are pure dead code — dropped.
+    #[test]
+    fn dce_drops_dead_fp_home() {
+        let body = "\tfmul d0, d0, d1\n\tfmov x10, d0\n\tfmov d17, x10\n\tfadd d0, d0, d2\n\tret\n";
+        let out = drop_dead_moves(body, 0b1);
+        assert_eq!(count(&out, "fmov d17, x10"), 0, "d17 never reloaded ⟹ dead FP store");
+        assert_eq!(count(&out, "fmov x10, d0"), 0, "x10 dead after its only consumer dropped");
+        assert_eq!(count(&out, "fmul d0, d0, d1"), 1, "the real op stays");
+        assert_eq!(count(&out, "fadd d0, d0, d2"), 1);
+    }
+
+    // TEETH: the home is KEPT when it IS reloaded (here d17 feeds the fadd) — dropping it would
+    // lose the value. FP liveness must see the d-register read.
+    #[test]
+    fn dce_keeps_live_fp_home() {
+        let body = "\tfmov x10, d0\n\tfmov d17, x10\n\tfadd d0, d17, d2\n\tret\n";
+        let out = drop_dead_moves(body, 0b1);
+        assert_eq!(count(&out, "fmov d17, x10"), 1, "d17 read by the fadd ⟹ live ⟹ keep");
+        assert_eq!(count(&out, "fmov x10, d0"), 1, "x10 read by the surviving fmov ⟹ keep");
+    }
+
+    // A float return seeds live-out with d0 (bit 32): the final `fmov d0,d1` producing the result
+    // must survive. With a GP-only exit mask (no d0) the same copy is provably dead and dropped —
+    // proving the FP exit-live seed is what keeps it.
+    #[test]
+    fn dce_float_return_keeps_d0() {
+        let body = "\tfmov d0, d1\n\tret\n";
+        assert_eq!(count(&drop_dead_moves(body, 1u64 << 32), "fmov d0, d1"), 1, "d0 is the return ⟹ keep");
+        assert_eq!(count(&drop_dead_moves(body, 0b1), "fmov d0, d1"), 0, "d0 not live at exit ⟹ dead");
+    }
+
+    // A dead FP reg-reg copy `fmov d5,d6` (d5 never read) is pure dead code and removed.
+    #[test]
+    fn dce_drops_dead_fp_copy() {
+        let body = "\tfmov d5, d6\n\tfmov d5, d7\n\tfadd d0, d5, d1\n\tret\n";
+        let out = drop_dead_moves(body, 0b1);
+        assert_eq!(count(&out, "fmov d5, d6"), 0, "d5 overwritten before read ⟹ dead");
+        assert_eq!(count(&out, "fmov d5, d7"), 1, "the copy that IS read stays");
     }
 
     use super::drop_wform_sxtw;
