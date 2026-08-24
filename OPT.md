@@ -142,7 +142,7 @@
 |---|---|---|---|
 | 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⚠️ pass shipped PROVEN but default-OFF + ✅ banked spin-off. See note ⓱ |
 | 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⛔ same-block core already ✅ (lever 5, 147 folds); cross-block extension ABANDONED — measured exec-NEUTRAL + unsafe-dominant. See note ⓲ |
-| 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | 🟡 IN-PROGRESS — sxtw-canonical residency lever ✅ BANKED; IV-simpl (2.3) already fires (ptr-to-end); remaining residency (invariant adrp/add hoist + scaled-index-on-global) = memory-bound floor = #23/#25. See note ⓳ |
+| 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ✅ BANKED (`463d90c`) — sxtw-canonical residency (and/uxt/ubfx) default-ON, +both axes (size −13 insns, exec +0.09%); IV-simpl (2.3) already fired via 5/6/13; remaining residency (invariant adrp/add hoist + scaled-index-on-global) = memory-bound floor → #23/#25. See note ⓳ |
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ⬜ B3 — AAPCS64 §5.4/5.5 |
 | 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5 |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⬜ B3 — f2/f3 |
@@ -152,8 +152,8 @@
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #19 (remaining residency — see note ⓳; the sxtw-canonical
-sub-lever is banked, the address-hoist/scaled-index sub-levers are the #23/#25 memory-bound floor).**
+only path to size *and* speed ≈ 1.0×. **RESUME = #20 (struct-by-value + HFA). #19 ✅ BANKED (`463d90c`);
+its remaining residency = the #23/#25 memory-bound floor, NOT a #19 peephole.**
 
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
