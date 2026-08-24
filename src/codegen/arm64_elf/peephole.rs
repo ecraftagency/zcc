@@ -3,6 +3,25 @@
 //! emit_ir spine sequences them. All operate on `&str` -> `String`, no Cg access.
 use std::fmt::Write;
 
+// ─── the SOLE assembly register-operand decoder ──────────────────────────────
+// Side-II (AAPCS64 §4.1 register naming): a GP operand token is `x<N>` (64-bit) or
+// `w<N>` (32-bit) over the SAME physical register N. Every peephole reads operand
+// registers through exactly these three fns — one spec-transcription of the token
+// grammar, so operand decoding is deterministic and auditable in a single place
+// (the formal-verification routine points here). None for sp / #imm / [mem] / :reloc:.
+// Leading/trailing spaces are tolerated (trim is idempotent) so callers may pass a raw
+// split() field or an already-trimmed token interchangeably.
+fn xreg(t: &str) -> Option<u32> {
+    t.trim().strip_prefix('x')?.parse().ok()
+}
+fn wreg(t: &str) -> Option<u32> {
+    t.trim().strip_prefix('w')?.parse().ok()
+}
+fn gpreg(t: &str) -> Option<u32> {
+    let t = t.trim();
+    t.strip_prefix('x').or_else(|| t.strip_prefix('w'))?.parse().ok()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // BACKEND PEEPHOLE (Phase C) — machine-level redundant register-move elimination.
 //
@@ -34,8 +53,8 @@ use std::fmt::Write;
 pub(super) fn parse_mov_xx(t: &str) -> Option<(u32, u32)> {
     let rest = t.strip_prefix("mov ")?;
     let mut it = rest.split(',');
-    let d = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
-    let s = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
+    let d = xreg(it.next()?)?;
+    let s = xreg(it.next()?)?;
     if it.next().is_some() {
         return None; // a third operand (shift) ⟹ not a plain reg-reg move
     }
@@ -45,7 +64,7 @@ pub(super) fn parse_mov_xx(t: &str) -> Option<(u32, u32)> {
 /// The slot of the first register operand (x or w share a physical slot), for DEF tracking.
 pub(super) fn first_reg_slot(operands: &str) -> Option<u32> {
     let tok = operands.split(',').next()?.trim();
-    tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
+    gpreg(tok)
 }
 
 /// The register slots an instruction READS and WRITES, plus whether it ends a straight-line
@@ -64,7 +83,7 @@ pub(super) fn reg_uses(t: &str) -> (Vec<u32>, Vec<u32>, bool) {
     // (q/d/s/v/h/b), an immediate, a label, or a condition. Brackets (memory `[x0]`) stripped.
     let slot = |tok: &str| -> Option<u32> {
         let tok = tok.trim().trim_start_matches('[').trim_end_matches(']');
-        tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
+        gpreg(tok)
     };
     // Operand tokens, POSITIONALLY (comma-split). The destination of a def-first instruction
     // is token[0]; a memory operand like `[x0, x1]` splits into two tokens, both address READS.
@@ -205,8 +224,8 @@ pub(super) fn drop_redundant_sxtw(body: &str) -> String {
     let parse_sxtw = |t: &str| -> Option<(u32, u32)> {
         let r = t.strip_prefix("sxtw ")?;
         let mut it = r.split(',');
-        let d = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
-        let s = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        let d = xreg(it.next()?)?;
+        let s = wreg(it.next()?)?;
         it.next().is_none().then_some((d, s))
     };
     for line in body.lines() {
@@ -288,8 +307,8 @@ pub(super) fn drop_redundant_uxt(body: &str) -> String {
             return None;
         };
         let mut it = rest.split(',');
-        let d = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
-        let s = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        let d = wreg(it.next()?)?;
+        let s = wreg(it.next()?)?;
         (it.next().is_none() && d == s).then_some((w, d))
     };
     for line in body.lines() {
@@ -369,8 +388,8 @@ pub(super) fn drop_wform_sxtw(body: &str) -> String {
     fn parse_inplace(t: &str) -> Option<u32> {
         let r = t.strip_prefix("sxtw ")?;
         let mut it = r.split(',');
-        let d = it.next()?.trim().strip_prefix('x')?.parse::<u32>().ok()?;
-        let s = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        let d = xreg(it.next()?)?;
+        let s = wreg(it.next()?)?;
         (it.next().is_none() && d == s).then_some(d)
     }
     // Does any operand token of `t` name GP register `d` at width `pref` ('x'/'w')? Brackets are
@@ -678,7 +697,7 @@ pub(super) fn propagate_copies(body: &str) -> String {
     const READ_THEN_FLUSH: &[&str] = &["cbz", "cbnz", "tbz", "tbnz", "br", "blr"];
     let gp = |tok: &str| -> Option<u32> {
         let t = tok.trim().trim_start_matches('[').trim_end_matches(']');
-        t.strip_prefix('x').or_else(|| t.strip_prefix('w'))?.parse::<u32>().ok()
+        gpreg(t)
     };
     for line in body.lines() {
         let t = line.trim();
@@ -923,16 +942,16 @@ pub(super) fn post_index(body: &str) -> String {
         if base.contains([',', '!', ' ']) {
             return None;
         }
-        let rt = reg_s.strip_prefix('x').or_else(|| reg_s.strip_prefix('w'))?.parse().ok()?;
-        let base = base.strip_prefix('x')?.parse().ok()?;
+        let rt = gpreg(reg_s)?;
+        let base = xreg(base)?;
         Some((is_load, rt, base))
     }
     // parse `add xP, xP, #k` → (dst, src, k).
     fn parse_add_imm(t: &str) -> Option<(u32, u32, i64)> {
         let rest = t.strip_prefix("add ")?;
         let mut it = rest.split(", ");
-        let d = it.next()?.strip_prefix('x')?.parse().ok()?;
-        let s = it.next()?.strip_prefix('x')?.parse().ok()?;
+        let d = xreg(it.next()?)?;
+        let s = xreg(it.next()?)?;
         let k = it.next()?.strip_prefix('#')?.parse().ok()?;
         if it.next().is_some() {
             return None;
@@ -1147,7 +1166,7 @@ pub(super) fn drop_dead_moves(body: &str, exit_live: u64) -> String {
         let toks: Vec<&str> = t[mn.len()..].trim_start().split(',').collect();
         let gp_slot = |tok: &str| -> Option<u32> {
             let tok = tok.trim().trim_start_matches('[').trim_end_matches('!').trim_end_matches(']');
-            tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok().filter(|&r| r < GPN)
+            gpreg(tok).filter(|&r| r < GPN)
         };
         let base = toks.iter().find(|x| x.contains('[')).and_then(|x| gp_slot(x));
         let is_store = mn.starts_with("st");
@@ -1200,7 +1219,7 @@ pub(super) fn drop_dead_moves(body: &str, exit_live: u64) -> String {
     }
     let first_reg = |t: &str, mn: &str| -> u64 {
         let f = t[mn.len()..].trim_start().split(',').next().unwrap_or("").trim();
-        f.strip_prefix('x').or_else(|| f.strip_prefix('w')).and_then(|s| s.parse::<u32>().ok())
+        gpreg(f)
             .filter(|&r| r < GPN).map(|r| 1u64 << r).unwrap_or(0)
     };
     fn last_tok(s: &str) -> &str {
@@ -1434,7 +1453,7 @@ pub(super) fn drop_redundant_moves(body: &str) -> String {
             for _ in 0..2 {
                 if let Some(r) = regs.next().and_then(|tok| {
                     let tok = tok.trim();
-                    tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok()
+                    gpreg(tok)
                 }) {
                     next += 1;
                     eq.insert(r, next);
@@ -1502,7 +1521,7 @@ pub(super) fn parse_frame_ldst(t: &str) -> Option<(bool, u32, &str)> {
         return None;
     }
     let (reg, mem) = rest.split_once(',')?;
-    let n = reg.trim().strip_prefix('x')?.parse::<u32>().ok()?; // x-form (64-bit) only
+    let n = xreg(reg)?; // x-form (64-bit) only
     let mem = mem.trim();
     mem.starts_with("[sp,").then_some((is_load, n, mem))
 }
@@ -1713,10 +1732,7 @@ pub(super) fn fold_fp_imm(body: &str) -> String {
                 // caller-saved regs (x0..x18) so xN is dead past it iff caller-saved; any in-block
                 // branch (b/b.cc/br) reaches another block where xN might be live ⟹ decline.
                 let touches = |t: &str, n: u32| {
-                    t.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
-                        tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))
-                            .and_then(|s| s.parse::<u32>().ok()) == Some(n)
-                    })
+                    t.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| gpreg(tok) == Some(n))
                 };
                 let mn = t.split_whitespace().next().unwrap_or("");
                 if touches(t, n1) {
@@ -1883,8 +1899,8 @@ pub(super) fn fuse_sxtw_extend(body: &str) -> String {
     // "sxtw xT, wS" → (T, S)
     fn psxtw(t: &str) -> Option<(u32, u32)> {
         let mut it = t.trim().strip_prefix("sxtw ")?.split(',');
-        let d = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
-        let s = it.next()?.trim().strip_prefix('w')?.parse().ok()?;
+        let d = xreg(it.next()?)?;
+        let s = wreg(it.next()?)?;
         it.next().is_none().then_some((d, s))
     }
     // "add|sub xD, xB, xT[, lsl #k]" (x-form) → (mn, D, B, T, k); k defaults 0, capped ≤4.
@@ -1895,9 +1911,9 @@ pub(super) fn fuse_sxtw_extend(body: &str) -> String {
             .map(|r| ("add", r))
             .or_else(|| t.strip_prefix("sub ").map(|r| ("sub", r)))?;
         let mut it = rest.split(',');
-        let d = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
-        let b = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
-        let tt = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
+        let d = xreg(it.next()?)?;
+        let b = xreg(it.next()?)?;
+        let tt = xreg(it.next()?)?;
         let k: u32 = match it.next() {
             None => 0,
             Some(sh) => sh.trim().strip_prefix("lsl #")?.parse().ok()?,
