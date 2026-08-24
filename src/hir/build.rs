@@ -159,7 +159,7 @@ impl<'a> B<'a> {
             return b;
         }
         let b = self.f.new_block();
-        self.f.blocks[b as usize].is_label = true;
+        self.f.blocks[b as usize].labels.push(name.to_string());
         self.labels.insert(name.to_string(), b);
         b
     }
@@ -435,21 +435,23 @@ impl<'a> B<'a> {
             .pointee(self.ty(r))
             .expect("__builtin_*_overflow: third argument is a pointer");
         let n = self.tt().size(rt) * 8;
-        let uns = self.tt().is_unsigned(rt);
+        let dst_uns = self.tt().is_unsigned(rt);
         let dt = hty(self.tt(), rt);
-        let wide = |b: &mut Self, e: NodeId| -> Operand {
+        // Widen each operand into the 64-bit domain under ITS OWN signedness.
+        let mut wide = |b: &mut Self, e: NodeId| -> (Operand, u32, bool) {
             let t = b.ty(e);
             let ht = hty(b.tt(), t);
+            let u = b.tt().is_unsigned(t);
             let v = b.expr(e);
-            if ht == Ty::I64 {
+            let v = if ht == Ty::I64 {
                 v
             } else {
-                let cv = if b.tt().is_unsigned(t) { CvtOp::Zext } else { CvtOp::Sext };
-                b.conv(cv, ht, Ty::I64, v)
-            }
+                b.conv(if u { CvtOp::Zext } else { CvtOp::Sext }, ht, Ty::I64, v)
+            };
+            (v, ht.bits(), u)
         };
-        let x = wide(self, a);
-        let y = wide(self, b);
+        let (y, yb, yu) = wide(self, b);
+        let (x, xb, xu) = wide(self, a);
         let dst = self.expr(r);
         let bop = match op {
             0 => BinOp::Add,
@@ -457,81 +459,119 @@ impl<'a> B<'a> {
             _ => BinOp::Mul,
         };
         let s = self.bin(bop, Ty::I64, x, y);
-        let ov = if n < 64 {
-            // representable ⟺ the value survives the round trip through `rt`
+        // Is the 64-bit computation ITSELF the infinite-precision one? For `+`
+        // and `-` two 32-bit inputs can never leave the 64-bit range, and for
+        // `*` the full product of two 32-bit inputs is exactly 64 bits wide.
+        let exact = xb <= 32 && yb <= 32;
+        // Otherwise the domain's own signedness decides how the 64-bit step
+        // overflows (DDI 0487 C6.2's carry/overflow rules, and the high half of
+        // the product for `*`).
+        let dom_uns = (xb == 64 && xu) || (yb == 64 && yu);
+        let mut flags: Vec<Operand> = Vec::new();
+        if !exact {
+            flags.push(match (op, dom_uns) {
+                (0, true) => self.def(Ty::I32, |d| Inst::Cmp {
+                    dst: d,
+                    op: CmpOp::Ult,
+                    ty: Ty::I64,
+                    a: s,
+                    b: x,
+                }),
+                (1, true) => self.def(Ty::I32, |d| Inst::Cmp {
+                    dst: d,
+                    op: CmpOp::Ult,
+                    ty: Ty::I64,
+                    a: x,
+                    b: y,
+                }),
+                (_, true) => {
+                    let hi = self.bin(BinOp::UMulHi, Ty::I64, x, y);
+                    self.def(Ty::I32, |d| Inst::Cmp {
+                        dst: d,
+                        op: CmpOp::Ne,
+                        ty: Ty::I64,
+                        a: hi,
+                        b: Operand::Imm(0),
+                    })
+                }
+                (2, false) => {
+                    let hi = self.bin(BinOp::SMulHi, Ty::I64, x, y);
+                    let want = self.bin(BinOp::AShr, Ty::I64, s, Operand::Imm(63));
+                    self.def(Ty::I32, |d| Inst::Cmp {
+                        dst: d,
+                        op: CmpOp::Ne,
+                        ty: Ty::I64,
+                        a: hi,
+                        b: want,
+                    })
+                }
+                // signed +/-: the classic sign-agreement test
+                (o, false) => {
+                    let m = if o == 0 {
+                        let u = self.bin(BinOp::Xor, Ty::I64, x, s);
+                        let v = self.bin(BinOp::Xor, Ty::I64, y, s);
+                        self.bin(BinOp::And, Ty::I64, u, v)
+                    } else {
+                        let u = self.bin(BinOp::Xor, Ty::I64, x, y);
+                        let v = self.bin(BinOp::Xor, Ty::I64, x, s);
+                        self.bin(BinOp::And, Ty::I64, u, v)
+                    };
+                    self.def(Ty::I32, |d| Inst::Cmp {
+                        dst: d,
+                        op: CmpOp::Slt,
+                        ty: Ty::I64,
+                        a: m,
+                        b: Operand::Imm(0),
+                    })
+                }
+            });
+        }
+        // …and, independently, is the exact value representable in the
+        // DESTINATION type? Below 64 bits that is the round trip; at 64 bits it
+        // is only the sign, and only when the two domains disagree.
+        if n < 64 {
             let narrow = self.conv(CvtOp::Trunc, Ty::I64, dt, s);
             let back = self.conv(
-                if uns { CvtOp::Zext } else { CvtOp::Sext },
+                if dst_uns { CvtOp::Zext } else { CvtOp::Sext },
                 dt,
                 Ty::I64,
                 narrow,
             );
-            self.def(Ty::I32, |d| Inst::Cmp {
+            flags.push(self.def(Ty::I32, |d| Inst::Cmp {
                 dst: d,
                 op: CmpOp::Ne,
                 ty: Ty::I64,
                 a: s,
                 b: back,
-            })
-        } else if op == 2 {
-            let hi = self.bin(
-                if uns { BinOp::UMulHi } else { BinOp::SMulHi },
-                Ty::I64,
-                x,
-                y,
-            );
-            let want = if uns {
-                Operand::Imm(0)
-            } else {
-                self.bin(BinOp::AShr, Ty::I64, s, Operand::Imm(63))
-            };
-            self.def(Ty::I32, |d| Inst::Cmp {
-                dst: d,
-                op: CmpOp::Ne,
-                ty: Ty::I64,
-                a: hi,
-                b: want,
-            })
-        } else if uns {
-            // add: the sum wrapped ⟺ it is below either operand; sub: x < y
-            let (p, q, c) = if op == 0 {
-                (s, x, CmpOp::Ult)
-            } else {
-                (x, y, CmpOp::Ult)
-            };
-            self.def(Ty::I32, |d| Inst::Cmp {
-                dst: d,
-                op: c,
-                ty: Ty::I64,
-                a: p,
-                b: q,
-            })
-        } else {
-            // signed: the classic sign-agreement test
-            let m = if op == 0 {
-                let u = self.bin(BinOp::Xor, Ty::I64, x, s);
-                let v = self.bin(BinOp::Xor, Ty::I64, y, s);
-                self.bin(BinOp::And, Ty::I64, u, v)
-            } else {
-                let u = self.bin(BinOp::Xor, Ty::I64, x, y);
-                let v = self.bin(BinOp::Xor, Ty::I64, x, s);
-                self.bin(BinOp::And, Ty::I64, u, v)
-            };
-            self.def(Ty::I32, |d| Inst::Cmp {
+            }));
+        } else if dst_uns != dom_uns {
+            // unsigned destination, signed value: negative is unrepresentable —
+            // and the mirror case is the same bit test
+            flags.push(self.def(Ty::I32, |d| Inst::Cmp {
                 dst: d,
                 op: CmpOp::Slt,
                 ty: Ty::I64,
-                a: m,
+                a: s,
                 b: Operand::Imm(0),
-            })
-        };
+            }));
+        }
         let narrow = if dt == Ty::I64 {
             s
         } else {
             self.conv(CvtOp::Trunc, Ty::I64, dt, s)
         };
         self.store(dt, dst, narrow, false);
-        ov
+        match flags.len() {
+            0 => Operand::Imm(0),
+            1 => flags[0],
+            _ => {
+                let mut acc = flags[0];
+                for f in &flags[1..] {
+                    acc = self.bin(BinOp::Or, Ty::I32, acc, *f);
+                }
+                acc
+            }
+        }
     }
 
     // ── EXT(gcc) inline asm ────────────────────────────────────────────────
@@ -590,7 +630,15 @@ impl<'a> B<'a> {
         let apa = self.addr(ap);
         let pt = param_ty(self.tt(), ty);
         let size = self.tt().size(ty);
-        let align = self.tt().align(ty);
+        // Over-alignment is ignored for argument passing (see `isel/abi.rs`): a
+        // composite walks the stack at 8, a scalar at its own width. Honouring
+        // an `aligned(32)` attribute here would round an ABSOLUTE address the
+        // caller never rounded (torture pr92904).
+        let align = if scalar(self.tt(), ty) {
+            self.tt().align(ty).min(16)
+        } else {
+            8
+        };
         // (save area is the VR one, bytes consumed there, HFA shape, indirect)
         let (vr, need, hfa, indirect) = match &pt {
             PTy::S(t) if t.is_float() => (true, 16, None, false),
@@ -1055,9 +1103,13 @@ impl<'a> B<'a> {
         let ot = hty(self.tt(), opnd_ty);
         let uns = self.tt().is_unsigned(opnd_ty);
         let fp = ot.is_float();
+        // C99 6.5p3 leaves operand order unspecified; the RIGHT operand is
+        // evaluated first, matching the referee. `x[i] |= foo()` needs foo() to
+        // run before x[i] is read, and choosing the other order turns every such
+        // program into differential noise (torture pr58943).
         if let Some(cmp) = cmp_op(op, fp, uns) {
-            let a = self.expr(l);
             let b = self.expr(r);
+            let a = self.expr(l);
             let (a, pt) = self.promote(a, ot, uns);
             let (b, ot) = self.promote(b, ot, uns);
             debug_assert_eq!(pt, ot);
@@ -1072,8 +1124,8 @@ impl<'a> B<'a> {
             return self.fit(c, Ty::I32, hty(self.tt(), nty));
         }
         let t = hty(self.tt(), nty);
-        let a = self.expr(l);
         let b = self.expr(r);
+        let a = self.expr(l);
         let bop = match (op, fp) {
             ("+", false) => BinOp::Add,
             ("-", false) => BinOp::Sub,
@@ -1424,12 +1476,18 @@ impl<'a> B<'a> {
         default: Option<NodeId>,
     ) {
         let cty = self.ty(c);
-        let t = hty(self.tt(), cty);
+        let uns = self.tt().is_unsigned(cty);
         let v = self.expr(c);
+        // C99 6.8.4.2p5: the controlling expression undergoes the integer
+        // promotions, and each case constant is converted to the promoted type.
+        // Without it a `switch (signed char)` compares the RAW BYTE against a
+        // negative label and never matches (torture pr48809).
+        let (v, t) = self.promote(v, hty(self.tt(), cty), uns);
         let xb = self.f.new_block();
         // One block per `case` label; `case lo...hi` (EXT gcc) expands to the
         // range's values, which is why the parser keeps (lo, hi) rather than one key.
         let mut arms: Vec<(i64, Target)> = Vec::new();
+        let mut ranges: Vec<(i64, i64, BlockId)> = Vec::new();
         for &(lo, hi, id) in cases {
             let b = match self.cases.get(&id) {
                 Some(&b) => b,
@@ -1439,19 +1497,21 @@ impl<'a> B<'a> {
                     b
                 }
             };
-            let mut k = lo;
-            loop {
+            if lo == hi {
                 arms.push((
-                    k,
+                    trunc(t, lo),
                     Target {
                         block: b,
                         args: vec![],
                     },
                 ));
-                if k == hi {
-                    break;
-                }
-                k += 1;
+            } else {
+                // EXT(gcc) `case lo ... hi`: a RANGE, tested as one unsigned
+                // comparison `(v − lo) ≤ᵤ (hi − lo)` rather than enumerated.
+                // Enumeration is not an optimization question — `case 1e18 ...
+                // 1e19` has 9·10^18 values and simply cannot be listed
+                // (torture pr34154).
+                ranges.push((lo, hi, b));
             }
         }
         let dflt = match default {
@@ -1468,6 +1528,26 @@ impl<'a> B<'a> {
             }
             None => xb,
         };
+        // C99 6.8.4.2p3 forbids two labels with the same value, so the ranges
+        // and the single values are disjoint and may be tested in either order.
+        for (lo, hi, b) in ranges {
+            let next = self.f.new_block();
+            let d = self.bin(BinOp::Sub, t, v, Operand::Imm(trunc(t, lo)));
+            let span = trunc(t, hi.wrapping_sub(lo));
+            let c = self.def(Ty::I32, |dst| Inst::Cmp {
+                dst,
+                op: CmpOp::Ule,
+                ty: t,
+                a: d,
+                b: Operand::Imm(span),
+            });
+            self.seal(Term::Br(
+                c,
+                Target { block: b, args: vec![] },
+                Target { block: next, args: vec![] },
+            ));
+            self.cur = next;
+        }
         self.seal(Term::Switch(
             v,
             t,
@@ -1559,18 +1639,15 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
         sig,
         blocks: Vec::new(),
         values: Vec::new(),
-        // Slot 0 is the parser's frame block. A function whose parser frame is
-        // empty gets NO stack object at all — and therefore no `sub sp` — which
-        // is the common case for a leaf.
-        slots: if af.frame == 0 {
-            Vec::new()
-        } else {
-            vec![Slot {
-                size: af.frame,
-                // AAPCS64 §6.2.2: the frame block is 16-byte aligned.
-                align: 16,
-            }]
-        },
+        // Slot 0 is the parser's frame block. It always EXISTS — `Node::Var(off)`
+        // names it unconditionally, and a frame of zero bytes is a real case
+        // (EXT(gcc) empty struct: every local has size 0) — but a zero-size slot
+        // occupies nothing, so a leaf still gets no `sub sp`.
+        slots: vec![Slot {
+            size: af.frame,
+            // AAPCS64 §6.2.2: the frame block is 16-byte aligned.
+            align: 16,
+        }],
         entry: 0,
         is_static: af.is_static,
         is_weak: af.is_weak || af.is_inline,
@@ -1634,6 +1711,22 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
             None
         };
         b.seal(Term::Ret(r));
+    }
+    // EXT(gcc) computed goto: the edge set of `goto *e` is every LABELLED block
+    // of the function, not only the labels whose address `&&l` was taken in an
+    // expression — a static initializer (`static void *j[] = {&&x, &&y};`) takes
+    // addresses the AST never shows as `LabelAddr`. Narrowing it there left the
+    // targets unreachable, so they were pruned and their symbols never emitted.
+    // The set is settled here, after every forward label has been created.
+    let all: Vec<BlockId> = {
+        let mut v: Vec<BlockId> = b.labels.values().copied().collect();
+        v.sort_unstable();
+        v
+    };
+    for blk in b.f.blocks.iter_mut() {
+        if let Term::GotoPtr(_, set) = &mut blk.term {
+            *set = all.clone();
+        }
     }
     f = b.f;
     // The label map may have created blocks a `goto` never reached — they keep

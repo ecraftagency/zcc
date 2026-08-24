@@ -1753,7 +1753,8 @@ impl P<'_> {
                     fp += n;
                 } else {
                     fp = 8; // AAPCS: when an HFA overflows, lock the remaining v-registers
-                    let o = alup(boff, self.tt.align(pt).max(8));
+                    // over-alignment is ignored (see isel/abi.rs, torture pr92904)
+                    let o = alup(boff, 8);
                     boff = o + self.tt.size(pt).div_ceil(8) * 8;
                 }
             } else if matches!(self.tt.tys[pt as usize], Ty::Struct(_)) {
@@ -1769,7 +1770,7 @@ impl P<'_> {
                     if gp + need <= 8 {
                         gp += need;
                     } else {
-                        let o = alup(boff, self.tt.align(pt).max(8));
+                        let o = alup(boff, 8);
                         boff = o + 8 * need;
                         gp = 8; // AAPCS C.11
                     }

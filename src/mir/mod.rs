@@ -1097,8 +1097,8 @@ pub struct MBlock {
     pub insts: Vec<MInst>,
     pub term: MTerm,
     pub weight: u32,
-    /// carried from HIR: a C `goto` label lands here (see `hir::Block::is_label`)
-    pub is_label: bool,
+    /// carried from HIR: the C `goto` labels landing here (`hir::Block::labels`)
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1157,7 +1157,7 @@ impl MFunc {
             insts: Vec::new(),
             term: MTerm::Unreachable,
             weight: 1,
-            is_label: false,
+            labels: Vec::new(),
         });
         (self.blocks.len() - 1) as MBlockId
     }

@@ -424,11 +424,11 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 ### R1 — correctness parity with `rc3` (no HIR optimization passes yet)
 | task | status |
 |---|---|
-| R1.1 full C99 lowering: aggregates (alloca + memcpy/memset), bitfields, `switch`, VLA/alloca, long double via soft-float calls | ⬜ |
-| R1.2 full ABI automaton: composites, HFA, sret, stack args, variadics + 192B save area, `va_arg` | ⬜ |
-| R1.3 EXT surface: `__sync_*`, `__builtin_*_overflow`, computed goto, statement-expr, inline asm (opaque), `__va_area__` | ⬜ |
-| R1.4 science gates green: `abi.sh alg.sh cpp.sh shape.sh decay.sh`; `tests/ext` 21/21 | ⬜ |
-| R1.5 torture ≥ 1471 pass (the `rc3` count; the 4 pre-existing runtime FAIL `20021127-1 bitfld-3 pr32244-1 pr34971` are a bonus if they pass), csmith300 0 DIVERGE, yarpgen300 0 DIVERGE | ⬜ |
+| R1.1 full C99 lowering: aggregates (alloca + memcpy/memset), bitfields, `switch`, VLA/alloca, long double via soft-float calls | ✅ `88c38e3` |
+| R1.2 full ABI automaton: composites, HFA, sret, stack args, variadics + 192B save area, `va_arg` | ✅ `88c38e3` |
+| R1.3 EXT surface: `__sync_*`, `__builtin_*_overflow`, computed goto, statement-expr, inline asm (opaque), `__va_area__` | ✅ `88c38e3` |
+| R1.4 science gates green: `abi.sh alg.sh cpp.sh shape.sh decay.sh`; `tests/ext` 21/21 | ✅ abi/alg/cpp/shape/decay all PASS · `tests/cases` 74/75 (only the adjudicated `float_h`) · `tests/ext` 19/19 (2 SKIP: `cc` rejects them) · determinism 85 progs × 8 fresh processes |
+| R1.5 torture ≥ 1471 pass (the `rc3` count; the 4 pre-existing runtime FAIL `20021127-1 bitfld-3 pr32244-1 pr34971` are a bonus if they pass), csmith300 0 DIVERGE, yarpgen300 0 DIVERGE | ✅ torture **1470 pass / 0 FAIL** / 224 not-impl — the not-impl manifest is BYTE-IDENTICAL to the committed `torture.not-impl` (rc3's, `423a42d`), and rc3's 4 runtime FAIL are gone; csmith300 **254 PARITY / 0 DIVERGE** (46 SKIP = `gcc` itself fails the sample; exactly rc3's 254/0); yarpgen300 **300 PARITY / 0 DIVERGE**. 13 torture defects were found and fixed on the way — see `§15` |
 | R1 measurement | sqlite static insns + `corpus25.sh` excess histogram + `exectime.sh` paired geo40, all with HIR passes OFF. Record here as the correctness-parity data point. **The allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573 at rc3) is NOT readable here**: per §14, R0/R1 keep every local in memory, so the allocator sees only expression temporaries. That KPI is measured at R2.2, immediately after SROA+mem2reg | ⬜ |
 
 ### R2 — tree-SSA parity (port the A7 ladder onto HIR, §4 order)
@@ -462,6 +462,30 @@ BOTH axes with the distribution flat. Items marked ★ in §16 are cheap enough 
 Law-2 attempt quarantines the task (⚠️ + reason), never the milestone. `main` is never touched; merge
 `mir-rearch` → `main` only at ≥ R2 KPI with the full gate green. Estimated backend size 13–17k LOC
 (today 17.2k) — a taste, not a budget.
+
+---
+
+## §15 R1 PROOF DEBT — what R1 shipped WITHOUT its commuting square (open)
+
+Law 3 says csmith/yarpgen only CONFIRM; the discovery must happen at the layer
+where the theorem lives. R1 did not honour that: **every feature below was
+validated by DIFFERENTIAL TESTING ALONE**, and `cargo test` still stands at the
+40 batteries R0.9 left — R1 added none. This is recorded as debt, not as a
+milestone, and it is the first thing to close.
+
+| shipped in R1 | its missing square |
+|---|---|
+| bit-field read / read-modify-write | `⟦load bf⟧` and `⟦store bf⟧` over an exhaustive small domain of (container, boff, w, signedness) |
+| the AAPCS64 automaton (composites, HFA, sret, stack args) | `classify` against a transcribed table of spec examples; `⟦hir⟧=⟦mir_v⟧` on a corpus of composite calls |
+| varargs (save area, `va_start`, `va_arg`) | ⟦·⟧ cannot even RUN them: `hir::interp` traps on `Inst::Intrinsic`, so every variadic function is ⊥ on both sides and the square holds vacuously |
+| long double (binary128 ↔ f64 bridge) | same — `LdLoad`/`LdStore` are intrinsics, hence ⊥ |
+| `__sync_*`, `__builtin_*_overflow`, inline asm | same for `__sync_*`/asm; the overflow builtins ARE expressible in HIR and have no battery |
+| `mir/pass/legalize.rs` | `⟦m⟧=⟦legalize m⟧` (the identity on ⟦·⟧: IP1 is reserved, the address is the same) |
+| the `case lo ... hi` range lowering | `⟦switch⟧` with ranges vs the enumerated form |
+| the rewritten spiller (batched victims, next-use index, incremental pressure) | the post-condition "pressure ≤ k at every point" is asserted by `regalloc::verify`, but the BATCHING argument (a victim removed for the rest of the sweep) has no test |
+
+Closing it means (a) teaching `hir::interp` the intrinsics so variadic /
+long-double / atomic functions stop being ⊥, and (b) one battery per row.
 
 ---
 

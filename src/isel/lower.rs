@@ -1427,7 +1427,7 @@ fn lower_func(h: &hir::Func) -> MFunc {
     }
     for (bi, b) in h.blocks.iter().enumerate() {
         f.blocks[bi].weight = b.weight;
-        f.blocks[bi].is_label = b.is_label;
+        f.blocks[bi].labels = b.labels.clone();
         f.blocks[bi].params = b.params.iter().map(|p| vmap[*p as usize]).collect();
     }
     // AAPCS64 entry: each parameter arrives where the ABI names it, and the

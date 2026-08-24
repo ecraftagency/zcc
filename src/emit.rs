@@ -87,7 +87,13 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
         // deallocated — sp returns to the frame base at every label. A jump INTO
         // a VLA scope is forbidden by the same clause, so the target's depth is
         // never greater than the current one and this is always safe.
-        if f.blocks[b as usize].is_label && f.has_vla && f.dyn_stack {
+        // EXT(gcc) `&&label`: a STATIC initializer may hold a label's address,
+        // and the linker needs a symbol for it — the parser spells it
+        // `lg_<function>.<label>` (parser.rs, `GInit::Addr`/`Diff`).
+        for l in &f.blocks[b as usize].labels {
+            let _ = writeln!(s, "lg_{}.{}:", name, l);
+        }
+        if !f.blocks[b as usize].labels.is_empty() && f.has_vla && f.dyn_stack {
             s.push_str("\tmov sp, x29\n");
         }
         for inst in &f.blocks[b as usize].insts {

@@ -590,10 +590,11 @@ pub struct Block {
     pub params: Vec<ValueId>,
     pub insts: Vec<Inst>,
     pub term: Term,
-    /// This block is the target of a C `goto` label. C99 6.8.6.1: a jump into
-    /// the block must leave the stack at the function's base, so a function with
-    /// a VLA deallocates here (`emit`). Nothing else reads it.
-    pub is_label: bool,
+    /// The C `goto` labels that land on this block. Two things read them:
+    /// C99 6.8.6.1 (a function with a VLA deallocates back to the frame base
+    /// here), and EXT(gcc) `&&label`, whose address a STATIC initializer may
+    /// take — so the label needs a real emitted symbol, not just a block index.
+    pub labels: Vec<String>,
     /// Static execution-frequency estimate (Ball & Larus 1993). Advisory only:
     /// it drives block layout and spill next-use weighting and carries NO
     /// semantic obligation, so no pass needs a commuting square for it.
@@ -660,7 +661,7 @@ impl Func {
             insts: Vec::new(),
             term: Term::Unreachable,
             weight: 1,
-            is_label: false,
+            labels: Vec::new(),
         });
         (self.blocks.len() - 1) as BlockId
     }

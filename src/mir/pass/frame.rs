@@ -72,7 +72,9 @@ pub fn run(f: &mut MFunc) {
         let a = s.align.max(1);
         at = (at + a - 1) / a * a;
         s.off = at as i32;
-        at += s.size.max(1);
+        // A zero-size object occupies nothing: nothing can read or write it, so
+        // two of them may share an address (EXT(gcc) empty struct).
+        at += s.size;
     }
     // AAPCS64 §6.2.2: sp is 16-byte aligned at every public interface.
     f.frame_size = (at + 15) & !15;

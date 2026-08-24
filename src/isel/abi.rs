@@ -124,7 +124,18 @@ pub fn classify(sig: &Sig) -> Assign {
                 } else {
                     // C.3: an HFA that does not fit LOCKS the remaining v registers
                     nsrn = 8;
-                    let o = up(nsaa, (*align).max(8));
+                    let _ = align;
+                    // Over-alignment is IGNORED for argument passing. AAPCS64
+                    // C.13 says "the larger of 8 or the natural alignment", and
+                    // gcc reads an `__attribute__((aligned(32)))` composite as
+                    // still naturally 8-aligned: measured, it places such an
+                    // argument at [sp, #0] and does NOT round NGRN to an even
+                    // register for an `aligned(16)` one (torture pr92904). The
+                    // callee's `va_arg` walk must round identically — and it
+                    // rounds an ABSOLUTE address, which is only 16-byte aligned,
+                    // so honouring 32 here would put the two sides on different
+                    // bytes.
+                    let o = up(nsaa, 8);
                     nsaa = o + size.div_ceil(8) * 8;
                     Loc::StackAgg { off: o, size: *size }
                 }
@@ -157,7 +168,8 @@ pub fn classify(sig: &Sig) -> Assign {
                     }
                 } else {
                     ngrn = 8;
-                    let o = up(nsaa, (*align).max(8));
+                    let _ = align;
+                    let o = up(nsaa, 8);
                     nsaa = o + 8 * need;
                     Loc::StackAgg { off: o, size: *size }
                 }
