@@ -640,6 +640,14 @@ pub struct Func {
     /// label-deallocation rule above reads it; a bare `alloca` does NOT set it
     /// (it has no scope to leave), which is exactly gcc's distinction.
     pub has_vla: bool,
+    /// The EXTENT of every object inside slot 0, as (offset within the slot,
+    /// size), carried over from `ast::Func::objs`. `SlotAddr` gives an offset;
+    /// without an extent a pass cannot tell where one local ends and the next
+    /// begins, and must treat an escaped address as reaching the whole frame.
+    /// With it, C99 6.5.6p8 (pointer arithmetic is defined only within the
+    /// object) bounds the escape to one object and `pass/sroa.rs` may promote
+    /// the rest.
+    pub objs: Vec<(i64, u32)>,
 }
 
 impl Func {

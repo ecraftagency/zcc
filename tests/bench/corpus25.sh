@@ -19,11 +19,23 @@ command -v "$GCC" >/dev/null 2>&1 || GCC=gcc
 SQ="${SQLITE:-/suites/sqlite/sqlite3.c}"
 SUITE="${SUITE:-tests/bench/suite}"
 TMP=/tmp/corpus25
-mkdir -p "$TMP"
+rm -rf "$TMP"; mkdir -p "$TMP"
 
 # ── emitters ────────────────────────────────────────────────────────────────
-"$ZCC" -O1 -S -o "$TMP/z.s" "$SQ" 2>/dev/null
-"$GCC" -O1 -S -o "$TMP/g.s" "$SQ" 2>/dev/null
+# A FAILED compile must turn the measurement red, not reuse the last good .s.
+# The directory used to persist across runs with stderr discarded, so a zcc that
+# crashed on sqlite silently re-reported the previous session's numbers — the
+# Article E "clean-input" hole: a green number with no evidence that the artifact
+# it counts was produced by THIS binary. (Found when R2.2's promoted values first
+# overflowed the spiller.)
+emit() { # emit <compiler> <out> <src> <label>
+    if ! "$1" -O1 -S -o "$2" "$3" 2>"$TMP/err"; then
+        echo "!! $4 FAILED to compile $3 — measurement void:"; head -5 "$TMP/err"; exit 1
+    fi
+    [ -s "$2" ] || { echo "!! $4 produced an empty .s for $3 — measurement void"; exit 1; }
+}
+emit "$ZCC" "$TMP/z.s" "$SQ" zcc
+emit "$GCC" "$TMP/g.s" "$SQ" gcc
 
 # A mnemonic is the first token after the leading whitespace, delimited by whitespace or EOL.
 # The delimiter MUST be [[:space:]] (matches BOTH gcc's tab and zcc's space) — an audit caught
@@ -87,13 +99,15 @@ echo
 
 echo "== M3. geo40 per-program: static insn ratio (deterministic) =="
 printf "  %-22s %8s %8s %7s\n" program zcc_ins gcc_ins ratio
-sum_z=0; sum_g=0; logsum=0; n=0
+sum_z=0; sum_g=0; logsum=0; n=0; skipped=""
+# A program that fails to compile is NAMED, never silently dropped: a geomean
+# over a shrinking population reads as an improvement (Article E, clean-input).
 for c in "$SUITE"/*.c; do
   b=$(basename "$c" .c)
-  "$ZCC" -O1 -S -o "$TMP/pz.s" "$c" 2>/dev/null || continue
-  "$GCC" -O1 -S -o "$TMP/pg.s" "$c" 2>/dev/null || continue
+  "$ZCC" -O1 -S -o "$TMP/pz.s" "$c" 2>/dev/null || { skipped="$skipped $b(zcc)"; continue; }
+  "$GCC" -O1 -S -o "$TMP/pg.s" "$c" 2>/dev/null || { skipped="$skipped $b(gcc)"; continue; }
   zi=$(insns "$TMP/pz.s"); gi=$(insns "$TMP/pg.s")
-  [ "$gi" -gt 0 ] || continue
+  [ "$gi" -gt 0 ] || { skipped="$skipped $b(empty)"; continue; }
   r=$(ratio "$zi" "$gi")
   printf "  %-22s %8s %8s %7s\n" "$b" "$zi" "$gi" "$r"
   sum_z=$((sum_z+zi)); sum_g=$((sum_g+gi))
@@ -102,6 +116,7 @@ done
 echo "  ------"
 echo "  INSN geomean over $n programs = $(awk "BEGIN{printf \"%.4f\", exp($logsum/$n)}")"
 echo "  INSN pooled (sum zcc / sum gcc) = $(ratio "$sum_z" "$sum_g")"
+[ -n "$skipped" ] && echo "  !! SKIPPED (measurement incomplete):$skipped"
 echo
 echo "NOTE: exec (wall-clock) geo40 is in tests/bench/exectime.sh — its geomean line is"
 echo "currently poisoned by g2_strlen exec_r=0.000 (zcc infinitely faster there); the #25"

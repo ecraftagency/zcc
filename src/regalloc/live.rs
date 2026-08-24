@@ -156,6 +156,17 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
             continue;
         }
         let mut live: BTreeSet<usize> = live_out[bi].clone();
+        // The TERMINATOR's own operand is live at the end of the block too, and
+        // it is not in `live_out` — `live_out` is what the SUCCESSORS need, and a
+        // branch condition is consumed here. Starting the backward walk without
+        // it makes a value whose only use is the branch invisible to the
+        // call-crossing test, and the colourer then hands it a caller-saved
+        // register that the call destroys. (Latent until R2.2: while every local
+        // was a memory cell, the condition was reloaded immediately before the
+        // branch and never spanned a call. torture pr36343.)
+        blk.term.visit(&mut |r, _| {
+            live.insert(sp.idx(r));
+        });
         // walk backwards, so `live` is the set live AFTER the instruction
         for inst in blk.insts.iter().rev() {
             if matches!(inst, MInst::Call { .. }) {

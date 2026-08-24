@@ -213,3 +213,123 @@ fn spilling_respects_both_ceilings() {
     );
 }
 
+
+#[test]
+fn a_join_wider_than_the_register_file_is_relieved_by_the_slot() {
+    // mem2reg gives a join one parameter per live local, so an edge can carry
+    // more arguments than the class has registers — and an argument is a use AT
+    // the terminator, which no eviction can relieve. The spiller answers by
+    // removing the PARAMETER: the value travels through its slot instead.
+    let mut src = String::from("int main(void){\nint s=0;\n");
+    for i in 0..40 {
+        src.push_str(&format!("int v{} = {};\n", i, i + 1));
+    }
+    src.push_str("if (s == 0) { s = 1; } else { s = 2; }\n");
+    // every value is live ACROSS the join
+    src.push_str("return (");
+    for i in 0..40 {
+        if i > 0 {
+            src.push('+');
+        }
+        src.push_str(&format!("v{}", i));
+    }
+    src.push_str(") + s;\n}\n");
+    same(&src);
+}
+
+#[test]
+fn a_value_crossing_many_calls_fits_the_callee_saved_file() {
+    // AAPCS64 §6.1.1 leaves ten allocatable callee-saved general registers, and
+    // `color.rs` applies that restriction to a VALUE over its whole range. More
+    // than ten live call-crossing values therefore cannot be coloured, however
+    // much room the class otherwise has — the spiller has to see the ceiling
+    // separately from the k ceiling.
+    let mut src = String::from("int g(int);\nint main(void){\n");
+    for i in 0..16 {
+        src.push_str(&format!("int a{} = g({});\n", i, i));
+    }
+    src.push_str("return ");
+    for i in 0..16 {
+        if i > 0 {
+            src.push('+');
+        }
+        src.push_str(&format!("a{}", i));
+    }
+    src.push_str(";\n}\nint g(int x){return x;}\n");
+    same(&src);
+}
+
+#[test]
+fn a_rematerializable_value_is_recomputed_rather_than_stored() {
+    // A producer that reads no register (`MovImm`, `Adrp`, `SlotAddr`) is
+    // cheaper to re-execute than to store and reload, and it needs no slot at
+    // all. The battery's job is the square — the count is checked on the corpus.
+    let mut src = String::from("int main(void){\nint s=0;\n");
+    for i in 0..40 {
+        src.push_str(&format!("int c{} = {};\n", i, 1000 + i * 7));
+    }
+    src.push_str("s = ");
+    for i in 0..40 {
+        if i > 0 {
+            src.push('+');
+        }
+        src.push_str(&format!("c{}", i));
+    }
+    src.push_str(";\nreturn s & 0x7f;\n}\n");
+    same(&src);
+}
+
+#[test]
+fn a_loop_carried_variable_survives_being_spilled() {
+    // The shape that broke first: a loop whose carried values exceed the file,
+    // so the parameter is evicted and the incoming argument is stored on every
+    // edge. Slot coalescing makes most of those stores no-ops; the value must
+    // still be right.
+    let mut src = String::from("int main(void){\nint i;\n");
+    for k in 0..30 {
+        src.push_str(&format!("int a{} = {};\n", k, k));
+    }
+    src.push_str("for(i=0;i<7;i++){\n");
+    for k in 0..30 {
+        src.push_str(&format!("a{} = a{} + i;\n", k, k));
+    }
+    src.push_str("}\nreturn (");
+    for k in 0..30 {
+        if k > 0 {
+            src.push('+');
+        }
+        src.push_str(&format!("a{}", k));
+    }
+    src.push_str(") & 0xff;\n}\n");
+    same(&src);
+}
+
+#[test]
+fn a_branch_condition_live_across_a_call_is_callee_saved() {
+    // The condition is used ONLY by the terminator, so it never appears in
+    // `live_out` — and the backward walk that decides "crosses a call" started
+    // from `live_out`. The value was therefore invisible to the rule and got a
+    // caller-saved register the call destroyed. Latent while every local was a
+    // memory cell: the condition was reloaded immediately before the branch.
+    // (torture pr36343.)
+    same(
+        "int g(int);\
+         int f(int c){int t=g(1);if(c)return t+1;return t+2;}\
+         int main(void){return f(0)==2?0:1;}\
+         int g(int x){return x;}",
+    );
+}
+
+#[test]
+fn an_indirect_callee_may_share_the_result_register() {
+    // `blr x0` reads the target before the call writes the result into x0, so
+    // the two may share — but only ONE of them dies there. The colourer's
+    // occupied set is a multiset for exactly this reason; collapsing the two
+    // holders into one entry made the survivor vanish with the corpse.
+    // (torture pr34768-2.)
+    same(
+        "int a(void){return 1;}int b(void){return 2;}\
+         int f(int c){int t=7;int r=(c?a:b)();return t+r;}\
+         int main(void){return f(1)==8?0:1;}",
+    );
+}

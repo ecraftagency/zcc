@@ -14,11 +14,13 @@
   It is the fallback. It is NOT to be touched, grinded, or referenced for structure.
 - `mir-rearch` = this branch, created from `rc3`. **It is the repository's DEFAULT branch** (GitHub
   default + `origin/HEAD`, set 2026-08-24). `main` is frozen at `rc3` and left alone.
-  **Progress: R0, R0.9 and ALL of R1 (R1.1–R1.6 + the measurement) are ✅ banked.**
-  The backend is `src/{cfg,mem,compile,emit}.rs` + `src/hir/` + `src/mir/` + `src/isel/` +
-  `src/regalloc/`; `cargo test` **52/52**, `tests/cases` 74/75 (only the adjudicated
-  `float_h`), `tests/ext` 19/19, all five science gates PASS, torture 1470 pass / 0 FAIL,
-  csmith300 254/0, yarpgen300 300/0, determinism 85 × 8. Next `⬜` = **R2.1**.
+  **Progress: R0, R0.9, ALL of R1, and R2.1 + R2.2 are ✅ banked.**
+  The backend is `src/{cfg,mem,compile,emit}.rs` + `src/hir/` (with `hir/pass/` = the §4
+  ladder) + `src/mir/` + `src/isel/` + `src/regalloc/`; `cargo test` **86/86**,
+  `tests/cases` 74/75 (only the adjudicated `float_h`), `tests/ext` 19/19, all five
+  science gates PASS, torture **1471 pass / 0 FAIL**, opt-parity 1552/0, csmith300 254/0,
+  yarpgen300 300/0, determinism 85 × 8. sqlite **322,606 = 2.043×** gcc-O1, geo40 INSN
+  **1.5244** (rc3: 1.768× / 1.5835). Next `⬜` = **R2.3**.
 - The box: `docker exec zccbox …`, suites cached at `/suites` (`ZCC_SUITE_CACHE=/suites`), build with
   `CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc`.
 
@@ -49,14 +51,14 @@ zcc solved the hard version of the problem. This document adopts the right versi
    override pointing here; the `[optimizer = main]` paragraph after it describes the DEAD architecture
    and does not apply on this branch.)
 2. Resume at the first `⬜` in the §12 ladder. **State at 2026-08-25: R0, R0.9,
-   R1.1–R1.6 and the R1 measurement are ✅ banked (HEAD `4c0bd14`); the first
-   `⬜` is R2.1.** The R1 GROUND METRIC is §13a — the origin every R2/R3 pass is
-   measured against; the one fact to carry into R2 is that `add` is **28.2%** of
-   sqlite's instructions because every local is addressed through the frame
-   block, which R2.2 (SROA+mem2reg) and R3.1 (addressing modes) between them
-   remove. Note R2.2's own BLOCKING prerequisite is still open: Braun-Hack
-   proper in `regalloc/spill.rs` (today's spiller is sound and enforces both
-   ceilings, but is spill-at-def / reload-per-use).
+   R1.1–R1.6, the R1 measurement, R2.1 and R2.2 are ✅ banked; the first `⬜` is
+   R2.3.** §13a is the R1 GROUND METRIC (the unoptimized origin) and the R2.2 row
+   of §12 records where the numbers stand now. The fact to carry into R2.3/R3 is
+   that the composition INVERTED: `add` fell from 28.2% to 11.0% and `ldr` from
+   19.2% to 19.6% of a much smaller total, while **`mov` is now the largest
+   killable class at 21.1%** (68,138) — reg-reg copies the biased colourer did
+   not manage to coalesce, which is R3's target, not another HIR pass. §15b is
+   the defect ledger for this milestone; read it before touching `regalloc/`.
 3. Every module ships with its verifier + interpreter-based proof battery before the next module.
 4. Bank each R-milestone with a commit + measurement line in §12; push.
 5. Standing gate for any bank: `cargo test` green · `tests/cases` no regression · `bash
@@ -310,7 +312,13 @@ Programs"), Boissinot et al. 2009 (fast liveness / out-of-SSA), Braun et al. 201
 1. **Liveness** (`live.rs`): iterative backward dataflow on SSA with block parameters (a target's
    argument is a use on the edge). Cheap enough; Boissinot's dominance-based variant is an optional
    later optimization.
-2. **Spilling** (`spill.rs`) — Braun-Hack, per register class:
+2. **Spilling** (`spill.rs`) — Braun-Hack, per register class. **As built (R2.2), with
+   two deviations recorded here rather than left implicit:** SSA RECONSTRUCTION is absent
+   because it is not needed — a reload's fresh register is used only inside the block that
+   created it, so its live range is dominated by its definition; and a spilled BLOCK
+   PARAMETER is removed from the IR rather than stored at its definition, since its
+   definition is the block head. One slot per SSA WEB (parameter ∪ its arguments), merged
+   only where the members do not interfere:
    - Walk blocks in dominance order. For each block compute the entry set `W_entry` (≤ k values) from
      the predecessors' exit sets, preferring values with the nearest next use (loop-aware next-use
      distance: uses outside the current loop count as "far").
@@ -443,9 +451,9 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 ### R2 — tree-SSA parity (port the A7 ladder onto HIR, §4 order)
 | task | status |
 |---|---|
-| R2.1 cfg_simplify, sccp, gvn, dce (+ batteries) | ⬜ |
-| R2.2 sroa+mem2reg, load_elim/dse, alias oracle. **Blocking prerequisite**: mem2reg is what first creates long-lived values, so Braun & Hack 2009 proper — per-block working set across edges, Belady MIN eviction, rematerialization of pure producers, SSA reconstruction (Braun 2013) — must land in `regalloc/spill.rs` FIRST, with its own battery. **The rc3 allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573) is measured here**, not at R1 | ⬜ |
-| R2.3 inline (+purity), licm (unconditional), iv/pointer-iv/LFTR | ⬜ |
+| R2.1 cfg_simplify, sccp, gvn, dce (+ batteries) | ✅ `e7473c9`. `cargo test` 52 → 67: `hir::tests::check` now runs EVERY battery program through both sides of ⟦f⟧=⟦P f⟧, and `isel`/`regalloc` do the same, so the R0/R1 corpus became the ladder's proof corpus at no authoring cost. Yield on its own is ~0 (every local is still a memory cell — that is what R2.2 fixes); one defect found: a literal address rode in ZR, which `Rn=31` decodes as SP (torture `930719-1`), now refused by `mir::verify` |
+| R2.2 sroa+mem2reg, load_elim/dse, alias oracle. **Blocking prerequisite**: mem2reg is what first creates long-lived values, so Braun & Hack 2009 proper — per-block working set across edges, Belady MIN eviction, rematerialization of pure producers, SSA reconstruction (Braun 2013) — must land in `regalloc/spill.rs` FIRST, with its own battery. **The rc3 allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573) is measured here**, not at R1 | ✅ sqlite **473,253 → 322,606** (2.997× → **2.043×**), geo40 INSN **2.5168 → 1.5244** (rc3 was 1.5835). `add` 133,264 → 35,357, `ldr` 90,906 → 63,286, frame-slot mem-ops 12,253 → 64,185 (the spill traffic promotion creates), reg-reg+imm `mov` 59,224 → 68,138 — the new top of the killable floor, and R3's target. Deviation from the plan, recorded: SSA RECONSTRUCTION was not needed and is not there. A reload's fresh register is used only inside the block that created it, so its live range is dominated by its definition and SSA holds by construction; a value that stays in the working set across an edge keeps its ORIGINAL name. The price is one reload per block-residency instead of one per program region. What the milestone did NOT anticipate, and what the measurement forced: (a) a spilled BLOCK PARAMETER cannot be stored at its definition — the parameter is removed and each predecessor writes the slot; (b) a join can be wider than the register file, and no eviction relieves an edge argument, so the successor's parameter is spilled instead; (c) one slot per SSA WEB, merged only where the members do not interfere — without it a spilled parameter copies between slots on every edge, which cost `sqlite3VdbeExec` 110,000 stores and made the milestone a REGRESSION (571,648) before it was a win |
+| R2.3 inline (+purity), licm (unconditional), iv/pointer-iv/LFTR | 🔨 inline + licm banked; **iv/strength-reduction/LFTR still ⬜**. licm: EXEC geo40 1.9415 → 1.8374 (−5.4%) for +0.011 INSN and +0.75% sqlite — banked because §13a's directive makes EXEC the target and size the byproduct. inline: the bound is DERIVED, not tuned — a body no larger than the call sequence it replaces (`params + 2`: one instruction to place each argument, the `bl`, one to take the result) cannot grow the program — plus gcc-O1's own `-finline-functions-called-once`. Net EXEC 1.8374 → 1.7468, INSN 1.5357 → 1.5148, sqlite 315,665 → 317,285. A called-once callee must also be DELETED once its last call site is gone, or the rule is a pure size loss: sqlite grew 25% before that existed |
 | R2.4 if_convert, rotate/final-value/pure-call hoist | ⬜ |
 | R2 gate + measurement | opt-parity (passes off vs on) 0 DIVERGE; csmith/yarpgen 0 DIVERGE. KPI: INSN geo ≤ 1.58 (rc3), sqlite ≤ 1.5×. **Merge-to-main eligibility starts here** | ⬜ |
 
@@ -520,6 +528,38 @@ It is also not width-aware: a `q` value crossing a call has no legal colour at
 all (AAPCS64 §6.1.2 preserves only the low half of v8–v15), which isel avoids by
 parking every quad in memory and `color.rs` now reports as a named error rather
 than silently truncating.
+
+---
+
+## §15b R2 defect ledger — what the batteries and the new verifiers found
+
+Every entry below is a WRONG-CODE bug that the differential suites reported as
+"binary aborts" and that a layer verifier now names at its own layer. The pattern
+is the one Law 3 predicts: a rule becomes REACHABLE only once an earlier layer
+optimizes, so R0/R1 could not have found any of them.
+
+| defect | why it was latent, and what now catches it |
+|---|---|
+| A literal null address rode in the zero register. DDI 0487 C1.2.5: in the Rn field of a load/store, register 31 decodes as SP, not ZR — `strb wzr, [xzr]` is not an instruction | `*(char *)0 = 0` is a literal address only after the cast FOLDS. Caught by `mir::verify`, which now refuses a zero-register memory base (torture `930719-1`) |
+| A promoted variable whose dominance frontier reaches a computed-goto target. `goto *e` names its successors without passing arguments, so the parameter placed there was never given a value — and neither `hir::verify` nor ⟦hir⟧ could see the hole, because both read arguments through `Term::targets`, which a computed goto has none of | R0/R1 created almost no block parameters. `sroa` now refuses to promote a variable whose frontier touches an argument-less edge (torture `comp-goto-1 920302-1 920501-3 20040302-1 20041214-1 20071210-1`) |
+| Dead-store elimination across a TYPE PUN. `*(double*)p = x; l = *(long*)p; *(double*)p = y;` — the first store is not dead: a read of a different type saw it | The pass had no notion of a read making a store observable. A load that is not forwarded now clears the deletable mark of every store it may alias (torture `cbrt`) |
+| A branch condition live across a call took a caller-saved register. `crosses_call` walked backwards from `live_out`, and a value used ONLY by the terminator is not in `live_out` — the branch consumes it here | While every local was a memory cell the condition was reloaded immediately before the branch and never spanned a call. `live::compute` now seeds the walk with the terminator's own operands (torture `pr36343`) |
+| At an indirect call the callee pointer and the result share x0 — legally, since `blr` reads the target before the call writes the result — but `occupied` held one entry for the register, so freeing the dying pointer freed the result's register with it | Needs an indirect call whose pointer dies exactly at it. `occupied` is now a multiset, and `color::check` re-derives the whole colouring from `Liveness` INDEPENDENTLY of the incremental set that produced it (torture `pr34768-2`) |
+
+**Two verifiers were added rather than two fixes**, because a fix that only
+removes one occurrence of a class of bug is not Law 3:
+`regalloc::spill::check_pressure` states the spiller's post-condition (pressure ≤
+k, call-crossing ≤ callee-saved, at every point) and `regalloc::color::check`
+states the colouring's (no two simultaneously-live values share a register).
+Both run on every function in the shipped pipeline: a violation now names the
+block, the instruction and the two values instead of surfacing as a wrong answer
+in csmith.
+
+**Measurement integrity.** `tests/bench/corpus25.sh` reused `/tmp/corpus25` across
+runs with stderr discarded, so a zcc that CRASHED on sqlite silently re-reported
+the previous session's numbers — the Article E clean-input hole, and it hid this
+milestone's first regression for a full cycle. A failed compile now voids the
+measurement, and a program dropped from the per-program table is NAMED.
 
 ---
 

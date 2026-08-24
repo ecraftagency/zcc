@@ -14,9 +14,13 @@ pub mod cfg;
 pub mod dce;
 pub mod fold;
 pub mod gvn;
+pub mod inline;
+pub mod licm;
+pub mod mem;
 #[cfg(test)]
 mod tests;
 pub mod sccp;
+pub mod sroa;
 
 use super::*;
 
@@ -29,8 +33,25 @@ use super::*;
 pub const ROUNDS: u32 = 3;
 
 pub fn run_module(m: &mut Module) {
+    run_module_with(m, &std::collections::HashSet::new());
+}
+
+/// `pinned` names functions a STATIC INITIALIZER refers to (`static void (*p)() =
+/// &f;`). HIR has no view of the data segment, so the caller supplies it — and
+/// without it the inliner would delete a function the linker still needs.
+pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String>) {
     for f in m.funcs.iter_mut() {
         run(f);
+    }
+    // Inlining is the one INTERPROCEDURAL row, so it runs between two
+    // intra-procedural sweeps rather than inside one: the callee must already be
+    // optimized when it is spliced in (its locals promoted, its constants
+    // folded), and the caller must be re-optimized afterwards, because a call
+    // replaced by a body is exactly the shape the other rows feed on.
+    if on("inline") && inline::run_module(m, pinned) {
+        for f in m.funcs.iter_mut() {
+            run(f);
+        }
     }
 }
 
@@ -40,15 +61,46 @@ pub fn run(f: &mut Func) {
     dom::split_critical_edges(f);
     for _ in 0..ROUNDS {
         let mut changed = false;
-        changed |= cfg::run(f);
-        changed |= sccp::run(f);
-        changed |= gvn::run(f);
-        changed |= dce::run(f);
+        if on("cfg") {
+            changed |= cfg::run(f);
+        }
+        if on("sroa") {
+            changed |= sroa::run(f);
+        }
+        if on("sccp") {
+            changed |= sccp::run(f);
+        }
+        if on("gvn") {
+            changed |= gvn::run(f);
+        }
+        if on("mem") {
+            changed |= mem::run(f);
+        }
+        if on("licm") {
+            changed |= licm::run(f);
+        }
+        if on("dce") {
+            changed |= dce::run(f);
+        }
         if !changed {
             break;
         }
     }
-    cfg::run(f);
+    if on("cfg") {
+        cfg::run(f);
+    }
+}
+
+/// `ZCC_NOPASS=gvn,mem` disables the named rows. This is a BISECTION tool, not a
+/// tuning knob: when a differential suite reports a wrong answer, the first
+/// question is which theorem's square is false, and answering it by rebuilding
+/// the compiler six times is the slow path Law 2 warns about. No shipped
+/// configuration reads it.
+fn on(name: &str) -> bool {
+    match std::env::var("ZCC_NOPASS") {
+        Ok(v) => !v.split(',').any(|x| x == name),
+        Err(_) => true,
+    }
 }
 
 // ── shared plumbing every pass needs ───────────────────────────────────────

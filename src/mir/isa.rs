@@ -73,6 +73,17 @@ pub fn callee_saved_mask(c: Class) -> u32 {
 }
 
 /// `k` for the coloring theorem: the number of assignable colors in a class.
+/// The allocatable registers a value that is NOT live across a call may use when
+/// the function contains one at all (AAPCS64 §6.1.1). Partitioning the file this
+/// way is what makes the two colouring sub-problems independent: a value live
+/// across a call has ONLY the callee-saved half, so letting a value that does not
+/// need that half occupy it starves the ones that do — and greedy colouring in
+/// dominance order (which chordality requires) cannot colour the constrained
+/// values first to avoid it.
+pub fn caller_saved_mask(c: Class) -> u32 {
+    alloc_mask(c) & !callee_saved_mask(c)
+}
+
 pub fn k(c: Class) -> usize {
     alloc_order(c).len()
 }

@@ -455,3 +455,26 @@ fn composites_by_value_and_by_return() {
     );
 }
 
+
+#[test]
+fn a_cast_from_an_array_to_an_integer_truncates() {
+    // The array has already decayed to its 64-bit address; casting it to `int`
+    // is a TRUNCATION like any other. Treating "one side is not scalar" as
+    // "an address is an address" left a 64-bit value in a 32-bit operand —
+    // ill-typed IR that only the verifier could see (torture `loop-2d`).
+    check("int a[2];int main(void){int x=(int)a;int y=(int)&a[0];return x==y;}", 1);
+    check("int a[2];int main(void){unsigned u=(unsigned)a;return (u&3)==0;}", 1);
+    check("int a[4];int main(void){return (int)(long)a==(int)(long)&a[0];}", 1);
+}
+
+#[test]
+fn an_alloca_size_is_extended_to_the_full_register() {
+    // `sub sp, sp, x` reads all 64 bits, so a narrower byte count has to be
+    // extended by its own signedness before it gets there (torture `pr36321`).
+    check("int main(void){int n=8;char*p=(char*)__builtin_alloca(n);p[0]=42;return p[0];}", 42);
+    check(
+        "int main(void){unsigned n=16;char*p=(char*)__builtin_alloca(n);p[15]=42;return p[15];}",
+        42,
+    );
+    check("int main(void){char*a=(char*)__builtin_alloca(0);return a!=0;}", 1);
+}

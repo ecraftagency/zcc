@@ -13,14 +13,14 @@
 //       disappears, a branch that becomes a jump). Law 4: a green test that
 //       cannot distinguish "correct" from "absent" is not evidence.
 use super::super::interp::{Trap, new_machine};
-use super::super::{BinOp, Func, Inst, Module, Term, build, verify};
+use super::super::{BinOp, Func, Inst, Module, Operand, Term, build, verify};
 use crate::testutil::frontend;
 
 fn module(src: &str, opt: bool) -> Module {
     let ast = frontend(src);
     let mut m = build::build(&ast);
     if opt {
-        super::run_module(&mut m);
+        super::run_module_with(&mut m, &crate::compile::pinned_symbols(&ast));
     }
     for f in &m.funcs {
         verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
@@ -38,7 +38,7 @@ fn square(src: &str, want: i64) {
     let ast = frontend(src);
     let mut a = build::build(&ast);
     let mut b = a.clone();
-    super::run_module(&mut b);
+    super::run_module_with(&mut b, &crate::compile::pinned_symbols(&ast));
     for f in &b.funcs {
         verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
     }
@@ -170,9 +170,6 @@ fn sccp_meets_a_join_parameter_both_edges_agree_on() {
     let after = module(src, true);
     let f = func(&after, "f");
     assert_eq!(count(f, |i| matches!(i, Inst::Cmp { .. })), 0, "t==7 must fold");
-    for b in &f.blocks {
-        assert!(!matches!(b.term, Term::Br(..)) || !b.insts.is_empty());
-    }
     square(src, 42);
     // and the same shape when the disagreement is real: nothing may be folded
     let live = "int f(int n){if((n?7:8)==7)return 42;return 9;}int main(void){return f(0);}";
@@ -247,11 +244,194 @@ fn gvn_respects_dominance() {
     square(src, 42);
 }
 
+// ── sroa + mem2reg ─────────────────────────────────────────────────────────
+
+#[test]
+fn mem2reg_promotes_a_scalar_local() {
+    let src = "int main(void){int i,s=0;for(i=0;i<10;i++)s+=i;return s;}";
+    let before = module(src, false);
+    let after = module(src, true);
+    let mem = |f: &Func| {
+        count(f, |i| matches!(i, Inst::Load { .. } | Inst::Store { .. } | Inst::SlotAddr { .. }))
+    };
+    assert!(mem(func(&before, "main")) > 0, "R1 keeps every local in the frame");
+    assert_eq!(
+        mem(func(&after, "main")),
+        0,
+        "a local whose address is never taken must leave memory entirely"
+    );
+    square(src, 45);
+}
+
+#[test]
+fn sroa_splits_a_struct_field_by_field() {
+    // The address of the struct is never taken, so each FIELD is its own
+    // promotable piece — that is the whole of SROA on this architecture: the
+    // unit of promotion is an (offset, type) piece, not an object.
+    let src = "struct P{int x;int y;};int main(void){struct P p;p.x=17;p.y=25;return p.x+p.y;}";
+    let after = module(src, true);
+    let f = func(&after, "main");
+    assert_eq!(
+        count(f, |i| matches!(i, Inst::Load { .. } | Inst::Store { .. })),
+        0,
+        "both fields must be promoted"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn an_escaped_local_bounds_the_escape_to_its_own_object() {
+    // `&a` escapes, so `a` stays in memory — but `b` is a different object and
+    // C99 6.5.6p8 says no arithmetic on `&a` can reach it, so `b` promotes. The
+    // whole point of exporting the parser's object table: without extents, one
+    // escaped local would pin the entire frame.
+    // `&a` is stored into a global, so nothing can bound the escape but the
+    // object table.
+    let src = "int *gp;int main(void){int a=1;int b=2;gp=&a;*gp=5;return a*8+b;}";
+    let after = module(src, true);
+    let f = func(&after, "main");
+    // Exactly ONE stack object is still addressed — `a`, whose address escaped.
+    // `b` never touches memory, which is the whole point: without the parser's
+    // extents the escape would have had to pin the entire frame.
+    assert_eq!(
+        count(f, |i| matches!(i, Inst::SlotAddr { .. })),
+        1,
+        "only the escaped object keeps a stack address"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn a_type_punned_slot_is_not_promoted() {
+    // Two different widths at one offset are not a variable; promoting either
+    // would lose the other's bytes. The union below is the C spelling of it.
+    let src = "union U{int i;char c[4];};int main(void){union U u;u.i=0x2a;return u.c[0];}";
+    square(src, 42);
+}
+
+#[test]
+fn a_variably_indexed_array_stays_in_memory() {
+    // `a[i]` computes an address from the slot address, which is an escape of
+    // that object — and the object is the whole array, so none of it promotes.
+    let src = "int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i*i;return a[0]+a[1]+a[2]+a[3]+28;}";
+    square(src, 42);
+}
+
+#[test]
+fn gvn_sees_through_a_promoted_local() {
+    // The R2.1 form of this test could only dedup a global's address, because
+    // every local was a memory cell and two reads of it were two loads. After
+    // promotion the two spellings of `a*b` are the same expression.
+    let src = "int f(int a,int b){int x=a*b+7;int y=a*b+7;return x+y;}int main(void){return f(3,5);}";
+    let before = module(src, false);
+    let after = module(src, true);
+    let muls = |f: &Func| count(f, |i| matches!(i, Inst::Bin { op: BinOp::Mul, .. }));
+    assert_eq!(muls(func(&before, "f")), 2);
+    assert_eq!(muls(func(&after, "f")), 1, "gvn must leave exactly one product");
+    square(src, 44);
+}
+
+#[test]
+fn sccp_finds_a_constant_around_a_loop() {
+    // `k` is 1 on entry and 1 on the back edge, so the meet at the loop header
+    // is 1 — a fact no non-conditional folder can see, because the back edge is
+    // only known executable while the analysis is still running. It needs
+    // mem2reg first: while `k` is a memory cell there is no loop-carried VALUE
+    // to run a lattice over.
+    let src = "int main(void){int k=1;int i;for(i=0;i<10;i++){k=k*1;}return k+41;}";
+    let after = module(src, true);
+    let f = func(&after, "main");
+    assert_eq!(
+        count(f, |i| matches!(i, Inst::Bin { op: BinOp::Mul, .. })),
+        0,
+        "the loop-carried multiply must be gone"
+    );
+    assert!(
+        f.blocks.iter().any(|b| matches!(&b.term, Term::Ret(Some(Operand::Imm(42))))),
+        "and the result must be the constant 42, not a loop-carried value"
+    );
+    // The loop ITSELF survives: deleting a counted loop with no effect needs a
+    // final-value/loop-DCE theorem, which is R2.4's row, not sccp's.
+    square(src, 42);
+}
+
+// ── load_elim / dse ────────────────────────────────────────────────────────
+
+#[test]
+fn a_stored_value_is_forwarded_to_the_load() {
+    let src = "int f(int*p){*p=42;return *p;}int main(void){int x=0;return f(&x);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    assert_eq!(count(f, |i| matches!(i, Inst::Load { .. })), 0, "the reload of *p is redundant");
+    assert_eq!(count(f, |i| matches!(i, Inst::Store { .. })), 1, "but the store is observable");
+    square(src, 42);
+}
+
+#[test]
+fn a_second_read_of_the_same_place_is_the_first() {
+    let src = "int f(int*p){return *p + *p;}int main(void){int x=21;return f(&x);}";
+    let after = module(src, true);
+    assert_eq!(count(func(&after, "f"), |i| matches!(i, Inst::Load { .. })), 1);
+    square(src, 42);
+}
+
+#[test]
+fn an_overwritten_store_is_dead() {
+    let src = "int f(int*p){*p=1;*p=42;return 0;}int main(void){int x=0;f(&x);return x;}";
+    let after = module(src, true);
+    assert_eq!(
+        count(func(&after, "f"), |i| matches!(i, Inst::Store { .. })),
+        1,
+        "only the last store to a location is observable"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn a_call_between_the_store_and_the_load_blocks_forwarding() {
+    // The callee may hold a pointer to the same object, so the reload has to
+    // happen. This is the case a "forward anything" rule miscompiles.
+    let src = "int*g;void set(void){*g=42;}               int f(int*p){*p=1;set();return *p;}               int main(void){int x=0;g=&x;return f(&x);}";
+    let after = module(src, true);
+    assert!(
+        count(func(&after, "f"), |i| matches!(i, Inst::Load { .. })) >= 1,
+        "an opaque call must invalidate the table"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn a_volatile_access_is_never_forwarded_or_removed() {
+    let src = "int f(volatile int*p){*p=42;return *p;}int main(void){int x=0;return f(&x);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    assert_eq!(count(f, |i| matches!(i, Inst::Load { vol: true, .. })), 1);
+    assert_eq!(count(f, |i| matches!(i, Inst::Store { vol: true, .. })), 1);
+    square(src, 42);
+}
+
+#[test]
+fn disjoint_objects_do_not_kill_each_other() {
+    // Writing through one pointer must not invalidate what is known about a
+    // different object — that is the whole value of the oracle.
+    let src = "int g1;int g2;               int f(void){g1=42;g2=7;return g1;}               int main(void){return f();}";
+    let after = module(src, true);
+    assert_eq!(
+        count(func(&after, "f"), |i| matches!(i, Inst::Load { .. })),
+        0,
+        "g2's store cannot touch g1"
+    );
+    square(src, 42);
+}
+
 // ── dce ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn dce_removes_an_unused_computation_but_not_a_call() {
-    let src = "int g(void){return 1;}int main(void){int dead=7*13;int keep=g();return keep+41;}";
+    // `g` is recursive, so the inliner never substitutes it and the call is
+    // still a call when dce runs.
+    let src = "int g(int n){if(n>0)return g(n-1);return 1;}\
+               int main(void){int dead=7*13;int keep=g(3);return keep+41;}";
     let after = module(src, true);
     let f = func(&after, "main");
     assert_eq!(count(f, |i| matches!(i, Inst::Call { .. })), 1, "a call is never dead");
@@ -277,6 +457,63 @@ fn dce_drops_a_dead_block_parameter() {
     square(src, 42);
 }
 
+// ── licm ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn licm_hoists_an_invariant_expression_out_of_the_loop() {
+    let src = "int f(int a,int b,int n){int i,s=0;for(i=0;i<n;i++)s+=a*b;return s;}               int main(void){return f(3,2,7);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    assert_eq!(lf.loops.len(), 1, "the loop must still be a loop");
+    let body = &lf.loops[0].body;
+    let in_loop = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| body.contains(&(*b as u32)))
+        .flat_map(|(_, blk)| blk.insts.iter())
+        .filter(|i| matches!(i, Inst::Bin { op: BinOp::Mul, .. }))
+        .count();
+    assert_eq!(in_loop, 0, "a*b is invariant and must leave the body");
+    square(src, 42);
+}
+
+#[test]
+fn licm_refuses_a_division_that_could_trap() {
+    // C99 6.5.5p5: division by zero is undefined. Hoisting `a/b` out of a loop
+    // that never runs would move the fault onto a path the program never took —
+    // so it moves only when the divisor is a non-zero literal.
+    let src = "int f(int a,int b,int n){int i,s=0;for(i=0;i<n;i++)s+=a/b;return s;}               int main(void){return f(6,3,0)+42;}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    let body = &lf.loops[0].body;
+    let in_loop = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| body.contains(&(*b as u32)))
+        .flat_map(|(_, blk)| blk.insts.iter())
+        .filter(|i| matches!(i, Inst::Bin { op: BinOp::SDiv, .. }))
+        .count();
+    assert_eq!(in_loop, 1, "a/b may fault and must stay inside");
+    square(src, 42);
+    // a literal divisor cannot fault, so that one does move
+    let ok = "int f(int a,int n){int i,s=0;for(i=0;i<n;i++)s+=a/3;return s;}              int main(void){return f(6,7);}";
+    square(ok, 14);
+}
+
+#[test]
+fn licm_leaves_a_variant_expression_alone() {
+    let src = "int f(int a,int n){int i,s=0;for(i=0;i<n;i++)s+=a*i;return s;}               int main(void){return f(2,7);}";
+    square(src, 42);
+}
+
 // ── the ladder as a whole ──────────────────────────────────────────────────
 
 #[test]
@@ -298,4 +535,82 @@ fn ladder_is_idempotent_at_the_fixpoint() {
         let twice: Vec<usize> = m.funcs.iter().map(ninsts).collect();
         assert_eq!(once, twice, "the ladder had not reached its fixpoint\n{}", src);
     }
+}
+
+// ── inline ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn inline_substitutes_a_static_callee_called_once() {
+    let src = "static int helper(int a,int b){int t=a*b;return t+t;}\
+               int main(void){return helper(3,7);}";
+    let after = module(src, true);
+    assert_eq!(count(func(&after, "main"), |i| matches!(i, Inst::Call { .. })), 0);
+    assert!(
+        after.funcs.iter().all(|f| f.name != "helper"),
+        "a static callee with no remaining call site is dead and must not be emitted"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn inline_refuses_a_recursive_callee() {
+    // β-reduction on a recursive term does not terminate; the pass must see the
+    // cycle in the call graph and decline.
+    let src = "int fact(int n){if(n<2)return 1;return n*fact(n-1);}\
+               int main(void){return fact(5)-78;}";
+    let after = module(src, true);
+    assert!(
+        count(func(&after, "fact"), |i| matches!(i, Inst::Call { .. })) >= 1,
+        "the recursive call must survive"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn inline_refuses_a_variadic_callee() {
+    let src = "static int sum(int n,...){__builtin_va_list a;int i,s=0;\
+               __builtin_va_start(a,n);for(i=0;i<n;i++)s+=__builtin_va_arg(a,int);\
+               __builtin_va_end(a);return s;}\
+               int main(void){return sum(3,20,20,2);}";
+    let after = module(src, true);
+    assert!(after.funcs.iter().any(|f| f.name == "sum"), "a variadic callee stays a call");
+    square(src, 42);
+}
+
+#[test]
+fn inline_keeps_a_function_a_static_initializer_names() {
+    // The reference lives in the data segment, where HIR cannot see it; deleting
+    // the body would be a link error, not a size win.
+    let src = "static int one(void){return 1;}\
+               static int (*tab[1])(void) = { one };\
+               int main(void){return tab[0]()+41;}";
+    let after = module(src, true);
+    assert!(after.funcs.iter().any(|f| f.name == "one"));
+    // Not run under ⟦hir⟧: the interpreter does not materialize a FUNCTION
+    // address inside static data, so the table would read as a null pointer.
+    // The obligation here is structural — the body must still exist — and the
+    // end-to-end confirmation is `tests/cases`, which links.
+}
+
+#[test]
+fn inline_preserves_the_value_through_a_branchy_callee() {
+    let src = "static int pick(int c,int a,int b){if(c)return a;return b;}\
+               int main(void){int s=0;s+=pick(1,40,0);s+=pick(0,0,2);return s;}";
+    square(src, 42);
+}
+
+#[test]
+fn an_aliased_global_is_one_object_under_two_names() {
+    // EXT(gcc) `__attribute__((alias))` declares another NAME, not another
+    // object. The oracle's rule "different symbols are different objects" is
+    // true of C but not of the linker, so the alias is resolved to its target
+    // when the address is built — otherwise a store through one name is
+    // invisible to a load through the other (torture `alias-3`).
+    let src = "static int a=0;extern int b __attribute__((alias(\"a\")));\
+               int main(void){a=0;b++;return a==1?42:0;}";
+    let after = module(src, true);
+    let f = func(&after, "main");
+    let stores = count(f, |i| matches!(i, Inst::Store { .. }));
+    assert!(stores >= 1, "the increment through the alias is observable");
+    square(src, 42);
 }

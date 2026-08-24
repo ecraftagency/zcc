@@ -14,11 +14,51 @@ use crate::ast::Ast;
 pub fn compile(ast: &Ast) -> String {
     let mut h = phase("hir::build", || crate::hir::build::build(ast));
     if optimize() {
-        phase("hir::pass", || crate::hir::pass::run_module(&mut h));
+        let pinned = pinned_symbols(ast);
+        phase("hir::pass", || crate::hir::pass::run_module_with(&mut h, &pinned));
     }
+    // Law 3 at the cheapest layer: the HIR verifier decides dominance, edge
+    // arity and type agreement on the IR alone, so a pass that breaks one of
+    // them is named HERE instead of surfacing as a wrong answer — or, worse, as
+    // an allocator that runs out of registers three layers down.
+    phase("hir::verify", || {
+        for f in &h.funcs {
+            if let Err(e) = crate::hir::verify::verify(f) {
+                panic!("zcc: internal: {}", e);
+            }
+        }
+    });
     let h = h;
     let m = backend(&h).unwrap_or_else(|e| panic!("zcc: internal: {}", e));
     phase("emit", || crate::emit::emit(ast, &m))
+}
+
+/// Every symbol a STATIC INITIALIZER names. A function whose address a data
+/// object holds is referenced by the linker, not by any instruction, so HIR
+/// cannot tell that it is still needed — and the inliner must not delete it.
+pub fn pinned_symbols(ast: &Ast) -> std::collections::HashSet<String> {
+    fn walk(i: &crate::ast::GInit, out: &mut std::collections::HashSet<String>) {
+        match i {
+            crate::ast::GInit::Addr(n, _) => {
+                out.insert(n.trim_start_matches('\u{1}').to_string());
+            }
+            crate::ast::GInit::Diff(a, b) => {
+                out.insert(a.trim_start_matches('\u{1}').to_string());
+                out.insert(b.trim_start_matches('\u{1}').to_string());
+            }
+            crate::ast::GInit::List(items) => {
+                for (_, _, x) in items {
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    for g in &ast.globals {
+        walk(&g.init, &mut out);
+    }
+    out
 }
 
 /// The HIR pass ladder is ON unless `ZCC_O0` says otherwise. The switch exists
@@ -54,6 +94,12 @@ pub fn backend(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
 /// frame/layout square (`⟦mir_p⟧ = ⟦mir_final⟧`) has two sides to compare.
 pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
     let mut m = phase("isel", || crate::isel::lower(h));
+    phase("mir::verify", || {
+        for f in &m.funcs {
+            crate::mir::verify::verify(f)?;
+        }
+        Ok::<(), String>(())
+    })?;
     phase("regalloc", || crate::regalloc::allocate_module(&mut m))?;
     Ok(m)
 }

@@ -102,6 +102,25 @@ struct Bf {
     w: u32,
 }
 
+/// The index of the object a global name actually denotes, following
+/// `__attribute__((alias))` to its target (transitively, with a bound so a
+/// malformed cycle cannot hang the compiler).
+fn canon_global(ast: &Ast, i: u32) -> u32 {
+    let mut cur = i;
+    for _ in 0..8 {
+        let name = &ast.globals[cur as usize].name;
+        let target = match ast.aliases.iter().find(|(new, ..)| new == name) {
+            Some((_, old, _)) => old,
+            None => return cur,
+        };
+        match ast.globals.iter().position(|g| &g.name == target) {
+            Some(j) if j as u32 != cur => cur = j as u32,
+            _ => return cur,
+        }
+    }
+    cur
+}
+
 struct B<'a> {
     ast: &'a Ast,
     f: Func,
@@ -751,6 +770,12 @@ impl<'a> B<'a> {
                 self.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off })
             }
             Node::GVar(i) => {
+                // EXT(gcc) `__attribute__((alias("x")))` declares ANOTHER NAME
+                // for an existing object, not another object. Naming it by its
+                // own index would make the alias oracle (`pass/mem.rs`) treat two
+                // names for one variable as two disjoint objects, and forward a
+                // load past a store through the other name (torture `alias-3`).
+                let i = &canon_global(self.ast, *i);
                 // EXT(gcc) `__thread`: a thread-local object is not at a link-time
                 // address at all — it is at an offset from the thread pointer.
                 let sym = if self.ast.globals[*i as usize].is_tls {
@@ -948,7 +973,27 @@ impl<'a> B<'a> {
             // being moved, duplicated or removed by any pass.
             Node::Alloca(e) => {
                 let e = *e;
+                let ety = self.ty(e);
                 let n = self.expr(e);
+                // The byte count is a 64-bit quantity: `sub sp, sp, x` reads the
+                // whole register, so a narrower expression has to be EXTENDED,
+                // and by its own signedness. Passing an `int` straight through
+                // left isel reading 64 bits of a 32-bit value (torture pr36321).
+                let n = if scalar(self.tt(), ety) {
+                    let ft = hty(self.tt(), ety);
+                    if ft == Ty::I64 || ft.is_float() {
+                        n
+                    } else {
+                        let op = if self.tt().is_unsigned(ety) {
+                            CvtOp::Zext
+                        } else {
+                            CvtOp::Sext
+                        };
+                        self.conv(op, ft, Ty::I64, n)
+                    }
+                } else {
+                    n
+                };
                 self.def(Ty::I64, |dst| Inst::Alloca {
                     dst,
                     size: n,
@@ -1028,10 +1073,20 @@ impl<'a> B<'a> {
     fn cast(&mut self, e: NodeId, to: TypeId) -> Operand {
         let from = self.ty(e);
         let a = self.expr(e);
-        let (ft, tt_) = (hty(self.tt(), from), hty(self.tt(), to));
-        if !scalar(self.tt(), from) || !scalar(self.tt(), to) {
-            return a; // aggregate ↔ pointer: an address is an address
+        // An ARRAY or FUNCTION operand has already decayed to its address, and a
+        // struct target receives one — so a non-scalar side is an I64 address,
+        // not a reason to skip the conversion. `(int)a` on an array must still
+        // TRUNCATE; returning the 64-bit address unchanged put an I64 value in an
+        // I32 operand, which `hir::verify` rejects (torture `loop-2d`).
+        if !scalar(self.tt(), to) {
+            return a; // the result is an address, whatever the source was
         }
+        let ft = if scalar(self.tt(), from) {
+            hty(self.tt(), from)
+        } else {
+            Ty::I64
+        };
+        let tt_ = hty(self.tt(), to);
         // C99 6.3.1.2: (_Bool)x is x != 0, not a truncation.
         if matches!(self.tt().tys[to as usize], ast::Ty::Bool) {
             let (a, ft) = self.promote(a, ft, src_unsigned_of(self.tt(), from));
@@ -1652,6 +1707,14 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
         is_static: af.is_static,
         is_weak: af.is_weak || af.is_inline,
         has_vla: af.has_vla,
+        // The parser lays out a local at `x29 − off`, and slot 0 starts at
+        // `x29 − frame`, so the object's offset INSIDE the slot is `frame − off`
+        // — the same conversion `Node::Var(off)` goes through above.
+        objs: af
+            .objs
+            .iter()
+            .map(|&(off, size)| ((af.frame - off) as i64, size))
+            .collect(),
     };
     let entry = f.new_block();
     let mut b = B {

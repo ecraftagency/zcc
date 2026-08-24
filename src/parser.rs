@@ -65,6 +65,8 @@ struct P<'a> {
     tt: TyTab,
     locals: Vec<(String, TypeId, Vloc)>, // scope = truncate when a block closes
     cur_off: u32,
+    /// (offset, size) of every stack object of the function being parsed
+    cur_objs: Vec<(u32, u32)>,
     globals: Vec<Global>,
     strs: Vec<Vec<u8>>,
     fns: HashMap<String, TypeId>, // function name → TypeId (Ty::Func)
@@ -1724,6 +1726,8 @@ impl P<'_> {
         let (sz, al) = (self.tt.size(t), self.tt.align(t));
         self.cur_off = (self.cur_off + sz).div_ceil(al) * al;
         self.locals.push((name, t, Vloc::Stack(self.cur_off)));
+        // the object's extent, for `ast::Func::objs`
+        self.cur_objs.push((self.cur_off, sz));
         self.cur_off
     }
     // allocate parameter slots + mirror the codegen spill algorithm (MUST match byte for byte):
@@ -3908,6 +3912,7 @@ impl P<'_> {
                     self.vla_szs.clear(); // same reason: key is a stack offset
                     self.vm_typedef_sz.clear(); // key is a TypeId but the value = a stack offset
                     self.cur_off = 0;
+                    self.cur_objs.clear();
                     self.fret = sig.ret;
                     self.fname = name.clone();
                     // old-style: parse the decl list assigning a type to each parameter name
@@ -3973,6 +3978,7 @@ impl P<'_> {
                         name,
                         params,
                         frame: (self.cur_off + 15) & !15,
+                        objs: std::mem::take(&mut self.cur_objs),
                         body,
                         ret: sig.ret,
                         is_static,
@@ -4130,6 +4136,7 @@ pub fn parse(
         tt: TyTab::new(),
         locals: Vec::new(),
         cur_off: 0,
+        cur_objs: Vec::new(),
         globals: Vec::new(),
         strs: Vec::new(),
         fns: HashMap::new(),

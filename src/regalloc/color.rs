@@ -26,6 +26,24 @@ use crate::cfg::DomTree;
 use crate::mir::*;
 use std::collections::BTreeSet;
 
+/// A colouring failure names the VALUE that ran out of registers, because the
+/// caller can act on that: force it into memory and try again.
+pub enum ColorErr {
+    /// the value that ran out of registers, every VIRTUAL value holding one of
+    /// its class at that moment (the caller may force any of them into memory
+    /// instead), and the message
+    NoColour(VReg, Vec<VReg>, String),
+    Other(String),
+}
+
+impl From<ColorErr> for String {
+    fn from(e: ColorErr) -> String {
+        match e {
+            ColorErr::NoColour(_, _, m) | ColorErr::Other(m) => m,
+        }
+    }
+}
+
 pub struct Coloring {
     /// colour of each virtual register, once assigned
     pub color: Vec<Option<PReg>>,
@@ -41,8 +59,16 @@ fn class_of(f: &MFunc, r: Reg) -> Class {
     }
 }
 
-pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, String> {
+pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorErr> {
     let sp = lv.sp;
+    // Once the function contains a call the file is partitioned (see
+    // `isa::caller_saved_mask`): values live across a call take the callee-saved
+    // half, everything else the caller-saved half. In a call-free function no
+    // value is constrained and the whole file is one pool.
+    let has_calls = f
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, MInst::Call { .. })));
     let mut color: Vec<Option<PReg>> = vec![None; sp.nv];
     let mut used = RegSet::default();
     let mut lu = super::live::LastUse::new(sp);
@@ -50,24 +76,37 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, String>
     for &b in &dt.preorder {
         let bi = b as usize;
         let blk = &f.blocks[bi];
-        // Colours occupied at the current point: every live value's colour.
-        // Values live-in are already coloured — their definitions dominate this
-        // block, which is exactly what the preorder guarantees.
-        let mut occupied: Vec<PReg> = Vec::new();
+        // How many LIVE values hold each register right now. A count, not a set:
+        // a physical register is not SSA — the same one is defined again and
+        // again — so "is it taken" cannot be answered by remembering that
+        // someone once took it, and a set that only ever gains entries runs the
+        // block out of colours it actually has.
+        let mut occ = Occupancy::new();
         let mut live_here: BTreeSet<usize> = lv.live_in[bi].clone();
         for &i in &live_here {
             if let Some(p) = color_of(&color, sp, i) {
-                occupied.push(p);
+                occ.add(p);
             }
         }
 
         super::live::last_use_into(f, sp, lv, bi, &mut lu);
         let last = &lu.at;
 
-        // block parameters are defined at the block's entry
+        // Block parameters are defined at the block's entry. One that this block
+        // never reads and that does not escape is dead immediately — the same
+        // rule the instruction loop applies to a dead definition, and without it
+        // the parameter's register is held for the whole block.
         for &p in &blk.params {
-            assign(f, lv, &mut color, &mut used, &mut occupied, p, None)?;
-            live_here.insert(sp.idx(p));
+            assign(f, lv, &mut color, &mut used, &mut occ, p, None, has_calls)
+                .map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
+            if last[sp.idx(p)].is_none() {
+                continue;
+            }
+            if live_here.insert(sp.idx(p)) {
+                if let Some(c) = color_of(&color, sp, sp.idx(p)) {
+                    occ.add(c);
+                }
+            }
         }
 
         for (i, inst) in blk.insts.iter().enumerate() {
@@ -80,8 +119,13 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, String>
             inst.visit(&mut |r, c| ops.push((r, c)));
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
-                    assign(f, lv, &mut color, &mut used, &mut occupied, *r, hint)?;
-                    live_here.insert(sp.idx(*r));
+                    assign(f, lv, &mut color, &mut used, &mut occ, *r, hint, has_calls)
+                        .map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
+                    if live_here.insert(sp.idx(*r)) {
+                        if let Some(p) = color_of(&color, sp, sp.idx(*r)) {
+                            occ.add(p);
+                        }
+                    }
                 }
             }
             // Free colours only AFTER the definitions of this instruction are
@@ -89,22 +133,178 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, String>
             // on A64 but NOT for a parallel copy, whose assignments are
             // simultaneous; taking the conservative order costs at most one
             // register and removes the case analysis entirely.
-            let dead: Vec<usize> = live_here
+            let mut dead: Vec<usize> = live_here
                 .iter()
                 .copied()
                 .filter(|&x| last[x] == Some(i))
                 .collect();
+            // A definition this block never reads and that does not escape
+            // through `live_out` is dead the moment it is made: `last_use_into`
+            // reports `None` for it, and treating that as "live forever" leaks a
+            // colour for the rest of the block. Rematerialization is what made
+            // this reachable — a remat'd value keeps no store, so its original
+            // definition can end up with no uses at all.
+            for (r, c) in &ops {
+                if matches!(c, Constraint::Def | Constraint::DefFixed(_))
+                    && last[sp.idx(*r)].is_none()
+                {
+                    dead.push(sp.idx(*r));
+                }
+            }
             for x in dead {
-                live_here.remove(&x);
-                if let Some(p) = color_of(&color, sp, x) {
-                    if let Some(k) = occupied.iter().position(|q| *q == p) {
-                        occupied.swap_remove(k);
+                if live_here.remove(&x) {
+                    if let Some(p) = color_of(&color, sp, x) {
+                        occ.sub(p);
                     }
                 }
             }
         }
     }
     Ok(Coloring { color, used })
+}
+
+/// Fill in the values that were holding a register of the failing class, so the
+/// caller can free one of them instead of giving up.
+fn with_holders(
+    e: ColorErr,
+    live_here: &BTreeSet<usize>,
+    color: &[Option<PReg>],
+    sp: Space,
+    f: &MFunc,
+    lv: &Liveness,
+) -> ColorErr {
+    match e {
+        ColorErr::NoColour(v, _, m) => {
+            let class = f.vregs[v as usize].class;
+            // Ordered by how much freeing them would HELP: a value that does not
+            // cross a call yet is sitting in a callee-saved register is the
+            // squatter that starved this one, so it comes first.
+            let mut hold: Vec<VReg> = live_here
+                .iter()
+                .filter(|&&x| x < sp.nv)
+                .map(|&x| x as VReg)
+                .filter(|&x| x != v && color[x as usize].is_some_and(|p| p.class == class))
+                .collect();
+            hold.sort_by_key(|&x| {
+                let squatter = color[x as usize].is_some_and(isa::is_callee_saved)
+                    && !lv.crosses_call[x as usize];
+                (!squatter, x)
+            });
+            ColorErr::NoColour(v, hold, m)
+        }
+        other => other,
+    }
+}
+
+/// Live holders per physical register.
+struct Occupancy([u16; 96]);
+
+impl Occupancy {
+    fn new() -> Occupancy {
+        Occupancy([0; 96])
+    }
+    fn slot(p: PReg) -> usize {
+        let base = match p.class {
+            Class::Gpr => 0,
+            Class::Fpr => 32,
+            Class::Flags => 64,
+        };
+        base + p.num as usize
+    }
+    fn add(&mut self, p: PReg) {
+        self.0[Self::slot(p)] += 1;
+    }
+    fn sub(&mut self, p: PReg) {
+        let s = Self::slot(p);
+        self.0[s] = self.0[s].saturating_sub(1);
+    }
+    fn taken(&self, p: PReg) -> bool {
+        self.0[Self::slot(p)] > 0
+    }
+    fn len(&self) -> usize {
+        self.0.iter().filter(|c| **c > 0).count()
+    }
+    fn callee_saved_taken(&self, class: Class) -> usize {
+        isa::alloc_order(class)
+            .iter()
+            .map(|&n| PReg { class, num: n })
+            .filter(|p| isa::is_callee_saved(*p) && self.taken(*p))
+            .count()
+    }
+}
+
+/// The colouring's own obligation (REARCH §7.6a), checked INDEPENDENTLY of the
+/// walk that produced it: at every program point, two values that are live
+/// together hold different registers, and no value holds a physical register
+/// that is live there. The colourer maintains an `occupied` set incrementally,
+/// and an incremental set is exactly the kind of thing that can be subtly wrong;
+/// this recomputes the live set from `Liveness` and compares.
+pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
+    let sp = lv.sp;
+    let cfg = super::super::mir::verify::cfg(f);
+    let mut lu = live::LastUse::new(sp);
+    for &b in &cfg.rpo {
+        let bi = b as usize;
+        live::last_use_into(f, sp, lv, bi, &mut lu);
+        let last = &lu.at;
+        let mut live: BTreeSet<usize> = lv.live_in[bi].clone();
+        for &p in &f.blocks[bi].params {
+            // a parameter this block never reads and that does not escape is dead
+            // at the head — the colourer frees it there, so the check must too
+            if last[sp.idx(p)].is_some() {
+                live.insert(sp.idx(p));
+            }
+        }
+        let mut probe = |live: &BTreeSet<usize>, at: String, note: &str| -> Result<(), String> {
+            let mut seen: Vec<(PReg, usize)> = Vec::new();
+            for &x in live.iter() {
+                let p = match color_of(&col.color, sp, x) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                if let Some(&(_, y)) = seen.iter().find(|(q, _)| *q == p) {
+                    return Err(format!(
+                        "{}: {:?} and {:?} are both live at {} and both hold {:?}{} ({})",
+                        f.name,
+                        sp.reg(y),
+                        sp.reg(x),
+                        at,
+                        p.class,
+                        p.num,
+                        note
+                    ));
+                }
+                seen.push((p, x));
+            }
+            Ok(())
+        };
+        probe(&live, format!("bb{} head", bi), "block entry")?;
+        for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
+            let mut ops = Vec::new();
+            inst.visit(&mut |r, c| ops.push((r, c)));
+            probe(&live, format!("bb{}[{}]", bi, i), "before the definitions")?;
+            for (r, c) in &ops {
+                if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
+                    live.insert(sp.idx(*r));
+                }
+            }
+            let mut dead: Vec<usize> = live.iter().copied().filter(|&x| last[x] == Some(i)).collect();
+            for (r, c) in &ops {
+                if matches!(c, Constraint::Def | Constraint::DefFixed(_)) && last[sp.idx(*r)].is_none() {
+                    dead.push(sp.idx(*r));
+                }
+            }
+            for x in dead {
+                live.remove(&x);
+            }
+            // Probed AFTER the dying operands leave: a definition may reuse the
+            // register of an operand this very instruction consumes — `blr x0`
+            // reads the target before the call writes the result into it — and
+            // that reuse is the whole point of the coalescing hint.
+            probe(&live, format!("bb{}[{}]", bi, i), &format!("{:?}", inst))?;
+        }
+    }
+    Ok(())
 }
 
 fn color_of(color: &[Option<PReg>], sp: Space, i: usize) -> Option<PReg> {
@@ -133,17 +333,20 @@ fn assign(
     lv: &Liveness,
     color: &mut [Option<PReg>],
     used: &mut RegSet,
-    occupied: &mut Vec<PReg>,
+    occ: &mut Occupancy,
     r: Reg,
     hint: Option<PReg>,
-) -> Result<(), String> {
+    has_calls: bool,
+) -> Result<(), ColorErr> {
     let v = match r {
-        // A physical definition occupies its own register.
+        // A physical definition needs no choice; the CALLER records it in the
+        // live set, and the occupancy count follows from that. Counting holders
+        // rather than remembering a set is what keeps an indirect call correct:
+        // the callee pointer may be coloured x0 and die at the `blr` whose result
+        // also lands in x0, and one register then has two holders for an instant
+        // (torture pr34768-2, found by `color::check`).
         Reg::P(p) => {
             used.add(p);
-            if !occupied.contains(&p) {
-                occupied.push(p);
-            }
             return Ok(());
         }
         Reg::V(v) => v,
@@ -165,39 +368,58 @@ fn assign(
     // call), and saying so here turns a future violation into a loud failure
     // instead of a silently truncated long double.
     if avoid_caller_saved && class == Class::Fpr && f.vregs[v as usize].width == Width::Q {
-        return Err(format!(
-            "{}: v{} is a 128-bit value live across a call — v8–v15 preserve only \
-             their low half (AAPCS64 §6.1.2), so it must be parked in memory",
-            f.name, v
+        return Err(ColorErr::NoColour(
+            v,
+            Vec::new(),
+            format!(
+                "{}: v{} is a 128-bit value live across a call — v8–v15 preserve only \
+                 their low half (AAPCS64 §6.1.2), so it must be parked in memory",
+                f.name, v
+            ),
         ));
     }
     let conflict = lv.phys_conflict[v as usize];
-    let free = |p: PReg, occupied: &Vec<PReg>| -> bool {
-        !occupied.contains(&p)
+    // The partition, as one predicate: a value live across a call may take only a
+    // callee-saved register, and — once the function has a call at all — a value
+    // that is NOT may take only a caller-saved one. Without the second half a
+    // value with no need of the callee-saved registers can occupy them and starve
+    // the values that have nowhere else to go, which greedy in dominance order
+    // cannot undo.
+    let free = |p: PReg, occ: &Occupancy| -> bool {
+        !occ.taken(p)
             && !conflict.has(p)
             && !(avoid_caller_saved && !isa::is_callee_saved(p))
     };
+    let _ = has_calls;
     let pick = hint
-        .filter(|h| h.class == class && free(*h, occupied))
+        .filter(|h| h.class == class && free(*h, occ))
         .or_else(|| {
             isa::alloc_order(class)
                 .iter()
                 .map(|&n| PReg { class, num: n })
-                .find(|p| free(*p, occupied))
+                .find(|p| free(*p, occ))
         });
     match pick {
         Some(p) => {
             color[v as usize] = Some(p);
             used.add(p);
-            occupied.push(p);
             Ok(())
         }
         // Unreachable once `spill` holds pressure ≤ k — and that is the theorem,
         // so reaching here is a Law-2 defect in the spiller, not a condition to
         // paper over with a fallback.
-        None => Err(format!(
-            "{}: no colour for v{} in class {:?} — pressure exceeds k",
-            f.name, v, class
-        )),
+        None => Err(ColorErr::NoColour(v, Vec::new(), format!(
+            "{}: no colour for v{} in class {:?} — {} registers occupied ({} of them \
+             callee-saved), callee-saved-only {}, physical conflicts {:#x}/{:#x}, k {}",
+            f.name,
+            v,
+            class,
+            occ.len(),
+            occ.callee_saved_taken(class),
+            avoid_caller_saved,
+            conflict.gpr,
+            conflict.fpr,
+            isa::k(class)
+        ))),
     }
 }
