@@ -147,13 +147,13 @@
 | 21 | **many-arg marshalling** (5.4) | BOTH | ✅ BANKED — GP parallel-move for the >8-arg hazard path (was spill-all/pop-reverse). See note ㉑ |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⚠️ re-eval DONE → stays OFF, deferred → #25 (geo40 +0.31% sub-threshold + size-negative; j2 win needs hotness gating). See note ㉓ |
-| 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED (asymptotic) | ⬜ B4 — NEW infra, needs explicit go; the 6 `gcc=0ms` cases. FULL EXECUTION BRIEF (target · projection · SUCCESS-KPI · ABANDON-KPI) = note ㉔ |
+| 24 | **loop-value analysis: invariant pure-call hoist** (the 6 `gcc=0ms` cases) | SPEED (asymptotic) | ✅ BANKED — interprocedural purity + loop-invariant pure-call LICM (4-fence commuting square). All 6 gcc-zeroed programs EMPTIED the bucket (j1 103→1ms). See note ㉔✅ |
 | 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #24 (SCEV final-value + loop-DCE, NEW infra).
-#23 ⚠️ re-eval DONE → LICM stays OFF → #25. #22 ⚠️ DEFERRED → #25 (FP residency). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
+only path to size *and* speed ≈ 1.0×. **RESUME = #25 (NUCLEAR — HARD STOP, wait for "go nuclear").
+#24 ✅ BANKED (invariant pure-call hoist: 6 gcc-zeroed programs emptied, j1 103→1ms; INSN geo 1.71→1.58; sqlite +230 negligible; full gate green). #23 ⚠️ re-eval DONE → LICM stays OFF → #25. #22 ⚠️ DEFERRED → #25 (FP residency). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
 
 > **㉕ #25 NUCLEAR — CONSOLIDATED SCOPE (what the 17–24 grind proved belongs HERE, not in a peephole).**
 > The grind's recurring verdict: the remaining size↔speed gap is one root cause — zcc's **home-primary
@@ -397,7 +397,44 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #24 (SCEV final-value + loop
 > - Gate goes red and ONE bounded Law-2 fix doesn't green it ⟹ revert-to-green, quarantine, advance.
 > - Realized yield < 20% of the 6 AND the rest are (b)-truncations uncracked after exactly ONE review-push
 >   round ⟹ bank whatever's positive, advance.
-> **GATE COMMAND CRIB** (box): rebuild → `docker exec zccbox sh -c 'cd /work && CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc'`; gate runners in §0 GATE block; scoreboard `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
+> **GATE COMMAND CRIB** (box): rebuild → `docker exec zccbox sh -c 'cd /work && CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc'`; gate runners in §0 GATE block (torture/csmith/yarpgen need `ZCC_SUITE_CACHE=/suites`); scoreboard `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
+
+> **㉔✅ #24 OUTCOME — BANKED (session 2026-08-24 S6). The asymptotic win LANDED on all 6.**
+> **MECHANISM CONFIRMED AT THE MIDDLE (Law-3, before building):** all 6 gcc-zeroed programs share ONE
+> shape — `main: for(k=0;k<K;k++) s += work(invariant_args)` with `work` a PURE function. gcc -O1 does
+> NOT inline `work`; it keeps `bl work`, hoists the invariant pure call OUT of the k-loop (computed
+> once), and leaves an empty O(K) countdown. The asymptotic O(K·N)→O(N) win is entirely the CALL-HOIST
+> (the reduction→multiply is a constant-factor cherry gcc adds but #24 does not need).
+> **WHAT SHIPPED (3 pieces, all under the CbC gate):**
+> 1. `opt/inline.rs::pure_functions` — interprocedural purity (fixpoint over the call graph): a function
+>    is pure ⟺ it writes only its OWN frame (`Lea(Local)` store dests), calls only pure functions, and has
+>    no exotic side-effect inst. gcc's `pure` (reads of globals/`*p` allowed).
+> 2. `opt/inline.rs::inline` — call reservation: a PURE callee WITH its own loop, called from inside a
+>    caller loop, is left un-inlined (so the hoister can lift the whole O(N) call) — matches gcc keeping
+>    `bl`. (Cost: a few sqlite single-call pure-loopy callees no longer inline+DFE → **sqlite +230 insns,
+>    +0.08%, negligible** — the projection's "sqlite ~unchanged"; SPEED wins the disagreement.)
+> 3. `opt/loops.rs::hoist_invariant_calls` (default-ON toggle `hoist_calls`) — SSA pass, hoists an
+>    invariant pure call to the preheader under FOUR fences that ARE the commuting-square premises:
+>    (1) purity, (2) invariant args (+ transitive hoistable operand slice), (3) memory-clean loop (no
+>    store / no impure-or-non-pure call in the body ⟹ read memory unchanged), (4) executes-≥1×
+>    (`loop_runs_at_least_once`, a const-bound counted-loop recognizer — the ZERO-TRIP fault fence: a
+>    pointer-derefing pure call must not be speculated past a possibly-zero-trip guard) AND the call block
+>    dominates the latch. Proof: inline tests `hoist_invariant_call_commutes` (⟦f⟧=⟦hoist f⟧ + teeth: call
+>    hoisted out of the loop) + `hoist_variable_bound_is_refused` (the ≥1-trip fence pins the refusal).
+> **MEASURED (box zccbox, same-session A/B vs clean HEAD):**
+> - **6 gcc-zeroed bucket EMPTIED**: b4/c1/c2/c3/f3/j1 collapsed 23–103ms → 0–1ms (j1 **103→1ms**);
+>   absolute suite wall-time of the 6 ~269ms → ~0. THIS is the honest #24 instrument (the geomean can't
+>   show it — the 6 aren't in the timeable sample).
+> - **INSN geomean 1.71× → 1.58×** (median 1.68→1.55): byproduct — `work` is no longer inlined-AND-emitted
+>   (the pre-#24 duplicate body is gone; `work` now emitted once as the hoisted call target).
+> - sqlite **283,756 → 283,986 (+230, +0.08%)** — negligible, as projected ("~unchanged").
+> - **FULL GATE GREEN**: cargo 183/0 · opt-parity 1552/0 · torture 1471/0 FAIL · csmith300 254/0 DIVERGE ·
+>   yarpgen300 300/0 DIVERGE. (f1_float_sum DIVERGE is PRE-EXISTING — clean HEAD produces the same
+>   last-digit `…667`; an FP-contraction rounding diff, Law-2 measurement exception, NOT #24.)
+> - **Law-4 residual**: all 6 matched/banked; none left as a (b)-truncation. The per-program INSN ratio
+>   stays 1.3–2.4 for the 6 because it is dominated by `work`'s STATIC body (emitted once by BOTH zcc and
+>   gcc) — #24 is asymptotic-exec, so static insn of the callee is untouched (correctly). NOT a residual.
+> **RESUME = #25 (NUCLEAR). HARD STOP — the grind reached the gated row. Wait for "go nuclear".**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 

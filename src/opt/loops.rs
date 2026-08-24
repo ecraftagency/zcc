@@ -438,6 +438,283 @@ pub fn licm(tt: &TyTab, f: &mut IrFunc, gp_k: u32) -> u32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// #24 — LOOP-INVARIANT PURE-CALL HOISTING (the asymptotic O(K·N)→O(N) lever).
+//
+// THE SHAPE (gcc -O1's `pure`-attribute LICM): an outer loop `for(k=0;k<K;k++) s += work(a,N)`
+// whose body calls a PURE function with LOOP-INVARIANT arguments. Because the call has no side
+// effect and its args do not change, and the memory it reads is not written anywhere in the
+// loop, EVERY iteration returns the SAME value — so the call (an entire O(N) computation) is
+// computed ONCE in the preheader and the loop keeps only the cheap O(1) reduction. gcc leaves
+// `bl work` before the loop and an empty countdown; zcc matches by keeping the callee a call
+// (the inliner reserves it, opt/inline.rs) and hoisting it here.
+//
+// COMMUTING SQUARE ⟦f⟧ = ⟦hoist f⟧ — the hoist is value-identical under FOUR fences, each a
+// premise of "the call returns the same value every iteration AND runs in the original":
+//   (1) PURITY — `g ∈ pure` (opt/inline.rs::pure_functions): g writes only its own frame and
+//       calls only pure functions ⟹ executing it in the preheader has no observable effect
+//       beyond its return value.
+//   (2) INVARIANT ARGS — every arg is a compile-time constant or a value AVAILABLE in the
+//       preheader (single-def outside the loop), optionally after hoisting a pure invariant
+//       operand slice (Lea/Copy/Cast/Bin) that feeds it. So the args in the preheader equal the
+//       args on every iteration.
+//   (3) MEMORY-CLEAN LOOP — the loop body contains NO store and NO impure/other call, so none
+//       of the memory g reads is modified across iterations ⟹ same inputs ⟹ same result.
+//   (4) EXECUTES-AT-LEAST-ONCE + DOMINATES-LATCH — the loop provably runs ≥1 iteration (a
+//       counted loop whose initial test passes, `loop_runs_at_least_once`) and the call's block
+//       dominates the back-edge, so the call ALREADY executes (≥1×) in the original. This is the
+//       speculation fence: hoisting to the preheader (which runs before the header test) does NOT
+//       introduce a call — hence no NEW fault — on a possibly-zero-trip loop.
+// Under (1)-(4) the preheader value equals the first (and every) iteration's value; replacing the
+// per-iteration call with one preheader call preserves ⟦f⟧. Proven by `equiv` in opt::tests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Does the counted loop `header` provably execute its body AT LEAST ONCE? True ⟺ the header's
+/// controlling test, evaluated on the induction variable's INITIAL value, selects the in-loop
+/// edge. Recognizes the canonical `for(iv=INIT; iv <cmp> BOUND; …)` post-SSA shape: the header
+/// ends in `Br(c, ·, ·)`, `c` is a comparison Bin defined in the header between the IV φ and a
+/// constant BOUND, and the IV φ's entry arm (predecessor ∉ body) is a constant INIT. The first
+/// test is then `eval_bin(cmp, INIT, BOUND)`, and the loop runs ≥1× iff that selects the body
+/// edge. Conservative: any deviation (non-constant bound/init, indirect operands) ⟹ false.
+pub(crate) fn loop_runs_at_least_once(
+    tt: &TyTab,
+    f: &IrFunc,
+    header: BlockId,
+    body: &BTreeSet<BlockId>,
+) -> bool {
+    let hb = &f.blocks[header as usize];
+    // The header's controlling branch and which edge STAYS in the loop.
+    let (cond, then_b, else_b) = match hb.term {
+        Term::Br(Val::Tmp(c), t, e) => (c, t, e),
+        _ => return false,
+    };
+    let then_in = body.contains(&then_b);
+    let else_in = body.contains(&else_b);
+    if then_in == else_in {
+        return false; // both or neither in the loop → not a clean single-exit test
+    }
+    // `cond` = a comparison Bin defined IN the header. Find it.
+    let (op, ty, a, b) = {
+        let mut found = None;
+        for inst in &hb.insts {
+            if let Inst::Bin(d, op, ty, a, b) = inst {
+                if *d == cond && matches!(op, Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Ne) {
+                    found = Some((*op, *ty, a.clone(), b.clone()));
+                }
+            }
+        }
+        match found {
+            Some(x) => x,
+            None => return false,
+        }
+    };
+    // Identify the IV operand (a φ in the header) and the constant BOUND operand. The IV's
+    // entry arm (predecessor outside the body) supplies the constant INIT.
+    let phi_init = |v: &Val| -> Option<i64> {
+        let Val::Tmp(t) = v else { return None };
+        for inst in &hb.insts {
+            if let Inst::Phi(d, _, arms) = inst {
+                if *d == *t {
+                    let mut init = None;
+                    for (pred, val) in arms {
+                        if !body.contains(pred) {
+                            match val {
+                                Val::Imm(n) if init.is_none() => init = Some(*n),
+                                _ => return None, // non-constant or multiple entry arms
+                            }
+                        }
+                    }
+                    return init;
+                }
+            }
+        }
+        None
+    };
+    // Try (IV = a, BOUND = b) then (IV = b, BOUND = a); keep operand POSITIONS for eval_bin.
+    let entry_taken = |x: i64, y: i64| -> bool {
+        // eval_bin yields 1/0 for a comparison; the body edge is `then` when the cond is nonzero.
+        match eval_bin(tt, op, ty, x, y) {
+            Ok(r) => (r != 0) == then_in,
+            Err(_) => false,
+        }
+    };
+    if let (Some(init), Val::Imm(bound)) = (phi_init(&a), &b) {
+        return entry_taken(init, *bound);
+    }
+    if let (Val::Imm(bound), Some(init)) = (&a, phi_init(&b)) {
+        return entry_taken(*bound, init);
+    }
+    false
+}
+
+/// Hoist loop-invariant PURE calls out of counted loops (#24). Returns the number hoisted.
+/// `pure` = the interprocedural pure-function name set (opt/inline.rs::pure_functions). The
+/// four fences (purity/invariant-args/memory-clean/executes-once) are checked per candidate;
+/// a loop or call failing any fence is left untouched (conservative). See the block comment.
+pub fn hoist_invariant_calls(tt: &TyTab, f: &mut IrFunc, pure: &HashSet<String>) -> u32 {
+    if pure.is_empty() || !cfg_complete(f) {
+        return 0;
+    }
+    let mut hoisted = 0u32;
+    // Re-derive dominance/loops after each hoist (the preheader insertion mutates the CFG).
+    'restart: loop {
+        let nt = f.temps.len();
+        let mut defcnt = vec![0u32; nt];
+        let mut def_block = vec![u32::MAX; nt];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for i in &b.insts {
+                if let Some(d) = inst_def(i) {
+                    defcnt[d as usize] += 1;
+                    def_block[d as usize] = bi as BlockId;
+                }
+            }
+        }
+        let dom = dominators(f);
+        for (tail, header) in back_edges(f, &dom) {
+            let body = natural_loop(f, tail, header);
+            // FENCE 3 — memory-clean: no store / no impure or non-pure call anywhere in the body.
+            let memory_clean = body.iter().all(|&bid| {
+                f.blocks[bid as usize].insts.iter().all(|i| match i {
+                    Inst::Store(..) | Inst::Memcpy(..) | Inst::Zero(..) => false,
+                    Inst::Call(_, Callee::Sym(g), ..) => pure.contains(g),
+                    Inst::Call(_, Callee::Ptr(_), ..)
+                    | Inst::CallX(..)
+                    | Inst::VaStart(..)
+                    | Inst::VaArg(..)
+                    | Inst::Sync(..)
+                    | Inst::Asm(..)
+                    | Inst::Overflow(..)
+                    | Inst::Alloca(..)
+                    | Inst::GotoPtr(..) => false,
+                    _ => true,
+                })
+            });
+            if !memory_clean {
+                continue;
+            }
+            // FENCE 4a — the loop provably runs ≥1 iteration (zero-trip speculation safety).
+            if !loop_runs_at_least_once(tt, f, header, &body) {
+                continue;
+            }
+            // Availability: a temp is preheader-available ⟺ single-def with its def OUTSIDE body.
+            let mut avail = vec![false; nt];
+            for t in 0..nt {
+                if defcnt[t] == 1 && def_block[t] != u32::MAX && !body.contains(&def_block[t]) {
+                    avail[t] = true;
+                }
+            }
+            // Locate each in-body single-def instruction (for the invariant-slice walk).
+            let def_loc = |t: Tmp| -> Option<(BlockId, usize)> {
+                if defcnt[t as usize] != 1 {
+                    return None;
+                }
+                let bid = def_block[t as usize];
+                if bid == u32::MAX || !body.contains(&bid) {
+                    return None;
+                }
+                f.blocks[bid as usize]
+                    .insts
+                    .iter()
+                    .position(|i| inst_def(i) == Some(t))
+                    .map(|ix| (bid, ix))
+            };
+            // FENCE 2 — the transitive invariant operand slice feeding `vals`. Returns the
+            // in-body instruction locations to hoist (deps-first, post-order), or None if some
+            // operand is neither a constant, preheader-available, nor a hoistable invariant.
+            let invariant_slice = |vals: &[Val],
+                                   avail: &[bool]|
+             -> Option<Vec<(BlockId, usize)>> {
+                let mut order: Vec<(BlockId, usize)> = Vec::new();
+                let mut seen: HashSet<Tmp> = HashSet::new();
+                // Iterative post-order DFS over the SSA def DAG.
+                let mut stack: Vec<(Tmp, bool)> = Vec::new();
+                for v in vals {
+                    if let Val::Tmp(t) = v {
+                        stack.push((*t, false));
+                    }
+                }
+                while let Some((t, expanded)) = stack.pop() {
+                    if avail[t as usize] || seen.contains(&t) {
+                        continue;
+                    }
+                    if expanded {
+                        // operands already scheduled → schedule this def
+                        if let Some(loc) = def_loc(t) {
+                            order.push(loc);
+                        }
+                        seen.insert(t);
+                        continue;
+                    }
+                    let (bid, ix) = def_loc(t)?; // must be an in-body single-def
+                    let inst = &f.blocks[bid as usize].insts[ix];
+                    if !is_hoistable(inst) {
+                        return None; // Load/φ/Call/etc. in the slice ⟹ not invariant here
+                    }
+                    stack.push((t, true));
+                    let mut u = Vec::new();
+                    inst_uses(inst, &mut u);
+                    for &ut in &u {
+                        if !avail[ut as usize] && !seen.contains(&ut) {
+                            stack.push((ut, false));
+                        }
+                    }
+                }
+                Some(order)
+            };
+            // Scan the body (deterministic block order) for the first hoistable pure call.
+            let mut target: Option<(BlockId, usize, Vec<(BlockId, usize)>)> = None;
+            'scan: for &bid in &body {
+                for (ix, inst) in f.blocks[bid as usize].insts.iter().enumerate() {
+                    if let Inst::Call(Some(t), Callee::Sym(g), args, _) = inst {
+                        // FENCE 1 (purity) + single-def dst + FENCE 4b (dominates the latch).
+                        if pure.contains(g)
+                            && defcnt[*t as usize] == 1
+                            && dom[tail as usize].contains(&bid)
+                        {
+                            if let Some(slice) = invariant_slice(args, &avail) {
+                                target = Some((bid, ix, slice));
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+            }
+            let (cbid, cix, slice) = match target {
+                Some(x) => x,
+                None => continue,
+            };
+            let ph = match ensure_preheader(f, header, &body) {
+                Some(p) => p,
+                None => continue,
+            };
+            // Collect the instructions to move: the invariant slice (deps-first) then the call.
+            // Gather clones by location, then delete from their blocks (descending ix per block),
+            // then append to the preheader in dependency order.
+            let mut moves = slice.clone();
+            moves.push((cbid, cix));
+            let ordered: Vec<Inst> =
+                moves.iter().map(|&(b, i)| f.blocks[b as usize].insts[i].clone()).collect();
+            let mut by_block: BTreeMap<BlockId, Vec<usize>> = BTreeMap::new();
+            for &(b, i) in &moves {
+                by_block.entry(b).or_default().push(i);
+            }
+            for (b, mut ixs) in by_block {
+                ixs.sort_unstable_by(|a, c| c.cmp(a)); // descending: later removals keep earlier valid
+                for i in ixs {
+                    f.blocks[b as usize].insts.remove(i);
+                }
+            }
+            for inst in ordered {
+                f.blocks[ph as usize].insts.push(inst);
+            }
+            hoisted += 1;
+            continue 'restart;
+        }
+        break;
+    }
+    hoisted
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // STRENGTH REDUCTION (Phase B.5) — induction-variable based, default-OFF.
 //
 // THE CLASSIC OPTIMIZATION (Cocke–Kennedy; Aho §9.6): inside a loop, a MULTIPLY by a

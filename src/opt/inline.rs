@@ -162,7 +162,38 @@ impl InlineCfg {
 }
 
 
-pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &[bool], cfg: &InlineCfg) -> u32 {
+/// The set of blocks that lie inside SOME natural loop of `f` (union over all back-edges).
+/// A computed-goto function has an incomplete CFG (dominance unsound) ⟹ treat as loop-free
+/// (conservative for the caller here: no site is suppressed, so inlining proceeds as before).
+fn loop_blocks(f: &IrFunc) -> HashSet<BlockId> {
+    if !cfg_complete(f) {
+        return HashSet::new();
+    }
+    let dom = dominators(f);
+    let mut all = HashSet::new();
+    for (tail, header) in back_edges(f, &dom) {
+        all.extend(natural_loop(f, tail, header));
+    }
+    all
+}
+
+/// Does `g` contain a loop (a back-edge)? A pure callee WITH its own loop, spliced into a
+/// caller loop, is exactly the O(K·N) blow-up #24 removes — leaving it a call lets
+/// `hoist_invariant_calls` lift the whole O(N) call out of the outer loop (gcc keeps `bl`
+/// and hoists it, rather than inlining). A pure loop-free callee, or one called OUTSIDE any
+/// loop, is unaffected — it still inlines.
+fn has_loop(f: &IrFunc) -> bool {
+    cfg_complete(f) && !back_edges(f, &dominators(f)).is_empty()
+}
+
+pub fn inline(
+    tt: &TyTab,
+    funcs: &mut [IrFunc],
+    caller_ok: &[bool],
+    callee_ok: &[bool],
+    pure: &HashSet<String>,
+    cfg: &InlineCfg,
+) -> u32 {
     let (leaf_max, self_max, single_max, max_rounds) = (cfg.leaf, cfg.self_, cfg.single, cfg.rounds);
     let mut total = 0u32;
     for _round in 0..max_rounds {
@@ -189,6 +220,12 @@ pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &
                 continue;
             }
             let start_nc = funcs[ci].blocks.len();
+            // #24: blocks of THIS caller that sit inside a loop — a pure loopy callee called
+            // from one of these is left un-inlined so `hoist_invariant_calls` can lift the whole
+            // O(N) call out of the outer loop. Computed once per caller (only when `pure` is
+            // non-empty, so the default/test paths with no purity set do zero extra work).
+            let caller_loops =
+                if pure.is_empty() { HashSet::new() } else { loop_blocks(&funcs[ci]) };
             let mut sites: Vec<(BlockId, usize, usize)> = Vec::new();
             for b in 0..start_nc {
                 for (k, inst) in funcs[ci].blocks[b].insts.iter().enumerate() {
@@ -198,6 +235,11 @@ pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &
                             continue; // volatile callee — never spliced into optimized code
                         }
                         let g = &snapshot[gi];
+                        // #24 hoist reservation: a PURE callee that has its own loop, called from
+                        // inside a loop of this caller, stays a call (see `has_loop`).
+                        if pure.contains(&g.name) && caller_loops.contains(&(b as BlockId)) && has_loop(g) {
+                            continue;
+                        }
                         if !inline_ok(tt, g) {
                             continue;
                         }
@@ -230,6 +272,73 @@ pub fn inline(tt: &TyTab, funcs: &mut [IrFunc], caller_ok: &[bool], callee_ok: &
         }
     }
     total
+}
+
+
+/// Interprocedural PURITY (#24, for hoisting loop-invariant calls). A function is PURE
+/// when it has NO observable side effect: it writes only its OWN frame (Store/Memcpy/Zero
+/// whose destination is a `Lea(Local)` address of this function's frame — private per call,
+/// invisible to any caller), calls only OTHER pure functions, and contains no exotic
+/// state-touching instruction (indirect/full-ABI call, va, atomic, inline-asm, overflow,
+/// alloca, computed-goto). Reads of arbitrary memory (globals, `*param`) ARE allowed — this
+/// is gcc's `pure` (not `const`): two calls with the same args over UNCHANGED memory return
+/// the same value, which is exactly the property loop-invariant hoisting needs (the hoister
+/// separately proves the read memory is unchanged across the loop). A pure call is therefore
+/// value-invariant when its args are, so it may be computed ONCE in the preheader.
+///
+/// Correctness of the classification is Law-1 Side-I: the whitelist below admits an inst
+/// ONLY when its execution leaves no trace observable outside the callee's own activation.
+/// Computed to a fixpoint over the call graph (a callee is pure ⟺ all its callees are), so a
+/// non-recursive chain of pure leaves lifts to pure. Recursion conservatively stays impure
+/// (a self-call sees the function not-yet-in-set) — sound, and none of the #24 targets recurse.
+/// `eligible[i]` masks out functions the optimizer must not reason about here (volatile / VLA /
+/// variadic): a volatile access is not modeled by ⟦·⟧, so such a function is never called pure.
+pub fn pure_functions(funcs: &[IrFunc], eligible: &[bool]) -> HashSet<String> {
+    // A Store/Memcpy/Zero is frame-local ⟺ its destination address temp is defined by
+    // Lea(Local(_)) IN THIS FUNCTION. Any other destination (a pointer param, a global
+    // address, a computed pointer) may be observable ⟹ impure.
+    let local_only_write = |f: &IrFunc| -> bool {
+        let mut local_addr = HashSet::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Lea(d, Place::Local(_)) = i {
+                    local_addr.insert(*d);
+                }
+            }
+        }
+        let is_local = |v: &Val| matches!(v, Val::Tmp(t) if local_addr.contains(t));
+        f.blocks.iter().flat_map(|b| &b.insts).all(|i| match i {
+            Inst::Store(_, addr, _) | Inst::Zero(addr, _) => is_local(addr),
+            Inst::Memcpy(dst, _, _) => is_local(dst),
+            _ => true,
+        })
+    };
+    // The instruction whitelist for "no exotic side effect". A direct Call is checked
+    // separately (its callee must itself be pure); everything state-touching is rejected.
+    let no_exotic = |f: &IrFunc, pure: &HashSet<String>| -> bool {
+        f.blocks.iter().flat_map(|b| &b.insts).all(|i| match i {
+            Inst::Bin(..) | Inst::Un(..) | Inst::Copy(..) | Inst::Load(..) | Inst::Store(..)
+            | Inst::Memcpy(..) | Inst::Zero(..) | Inst::Lea(..) | Inst::Cast(..) | Inst::Phi(..)
+            | Inst::Select(..) | Inst::FunAddr(..) | Inst::LabelAddr(..) | Inst::Param(..) => true,
+            Inst::Call(_, Callee::Sym(g), ..) => pure.contains(g),
+            _ => false, // Call(Ptr) / CallX / Va* / Sync / Asm / Overflow / Alloca / GotoPtr
+        })
+    };
+    let idx_ok = |i: usize| eligible.get(i).copied().unwrap_or(false);
+    let mut pure: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (i, f) in funcs.iter().enumerate() {
+            if idx_ok(i) && !pure.contains(&f.name) && local_only_write(f) && no_exotic(f, &pure) {
+                pure.insert(f.name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    pure
 }
 
 

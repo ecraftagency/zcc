@@ -102,6 +102,7 @@ pub struct Passes {
     pub sroa: bool,     // SROA: split non-escaping aggregate locals into per-field slots (before to_ssa)
     pub hoist_const: bool, // lever 9: hoist loop-invariant expensive immediates (bounds) to preheader (last)
     pub rotate: bool,   // #17: loop rotation (top-test → bottom-test + guard) — kills the back-edge branch
+    pub hoist_calls: bool, // #24: hoist loop-invariant PURE calls out of counted loops (O(K·N)→O(N))
 }
 
 
@@ -128,6 +129,7 @@ impl Default for Passes {
             remat: false, // Tier-5 #26: proven (equiv) but speed-gated on the box A/B (like licm/sr)
             sroa: true,   // SROA: field-split non-escaping aggregates; proven (equiv) — feeds to_ssa
             hoist_const: true, // lever 9: pressure-safe (spill-reload ≤ mov;movk), exec-positive on loop bounds
+            hoist_calls: true, // #24: asymptotic O(K·N)→O(N); proven (equiv) under 4 fences, default-ON
             rotate: false, // #17: pure CFG reshape (equiv-proven) — makes loop bodies gcc-tight
             // (post-index + fused cmp;b.cc), but the entry-guard DUPLICATION costs +297 static
             // insns on the suite with NO measured exec gain (the back-edge branch is free on the
@@ -175,6 +177,7 @@ impl Passes {
             "sroa" => self.sroa = v,
             "hoist_const" | "hoistconst" | "hc" => self.hoist_const = v,
             "rotate" | "loop_rotate" | "rot" => self.rotate = v,
+            "hoist_calls" | "hoistcalls" | "hc_calls" => self.hoist_calls = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -220,7 +223,7 @@ impl Passes {
 // backend makes hoisting pay. All other proven passes default ON.
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
+pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32, pure: &HashSet<String>) {
     if p.sroa {
         sroa(tt, f); // field-split non-escaping aggregates so to_ssa can promote their fields
     }
@@ -259,6 +262,9 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
         }
         if p.pointer_iv {
             n += pointer_iv(tt, f, gp_k); // base+i·d → marching pointer + LFTR (pressure-reducing)
+        }
+        if p.hoist_calls {
+            n += hoist_invariant_calls(tt, f, pure); // #24: lift invariant pure calls out of loops
         }
         if n == 0 {
             break; // fixpoint

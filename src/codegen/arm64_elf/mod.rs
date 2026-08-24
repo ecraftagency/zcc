@@ -271,6 +271,12 @@ pub fn emit_ir(ast: &Ast) -> String {
     // (ZCC_OPT_OFF / ZCC_OPT_ON over the default profile). `coalesce` is consumed later by
     // abi_alloc, so it is stashed on Cg.
     let passes = crate::opt::Passes::from_env();
+    // #24: interprocedural PURITY, computed ONCE on the straight-lowered (pre-inline) bodies —
+    // a stable by-NAME set the inliner (call reservation) and the per-function hoister both read.
+    // Eligible = optimizable AND volatile-free (a volatile access is outside ⟦·⟧, so never pure).
+    let pure_eligible: Vec<bool> =
+        (0..funcs.len()).map(|i| opt_ok.get(i).copied().unwrap_or(false) && vol_free.get(i).copied().unwrap_or(false)).collect();
+    let pure = crate::opt::pure_functions(&funcs, &pure_eligible);
     {
         // Tier-1 #5: whole-program inlining runs FIRST (it is interprocedural — it reads
         // the whole `funcs` set), on straight-lowered IR; the per-function SSA passes then
@@ -286,7 +292,7 @@ pub fn emit_ir(ast: &Ast) -> String {
                 .enumerate()
                 .map(|(i, f)| opt_ok[i] && !f.variadic && !f.has_vla)
                 .collect();
-            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &vol_free, &crate::opt::InlineCfg::from_env());
+            crate::opt::inline(&ast.tt, &mut funcs, &caller_ok, &vol_free, &pure, &crate::opt::InlineCfg::from_env());
         }
         for (i, f) in funcs.iter_mut().enumerate() {
             if opt_ok.get(i).copied().unwrap_or(false) {
@@ -296,7 +302,7 @@ pub fn emit_ir(ast: &Ast) -> String {
                 // conservative LOWER bound: k=10 ≤ whatever the allocator ends up with, so the
                 // guard can only under-hoist, never over-pressure. Correctness is k-independent
                 // (loops.rs::hoist_loop_consts); size impact ≈ 0 (hoists are size-neutral).
-                crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k);
+                crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k, &pure);
                 debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
             }
         }

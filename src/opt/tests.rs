@@ -1393,7 +1393,7 @@ fn volatile_accesses_preserved() {
     assert!(before >= 4, "test must exercise ≥4 volatile accesses (got {before})");
     let mut ssa = ir.clone();
     for f in ssa.iter_mut() {
-        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K, &HashSet::new());
     }
     for f in &ssa {
         verify(f).unwrap();
@@ -1417,7 +1417,7 @@ fn sccp_truncates_signed_bitfield() {
     );
     let mut ssa = ir.clone();
     for f in ssa.iter_mut() {
-        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K, &HashSet::new());
     }
     for f in &ssa {
         verify(f).unwrap();
@@ -2135,7 +2135,7 @@ fn licm_multidef_condition_stays_finite() {
     // Full pipeline (the real backend path).
     let mut opt = ir.clone();
     for f in opt.iter_mut() {
-        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K, &HashSet::new());
     }
     for f in &opt {
         verify(f).unwrap_or_else(|e| panic!("verify: {e}"));
@@ -2490,7 +2490,7 @@ fn strength_reduce_in_pipeline_terminates_correct() {
         compile("srp", "int f(int n){int s=0;int i;for(i=0;i<n;i=i+1){s=s+i*3;}return s;}");
     let mut opt = ir.clone();
     for f in opt.iter_mut() {
-        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+        optimize_ssa(&ast.tt, f, &Passes::all(), GP_K, &HashSet::new());
     }
     for f in &opt {
         verify(f).unwrap_or_else(|e| panic!("verify: {e}"));
@@ -2550,7 +2550,7 @@ fn optimize_ssa_preserves() {
         let (ast, ir) = compile("pipe", src);
         let mut opt = ir.clone();
         for f in opt.iter_mut() {
-            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K, &HashSet::new());
         }
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify optimize_ssa {src}: {e}"));
@@ -2582,7 +2582,7 @@ fn optimize_ssa_preserves_corpus_and_reduces() {
         let before = count_insts(&ir);
         let mut opt = ir.clone();
         for f in opt.iter_mut() {
-            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K);
+            optimize_ssa(&ast.tt, f, &Passes::all(), GP_K, &HashSet::new());
         }
         for f in &opt {
             verify(f).unwrap_or_else(|e| panic!("verify {nm}: {e}"));
@@ -2620,7 +2620,7 @@ fn inline_leaf_commutes() {
     assert_eq!(count_sym_calls(&ir, "add"), 2, "baseline: two calls to add");
     let mut inl = ir.clone();
     let ok = vec![true; inl.len()];
-    inline(&ast.tt, &mut inl, &ok, &ok, &InlineCfg::exercise_all());
+    inline(&ast.tt, &mut inl, &ok, &ok, &HashSet::new(), &InlineCfg::exercise_all());
     for g in &inl {
         verify(g).unwrap_or_else(|e| panic!("verify after inline: {e}"));
     }
@@ -2640,7 +2640,7 @@ fn inline_void_commutes() {
     );
     let mut inl = ir.clone();
     let ok = vec![true; inl.len()];
-    inline(&ast.tt, &mut inl, &ok, &ok, &InlineCfg::exercise_all());
+    inline(&ast.tt, &mut inl, &ok, &ok, &HashSet::new(), &InlineCfg::exercise_all());
     for g in &inl {
         verify(g).unwrap_or_else(|e| panic!("verify: {e}"));
     }
@@ -2670,7 +2670,7 @@ fn inline_self_recursion_depth1() {
     assert_eq!(count_sym_calls(&ir, "fib"), 3, "2 inside fib + 1 in f");
     let mut inl = ir.clone();
     let ok = vec![true; inl.len()];
-    inline(&ast.tt, &mut inl, &ok, &ok, &InlineCfg::exercise_all());
+    inline(&ast.tt, &mut inl, &ok, &ok, &HashSet::new(), &InlineCfg::exercise_all());
     for g in &inl {
         verify(g).unwrap_or_else(|e| panic!("verify after self-inline: {e}"));
     }
@@ -2682,4 +2682,69 @@ fn inline_self_recursion_depth1() {
         let (a, b) = (interp(&ast.tt, &ir, "fib", &[n]).unwrap(), interp(&ast.tt, &inl, "fib", &[n]).unwrap());
         assert_eq!(a, b, "fib({n}): {a} vs {b}");
     }
+}
+
+// ── #24 (hoist_invariant_calls): an invariant PURE call in a counted loop's reduction is
+// lifted to the preheader (computed once), and the commuting square ⟦f⟧=⟦hoist f⟧ holds. The
+// callee `sq` reads only its scalar arg (interp-modelable — no globals), the loop bound is the
+// constant 10 (≥1-trip fence fires), and the arg `n` is loop-invariant. Result = 10·n².
+#[test]
+fn hoist_invariant_call_commutes() {
+    let (ast, ir) = compile(
+        "h24",
+        "static int sq(int x){ return x*x; }\
+         int f(int n){ int s=0; int i; for(i=0;i<10;i++){ s += sq(n); } return s; }",
+    );
+    let pure = pure_functions(&ir, &vec![true; ir.len()]);
+    assert!(pure.contains("sq"), "sq (only local writes, no callee) must be classified pure");
+    let mut opt = ir.clone();
+    let fi = opt.iter().position(|g| g.name == "f").unwrap();
+    // Production pipeline (hoist_calls default-ON), with the purity set threaded in.
+    optimize_ssa(&ast.tt, &mut opt[fi], &Passes::default(), GP_K, &pure);
+    verify(&opt[fi]).unwrap_or_else(|e| panic!("verify after hoist: {e}"));
+    // TEETH — the sq call survives exactly once and no longer sits inside any loop of f.
+    assert_eq!(count_sym_calls(&opt, "sq"), 1, "the pure call is preserved (once), not deleted");
+    let g = &opt[fi];
+    let dom = dominators(g);
+    let looped: std::collections::HashSet<BlockId> =
+        back_edges(g, &dom).into_iter().flat_map(|(t, h)| natural_loop(g, t, h)).collect();
+    let call_in_loop = g.blocks.iter().enumerate().any(|(bi, b)| {
+        looped.contains(&(bi as BlockId))
+            && b.insts.iter().any(|i| matches!(i, Inst::Call(_, Callee::Sym(s), ..) if s == "sq"))
+    });
+    assert!(!call_in_loop, "#24: the invariant sq() call must be hoisted OUT of the loop");
+    // PROOF — ⟦f⟧ is unchanged (equiv battery + spot values 10·n²).
+    equiv(&ast.tt, &ir, &opt, "f").expect("⟦f⟧ = ⟦hoist_invariant_calls f⟧");
+    for n in [-4i64, -1, 0, 1, 3, 6, 9] {
+        assert_eq!(interp(&ast.tt, &opt, "f", &[n]).unwrap(), 10 * n * n, "f({n}) = 10·n²");
+    }
+}
+
+// ── #24 fence: a NON-constant loop bound (variable trip count) must NOT hoist — the ≥1-trip
+// speculation fence (`loop_runs_at_least_once`) can't prove the body runs, so a possibly-zero-trip
+// loop keeps its call in place (hoisting a pointer-derefing pure call past a zero-trip guard would
+// fault). Here the callee is fault-free so ⟦·⟧ would survive either way; the test pins the FENCE
+// (call stays in the loop), guarding the sound-but-conservative behavior against regression.
+#[test]
+fn hoist_variable_bound_is_refused() {
+    let (ast, ir) = compile(
+        "h24v",
+        "static int sq(int x){ return x*x; }\
+         int f(int n,int m){ int s=0; int i; for(i=0;i<m;i++){ s += sq(n); } return s; }",
+    );
+    let pure = pure_functions(&ir, &vec![true; ir.len()]);
+    let mut opt = ir.clone();
+    let fi = opt.iter().position(|g| g.name == "f").unwrap();
+    optimize_ssa(&ast.tt, &mut opt[fi], &Passes::default(), GP_K, &pure);
+    verify(&opt[fi]).unwrap();
+    let g = &opt[fi];
+    let dom = dominators(g);
+    let looped: std::collections::HashSet<BlockId> =
+        back_edges(g, &dom).into_iter().flat_map(|(t, h)| natural_loop(g, t, h)).collect();
+    let call_in_loop = g.blocks.iter().enumerate().any(|(bi, b)| {
+        looped.contains(&(bi as BlockId))
+            && b.insts.iter().any(|i| matches!(i, Inst::Call(_, Callee::Sym(s), ..) if s == "sq"))
+    });
+    assert!(call_in_loop, "variable-bound loop: the ≥1-trip fence must REFUSE the hoist");
+    equiv(&ast.tt, &ir, &opt, "f").expect("⟦f⟧ unchanged (refused hoist)");
 }
