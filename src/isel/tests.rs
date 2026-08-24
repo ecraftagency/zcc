@@ -189,3 +189,152 @@ fn block_arguments_survive_selection() {
         "double m(double a,double b){return a<b?a:b;} int main(void){return (int)m(2.0,5.0);}",
     ]);
 }
+
+
+// ── R1 selection rules (REARCH §15) ────────────────────────────────────────
+// These were vacuous until `hir::interp` learned the intrinsics: a variadic or
+// long-double function trapped on the HIR side, so `equiv` compared nothing.
+
+#[test]
+fn r1_lowering_rules() {
+    equiv_all(&[
+        // bit-fields: the shift pair and the read-modify-write
+        "struct B{int a:3;unsigned b:5;int c:10;};\n\
+         int main(void){struct B s;s.a=-2;s.b=19;s.c=-300;return s.a*10000+s.b*100+s.c;}",
+        "struct B{int a:3;};int main(void){struct B s;s.a=3;s.a++;return s.a;}",
+        // composites: registers, x8, HFA, and the stack
+        "struct P{int x,y;};struct P mk(int a){struct P p;p.x=a;p.y=a*2;return p;}\n\
+         int main(void){struct P q=mk(5);return q.x*100+q.y;}",
+        "struct B{long a,b,c,d;};struct B mk(long x){struct B r;r.a=x;r.b=x+1;r.c=x+2;r.d=x+3;return r;}\n\
+         long sum(struct B s){return s.a+s.b+s.c+s.d;}int main(void){return (int)sum(mk(10));}",
+        "struct H{float a,b,c,d;};int s(struct H h){return (int)(h.a+h.b+h.c+h.d);}\n\
+         int main(void){struct H h;h.a=1;h.b=2;h.c=3;h.d=4;return s(h);}",
+        "int f(int a,int b,int c,int d,int e,int g,int h,int i,int j){return j*10+i;}\n\
+         int main(void){return f(1,2,3,4,5,6,7,8,9);}",
+        // varargs, in both files and over the register boundary
+        "int s(int n,...){__builtin_va_list a;int i,t=0;__builtin_va_start(a,n);\
+         for(i=0;i<n;i++)t+=__builtin_va_arg(a,int);return t;}\n\
+         int main(void){return s(12,1,2,3,4,5,6,7,8,9,10,11,12);}",
+        "double f(int n,...){__builtin_va_list a;double s=0;int i;__builtin_va_start(a,n);\
+         for(i=0;i<n;i++)s+=__builtin_va_arg(a,double);return s;}\n\
+         int main(void){return (int)f(10,1.,2.,3.,4.,5.,6.,7.,8.,9.,10.);}",
+        // long double: the binary128 bridge at every boundary
+        "long double id(long double x){return x;}int main(void){return (int)(id(3.5L)*2);}",
+        "int main(void){long double x=2.5L;x+=1.0L;return (int)(x*2);}",
+        "long double many(long double a,long double b,long double c,long double d,\
+         long double e,long double f,long double g,long double h,long double i,long double j)\
+         {return a+b+c+d+e+f+g+h+i+j;}\n\
+         int main(void){return (int)many(1.L,2,3,4,5,6,7,8,9,10);}",
+        // atomics and the overflow builtins
+        "int main(void){int i=10;int o=__sync_fetch_and_add(&i,5);return o*100+i;}",
+        "int main(void){int i=17;return __sync_bool_compare_and_swap(&i,17,99)*100+i;}",
+        "int main(void){int r;return __builtin_mul_overflow(100000,100000,&r)*10+r;}",
+        // switch ranges and the promoted controlling expression
+        "int f(int x){switch(x){case 10 ... 20: return 1;case 30: return 2;}return 0;}\n\
+         int main(void){return f(15)*100+f(30)*10+f(25);}",
+        "int g(signed char c){switch(c){case -62: return 19;}return 0;}int main(void){return g(-62);}",
+        // VLA and a dynamic frame
+        "int sum(int n){int a[n];int i,s=0;for(i=0;i<n;i++)a[i]=i*i;\
+         for(i=0;i<n;i++)s+=a[i];return s;}int main(void){return sum(10);}",
+    ]);
+}
+
+/// AAPCS64 §6.4 C.1–C.15, checked against the SPEC's own answers rather than
+/// against whatever `classify` currently returns.
+#[test]
+fn abi_classification_matches_the_spec() {
+    use super::abi::{Loc, classify};
+    use crate::hir::{PTy, Sig, Ty};
+    use crate::mir::{PReg, Width};
+    let sig = |params: Vec<PTy>, ret: Option<PTy>| Sig {
+        nfix: params.len() as u32,
+        params,
+        ret,
+        variadic: false,
+    };
+    let agg = |size, align, hfa| PTy::Agg { size, align, hfa };
+
+    // C.9: integers take x0.. in order; C.1: floats take v0.. independently
+    let a = classify(&sig(
+        vec![PTy::S(Ty::I32), PTy::S(Ty::F64), PTy::S(Ty::I64), PTy::S(Ty::F32)],
+        None,
+    ));
+    assert_eq!(a.args[0], Loc::Reg(PReg::gpr(0), Width::W32));
+    assert_eq!(a.args[1], Loc::Reg(PReg::fpr(0), Width::D));
+    assert_eq!(a.args[2], Loc::Reg(PReg::gpr(1), Width::W64));
+    assert_eq!(a.args[3], Loc::Reg(PReg::fpr(1), Width::S));
+
+    // C.14 + C.16: past x7 the NSAA is rounded to 8 AND the argument occupies a
+    // full 8 bytes however narrow it is (measured against gcc: char, short, int
+    // land at [sp,0], [sp,8], [sp,16])
+    let mut p = vec![PTy::S(Ty::I64); 8];
+    p.extend([PTy::S(Ty::I8), PTy::S(Ty::I16), PTy::S(Ty::I32)]);
+    let a = classify(&sig(p, None));
+    assert_eq!(a.args[8], Loc::Stack(0, Width::W32));
+    assert_eq!(a.args[9], Loc::Stack(8, Width::W32));
+    assert_eq!(a.args[10], Loc::Stack(16, Width::W32));
+
+    // §6.8.2: a composite of 16 bytes or fewer takes ⌈size/8⌉ x-registers…
+    let a = classify(&sig(vec![agg(16, 8, None), PTy::S(Ty::I32)], None));
+    assert_eq!(a.args[0], Loc::Regs { first: PReg::gpr(0), n: 2, esz: 8, size: 16 });
+    assert_eq!(a.args[1], Loc::Reg(PReg::gpr(2), Width::W32));
+    // …and one larger is replaced by a POINTER, i.e. one ordinary x-register
+    assert_eq!(
+        classify(&sig(vec![agg(32, 8, None)], None)).args[0],
+        Loc::Reg(PReg::gpr(0), Width::W64)
+    );
+    // §5.9.5: an HFA takes consecutive v-registers, one per element
+    assert_eq!(
+        classify(&sig(vec![agg(16, 4, Some((false, 4)))], None)).args[0],
+        Loc::Regs { first: PReg::fpr(0), n: 4, esz: 4, size: 16 }
+    );
+    // C.3: an HFA that does not fit LOCKS the remaining v-registers, so a later
+    // float goes to the stack rather than into the gap
+    let a = classify(&sig(
+        vec![PTy::S(Ty::F64); 6]
+            .into_iter()
+            .chain([agg(32, 8, Some((true, 4))), PTy::S(Ty::F64)])
+            .collect(),
+        None,
+    ));
+    assert_eq!(a.args[6], Loc::StackAgg { off: 0, size: 32 });
+    assert_eq!(a.args[7], Loc::Stack(32, Width::D));
+    // C.11: a composite that does not fit locks NGRN the same way
+    let a = classify(&sig(
+        vec![PTy::S(Ty::I64); 7]
+            .into_iter()
+            .chain([agg(16, 8, None), PTy::S(Ty::I64)])
+            .collect(),
+        None,
+    ));
+    assert_eq!(a.args[7], Loc::StackAgg { off: 0, size: 16 });
+    assert_eq!(a.args[8], Loc::Stack(16, Width::W64));
+    // over-alignment is IGNORED (gcc places an aligned(32) composite at [sp,0])
+    let a = classify(&sig(
+        vec![PTy::S(Ty::I64); 8]
+            .into_iter()
+            .chain([agg(32, 32, None)])
+            .collect(),
+        None,
+    ));
+    assert_eq!(a.args[8], Loc::Stack(0, Width::W64));
+
+    // §5.1.2: binary128 is a whole v-register, or 16 stack bytes aligned to 16
+    assert_eq!(
+        classify(&sig(vec![PTy::LDouble], None)).args[0],
+        Loc::Reg(PReg::fpr(0), Width::Q)
+    );
+
+    // §6.9: HFA in v0.., ≤16 bytes in x0..x1, anything larger through x8
+    assert!(!classify(&sig(vec![], Some(agg(32, 8, Some((true, 4)))))).sret);
+    assert_eq!(
+        classify(&sig(vec![], Some(agg(16, 8, None)))).ret,
+        Some(Loc::Regs { first: PReg::gpr(0), n: 2, esz: 8, size: 16 })
+    );
+    let a = classify(&sig(vec![], Some(agg(24, 8, None))));
+    assert!(a.sret && a.ret.is_none());
+
+    // the counters `va_start` publishes, after the NAMED parameters only
+    let a = classify(&sig(vec![PTy::S(Ty::I32), PTy::S(Ty::F64), PTy::S(Ty::I32)], None));
+    assert_eq!((a.ngrn, a.nsrn, a.nsaa), (2, 1, 0));
+}

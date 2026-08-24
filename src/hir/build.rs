@@ -1670,7 +1670,7 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
     // at which point these stores disappear rather than being special-cased.
     for (k, &(off, t)) in af.params.iter().enumerate() {
         let o = (af.frame - off) as i64;
-        if !scalar(&ast.tt, t) || matches!(ast.tt.tys[t as usize], ast::Ty::LDouble) {
+        if !scalar(&ast.tt, t) {
             // AAPCS64 §6.8.2: a composite parameter is delivered either in
             // registers, on the stack, or (over 16 bytes) as a pointer to the
             // caller's copy. All three become one thing at this level — the
@@ -1688,6 +1688,16 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
         let ht = hty(&ast.tt, t);
         let v = b.f.new_value(ht, Def::FuncParam(k as u32));
         let a = b.def(Ty::I64, |dst| Inst::SlotAddr { dst, slot: 0, off: o });
+        // A long double parameter is an F64 VALUE like any other scalar — the
+        // 16-byte binary128 object exists only in memory, so writing it to the
+        // frame slot goes through the same bridge every other store does. HIR
+        // must not mean two different things by `PTy::LDouble` on the two sides
+        // of a call: it did, and ⟦hir⟧ could not run a long-double function at
+        // all as a result (REARCH §15).
+        if matches!(ast.tt.tys[t as usize], ast::Ty::LDouble) {
+            b.ld_store(a, Operand::Val(v));
+            continue;
+        }
         let vol = ast.tt.is_volatile(t);
         b.store(ht, a, Operand::Val(v), vol);
     }

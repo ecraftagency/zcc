@@ -143,3 +143,61 @@ fn parallel_copy_cycles_are_broken_with_the_scratch_register() {
         "int main(void){int a=1,b=2,c=3,i;for(i=0;i<7;i++){int t=a;a=b;b=c;c=t;}return a*100+b*10+c;}",
     ]);
 }
+
+/// The spiller's TWO ceilings (REARCH §7.2/§7.3), both of which the colourer
+/// depends on and neither of which is visible in a small function:
+///
+///   1. total pressure ≤ k at every point, where a call's clobber set counts as
+///      fixed definitions live across it;
+///   2. the number of live CALL-CROSSING values ≤ the callee-saved count of the
+///      class — checked at every point, not only at the calls. Two values may
+///      cross DIFFERENT calls and still be live together in between, and the
+///      colourer would then need more callee-saved colours than exist.
+///
+/// The second ceiling was missing, and a long-double prologue (one conversion
+/// call per parameter, every converted value live to the end) is exactly the
+/// shape that exposes it.
+#[test]
+fn spilling_respects_both_ceilings() {
+    // 12 integer values, each defined by a call and all live to the end: more
+    // call-crossing values than x19–x28 can hold
+    let mut src = String::from("int f(int x){return x*2+1;}\nint main(void){\n");
+    for i in 0..12 {
+        src.push_str(&format!("int v{i}=f({i});\n"));
+    }
+    src.push_str("return ");
+    for i in 0..12 {
+        src.push_str(&format!("v{i}{}", if i == 11 { ";}\n" } else { "+" }));
+    }
+    same(&src);
+
+    // the same shape in the FP file, where only v8–v15 survive a call
+    let mut src = String::from("double f(double x){return x*2.0+1.0;}\nint main(void){\n");
+    for i in 0..12 {
+        src.push_str(&format!("double v{i}=f({i}.0);\n"));
+    }
+    src.push_str("return (int)(");
+    for i in 0..12 {
+        src.push_str(&format!("v{i}{}", if i == 11 { ");}\n" } else { "+" }));
+    }
+    same(&src);
+
+    // long double: one conversion call per parameter, ten values live at once
+    same(
+        "long double many(long double a,long double b,long double c,long double d,\
+         long double e,long double f,long double g,long double h,long double i,long double j)\
+         {return a+b+c+d+e+f+g+h+i+j;}\n\
+         int main(void){return (int)many(1.L,2,3,4,5,6,7,8,9,10);}",
+    );
+
+    // mixed files at once, so neither ceiling can be satisfied by luck
+    same(
+        "int fi(int x){return x+1;}double fd(double x){return x+1.0;}\n\
+         int main(void){int a=fi(1),b=fi(2),c=fi(3),d=fi(4),e=fi(5),g=fi(6),h=fi(7),\
+         i=fi(8),j=fi(9),k=fi(10),l=fi(11),m=fi(12);\n\
+         double p=fd(1),q=fd(2),r=fd(3),s=fd(4),t=fd(5),u=fd(6),v=fd(7),w=fd(8),\
+         x=fd(9),y=fd(10);\n\
+         return a+b+c+d+e+g+h+i+j+k+l+m+(int)(p+q+r+s+t+u+v+w+x+y);}",
+    );
+}
+

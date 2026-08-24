@@ -61,6 +61,17 @@ pub fn alloc_mask(c: Class) -> u32 {
     alloc_order(c).iter().fold(0u32, |m, &n| m | 1 << n)
 }
 
+/// The allocatable CALLEE-SAVED registers of a class, as a bit mask. A value
+/// that crosses a call can only be coloured from this set (AAPCS64 §6.1.1), so
+/// its population count is the hard ceiling on how many call-crossing values
+/// may be live at one point — the spiller's second obligation.
+pub fn callee_saved_mask(c: Class) -> u32 {
+    alloc_order(c)
+        .iter()
+        .filter(|&&n| is_callee_saved(PReg { class: c, num: n }))
+        .fold(0u32, |m, &n| m | 1 << n)
+}
+
 /// `k` for the coloring theorem: the number of assignable colors in a class.
 pub fn k(c: Class) -> usize {
     alloc_order(c).len()

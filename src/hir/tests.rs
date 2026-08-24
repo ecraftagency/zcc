@@ -180,3 +180,256 @@ fn verifier_accepts_every_shape() {
     );
     assert_eq!(m.funcs.len(), 3);
 }
+
+// ── R1 lowering batteries (REARCH §15) ─────────────────────────────────────
+// R1 shipped its features validated by differential testing alone. These are
+// the squares that were owed: each states the value C99 assigns and checks
+// ⟦hir⟧ produces it, so csmith/yarpgen go back to CONFIRMING (Law 3).
+
+/// C99 6.7.2.1: a bit-field of width `w` holds exactly the low `w` bits of the
+/// value stored, read back under the container's signedness — and a write must
+/// leave the neighbouring fields of the same unit untouched.
+#[test]
+fn bitfields_are_exact_over_their_domain() {
+    for w in 1..=12i64 {
+        for pre in 1..=3i64 {
+            for v in [-100i64, -3, -1, 0, 1, 5, 100, 511] {
+                let m = 1i64 << w;
+                let low = ((v % m) + m) % m;
+                let signed = if low >= m / 2 { low - m } else { low };
+                // signed field: value truncates to w bits, sign-extended back
+                check(
+                    &format!(
+                        "struct B{{int p:{pre};int a:{w};}};\n\
+                         int main(void){{struct B s;s.p=1;s.a={v};return s.a;}}"
+                    ),
+                    signed,
+                );
+                // unsigned field: the same bits, read without a sign
+                check(
+                    &format!(
+                        "struct B{{unsigned p:{pre};unsigned a:{w};}};\n\
+                         int main(void){{struct B s;s.p=1;s.a={v};return (int)s.a;}}"
+                    ),
+                    low,
+                );
+                // the neighbour survives the read-modify-write
+                check(
+                    &format!(
+                        "struct B{{int p:{pre};int a:{w};}};\n\
+                         int main(void){{struct B s;s.p=1;s.a={v};return s.p;}}"
+                    ),
+                    if pre == 1 { -1 } else { 1 },
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bitfield_increment_wraps_inside_the_field() {
+    // C99 6.5.2.4 + 6.7.2.1: `a` is 3 bits signed, so 3+1 is 4 → −4.
+    check("struct B{int a:3;};int main(void){struct B s;s.a=3;s.a++;return s.a;}", -4);
+    check("struct B{int a:3;};int main(void){struct B s;s.a=3;return s.a++;}", 3);
+    // compound assignment truncates the same way: 19 + 20 = 39, 39 & 31 = 7
+    check(
+        "struct B{unsigned b:5;};int main(void){struct B s;s.b=19;s.b+=20;return (int)s.b;}",
+        7,
+    );
+    // the value of the assignment expression is the value STORED (6.5.16p3)
+    check("struct B{int a:3;};int main(void){struct B s;return (s.a=5);}", -3);
+    // a container narrower than int, and one wider
+    check(
+        "struct B{unsigned char x:3;unsigned char y:5;};\n\
+         int main(void){struct B s;s.x=5;s.y=30;return s.x*100+s.y;}",
+        530,
+    );
+    check(
+        "struct B{long q:40;};int main(void){struct B s;s.q=-123456789012L;return (int)(s.q%1000);}",
+        -12,
+    );
+}
+
+/// THEORY II-2: long double is binary128 in memory, computed at double. The
+/// round trip through the soft-float pair must be the identity on any value a
+/// double can hold.
+#[test]
+fn long_double_round_trips_through_binary128() {
+    check("int main(void){long double x=2.5L;x+=1.0L;return (int)(x*2);}", 7);
+    check("int main(void){return (int)sizeof(long double);}", 16);
+    check("int main(void){long double a=10;int k=3;return (int)((a/k)*3+0.5);}", 10);
+    check("int main(void){long double m=-0.5L;return (m<0.0L)*10+(m==m);}", 11);
+    check("long double id(long double x){return x;}int main(void){return (int)(id(3.5L)*2);}", 7);
+    // a struct member, so the 16-byte object is loaded and stored through memory
+    check(
+        "struct S{long double x;char c;};\n\
+         int main(void){struct S s;s.x=1.25L;s.c=7;return (int)(s.x*4)+s.c;}",
+        12,
+    );
+    check("struct S{long double x;char c;};int main(void){return (int)sizeof(struct S);}", 32);
+}
+
+/// EXT(gcc) `__sync_*` (ARM DDI 0487 B2.9). One thread, so the exclusive pair
+/// is an ordinary read-modify-write — which is exactly what the C-level
+/// contract of these builtins says the result must be.
+#[test]
+fn sync_builtins() {
+    check("int main(void){int i=10;int o=__sync_fetch_and_add(&i,5);return o*100+i;}", 1015);
+    check("int main(void){int i=10;int n=__sync_add_and_fetch(&i,5);return n*100+i;}", 1515);
+    check("int main(void){int i=20;int o=__sync_fetch_and_sub(&i,3);return o*100+i;}", 2017);
+    check("int main(void){int i=20;int n=__sync_sub_and_fetch(&i,3);return n*100+i;}", 1717);
+    check("int main(void){unsigned u=100;unsigned o=__sync_fetch_and_or(&u,15);return o*1000+u;}", 100111);
+    check("int main(void){unsigned u=111;unsigned o=__sync_fetch_and_xor(&u,255);return (int)u;}", 144);
+    check("int main(void){unsigned u=144;__sync_fetch_and_and(&u,60);return (int)u;}", 16);
+    // compare-and-swap: the SECOND argument is the expected value
+    check("int main(void){int i=17;int o=__sync_val_compare_and_swap(&i,17,99);return o*1000+i;}", 17099);
+    check("int main(void){int i=99;int b=__sync_bool_compare_and_swap(&i,99,7);return b*100+i;}", 107);
+    check("int main(void){int i=7;int b=__sync_bool_compare_and_swap(&i,99,8);return b*100+i;}", 7);
+    check("int main(void){long l=1000;long o=__sync_lock_test_and_set(&l,555);return (int)(o+l);}", 1555);
+    check("int main(void){long l=555;__sync_lock_release(&l);__sync_synchronize();return (int)l;}", 0);
+}
+
+/// EXT(gcc) `__builtin_*_overflow`: ℤ semantics — compute at infinite
+/// precision, store the truncation, report whether the exact value was
+/// representable in the DESTINATION type.
+#[test]
+fn overflow_builtins_use_infinite_precision() {
+    // in range: no overflow, exact result stored
+    check("int main(void){int r;int f=__builtin_add_overflow(2,3,&r);return f*100+r;}", 5);
+    check("int main(void){int r;int f=__builtin_sub_overflow(2,5,&r);return f*100+r;}", -3);
+    check("int main(void){int r;int f=__builtin_mul_overflow(6,7,&r);return f*100+r;}", 42);
+    // 32-bit signed overflow
+    check("int main(void){int r;return __builtin_add_overflow(2147483647,1,&r);}", 1);
+    check("int main(void){int r;return __builtin_sub_overflow(-2147483647-1,1,&r);}", 1);
+    check("int main(void){int r;return __builtin_mul_overflow(100000,100000,&r);}", 1);
+    // unsigned destination: a negative exact value is not representable
+    check("int main(void){unsigned r;return __builtin_sub_overflow(1,2,&r);}", 1);
+    check("int main(void){unsigned r;return __builtin_add_overflow(1,2,&r);}", 0);
+    // the OPERAND width decides whether the 64-bit step is already exact:
+    // int × int always fits i64, so only the sign can make it unrepresentable
+    check("int main(void){unsigned long long r;return __builtin_mul_overflow(-2,3,&r);}", 1);
+    check("int main(void){unsigned long long r;return __builtin_mul_overflow(2,3,&r);}", 0);
+    // 64-bit operands need the carry rule and the high half of the product
+    check("int main(void){long r;return __builtin_mul_overflow(4000000000L,4000000000L,&r);}", 1);
+    check("int main(void){unsigned long r;return __builtin_add_overflow(18446744073709551615UL,1UL,&r);}", 1);
+    // a narrow destination: representability is the round trip. THEORY II-3:
+    // plain `char` is UNSIGNED on AArch64-ELF, so 128 fits it and only the
+    // explicitly signed one overflows (confirmed against the referee).
+    check("int main(void){signed char r;return __builtin_add_overflow(127,1,&r);}", 1);
+    check("int main(void){char r;int f=__builtin_add_overflow(127,1,&r);return f*100+r;}", 128);
+    check("int main(void){unsigned char r;return __builtin_add_overflow(255,1,&r);}", 1);
+    check("int main(void){signed char r;int f=__builtin_add_overflow(120,5,&r);return f*100+r;}", 125);
+}
+
+/// EXT(gcc) `case lo ... hi` and C99 6.8.4.2p5's promotion of the controlling
+/// expression. A range means exactly the set of values it spans — the property
+/// the enumerated form had, kept when enumeration became impossible.
+#[test]
+fn switch_ranges_and_promotion() {
+    let f = "int f(int x){switch(x){case 10 ... 20: return 1; case 30: return 2; \
+             case -5 ... -1: return 3;} return 0;}\n";
+    for (x, want) in [(9, 0), (10, 1), (15, 1), (20, 1), (21, 0), (30, 2), (-6, 0), (-5, 3), (-1, 3), (0, 0)] {
+        check(&format!("{f}int main(void){{return f({x});}}"), want);
+    }
+    // a range no machine could enumerate
+    check(
+        "int f(unsigned long long a){switch(a){case 1000000000000000000ULL ... \
+         9999999999999999999ULL: return 19; default: return 20;}}\n\
+         int main(void){return f(1000000000000000000ULL)*100+f(1);}",
+        1920,
+    );
+    // the controlling expression is PROMOTED, so a negative label matches
+    check(
+        "int g(signed char c){switch(c){case -62: return 19; case 98: return 18;} return 0;}\n\
+         int main(void){return g(-62)*100+g(98);}",
+        1918,
+    );
+    check(
+        "int g(unsigned char c){switch(c){case 200: return 7;} return 0;}\n\
+         int main(void){return g(200);}",
+        7,
+    );
+}
+
+/// AAPCS64 §B.6: `va_arg` walks the register save area and then the caller's
+/// stack area. The battery drives arguments past the 8-register boundary in
+/// both files, which is where the two areas must agree with the caller.
+#[test]
+fn varargs_walk_both_save_areas() {
+    let si = "int s(int n,...){__builtin_va_list a;int i,t=0;__builtin_va_start(a,n);\
+              for(i=0;i<n;i++)t+=__builtin_va_arg(a,int);return t;}\n";
+    check(&format!("{si}int main(void){{return s(4,1,2,3,4);}}"), 10);
+    // 12 integer arguments: 7 in x1–x7, the rest on the stack
+    check(
+        &format!("{si}int main(void){{return s(12,1,2,3,4,5,6,7,8,9,10,11,12);}}"),
+        78,
+    );
+    let sd = "double f(int n,...){__builtin_va_list a;double s=0;int i;__builtin_va_start(a,n);\
+              for(i=0;i<n;i++)s+=__builtin_va_arg(a,double);return s;}\n";
+    check(&format!("{sd}int main(void){{return (int)f(3,1.5,2.5,3.0);}}"), 7);
+    // 10 doubles: 8 in v0–v7, two on the stack
+    check(
+        &format!("{sd}int main(void){{return (int)f(10,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0);}}"),
+        55,
+    );
+    // the two files advance INDEPENDENTLY
+    check(
+        "int m(int n,...){__builtin_va_list a;int i,t=0;__builtin_va_start(a,n);\
+         for(i=0;i<n;i++){t+=__builtin_va_arg(a,int);t+=(int)__builtin_va_arg(a,double);}\
+         return t;}\n\
+         int main(void){return m(3,1,10.0,2,20.0,3,30.0);}",
+        66,
+    );
+    // a long double variadic argument is a 16-byte quad in the VR area
+    check(
+        "double q(int n,...){__builtin_va_list a;double s=0;int i;__builtin_va_start(a,n);\
+         for(i=0;i<n;i++)s+=(double)__builtin_va_arg(a,long double);return s;}\n\
+         int main(void){return (int)q(3,1.5L,2.5L,3.5L);}",
+        7,
+    );
+}
+
+/// AAPCS64 §6.8.2 / §6.9 as C sees it: a composite argument and a composite
+/// result mean the same thing whichever register file or stack slot they ride in.
+#[test]
+fn composites_by_value_and_by_return() {
+    // ≤16 bytes: two general registers, out and back
+    check(
+        "struct P{int x,y;};struct P mk(int a){struct P p;p.x=a;p.y=a*2;return p;}\n\
+         int sum(struct P p){return p.x+p.y;}\n\
+         int main(void){return sum(mk(5));}",
+        15,
+    );
+    // >16 bytes: the caller's copy, passed by reference, returned through x8
+    check(
+        "struct B{long a,b,c,d;};\n\
+         struct B mk(long x){struct B r;r.a=x;r.b=x+1;r.c=x+2;r.d=x+3;return r;}\n\
+         long sum(struct B s){return s.a+s.b+s.c+s.d;}\n\
+         int main(void){return (int)(sum(mk(10))+sum(mk(100)));}",
+        452,
+    );
+    // an HFA: four floats in v0–v3
+    check(
+        "struct H{float a,b,c,d;};\n\
+         struct H mk(void){struct H h;h.a=1;h.b=2;h.c=3;h.d=4;return h;}\n\
+         int sum(struct H h){return (int)(h.a+h.b+h.c+h.d);}\n\
+         int main(void){return sum(mk());}",
+        10,
+    );
+    // a composite pushed past the register file, onto the stack
+    check(
+        "struct P{int x,y;};\n\
+         int f(int a,int b,int c,int d,int e,int f2,int g,struct P p){return a+p.x*100+p.y;}\n\
+         int main(void){struct P p;p.x=3;p.y=4;return f(1,2,3,4,5,6,7,p);}",
+        305,
+    );
+    // the value of a struct assignment, and a struct through ?: and a stmt-expr
+    check(
+        "struct P{int x,y;};\n\
+         int main(void){struct P a,b;b.x=1;b.y=2;int c=(a=b).x;\n\
+         struct P s={10,20},t={30,40};int d=(1?s:t).y;\n\
+         int e=({struct P q={99,88};q;}).x;return c*10000+d*100+e;}",
+        12099,
+    );
+}
+

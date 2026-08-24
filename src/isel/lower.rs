@@ -1452,6 +1452,9 @@ fn lower_func(h: &hir::Func) -> MFunc {
     // (destination value, the in-argument-area offset, load width) for scalars
     let mut from_stack: Vec<(Reg, u32, hir::Ty)> = Vec::new();
     let mut agg_stack: Vec<(Reg, u32)> = Vec::new();
+    // (destination F64 value, the quad's register if it came in one, else its
+    // offset in the caller's argument area)
+    let mut ld_params: Vec<(Reg, Option<Reg>, u32)> = Vec::new();
     if l.asn.sret {
         let p = l.f.new_vreg(Width::W64);
         pairs.push((p, Reg::P(PReg::gpr(8)), Width::W64));
@@ -1493,15 +1496,14 @@ fn lower_func(h: &hir::Func) -> MFunc {
                 agg_regs.push((d, rs, esz, *size, *align));
             }
             (hir::PTy::Agg { .. }, Loc::StackAgg { off, .. }) => agg_stack.push((d, off)),
-            // a quad parameter is an OBJECT to the body (memory is binary128),
-            // so it follows the composite path: park the register, hand over the
-            // address
+            // A quad parameter arrives as binary128 but the body reads an F64
+            // value (THEORY II-2), so the bridge runs once, at entry.
             (hir::PTy::LDouble, Loc::Reg(pr, _)) => {
                 let v = l.f.new_vreg(Width::Q);
                 pairs.push((v, Reg::P(pr), Width::Q));
-                agg_regs.push((d, vec![(v, Width::Q)], 16, 16, 16));
+                ld_params.push((d, Some(v), 0));
             }
-            (hir::PTy::LDouble, Loc::Stack(off, _)) => agg_stack.push((d, off)),
+            (hir::PTy::LDouble, Loc::Stack(off, _)) => ld_params.push((d, None, off)),
             (hir::PTy::LDouble, _) => unreachable!("binary128 in a composite location"),
             (hir::PTy::S(_), Loc::Regs { .. } | Loc::StackAgg { .. }) => {
                 unreachable!("scalar in a composite location")
@@ -1542,6 +1544,49 @@ fn lower_func(h: &hir::Func) -> MFunc {
                 off: off as i32,
             },
             vol: false,
+        });
+    }
+    // THEORY II-2: convert each incoming binary128 to the canonical f64 the
+    // body computes with. Done AFTER the parallel copy, so the conversion call
+    // cannot destroy an argument register that has not been read yet.
+    // Every incoming quad is PARKED IN MEMORY first, before any conversion call
+    // runs. AAPCS64 §6.1.2 preserves only the LOW half of v8–v15, so a
+    // 128-bit value has no register that survives a call — a quad must never be
+    // live across one, and the parking is what guarantees it.
+    let parked: Vec<(Reg, SlotId, u32)> = ld_params
+        .iter()
+        .map(|&(d, q, off)| match q {
+            Some(q) => {
+                let slot = l.f.new_slot(16, 16, SlotKind::Local);
+                l.push(MInst::Store {
+                    op: MemOp::Q,
+                    src: q,
+                    mem: AddrMode::Slot { slot, off: 0 },
+                    vol: false,
+                });
+                (d, slot, 0)
+            }
+            None => (d, l.in_args(), off),
+        })
+        .collect();
+    for (d, slot, off) in parked {
+        let t = l.tmp(Width::Q);
+        l.push(MInst::Load {
+            op: MemOp::Q,
+            dst: t,
+            mem: AddrMode::Slot {
+                slot,
+                off: off as i32,
+            },
+            vol: false,
+        });
+        l.push(MInst::ParallelCopy(vec![(Reg::P(PReg::fpr(0)), t, Width::Q)]));
+        l.fp_libcall("__trunctfdf2");
+        l.push(MInst::FMov {
+            dw: Width::D,
+            sw: Width::D,
+            dst: d,
+            src: Reg::P(PReg::fpr(0)),
         });
     }
     // A composite delivered in registers has no address of its own, so one is

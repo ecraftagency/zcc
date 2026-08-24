@@ -125,3 +125,33 @@ fn slots_do_not_overlap_and_respect_alignment() {
         }
     }
 }
+
+/// `pass/legalize.rs` — a frame offset past the addressing modes' reach is an
+/// operand to legalize, not an assembler error. Its square is the identity on
+/// ⟦·⟧: `Slot{s, off}` and `BaseImm{IP1, 0}` after `IP1 = &slot + off` denote
+/// the same address, and IP1 is reserved, so no live value is destroyed. The
+/// frames below are chosen to straddle the imm12 and scaled-offset limits.
+#[test]
+fn legalization_of_out_of_range_frame_offsets() {
+    for n in [64usize, 600, 1200, 5000, 20000] {
+        same(&format!(
+            "int main(void){{char pad[{n}];int i,s=0;pad[0]=1;pad[{last}]=2;\n\
+             for(i=0;i<8;i++)s+=pad[i*3]+i;return s+pad[0]+pad[{last}];}}",
+            n = n,
+            last = n - 1
+        ));
+    }
+    // a spill slot beyond the reach as well: many live values over a big frame
+    same(
+        "int f(int x){return x+1;}\n\
+         int main(void){char pad[9000];int a=f(1),b=f(2),c=f(3),d=f(4),e=f(5);\n\
+         pad[0]=(char)a;pad[8999]=(char)b;return a+b+c+d+e+pad[0]+pad[8999];}",
+    );
+    // a DYNAMIC frame: x29 becomes the base and the outgoing area rides on sp
+    same(
+        "int g(int a,int b,int c,int d,int e,int f2,int g2,int h,int i){return i;}\n\
+         int sum(int n){int v[n];int k,s=0;for(k=0;k<n;k++)v[k]=k;\n\
+         for(k=0;k<n;k++)s+=v[k];return s+g(1,2,3,4,5,6,7,8,9);}\n\
+         int main(void){return sum(12);}",
+    );
+}

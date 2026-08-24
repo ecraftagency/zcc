@@ -85,6 +85,18 @@ fn victims(
         isa::alloc_mask(Class::Fpr),
         0u32,
     ];
+    // AAPCS64 §6.1.1: a value that crosses a call can ONLY live in a
+    // callee-saved register, so at EVERY point — not only at the calls — the
+    // number of live call-crossing values of a class is bounded by how many
+    // such registers it has. Measuring this only at calls is not enough: two
+    // values may cross DIFFERENT calls and still be live together somewhere in
+    // between, and the colourer would then need more callee-saved colours than
+    // exist. That is precisely the shape a long-double-heavy prologue produces.
+    let cs = [
+        (isa::callee_saved_mask(Class::Gpr) & masks[0]).count_ones() as usize,
+        (isa::callee_saved_mask(Class::Fpr) & masks[1]).count_ones() as usize,
+        usize::MAX,
+    ];
     for &b in &cfg.rpo {
         let bi = b as usize;
         let blk = &f.blocks[bi];
@@ -98,6 +110,44 @@ fn victims(
         }
         live::last_use_into(f, lv.sp, lv, bi, &mut lu);
         let last = &lu.at;
+        // The colourer assigns at the BLOCK HEAD too (block parameters are
+        // defined there), so the ceilings bind there as well — checking only
+        // instructions leaves a point where it can run out of colours.
+        for &p in &blk.params {
+            let x = lv.sp.idx(p);
+            if !gone.contains(&x) {
+                st.insert(f, lv, x);
+            }
+        }
+        let head = base[bi];
+        for ci in 0..2 {
+            let class = if ci == 0 { Class::Gpr } else { Class::Fpr };
+            let extra = (st.phys_mask(ci) & masks[ci]).count_ones() as usize;
+            while st.cross[ci] > cs[ci] || st.count[ci] + extra > isa::k(class) {
+                let over_cross = st.cross[ci] > cs[ci];
+                let cand = st
+                    .set
+                    .iter()
+                    .copied()
+                    .filter(|&x| x < lv.sp.nv && class_of(f, lv.sp.reg(x)) == class)
+                    .filter(|&x| !over_cross || lv.crosses_call[x])
+                    .filter(|&x| !blk.params.iter().any(|p| lv.sp.idx(*p) == x))
+                    .max_by_key(|&x| next_use(&uses, x, head));
+                match cand {
+                    Some(x) => {
+                        chosen.push(x as VReg);
+                        gone.insert(x);
+                        st.remove(f, lv, x);
+                    }
+                    None => {
+                        return Err(format!(
+                            "{}: {:?} pressure exceeds k at the head of bb{} with nothing evictable",
+                            f.name, class, bi
+                        ));
+                    }
+                }
+            }
+        }
         for (i, inst) in blk.insts.iter().enumerate() {
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
@@ -118,16 +168,56 @@ fn victims(
             // caller-saved exclusion can never fail afterwards. Only ALLOCATABLE
             // clobbers count, and only those not already live, so the number is
             // the spec's and not an over-estimate.
-            let extra = match inst {
-                MInst::Call { clobbers, .. } => [
-                    (clobbers.gpr & masks[0] & !st.phys.gpr).count_ones() as usize,
-                    (clobbers.fpr & masks[1] & !st.phys.fpr).count_ones() as usize,
-                    0,
-                ],
-                _ => [0, 0, 0],
+            // Pressure of a class = the VIRTUAL values live here, plus every
+            // allocatable register already spoken for: the physical registers
+            // live at this point and, at a call, its whole clobber set. The two
+            // are UNIONED, never summed — a live argument register is itself
+            // clobbered, and subtracting it would pretend it frees a
+            // callee-saved colour, which is exactly what it does not do. With
+            // the union, `k − |clobbered ∩ allocatable|` is precisely the number
+            // of callee-saved registers, so the colourer's caller-saved
+            // exclusion can never fail afterwards.
+            let held = match inst {
+                MInst::Call { clobbers, .. } => RegSet {
+                    gpr: st.phys.gpr | clobbers.gpr,
+                    fpr: st.phys.fpr | clobbers.fpr,
+                },
+                _ => st.phys,
             };
+            let extra = [
+                (held.gpr & masks[0]).count_ones() as usize,
+                (held.fpr & masks[1]).count_ones() as usize,
+                0,
+            ];
             let at = base[bi] + i;
             for (ci, class) in [Class::Gpr, Class::Fpr, Class::Flags].into_iter().enumerate() {
+                // the call-crossing ceiling first: only a CROSSING value can
+                // relieve it, so choosing a victim from the whole live set
+                // would not converge
+                while st.cross[ci] > cs[ci] {
+                    let cand = st
+                        .set
+                        .iter()
+                        .copied()
+                        .filter(|&x| x < lv.sp.nv && lv.crosses_call[x])
+                        .filter(|&x| class_of(f, lv.sp.reg(x)) == class)
+                        .filter(|&x| !ops.iter().any(|(r, _)| lv.sp.idx(*r) == x))
+                        .max_by_key(|&x| next_use(&uses, x, at));
+                    match cand {
+                        Some(x) => {
+                            chosen.push(x as VReg);
+                            gone.insert(x);
+                            st.remove(f, lv, x);
+                        }
+                        None => {
+                            return Err(format!(
+                                "{}: {:?} has more call-crossing values live at bb{}[{}] than it \
+                                 has callee-saved registers, and none is evictable",
+                                f.name, class, bi, i
+                            ));
+                        }
+                    }
+                }
                 while st.count[ci] + extra[ci] > isa::k(class) {
                     if class == Class::Flags {
                         // Flags are never spilled: their producer is pure, so the
@@ -187,6 +277,8 @@ fn victims(
 struct LiveSet {
     set: BTreeSet<usize>,
     count: [usize; 3],
+    /// of those, the ones that cross a call — bounded by the callee-saved count
+    cross: [usize; 3],
     phys: RegSet,
 }
 
@@ -195,8 +287,12 @@ impl LiveSet {
         LiveSet {
             set: BTreeSet::new(),
             count: [0; 3],
+            cross: [0; 3],
             phys: RegSet::default(),
         }
+    }
+    fn phys_mask(&self, ci: usize) -> u32 {
+        if ci == 0 { self.phys.gpr } else { self.phys.fpr }
     }
     fn slot(f: &MFunc, lv: &live::Liveness, x: usize) -> usize {
         match class_of(f, lv.sp.reg(x)) {
@@ -207,15 +303,27 @@ impl LiveSet {
     }
     fn insert(&mut self, f: &MFunc, lv: &live::Liveness, x: usize) {
         if self.set.insert(x) {
-            self.count[Self::slot(f, lv, x)] += 1;
-            if let Reg::P(p) = lv.sp.reg(x) {
-                self.phys.add(p);
+            match lv.sp.reg(x) {
+                Reg::P(p) => self.phys.add(p),
+                // only VIRTUAL values are counted here; the physical ones are
+                // counted through `phys`, unioned with the clobber set
+                Reg::V(_) => {
+                    self.count[Self::slot(f, lv, x)] += 1;
+                    if lv.crosses_call[x] {
+                        self.cross[Self::slot(f, lv, x)] += 1;
+                    }
+                }
             }
         }
     }
     fn remove(&mut self, f: &MFunc, lv: &live::Liveness, x: usize) {
         if self.set.remove(&x) {
-            self.count[Self::slot(f, lv, x)] -= 1;
+            if x < lv.sp.nv {
+                self.count[Self::slot(f, lv, x)] -= 1;
+                if lv.crosses_call[x] {
+                    self.cross[Self::slot(f, lv, x)] -= 1;
+                }
+            }
             if let Reg::P(p) = lv.sp.reg(x) {
                 match p.class {
                     Class::Gpr => self.phys.gpr &= !(1 << p.num),

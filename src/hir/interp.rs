@@ -28,12 +28,87 @@ pub const STEP_BUDGET: u64 = 50_000_000;
 pub use crate::mem::Trap;
 use crate::mem::{FUNC_TAG, LABEL_TAG, Layout, Mem};
 
+// ── IEEE-754 binary128 ↔ binary64 (THEORY II-2) ────────────────────────────
+// zcc's long double is binary128 IN MEMORY and canonical f64 IN A REGISTER, so
+// every load/store/ABI boundary crosses this pair — in the compiled program via
+// libgcc's `__extenddftf2`/`__trunctfdf2`, and here so that ⟦·⟧ can execute the
+// same program. The format is the standard's, transcribed: sign · 15-bit
+// exponent (bias 16383) · 112-bit trailing significand, against binary64's
+// 11-bit exponent (bias 1023) · 52-bit significand.
+
+/// binary64 → binary128, returned as (low 64 bits, high 64 bits).
+pub fn f64_to_f128(b: u64) -> (u64, u64) {
+    let sign = b >> 63;
+    let exp = (b >> 52) & 0x7ff;
+    let man = b & ((1u64 << 52) - 1);
+    // The 112-bit significand is the 52-bit one shifted up by 60.
+    let split = |m: u64, e: u64| ((m & 0xf) << 60, (sign << 63) | (e << 48) | (m >> 4));
+    match exp {
+        // ±0 and subnormals: every binary64 subnormal is a NORMAL binary128
+        // (its exponent, ≥ −1074, is far above binary128's −16382 floor).
+        0 if man == 0 => (0, sign << 63),
+        0 => {
+            let sh = (man.leading_zeros() - 11) as u64; // bit 52 to the hidden place
+            let m = (man << (sh + 1)) & ((1u64 << 52) - 1);
+            split(m, 16383 - 1022 - sh)
+        }
+        0x7ff => split(man, 0x7fff), // ±∞ and NaN keep their payload
+        _ => split(man, exp - 1023 + 16383),
+    }
+}
+
+/// binary128 → binary64, round-to-nearest-even (IEEE 754 §4.3.1). Exact for any
+/// value that came from a binary64, which is every value zcc produces.
+pub fn f128_to_f64(lo: u64, hi: u64) -> u64 {
+    let sign = hi >> 63;
+    let e128 = (hi >> 48) & 0x7fff;
+    let m: u128 = (((hi & 0xffff_ffff_ffff) as u128) << 64) | lo as u128;
+    if e128 == 0x7fff {
+        // ±∞ (m = 0) or NaN; keep the top of the payload so a NaN stays a NaN
+        let man = (m >> 60) as u64;
+        return (sign << 63) | (0x7ff << 52) | if m != 0 { man.max(1) } else { 0 };
+    }
+    if e128 == 0 {
+        return sign << 63; // binary128 zero/subnormal underflows binary64
+    }
+    let mut e = e128 as i64 - 16383 + 1023;
+    let (mut man, rem) = ((m >> 60) as u64, m & ((1u128 << 60) - 1));
+    let half = 1u128 << 59;
+    if rem > half || (rem == half && man & 1 == 1) {
+        man += 1;
+        if man >> 52 != 0 {
+            man >>= 1;
+            e += 1;
+        }
+    }
+    if e >= 0x7ff {
+        (sign << 63) | (0x7ff << 52)
+    } else if e <= 0 {
+        sign << 63
+    } else {
+        (sign << 63) | ((e as u64) << 52) | man
+    }
+}
+
+/// AAPCS64 §B.6 as ⟦hir⟧ models it: the 192-byte register save area, the
+/// caller's stack-argument area, and the two negative offsets that walk them.
+#[derive(Clone, Copy)]
+struct Va {
+    save: u64,
+    stack: u64,
+    gr_offs: i32,
+    vr_offs: i32,
+}
+
 pub struct Machine<'a> {
     m: &'a Module,
     /// function name → index in `m.funcs`
     by_name: HashMap<&'a str, usize>,
     lay: Layout,
     mem: Mem,
+    /// One entry per active call: the AAPCS64 va state a variadic callee sees
+    /// (`va_start`'s five fields). See `call_sret`.
+    va: Vec<Option<Va>>,
     steps: u64,
 }
 
@@ -49,6 +124,7 @@ pub fn new_machine<'a>(m: &'a Module, ast: &Ast) -> Machine<'a> {
             .collect(),
         lay,
         mem,
+        va: Vec::new(),
         steps: 0,
     }
 }
@@ -86,6 +162,114 @@ impl<'a> Machine<'a> {
     /// the copy has to happen before that frame is popped — which is exactly
     /// what AAPCS64 §6.9 does with registers or the x8 indirection.
     fn call_sret(
+        &mut self,
+        fi: usize,
+        args: &[Bits],
+        sret: Option<(u64, u64)>,
+    ) -> Result<Option<Bits>, Trap> {
+        self.call_va(fi, args, sret, None)
+    }
+
+    /// `sig` is the CALL SITE's signature — the only place the variadic
+    /// arguments are described. When the callee is variadic, ⟦·⟧ materializes
+    /// the AAPCS64 save area and stack-argument area the psABI's `va_list` walk
+    /// (built by `hir::build::va_arg`) reads back. This is the ONE place ⟦hir⟧
+    /// is ABI-aware, and it is inherited, not chosen: `va_arg` is already
+    /// lowered against the psABI layout, so a semantics that refused to model it
+    /// could not execute a variadic function at all — every square over one
+    /// would hold vacuously (REARCH §15).
+    fn call_va(
+        &mut self,
+        fi: usize,
+        args: &[Bits],
+        sret: Option<(u64, u64)>,
+        sig: Option<&Sig>,
+    ) -> Result<Option<Bits>, Trap> {
+        let va_bytes: u64 = match sig {
+            Some(g) if g.variadic => 192 + ((crate::isel::abi::classify(g).stack_bytes as u64 + 15) & !15),
+            _ => 0,
+        };
+        let va = if va_bytes > 0 {
+            let base = self.mem.push_frame(va_bytes)?;
+            Some(self.build_va(base, sig.unwrap(), args)?)
+        } else {
+            None
+        };
+        self.va.push(va);
+        let r = self.call_body(fi, args, sret);
+        self.va.pop();
+        if va_bytes > 0 {
+            self.mem.pop_frame(va_bytes);
+        }
+        r
+    }
+
+    /// Place every argument where AAPCS64 says it goes, into the synthetic save
+    /// and stack areas, and record the two counters `va_start` publishes.
+    fn build_va(&mut self, base: u64, sig: &Sig, args: &[Bits]) -> Result<Va, Trap> {
+        use crate::isel::abi::Loc;
+        use crate::mir::Class;
+        let (save, stack) = (base, base + 192);
+        let asn = crate::isel::abi::classify(sig);
+        // the counters after the NAMED parameters — what `va_start` records
+        let named = Sig {
+            params: sig.params[..(sig.nfix as usize).min(sig.params.len())].to_vec(),
+            ret: sig.ret.clone(),
+            nfix: sig.nfix,
+            variadic: false,
+        };
+        let n = crate::isel::abi::classify(&named);
+        for ((p, loc), v) in sig.params.iter().zip(&asn.args).zip(args) {
+            match (p, loc) {
+                (PTy::LDouble, Loc::Reg(r, _)) => {
+                    let (lo, hi) = f64_to_f128(*v);
+                    self.mem.store(save + 16 * r.num as u64, 8, lo)?;
+                    self.mem.store(save + 16 * r.num as u64 + 8, 8, hi)?;
+                }
+                (PTy::LDouble, Loc::Stack(o, _)) => {
+                    let (lo, hi) = f64_to_f128(*v);
+                    self.mem.store(stack + *o as u64, 8, lo)?;
+                    self.mem.store(stack + *o as u64 + 8, 8, hi)?;
+                }
+                (_, Loc::Reg(r, _)) => {
+                    let a = match r.class {
+                        Class::Fpr => save + 16 * r.num as u64,
+                        _ => save + 128 + 8 * r.num as u64,
+                    };
+                    self.mem.store(a, 8, *v)?;
+                }
+                (_, Loc::Stack(o, _)) => self.mem.store(stack + *o as u64, 8, *v)?,
+                // a composite travels as an ADDRESS: copy it into its slots
+                (_, Loc::Regs { first, n: cnt, esz, size }) => {
+                    for i in 0..*cnt {
+                        let a = match first.class {
+                            Class::Fpr => save + 16 * (first.num as u64 + i as u64),
+                            _ => save + 128 + 8 * (first.num as u64 + i as u64),
+                        };
+                        let k = (size.saturating_sub(i * esz)).min(*esz) as u64;
+                        for b in 0..k {
+                            let byte = self.mem.load(*v + (i * esz) as u64 + b, 1)?;
+                            self.mem.store(a + b, 1, byte)?;
+                        }
+                    }
+                }
+                (_, Loc::StackAgg { off, size }) => {
+                    for b in 0..*size as u64 {
+                        let byte = self.mem.load(*v + b, 1)?;
+                        self.mem.store(stack + *off as u64 + b, 1, byte)?;
+                    }
+                }
+            }
+        }
+        Ok(Va {
+            save,
+            stack,
+            gr_offs: -8 * (8 - n.ngrn as i32),
+            vr_offs: -16 * (8 - n.nsrn as i32),
+        })
+    }
+
+    fn call_body(
         &mut self,
         fi: usize,
         args: &[Bits],
@@ -274,7 +458,7 @@ impl<'a> Machine<'a> {
                 });
                 let r = match callee {
                     Callee::Direct(name) => match self.by_name.get(name.as_str()) {
-                        Some(&i) => self.call_sret(i, &xs, sr)?,
+                        Some(&i) => self.call_va(i, &xs, sr, Some(sig))?,
                         None => self.builtin(name, &xs)?,
                     },
                     Callee::Indirect(o) => {
@@ -283,19 +467,100 @@ impl<'a> Machine<'a> {
                         if a & FUNC_TAG == 0 || i >= self.m.funcs.len() {
                             return Err(Trap::BadAddress(a));
                         }
-                        self.call_sret(i, &xs, sr)?
+                        self.call_va(i, &xs, sr, Some(sig))?
                     }
                 };
                 if let Some(d) = dst {
                     vals[*d as usize] = r.unwrap_or(0);
                 }
             }
-            Inst::Intrinsic { .. } => {
+            // ── the EXT / builtin surface ──────────────────────────────────
+            // Each of these has a MEANING, and giving it one here is what stops
+            // a variadic, long-double or atomic function from being ⊥ on the HIR
+            // side of every square (REARCH §15).
+            Inst::Intrinsic { dst, kind, args } => {
                 let _ = fi;
-                return Err(Trap::Unreachable); // R1: EXT intrinsics
+                let v = self.intrinsic(kind, args, vals)?;
+                if let (Some(d), Some(v)) = (dst, v) {
+                    vals[*d as usize] = v;
+                }
             }
         }
         Ok(())
+    }
+
+    /// ⟦intrinsic⟧. ONE thread, so an exclusive pair is an ordinary load/store
+    /// and the store always succeeds — which is the whole of `__sync_*`'s
+    /// meaning in a single-threaded semantics.
+    fn intrinsic(
+        &mut self,
+        kind: &IntrinKind,
+        args: &[Operand],
+        vals: &Vec<Bits>,
+    ) -> Result<Option<Bits>, Trap> {
+        let get = |o: &Operand| -> Bits {
+            match o {
+                Operand::Val(v) => vals[*v as usize],
+                Operand::Imm(k) => *k as u64,
+                Operand::Fimm(k) => *k,
+            }
+        };
+        Ok(match kind {
+            IntrinKind::LdAxr(t) => Some(self.mem.load(get(&args[0]), t.bytes())?),
+            IntrinKind::StlXr(t) => {
+                self.mem.store(get(&args[0]), t.bytes(), get(&args[1]))?;
+                Some(0) // 0 = the store took the monitor
+            }
+            IntrinKind::Stlr(t) => {
+                self.mem.store(get(&args[0]), t.bytes(), get(&args[1]))?;
+                None
+            }
+            IntrinKind::Dmb => None,
+            // THEORY II-2: memory is binary128, the register is canonical f64.
+            IntrinKind::LdLoad => {
+                let a = get(&args[0]);
+                let (lo, hi) = (self.mem.load(a, 8)?, self.mem.load(a + 8, 8)?);
+                Some(f128_to_f64(lo, hi))
+            }
+            IntrinKind::LdStore => {
+                let (a, v) = (get(&args[0]), get(&args[1]));
+                let (lo, hi) = f64_to_f128(v);
+                self.mem.store(a, 8, lo)?;
+                self.mem.store(a + 8, 8, hi)?;
+                None
+            }
+            // An asm template is opaque BY CONSTRUCTION: its meaning is the
+            // assembler's, not C's, so ⊥ is the correct answer and not a debt.
+            IntrinKind::Asm { .. } => return Err(Trap::Unreachable),
+            // `build.rs` expands both of these into ordinary HIR before they
+            // can reach here — `Overflow` into the ℤ-semantics arithmetic and
+            // `VaArg` into the va_list walk — so the variants exist only as the
+            // vocabulary the AST arrives in.
+            IntrinKind::Overflow { .. } | IntrinKind::VaArg(_) => {
+                return Err(Trap::Unreachable);
+            }
+            // §B.6: the five fields, from the state `build_va` recorded.
+            IntrinKind::VaStart => {
+                let va = match self.va.last().copied().flatten() {
+                    Some(v) => v,
+                    None => return Err(Trap::Unreachable), // not a variadic call
+                };
+                let ap = get(&args[0]);
+                self.mem.store(ap, 8, va.stack)?;
+                self.mem.store(ap + 8, 8, va.save + 192)?;
+                self.mem.store(ap + 16, 8, va.save + 128)?;
+                self.mem.store(ap + 24, 4, va.gr_offs as u32 as u64)?;
+                self.mem.store(ap + 28, 4, va.vr_offs as u32 as u64)?;
+                None
+            }
+            IntrinKind::VaArea => {
+                let va = match self.va.last().copied().flatten() {
+                    Some(v) => v,
+                    None => return Err(Trap::Unreachable),
+                };
+                Some((va.stack as i64 + get(&args[0]) as i64) as u64)
+            }
+        })
     }
 
     /// The externals a corpus function may reach. Anything else is ⊥ — the

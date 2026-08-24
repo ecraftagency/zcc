@@ -429,6 +429,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R1.3 EXT surface: `__sync_*`, `__builtin_*_overflow`, computed goto, statement-expr, inline asm (opaque), `__va_area__` | ✅ `88c38e3` |
 | R1.4 science gates green: `abi.sh alg.sh cpp.sh shape.sh decay.sh`; `tests/ext` 21/21 | ✅ abi/alg/cpp/shape/decay all PASS · `tests/cases` 74/75 (only the adjudicated `float_h`) · `tests/ext` 19/19 (2 SKIP: `cc` rejects them) · determinism 85 progs × 8 fresh processes |
 | R1.5 torture ≥ 1471 pass (the `rc3` count; the 4 pre-existing runtime FAIL `20021127-1 bitfld-3 pr32244-1 pr34971` are a bonus if they pass), csmith300 0 DIVERGE, yarpgen300 0 DIVERGE | ✅ torture **1470 pass / 0 FAIL** / 224 not-impl — the not-impl manifest is BYTE-IDENTICAL to the committed `torture.not-impl` (rc3's, `423a42d`), and rc3's 4 runtime FAIL are gone; csmith300 **254 PARITY / 0 DIVERGE** (46 SKIP = `gcc` itself fails the sample; exactly rc3's 254/0); yarpgen300 **300 PARITY / 0 DIVERGE**. 13 torture defects were found and fixed on the way — see `§15` |
+| R1.6 close the §15 PROOF DEBT: teach `hir::interp` the intrinsics so no R1 feature is ⊥ on both sides, then one battery per §15 row. Ordered BEFORE the measurement because a battery's job is to DISCOVER a lowering defect, and a fix moves the emitted code — a number taken first would be stale. Ordered before R2 because every R2 pass owes `⟦f⟧=⟦P f⟧` under this interpreter: while it traps on `Inst::Intrinsic`, each of the eleven batteries would hold VACUOUSLY over every variadic / long-double / atomic function | ✅ `cargo test` 40 → **52**; three defects found, one of them a latent MISCOMPILE (call-crossing values exceeding the callee-saved count at a non-call point). See §15 |
 | R1 measurement | sqlite static insns + `corpus25.sh` excess histogram + `exectime.sh` paired geo40, all with HIR passes OFF. Record here as the correctness-parity data point. **The allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573 at rc3) is NOT readable here**: per §14, R0/R1 keep every local in memory, so the allocator sees only expression temporaries. That KPI is measured at R2.2, immediately after SROA+mem2reg | ⬜ |
 
 ### R2 — tree-SSA parity (port the A7 ladder onto HIR, §4 order)
@@ -465,27 +466,52 @@ Law-2 attempt quarantines the task (⚠️ + reason), never the milestone. `main
 
 ---
 
-## §15 R1 PROOF DEBT — what R1 shipped WITHOUT its commuting square (open)
+## §15 R1 proof debt — CLOSED (R1.6), and what it cost to find out
 
-Law 3 says csmith/yarpgen only CONFIRM; the discovery must happen at the layer
-where the theorem lives. R1 did not honour that: **every feature below was
-validated by DIFFERENTIAL TESTING ALONE**, and `cargo test` still stands at the
-40 batteries R0.9 left — R1 added none. This is recorded as debt, not as a
-milestone, and it is the first thing to close.
+R1 shipped its features validated by DIFFERENTIAL TESTING ALONE, which inverts
+Law 3: csmith/yarpgen were DISCOVERING defects that the layer's own square
+should have caught. `cargo test` stood at the 40 batteries R0.9 left; it now
+stands at **52**, and no R1 feature is ⊥ on both sides of a square any more.
 
-| shipped in R1 | its missing square |
+**What the interpreters gained.** `hir::interp` traps no longer on
+`Inst::Intrinsic`: the exclusive pair and the barrier have their single-threaded
+meaning, `LdLoad`/`LdStore` cross the binary128 bridge (`f64_to_f128` /
+`f128_to_f64`, IEEE 754 §3.6 transcribed), and a variadic call materializes the
+AAPCS64 save area and stack-argument area so `va_start`/`va_arg` execute. That
+last one makes ⟦hir⟧ ABI-aware in exactly ONE place, and it is inherited rather
+than chosen: `build::va_arg` is already lowered against the psABI `va_list`
+layout, so a semantics refusing to model it could not run a variadic function at
+all. (Removing the dependency means moving `va_arg` lowering into isel — an
+option, not a debt.) `mir::interp` gained the soft-float externs and, more
+importantly, DDI 0487 C6.2's rule that a scalar FP write zeroes bits 127:64.
+
+**Inline asm stays ⊥ — by construction, not as debt.** An asm template's
+meaning is the assembler's, not C's; ⟦·⟧ has nothing to say about it and
+should not pretend otherwise.
+
+**Three defects the new batteries found**, none of which the suites had caught:
+
+| defect | why the suites missed it |
 |---|---|
-| bit-field read / read-modify-write | `⟦load bf⟧` and `⟦store bf⟧` over an exhaustive small domain of (container, boff, w, signedness) |
-| the AAPCS64 automaton (composites, HFA, sret, stack args) | `classify` against a transcribed table of spec examples; `⟦hir⟧=⟦mir_v⟧` on a corpus of composite calls |
-| varargs (save area, `va_start`, `va_arg`) | ⟦·⟧ cannot even RUN them: `hir::interp` traps on `Inst::Intrinsic`, so every variadic function is ⊥ on both sides and the square holds vacuously |
-| long double (binary128 ↔ f64 bridge) | same — `LdLoad`/`LdStore` are intrinsics, hence ⊥ |
-| `__sync_*`, `__builtin_*_overflow`, inline asm | same for `__sync_*`/asm; the overflow builtins ARE expressible in HIR and have no battery |
-| `mir/pass/legalize.rs` | `⟦m⟧=⟦legalize m⟧` (the identity on ⟦·⟧: IP1 is reserved, the address is the same) |
-| the `case lo ... hi` range lowering | `⟦switch⟧` with ranges vs the enumerated form |
-| the rewritten spiller (batched victims, next-use index, incremental pressure) | the post-condition "pressure ≤ k at every point" is asserted by `regalloc::verify`, but the BATCHING argument (a victim removed for the rest of the sweep) has no test |
+| `PTy::LDouble` meant a VALUE at a call site but an ADDRESS at the definition — HIR contradicting itself. isel implemented both conventions consistently, so the compiled code worked and only ⟦hir⟧ could see the contradiction | the code was RIGHT; only the semantics was unrunnable |
+| A value crossing a call could exceed the callee-saved count AT A NON-CALL POINT. The spiller measured the ceiling only at calls, but two values may cross DIFFERENT calls and be live together in between — the colourer then needs more callee-saved colours than exist. LATENT MISCOMPILE on any FP-heavy function | needs ≥9 simultaneously-live call-crossing FP values; no suite program has that shape |
+| ⟦mir⟧'s `FMov` never carried the upper 64 bits, and no FP write cleared them — so a `q` read could see a stale half | only a 128-bit value can observe it, and `Width::Q` arrived with R1 |
 
-Closing it means (a) teaching `hir::interp` the intrinsics so variadic /
-long-double / atomic functions stop being ⊥, and (b) one battery per row.
+The second is the one that matters: it was a wrong-code bug reachable from
+ordinary C, found because a battery asked a question the corpus never did.
+
+Both ceilings are checked at every point the COLOURER assigns — each
+instruction AND each block head, since block parameters are coloured there.
+Checking only instructions left a hole a csmith program walked straight into.
+
+**Residual, recorded rather than left implicit.** The spiller enforces both
+ceilings — pressure ≤ k with a call's clobber set counted as fixed definitions,
+and live call-crossing values ≤ the callee-saved count — but it is still
+spill-at-def / reload-per-use, NOT Braun-Hack. R2.2's prerequisite is unchanged.
+It is also not width-aware: a `q` value crossing a call has no legal colour at
+all (AAPCS64 §6.1.2 preserves only the low half of v8–v15), which isel avoids by
+parking every quad in memory and `color.rs` now reports as a named error rather
+than silently truncating.
 
 ---
 

@@ -159,6 +159,18 @@ fn assign(
         return Ok(());
     }
     let avoid_caller_saved = lv.crosses_call[v as usize];
+    // AAPCS64 §6.1.2: only the LOW 64 bits of v8–v15 are preserved across a
+    // call, so a 128-bit value live across one has NO legal colour. isel
+    // guarantees this never happens (a quad is parked in memory before any
+    // call), and saying so here turns a future violation into a loud failure
+    // instead of a silently truncated long double.
+    if avoid_caller_saved && class == Class::Fpr && f.vregs[v as usize].width == Width::Q {
+        return Err(format!(
+            "{}: v{} is a 128-bit value live across a call — v8–v15 preserve only \
+             their low half (AAPCS64 §6.1.2), so it must be parked in memory",
+            f.name, v
+        ));
+    }
     let conflict = lv.phys_conflict[v as usize];
     let free = |p: PReg, occupied: &Vec<PReg>| -> bool {
         !occupied.contains(&p)

@@ -150,6 +150,16 @@ impl<'a> Machine<'a> {
         }
     }
 
+    /// Write an FP result. DDI 0487 C6.2: writing a v register in a SCALAR form
+    /// (`s`/`d`) zeroes bits 127:64 — so a later `q` read of the same register
+    /// must not see a stale upper half. Only the `q` forms carry one.
+    fn set_fp(&mut self, fr: &mut Frame, r: Reg, v: u64, w: Width) {
+        self.set(fr, r, v);
+        if w != Width::Q {
+            self.set_hi(fr, r, 0);
+        }
+    }
+
     fn set(&mut self, fr: &mut Frame, r: Reg, v: u64) {
         match r {
             Reg::V(x) => fr.vals[x as usize] = v,
@@ -444,6 +454,9 @@ impl<'a> Machine<'a> {
                     MemOp::SW => raw as u32 as i32 as i64 as u64,
                     _ => raw,
                 };
+                if op.class() == Class::Fpr {
+                    self.set_hi(fr, *dst, 0); // `ldr s`/`ldr d` zero bits 127:64
+                }
                 self.set(fr, *dst, v);
                 if let Some((r, x)) = wb {
                     self.set(fr, r, x);
@@ -520,7 +533,7 @@ impl<'a> Machine<'a> {
                     })
                     .to_bits()
                 };
-                self.set(fr, *dst, v);
+                self.set_fp(fr, *dst, v, *w);
             }
             MInst::FpUn { op, w, dst, src, sw } => {
                 let x = self.get(fr, *src);
@@ -553,7 +566,7 @@ impl<'a> Machine<'a> {
                         .to_bits()
                     }
                 };
-                self.set(fr, *dst, v);
+                self.set_fp(fr, *dst, v, *w);
             }
             MInst::FpCmp {
                 w,
@@ -634,7 +647,7 @@ impl<'a> Machine<'a> {
                         trunc(sat_u(d, *dw), *dw)
                     }
                 };
-                self.set(fr, *dst, v);
+                self.set_fp(fr, *dst, v, *dw);
             }
             MInst::FMov { dw, sw, dst, src } => {
                 let x = self.get(fr, *src);
@@ -642,7 +655,15 @@ impl<'a> Machine<'a> {
                     (Width::S, Width::W32) | (Width::W32, Width::S) => x & 0xffff_ffff,
                     _ => x,
                 };
-                self.set(fr, *dst, v);
+                // the 128-bit form is the vector move `mov Vd.16b, Vn.16b`, the
+                // only one that carries the upper half
+                if *dw == Width::Q {
+                    let h = self.get_hi(fr, *src);
+                    self.set(fr, *dst, v);
+                    self.set_hi(fr, *dst, h);
+                } else {
+                    self.set_fp(fr, *dst, v, *dw);
+                }
             }
             MInst::Call {
                 callee,
@@ -680,11 +701,11 @@ impl<'a> Machine<'a> {
             }
             MInst::Copy { dst, src, w } => {
                 let v = trunc(self.get(fr, *src), *w);
-                if *w == Width::Q {
-                    let h = self.get_hi(fr, *src);
-                    self.set_hi(fr, *dst, h);
-                }
+                let h = self.get_hi(fr, *src);
                 self.set(fr, *dst, v);
+                if w.class() == Class::Fpr {
+                    self.set_hi(fr, *dst, if *w == Width::Q { h } else { 0 });
+                }
             }
             MInst::ParallelCopy(pairs) => {
                 let vs: Vec<(u64, u64)> = pairs
@@ -693,8 +714,8 @@ impl<'a> Machine<'a> {
                     .collect();
                 for ((d, _, w), (v, h)) in pairs.iter().zip(vs) {
                     self.set(fr, *d, v);
-                    if *w == Width::Q {
-                        self.set_hi(fr, *d, h);
+                    if w.class() == Class::Fpr {
+                        self.set_hi(fr, *d, if *w == Width::Q { h } else { 0 });
                     }
                 }
             }
@@ -717,7 +738,7 @@ impl<'a> Machine<'a> {
                     self.set_hi(fr, *dst, hi);
                 } else {
                     let v = self.mem.load(a, w.bytes())?;
-                    self.set(fr, *dst, v);
+                    self.set_fp(fr, *dst, v, *w);
                 }
             }
             // B2.9: single-threaded, an exclusive pair is an ordinary
@@ -842,6 +863,17 @@ impl<'a> Machine<'a> {
                 self.gpr[0] = n;
             }
             "abs" => self.gpr[0] = (a[0] as i32).unsigned_abs() as u64,
+            // THEORY II-2: the libgcc soft-float pair zcc's long double rides
+            // on. Argument and result both live in q0/d0, so there is nothing
+            // to marshal — only the format change (see `hir::interp::f64_to_f128`).
+            "__extenddftf2" => {
+                let (lo, hi) = crate::hir::interp::f64_to_f128(self.fpr[0]);
+                self.fpr[0] = lo;
+                self.fpr_hi[0] = hi;
+            }
+            "__trunctfdf2" => {
+                self.fpr[0] = crate::hir::interp::f128_to_f64(self.fpr[0], self.fpr_hi[0]);
+            }
             "putchar" | "puts" | "printf" | "fprintf" => self.gpr[0] = 0,
             _ => return Err(Trap::NoSuchFunction(name.to_string())),
         }
