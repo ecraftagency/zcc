@@ -145,15 +145,15 @@
 | 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ✅ BANKED (`463d90c`) — sxtw-canonical residency (and/uxt/ubfx) default-ON, +both axes (size −13 insns, exec +0.09%); IV-simpl (2.3) already fired via 5/6/13; remaining residency (invariant adrp/add hoist + scaled-index-on-global) = memory-bound floor → #23/#25. See note ⓳ |
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ✅ BANKED — composite-marshal no-hazard fast path (skip stack round-trip). See note ⓴ |
 | 21 | **many-arg marshalling** (5.4) | BOTH | ✅ BANKED — GP parallel-move for the >8-arg hazard path (was spill-all/pop-reverse). See note ㉑ |
-| 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⬜ B3 — f2/f3 |
+| 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⬜ re-eval under speed metric (was size-negative → parked; speed lever now) |
 | 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
 | 25 | ☢ **NUCLEAR — SSA global register allocator** (GP+FP class, coalescing, spill-cost model) — subsumes 4.3, kills the uniform residency floor | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #22 (bounded FP register allocation / FP loop residency).
-#21 ✅ BANKED (GP parallel-move on the many-arg hazard path — sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
+only path to size *and* speed ≈ 1.0×. **RESUME = #23 (LICM / invariant-setup hoist, re-eval under speed).
+#22 ⚠️ DEFERRED → #25 (FP residency = FP arm of nuclear regalloc). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
 
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
@@ -276,6 +276,28 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #22 (bounded FP register all
 > bigger, rarer case; deferred, not on the near path). The two dead `mov x9,xN` before each stack-arg
 > store are the pre-existing DCE-after-forward gap (peephole forwards x9→xN for the str, leaves the mov),
 > shared with #20; a separate small dead-move lever, not #21. **RESUME = #22 (bounded FP regalloc).**
+
+> **㉒ #22 BOUNDED FP REGALLOC / FP LOOP RESIDENCY — outcome (session 2026-08-24). ⚠️ DEFERRED → #25.**
+> Measured the worst FP programs at the middle (Law-3) vs gcc-O1: **f3_float_minmax** work 2.83× / main
+> 3.63×, **f2_double_poly** poly 2.08×. Diagnosis:
+> - **f3**: `float mn,mx` loop-carried min/max. gcc keeps them in float s-regs (`fcmpe s1,s2` direct, 2
+>   insn inner). zcc keeps them DOUBLE-resident (d16/d17) and re-materializes `(double)(float)v` at every
+>   use — `fmov d0,d17; fcvt s0,d0; fcvt d0,s0; fmov d19,d0` — an 8-insn inner body of float→double→float
+>   churn. The narrow-then-widen pair `fcvt sX,dY; fcvt dY,sX` IS a provable identity when dY holds a
+>   widened-float (⟦·⟧: `(double)((float)((double)f)) = (double)f`, exact), so a value-residency peephole
+>   COULD drop it — BUT the anchor that proves "dY is float-valued" (mn/mx) is defined in the PREHEADER
+>   and read cross-block in the loop body. A block-local F-set is empty at the loop-body label ⟹ the
+>   peephole provably fires **0 times** on the hot loop (predicted Δ≈0 on the cost-model, before any
+>   patch). Suite-wide there are 13 such pairs, ALL cross-block-anchored (all in f3). Capturing them needs
+>   **cross-block FP value-residency dataflow** — not a peephole.
+> - **f2**: the `double` accumulator has NO fcvt churn (0 fcvt in poly) — its 2.08× is pure double-value
+>   home-residency (spill/reload of the accumulator + poly coefficients), i.e. the uniform home-primary
+>   floor, same as the GP side #17/#18/#19 hit.
+> Both are the **FP arm of #25 (nuclear regalloc — "native GP+FP class")**: either a real FP register
+> class keeping float locals in s-regs (kills f3's churn at the root) or cross-block FP residency dataflow
+> (kills the round-trips) — both = the register-primary rewrite, NOT a bounded lever. The one bounded
+> transform (block-local narrow-widen elimination) was Law-3-refuted before shipping (Δ≈0, cross-block
+> anchor). No positive to bank; tree unchanged. NO-PIVOT: quarantine-mark-advance. **RESUME = #23.**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 
