@@ -662,41 +662,89 @@ impl<'a> Cg<'a> {
             .filter(|(_, sl)| !matches!(sl, ASlot::S(..) | ASlot::StS(..)))
             .map(|(&(v, _), &sl)| (v, sl))
             .collect();
-        for &(val, sl) in &regargs {
-            self.ld_val(val, "x9"); // struct: x9 = address (home-safe staging, see ASlot::S)
-            if matches!(sl, ASlot::Q(_)) {
-                self.s += "\tfmov d0, x9\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
-            } else {
-                self.s += "\tstr x9, [sp, #-16]!\n";
-            }
-        }
-        for &(_, sl) in regargs.iter().rev() {
-            match sl {
-                ASlot::G(i) => _ = writeln!(self.s, "\tldr x{i}, [sp], #16"),
-                ASlot::F(i, f32_) => {
-                    _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tfmov d{i}, x9");
-                    if f32_ {
-                        _ = writeln!(self.s, "\tfcvt s{i}, d{i}");
-                    }
-                }
-                ASlot::St(i, two) => {
-                    _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tldr x{i}, [x9]");
-                    if two {
-                        _ = writeln!(self.s, "\tldr x{}, [x9, #8]", i + 1);
-                    }
-                }
-                ASlot::H(f0, n, dbl) => {
-                    self.s += "\tldr x9, [sp], #16\n";
-                    for j in 0..n {
-                        if dbl {
-                            _ = writeln!(self.s, "\tldr d{}, [x9, #{}]", f0 + j, 8 * j);
-                        } else {
-                            _ = writeln!(self.s, "\tldr s{}, [x9, #{}]", f0 + j, 4 * j);
+        // COMPOSITE-MARSHAL FAST PATH (#20 struct-by-value / #21 many-args). The push-all/
+        // pop-reverse scheme below is a SIMULTANEOUS-COPY sequentialization by stack round-trip:
+        // it reads every source (to the stack) before writing any arg-register dest, so a dest
+        // write can never clobber an unread source. That is sound but costs a str/ldr pair per
+        // reg-arg. When NO reg-arg source lives in a written GP arg register x{p}, p<gp (the
+        // common case — struct addresses / values are homed above the arg file), arg-order
+        // direct emission realizes the SAME register←source function with no round-trip. This
+        // is exactly the no-hazard fast path already proven for scalar calls in marshal_call_args
+        // (⟦·⟧: a hazard-free parallel move needs no sequentialization). Fall back to the stack
+        // scheme on any hazard, or on any Q reg-arg (long-double `bl __extenddftf2` mid-marshal
+        // clobbers the whole caller-saved file, so its source MUST be parked on the stack first).
+        let has_q = regargs.iter().any(|(_, sl)| matches!(sl, ASlot::Q(_)));
+        let hazard = regargs
+            .iter()
+            .any(|&(v, _)| matches!(v, Val::Tmp(t) if self.gp_home(t).is_some_and(|p| p < gp)));
+        if !has_q && !hazard {
+            for &(val, sl) in &regargs {
+                match sl {
+                    ASlot::G(i) => self.ld_val(val, &format!("x{i}")),
+                    ASlot::St(i, two) => {
+                        self.ld_val(val, "x9"); // x9 = struct address (scratch, never a home)
+                        _ = writeln!(self.s, "\tldr x{i}, [x9]");
+                        if two {
+                            _ = writeln!(self.s, "\tldr x{}, [x9, #8]", i + 1);
                         }
                     }
+                    ASlot::F(i, f32_) => {
+                        self.ld_val(val, "x9");
+                        _ = writeln!(self.s, "\tfmov d{i}, x9");
+                        if f32_ {
+                            _ = writeln!(self.s, "\tfcvt s{i}, d{i}");
+                        }
+                    }
+                    ASlot::H(f0, n, dbl) => {
+                        self.ld_val(val, "x9");
+                        for j in 0..n {
+                            if dbl {
+                                _ = writeln!(self.s, "\tldr d{}, [x9, #{}]", f0 + j, 8 * j);
+                            } else {
+                                _ = writeln!(self.s, "\tldr s{}, [x9, #{}]", f0 + j, 4 * j);
+                            }
+                        }
+                    }
+                    ASlot::Q(..) | ASlot::S(..) | ASlot::StS(..) => unreachable!(),
                 }
-                ASlot::Q(i) => _ = writeln!(self.s, "\tldr q{i}, [sp], #16"),
-                ASlot::S(..) | ASlot::StS(..) => unreachable!(),
+            }
+        } else {
+            for &(val, sl) in &regargs {
+                self.ld_val(val, "x9"); // struct: x9 = address (home-safe staging, see ASlot::S)
+                if matches!(sl, ASlot::Q(_)) {
+                    self.s += "\tfmov d0, x9\n\tbl __extenddftf2\n\tstr q0, [sp, #-16]!\n";
+                } else {
+                    self.s += "\tstr x9, [sp, #-16]!\n";
+                }
+            }
+            for &(_, sl) in regargs.iter().rev() {
+                match sl {
+                    ASlot::G(i) => _ = writeln!(self.s, "\tldr x{i}, [sp], #16"),
+                    ASlot::F(i, f32_) => {
+                        _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tfmov d{i}, x9");
+                        if f32_ {
+                            _ = writeln!(self.s, "\tfcvt s{i}, d{i}");
+                        }
+                    }
+                    ASlot::St(i, two) => {
+                        _ = writeln!(self.s, "\tldr x9, [sp], #16\n\tldr x{i}, [x9]");
+                        if two {
+                            _ = writeln!(self.s, "\tldr x{}, [x9, #8]", i + 1);
+                        }
+                    }
+                    ASlot::H(f0, n, dbl) => {
+                        self.s += "\tldr x9, [sp], #16\n";
+                        for j in 0..n {
+                            if dbl {
+                                _ = writeln!(self.s, "\tldr d{}, [x9, #{}]", f0 + j, 8 * j);
+                            } else {
+                                _ = writeln!(self.s, "\tldr s{}, [x9, #{}]", f0 + j, 4 * j);
+                            }
+                        }
+                    }
+                    ASlot::Q(i) => _ = writeln!(self.s, "\tldr q{i}, [sp], #16"),
+                    ASlot::S(..) | ASlot::StS(..) => unreachable!(),
+                }
             }
         }
         // struct return >16B: the callee writes directly via x8 (set AFTER popping registers, so it is not clobbered)

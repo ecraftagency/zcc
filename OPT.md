@@ -143,8 +143,8 @@
 | 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⚠️ pass shipped PROVEN but default-OFF + ✅ banked spin-off. See note ⓱ |
 | 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⛔ same-block core already ✅ (lever 5, 147 folds); cross-block extension ABANDONED — measured exec-NEUTRAL + unsafe-dominant. See note ⓲ |
 | 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ✅ BANKED (`463d90c`) — sxtw-canonical residency (and/uxt/ubfx) default-ON, +both axes (size −13 insns, exec +0.09%); IV-simpl (2.3) already fired via 5/6/13; remaining residency (invariant adrp/add hoist + scaled-index-on-global) = memory-bound floor → #23/#25. See note ⓳ |
-| 20 | **struct-by-value + HFA** (5.3) | BOTH | ⬜ B3 — AAPCS64 §5.4/5.5 |
-| 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5 |
+| 20 | **struct-by-value + HFA** (5.3) | BOTH | ✅ BANKED — composite-marshal no-hazard fast path (skip stack round-trip). See note ⓴ |
+| 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5. NB e2's args ARE arg-reg-homed ⟹ hazard ⟹ needs composite parallel-move (bigger than #20's fast path) |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⬜ B3 — f2/f3 |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⬜ re-eval under speed metric (was size-negative → parked; speed lever now) |
 | 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
@@ -152,8 +152,8 @@
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #20 (struct-by-value + HFA). #19 ✅ BANKED (`463d90c`);
-its remaining residency = the #23/#25 memory-bound floor, NOT a #19 peephole.**
+only path to size *and* speed ≈ 1.0×. **RESUME = #21 (many-arg marshalling). #20 ✅ BANKED (composite-marshal
+no-hazard fast path); its remaining residency (sum-body home-reload) = the #25 regalloc floor, NOT a #20 lever.**
 
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
@@ -230,6 +230,29 @@ its remaining residency = the #23/#25 memory-bound floor, NOT a #19 peephole.**
 >   it only falls to #25 (nuclear regalloc, home→register-primary). NO-PIVOT: do NOT chase it here; the
 >   clean sub-lever is banked, the floor is #23/#25's problem. **RESUME = re-eval #23 LICM under the speed
 >   metric, or advance to #20 (struct-by-value).**
+
+> **⓴ #20 STRUCT-BY-VALUE + HFA — outcome (session 2026-08-24).** Measured e3 (the only true by-value
+> caller in the suite; c1/c3 pass structs by POINTER = scalar, already handled by addr levers) at the
+> middle vs gcc-O1: **ABI classification is CORRECT** (16B struct → x0:x1 per AAPCS64 §5.4; HFA classify
+> + v-reg marshal already present). The struct-SPECIFIC inefficiency was the CALLER marshalling: the
+> composite path `ir_call_abi` (Inst::CallX — any struct/HFA/>8-arg call) used a push-all/pop-reverse
+> STACK round-trip per reg-arg, while the scalar path `marshal_call_args` already emits direct
+> parallel-moves with no round-trip. **✅ BANKED — composite-marshal no-hazard fast path.** When no
+> reg-arg's GP source is homed in a written arg register x{p},p<gp (the common case; and no Q/long-double
+> arg whose `bl __extenddftf2` clobbers the file mid-marshal), emit reg args in arg order directly —
+> same register←source function, no stack round-trip. This is the SAME parallel-move soundness already
+> proven for scalar calls (⟦·⟧: a hazard-free parallel move needs no sequentialization); the proven
+> stack scheme stays as the hazard/Q fallback. e3 `sum(v)` marshalling `mov x9,x2; str x9,[sp,#-16]!;
+> ldr x9,[sp],#16; ldp x0,x1,[x9]` → `ldp x0,x1,[x2]`. **MEASURED (same-session A/B vs rebuilt
+> baseline):** sqlite 286,833→**286,805** (−28); perfn 1.759×→**1.758×** (−2 suite insns, e3 only); e3
+> exec best-of-5 10→9ms (positive, non-regressing). FULL GATE GREEN (cargo 181/0, opt-parity 1552/0,
+> torture 1471/0 FAIL, csmith300 254/0, yarpgen300 300/0). Small but proven + zero-risk (Law-4: capture
+> the struct-specific residual, don't stop at first green). **RESIDUAL (NOT #20 — the #25 floor):** the
+> callee `sum()` body still spills the 2 param regs to stack home and reloads each field with
+> `ldrsw`+redundant `sxtw` instead of gcc's in-register `asr 32` field-extract — that is the UNIFORM
+> home-primary regalloc floor (#17/#18/#19 all hit it), falls only to #25 nuclear, NOT a struct lever.
+> **e2 (#21) did NOT take the fast path** — its 8+ args overflow and ARE homed in arg registers ⟹
+> hazard ⟹ stayed on the proven stack scheme; #21 needs a composite parallel-move (bigger). **RESUME = #21.**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 
