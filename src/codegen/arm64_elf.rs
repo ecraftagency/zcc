@@ -3654,10 +3654,13 @@ fn drop_wform_sxtw(body: &str) -> String {
 /// copies the emitter inserts become dead), THEN redundant round-trips, THEN dead stores,
 /// THEN bitfield fusion (LEVER 1) + redundant sign-extend elim (LEVER 2) + the demand-side w-form
 /// sign-extend elim (LEVER 7) on the settled stream.
-fn peephole_moves(body: &str) -> String {
-    drop_wform_sxtw(&drop_dead_moves(&drop_redundant_uxt(&drop_redundant_sxtw(&fuse_bitfield(
-        &drop_redundant_moves(&propagate_copies(body)),
-    )))))
+fn peephole_moves(body: &str, ret_gp: u32) -> String {
+    drop_wform_sxtw(&drop_dead_moves(
+        &drop_redundant_uxt(&drop_redundant_sxtw(&fuse_bitfield(&drop_redundant_moves(
+            &propagate_copies(body),
+        )))),
+        ret_gp,
+    ))
 }
 
 // The target `.L` label of a local branch, or None if the line is not one. Branches to a
@@ -4303,59 +4306,255 @@ fn cbz_fuse(body: &str) -> String {
     out
 }
 
-/// DEAD-MOVE ELIMINATION (region-local backward liveness). A `mov xD,xS` is deleted when xD
-/// is redefined later in the same straight-line region BEFORE any read of xD — its value is
-/// never observed. The coalescer gives many short-lived temps the same home register, so the
-/// emitter stores each to that home and overwrites it before it is read: pure dead stores.
-/// Live-out at a region boundary is the conservative FULL set, so a move is dropped only when
-/// a later write within the region provably kills it. Only `mov x,x` lines are ever removed.
-fn drop_dead_moves(body: &str) -> String {
-    use std::collections::HashSet;
+/// GLOBAL DEAD-MOVE ELIMINATION (CFG live-out backward dataflow). [Phase 1.4 — supersedes the
+/// region-local scan.] A `mov xD,xS` (and a dead in-place `sxtw xD,wD`) is deleted when xD is not
+/// live-out at that point, computed over the WHOLE function CFG instead of reset to FULL at every
+/// label/branch. The out-of-SSA φ-destruction copies the coalescer leaves in every loop header —
+/// `mov xD,xS` overwritten in the body before any read, but ACROSS a block boundary — become
+/// visibly dead only with cross-block liveness; the old local scan could never see it.
+///
+/// Soundness (translation-validation): a line is removed ONLY when its destination register is
+/// dead on every CFG path (bit 0 in the fix-pointed live-out) — nothing observes the value, so
+/// ⟦body⟧ = ⟦body∖line⟧. Every uncertainty WIDENS liveness, never narrows it:
+///   • a call/unknown line ⟹ its whole block is OPAQUE (live-in = FULL): nothing dropped there;
+///   • an unresolved branch target (label outside this body) ⟹ that block's live-out = FULL;
+///   • a trailing block with no `ret` and no successor ⟹ live-out = FULL;
+///   • `ret` seeds live-out with exactly the caller-visible return regs (`ret_gp` = 0 for void/
+///     float/HFA, 1 for a scalar in x0, 2 for a 128-bit x0:x1) — callee-saved/fp/lr liveness
+///     rides in on the epilogue's own reads/writes (its restore-`ldp` kills them from above).
+/// Pre/post-index writeback (`[xN],#k` / `[xN,#k]!`) is MODELLED (base read+written, Rt read for
+/// a store / written for a load) instead of forcing a boundary, so the post-index loads in hot
+/// loops no longer poison the analysis (their block stays analyzable).
+fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
+    use std::collections::HashMap;
+    const NR: u32 = 31; // regs x0..x30 tracked; bit r ↔ reg r
+    let full: u32 = (1u32 << NR) - 1;
+    let mut exit_live: u32 = 0;
+    for r in 0..ret_gp.min(NR) {
+        exit_live |= 1 << r;
+    }
     let lines: Vec<&str> = body.lines().collect();
+
+    // reads/writes as bitmasks, or None ⟹ opaque (control transfer / unmodelable). Writeback
+    // addressing is modelled here (reg_uses conservatively rejects it as a boundary).
+    let live_rw = |t: &str| -> Option<(u32, u32)> {
+        let mask = |v: Vec<u32>| -> u32 { v.into_iter().filter(|&x| x < NR).fold(0, |m, x| m | (1 << x)) };
+        if !(t.contains("],") || t.contains("]!")) {
+            let (r, w, boundary) = reg_uses(t);
+            return if boundary { None } else { Some((mask(r), mask(w))) };
+        }
+        let mn = t.split_whitespace().next().unwrap_or("");
+        let toks: Vec<&str> = t[mn.len()..].trim_start().split(',').collect();
+        let slot = |tok: &str| -> Option<u32> {
+            let tok = tok.trim().trim_start_matches('[').trim_end_matches('!').trim_end_matches(']');
+            tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))?.parse::<u32>().ok().filter(|&r| r < NR)
+        };
+        let base = toks.iter().find(|x| x.contains('[')).and_then(|x| slot(x));
+        let is_store = mn.starts_with("st");
+        let (mut reads, mut writes) = (0u32, 0u32);
+        if let Some(b) = base {
+            reads |= 1 << b; // base += imm : read then written by the writeback
+            writes |= 1 << b;
+        }
+        for tk in &toks {
+            if tk.contains('[') {
+                continue;
+            }
+            if let Some(r) = slot(tk) {
+                if is_store {
+                    reads |= 1 << r;
+                } else {
+                    writes |= 1 << r;
+                }
+            }
+        }
+        Some((reads, writes))
+    };
+
+    // Per-line kind. Labels/targets borrow `body` (via `lines`).
+    enum K<'a> {
+        Skip,               // directive / blank — no liveness effect
+        Label(&'a str),     // block header (name without ':')
+        Jump(&'a str),      // b <target>
+        Cond(u32, &'a str), // b.cc / cbz / tbz : (reads-mask, target); + fallthrough
+        Exit(u32),          // ret / br : (reads-mask); no in-body successor
+        Opaque,             // bl / blr / unmodelable ⟹ block opaque
+        Mov(u32, u32),      // mov xD,xS : (d, s)  — drop candidate
+        Sxtw(u32),          // in-place sxtw xD,wD : (d)  — drop candidate
+        Op(u32, u32),       // everything else : (reads, writes)
+    }
+    let first_reg = |t: &str, mn: &str| -> u32 {
+        let f = t[mn.len()..].trim_start().split(',').next().unwrap_or("").trim();
+        f.strip_prefix('x').or_else(|| f.strip_prefix('w')).and_then(|s| s.parse::<u32>().ok())
+            .filter(|&r| r < NR).map(|r| 1u32 << r).unwrap_or(0)
+    };
+    fn last_tok(s: &str) -> &str {
+        s.rsplit([',', ' ', '\t']).next().unwrap_or("").trim()
+    }
+    let kinds: Vec<K> = lines
+        .iter()
+        .map(|line| {
+            let t = line.trim();
+            if t.is_empty() || (t.starts_with('.') && !t.ends_with(':')) {
+                return K::Skip;
+            }
+            if t.ends_with(':') {
+                return K::Label(&t[..t.len() - 1]);
+            }
+            let mn = t.split_whitespace().next().unwrap_or("");
+            if mn == "b" {
+                return K::Jump(last_tok(t));
+            }
+            if mn.starts_with("b.") {
+                return K::Cond(0, last_tok(t));
+            }
+            if mn == "cbz" || mn == "cbnz" || mn == "tbz" || mn == "tbnz" {
+                return K::Cond(first_reg(t, mn), last_tok(t));
+            }
+            if mn == "ret" {
+                return K::Exit(0);
+            }
+            if mn == "br" {
+                return K::Exit(first_reg(t, mn));
+            }
+            if mn == "bl" || mn == "blr" {
+                return K::Opaque;
+            }
+            match live_rw(t) {
+                None => K::Opaque,
+                Some((r, w)) => {
+                    if let Some((d, s)) = parse_mov_xx(t) {
+                        if d < NR && s < NR {
+                            return K::Mov(d, s);
+                        }
+                    }
+                    if t.starts_with("sxtw ") && w.count_ones() == 1 && r == w {
+                        return K::Sxtw(w.trailing_zeros());
+                    }
+                    K::Op(r, w)
+                }
+            }
+        })
+        .collect();
+
+    // Build blocks: a new block begins at the first meaningful line, at every label, and after
+    // every terminator (Jump/Cond/Exit). `bl` does NOT split a block — it only marks it opaque.
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    let mut prev_term = true; // force the first meaningful line to open a block
+    for (i, k) in kinds.iter().enumerate() {
+        if matches!(k, K::Skip) {
+            continue;
+        }
+        if prev_term || matches!(k, K::Label(_)) || blocks.is_empty() {
+            blocks.push(Vec::new());
+        }
+        let b = blocks.len() - 1;
+        blocks[b].push(i);
+        prev_term = matches!(k, K::Jump(_) | K::Cond(..) | K::Exit(_));
+    }
+    let nb = blocks.len();
+    let mut label_map: HashMap<&str, usize> = HashMap::new();
+    for (b, mem) in blocks.iter().enumerate() {
+        if let Some(&f) = mem.first() {
+            if let K::Label(name) = kinds[f] {
+                label_map.insert(name, b);
+            }
+        }
+    }
+    // Static successor/exit/full/opaque info per block.
+    struct BInfo {
+        succ: Vec<usize>,
+        exit: bool,
+        full: bool, // live-out unconditionally FULL (unresolved target / trailing fall-through)
+        opaque: bool,
+    }
+    let info: Vec<BInfo> = blocks
+        .iter()
+        .enumerate()
+        .map(|(b, mem)| {
+            let opaque = mem.iter().any(|&i| matches!(kinds[i], K::Opaque));
+            let fallthrough = |b: usize| -> Option<usize> { (b + 1 < nb).then_some(b + 1) };
+            let (mut succ, mut exit, mut full) = (Vec::new(), false, false);
+            match kinds[*mem.last().unwrap()] {
+                K::Exit(_) => exit = true,
+                K::Jump(tg) => match label_map.get(tg) {
+                    Some(&s) => succ.push(s),
+                    None => full = true,
+                },
+                K::Cond(_, tg) => {
+                    match label_map.get(tg) {
+                        Some(&s) => succ.push(s),
+                        None => full = true,
+                    }
+                    match fallthrough(b) {
+                        Some(s) => succ.push(s),
+                        None => full = true,
+                    }
+                }
+                _ => match fallthrough(b) {
+                    Some(s) => succ.push(s),
+                    None => full = true, // trailing block, no terminator ⟹ conservative
+                },
+            }
+            BInfo { succ, exit, full, opaque }
+        })
+        .collect();
+
+    // Backward transfer of one line over the live-after set `cur`.
+    let step = |i: usize, cur: u32| -> u32 {
+        match kinds[i] {
+            K::Cond(r, _) | K::Exit(r) => cur | r,
+            K::Mov(d, s) => (cur & !(1 << d)) | (1 << s),
+            K::Sxtw(d) => cur | (1 << d), // reads==writes==d ⟹ keeps d live
+            K::Op(r, w) => (cur & !w) | r,
+            _ => cur, // Skip / Label / Jump / Opaque : no GP effect (opaque block handled apart)
+        }
+    };
+    let live_out = |b: usize, live_in: &[u32]| -> u32 {
+        let mut lo = if info[b].full { full } else { 0 };
+        if info[b].exit {
+            lo |= exit_live;
+        }
+        for &s in &info[b].succ {
+            lo |= live_in[s];
+        }
+        lo
+    };
+
+    // Fixpoint for live-in per block.
+    let mut live_in = vec![0u32; nb];
+    loop {
+        let mut changed = false;
+        for b in (0..nb).rev() {
+            let li = if info[b].opaque {
+                full
+            } else {
+                blocks[b].iter().rev().fold(live_out(b, &live_in), |cur, &i| step(i, cur))
+            };
+            if live_in[b] != li {
+                live_in[b] = li;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Drop pass: re-scan each non-opaque block backward from its final live-out, deleting a
+    // `mov`/in-place-`sxtw` whose destination is dead at that point.
     let mut drop = vec![false; lines.len()];
-    let full: HashSet<u32> = (0..=30).collect();
-    let mut live = full.clone();
-    for (i, line) in lines.iter().enumerate().rev() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('.') {
-            continue; // directive/blank: no effect on register liveness
-        }
-        if t.ends_with(':') {
-            live = full.clone(); // label = region boundary above it ⟹ all live-out
+    for b in 0..nb {
+        if info[b].opaque {
             continue;
         }
-        let (reads, writes, boundary) = reg_uses(t);
-        if boundary {
-            live = full.clone(); // branch/call/ret/unknown ⟹ conservative live-out
-            continue;
-        }
-        if let Some((d, _s)) = parse_mov_xx(t) {
-            if !live.contains(&d) {
-                drop[i] = true; // xD is dead here ⟹ this store is never observed
-                continue; // deleted ⟹ it neither reads nor writes
+        let mut cur = live_out(b, &live_in);
+        for &i in blocks[b].iter().rev() {
+            match kinds[i] {
+                K::Mov(d, _) if (cur & (1 << d)) == 0 => drop[i] = true,
+                K::Sxtw(d) if (cur & (1 << d)) == 0 => drop[i] = true,
+                _ => cur = step(i, cur),
             }
-        }
-        // LEVER 7 (R2) — a dead in-place `sxtw xD, wD` is pure dead code: it writes xD and, when
-        // xD is not live below, nothing observes the extension. Same dead-store proof as `mov x,x`
-        // above, but the backward liveness sees ACROSS region boundaries where the forward
-        // `drop_wform_sxtw` scan conservatively stops (a value live-out of the block but dead in
-        // every successor is caught here, not there). Dropping removes both the write and the
-        // same-register read, leaving xD's (already-dead) liveness above unchanged.
-        if t.starts_with("sxtw ")
-            && writes.len() == 1
-            && reads == writes
-            && !live.contains(&writes[0])
-        {
-            drop[i] = true;
-            continue;
-        }
-        for w in &writes {
-            if !reads.contains(w) {
-                live.remove(w); // a pure write kills the register above it
-            }
-        }
-        for r in &reads {
-            live.insert(*r);
         }
     }
     let mut out = String::with_capacity(body.len());
@@ -4820,8 +5019,20 @@ pub fn emit_ir(ast: &Ast) -> String {
             body = drop_redundant_loads(&body); // run on the raw stream, before copy-prop renames
         }
         let c_load = costsq.then(|| count_insn_lines(&body));
+        // GP registers the caller can observe at `ret` — the seed for cross-block dead-move
+        // liveness. sret (struct via x8) returns the pointer in x0:x1 (conservative 2); a scalar
+        // ≤8B → x0; a 128-bit scalar/struct → x0:x1; void/float/HFA → none (result in v-regs).
+        let ret_gp: u32 = if f.sret != 0 {
+            2
+        } else if matches!(g.a.tt.tys[f.ret as usize], Ty::Void) || g.a.tt.is_float(f.ret) || g.a.tt.hfa(f.ret).is_some() {
+            0
+        } else if g.a.tt.size(f.ret) > 8 {
+            2
+        } else {
+            1
+        };
         if g.regalloc && passes.peephole {
-            body = peephole_moves(&body); // redundant/dead reg-moves…
+            body = peephole_moves(&body, ret_gp); // redundant/dead reg-moves…
             if !f.has_volatile {
                 // …then fold a loop-IV `mem [xP]; add xP,xP,#k` into a post-index access. Skipped
                 // for volatile functions (the increment's hoist reorders relative to the access).
@@ -4929,7 +5140,7 @@ mod tests {
     #[test]
     fn peephole_drops_redundant_roundtrip() {
         let body = "\tmov x24, x0\n\tmov x0, x24\n\tadd x0, x0, x1\n";
-        let out = peephole_moves(body);
+        let out = peephole_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x24"), 0, "the redundant reload must be dropped");
         assert_eq!(count(&out, "mov x24, x0"), 1, "the store to the home must be kept");
         assert!(out.contains("add x0, x0, x1"), "the real op is untouched");
@@ -4940,7 +5151,7 @@ mod tests {
     #[test]
     fn peephole_keeps_move_after_clobber() {
         let body = "\tmov x24, x0\n\tmul x0, x5, x6\n\tmov x0, x24\n";
-        let out = peephole_moves(body);
+        let out = peephole_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x24"), 1, "x0 was clobbered ⟹ the reload is real");
     }
 
@@ -4998,7 +5209,7 @@ mod tests {
     #[test]
     fn peephole_flushes_at_label() {
         let body = "\tmov x24, x0\n.Lx:\n\tmov x0, x24\n";
-        let out = peephole_moves(body);
+        let out = peephole_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x24"), 1, "must not elide across a label");
     }
 
@@ -5006,7 +5217,7 @@ mod tests {
     #[test]
     fn peephole_flushes_on_unknown() {
         let body = "\tmov x24, x0\n\tzzz x0, x1\n\tmov x0, x24\n";
-        let out = peephole_moves(body);
+        let out = peephole_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x24"), 1, "unknown insn ⟹ flush ⟹ keep the reload");
     }
 
@@ -5015,7 +5226,7 @@ mod tests {
     #[test]
     fn peephole_preserves_distinct_move() {
         let body = "\tmov x24, x0\n\tmov x0, x24\n\tmov x1, x25\n";
-        let out = peephole_moves(body);
+        let out = peephole_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x24"), 0, "redundant dropped");
         assert_eq!(count(&out, "mov x1, x25"), 1, "an unrelated move is preserved");
     }
@@ -5094,7 +5305,7 @@ mod tests {
     #[test]
     fn dce_drops_dead_store() {
         let body = "\tmov x24, x0\n\tmov x24, x1\n\tmov x2, x24\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x24, x0"), 0, "the overwritten-before-read store is dead");
         assert_eq!(count(&out, "mov x24, x1"), 1, "the store that IS read must stay");
     }
@@ -5104,7 +5315,7 @@ mod tests {
     #[test]
     fn dce_keeps_used_store() {
         let body = "\tmov x24, x0\n\tmov x2, x24\n\tmov x24, x1\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x24, x0"), 1, "x24 is READ before overwrite ⟹ live, keep");
     }
 
@@ -5112,7 +5323,7 @@ mod tests {
     #[test]
     fn dce_counts_reads_in_stores() {
         let body = "\tmov x24, x0\n\tstr x24, [x1]\n\tmov x24, x2\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x24, x0"), 1, "str reads x24 ⟹ the store is live");
     }
 
@@ -5121,17 +5332,55 @@ mod tests {
     #[test]
     fn dce_conservative_across_boundary() {
         let body = "\tmov x24, x0\n\tcbz x1, .Lx\n\tmov x24, x2\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x24, x0"), 1, "live-out across a branch ⟹ keep");
     }
 
-    // Writeback addressing implicitly mutates a base register — treated as a boundary, so no
-    // move is dropped across it (safety over coverage).
+    // Writeback addressing is now MODELLED (pre/post-index base = read+written, Rt = load-write /
+    // store-read) rather than forcing a boundary. `ldr x2,[x3,#8]!` touches x2/x3, NOT x24, so the
+    // first `mov x24,x0` is genuinely dead (x24 overwritten by `mov x24,x1` before any read) and
+    // removable — a sound win the old conservative boundary left on the table.
     #[test]
-    fn dce_safe_on_writeback() {
+    fn dce_models_writeback_base() {
         let body = "\tmov x24, x0\n\tldr x2, [x3, #8]!\n\tmov x24, x1\n";
-        let out = drop_dead_moves(body);
-        assert_eq!(count(&out, "mov x24, x0"), 1, "writeback ⟹ boundary ⟹ conservative keep");
+        let out = drop_dead_moves(body, 1);
+        assert_eq!(count(&out, "mov x24, x0"), 0, "writeback modelled ⟹ x24 dead ⟹ dropped");
+        assert_eq!(count(&out, "ldr x2, [x3, #8]!"), 1, "the writeback load itself is preserved");
+    }
+
+    // TEETH for writeback modelling: a `str x24,[x3],#8` READS x24 (post-index store), so the
+    // prior `mov x24,x0` is LIVE and must be kept — mis-modelling the store's Rt as a write would
+    // wrongly drop it (a miscompile). The base x3 is read+written; x24 is a pure read.
+    #[test]
+    fn dce_writeback_store_reads_rt() {
+        let body = "\tmov x24, x0\n\tstr x24, [x3], #8\n\tmov x24, x1\n";
+        let out = drop_dead_moves(body, 1);
+        assert_eq!(count(&out, "mov x24, x0"), 1, "post-index store reads x24 ⟹ keep");
+    }
+
+    // CROSS-BLOCK (Phase 1.4 core): a φ-destruction copy in a loop HEADER whose destination is
+    // overwritten in the BODY before any read — dead only when liveness crosses the block edge.
+    // x2 is written by `mov x2,x3` in the header, redefined by `ldrsw x2,[x19]` in the body before
+    // use, and not a return reg (ret_gp=1 ⟹ only x0 live at exit) ⟹ the header copy is dead.
+    // The old region-local scan reset to FULL at the label and could never remove it.
+    #[test]
+    fn dce_cross_block_dead_phi_copy() {
+        let body = "\tmov x0, #0\n.Lh:\n\tmov x2, x3\n\tcmp x19, x20\n\tb.hs .Le\n\
+                    \tldrsw x2, [x19], #4\n\tadd x0, x0, x2\n\tb .Lh\n.Le:\n\tret\n";
+        let out = drop_dead_moves(body, 1);
+        assert_eq!(count(&out, "mov x2, x3"), 0, "x2 dead across the header→body edge ⟹ dropped");
+        assert_eq!(count(&out, "ldrsw x2, [x19], #4"), 1, "the real definition stays");
+        assert_eq!(count(&out, "add x0, x0, x2"), 1, "the live accumulation stays");
+    }
+
+    // TEETH for cross-block: the SAME shape but the copy's destination (x0) IS the return value —
+    // live at `ret` (ret_gp=1) — so it must NOT be dropped even though the body writes x0 too.
+    #[test]
+    fn dce_cross_block_keeps_live_out() {
+        let body = "\tmov x0, x5\n.Lh:\n\tcmp x19, x20\n\tb.hs .Le\n\
+                    \tadd x19, x19, #1\n\tb .Lh\n.Le:\n\tret\n";
+        let out = drop_dead_moves(body, 1);
+        assert_eq!(count(&out, "mov x0, x5"), 1, "x0 is returned (live at ret) ⟹ keep");
     }
 
     // REGRESSION (the stdarg-1 miscompile): a FLOAT/VECTOR destination whose ADDRESS is a GP
@@ -5141,7 +5390,7 @@ mod tests {
     #[test]
     fn dce_keeps_addr_of_float_load() {
         let body = "\tmov x0, x10\n\tldr q0, [x0]\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x10"), 1, "x0 is the load address (read) ⟹ keep");
     }
 
@@ -5149,7 +5398,7 @@ mod tests {
     #[test]
     fn dce_keeps_src_of_fmov_to_float() {
         let body = "\tmov x0, x10\n\tfmov d0, x0\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x10"), 1, "x0 is the fmov source (read) ⟹ keep");
     }
 
@@ -5158,7 +5407,7 @@ mod tests {
     #[test]
     fn dce_float_to_gp_writes_dst() {
         let body = "\tmov x0, x10\n\tfmov x0, d0\n\tmov x1, x0\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "mov x0, x10"), 0, "fmov x0,d0 overwrites x0 ⟹ prior store dead");
     }
 
@@ -5167,7 +5416,7 @@ mod tests {
     #[test]
     fn dce_drops_dead_inplace_sxtw() {
         let body = "\tsxtw x24, w24\n\tmov x24, x1\n\tmov x2, x24\n";
-        let out = drop_dead_moves(body);
+        let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "sxtw x24, w24"), 0, "the re-canon whose result is overwritten is dead");
     }
 
