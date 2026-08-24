@@ -265,7 +265,7 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | **4.2** | FP value residency (kill `d→x→d` round-trips) | 1 | all F (f3 5.1×) | value-residency + FP class | ✅ DONE (`collapse_fp_bridge`, d→x→d bridge collapse) |
 | **4.3** | bounded FP register allocation (v-regs) | 1/3 | all F | AAPCS64 §5.1.2 | ⬜ |
 | **5.1** | switch jump-table (dense → `adr;br` offset table) | 1 | d1 (5.4×) | switch-table theorem | ⬜ |
-| **5.2** | bitfield `bfi`/`bfxil`/`sbfx` | 2 | c2 (3.15×) | ARMv8 bitfield | ⬜ |
+| **5.2** | bitfield `bfi`/`bfxil`/`sbfx` | 2 | c2 (3.15×) | ARMv8 bitfield | ✅ **WRITE side DONE** (`store()` Bitfield → single `bfi rD,rS,#lsb,#w`, was 7–9-insn imm/bic/lsl/and/orr RMW; read side already fused via `ubfx`/`sbfx`). sqlite −506, c2 main 106→95, perfn 1.778→1.771. Residual = `sxtw/ubfx` value-prep before bfi (value-residency floor). |
 | **5.3** | struct-by-value in registers + HFA | 2 | e3 (4.4×) | AAPCS64 §5.4/§5.5 | ⬜ |
 | **5.4** | many-arg marshalling | 2 | e2 (3.2×) | AAPCS64 §5.5 | ⬜ |
 | **6** | ☢ **SSA global register allocator** (native GP+FP class, coalescing, save-cost model) — REWRITE, standalone, subsumes 4.3 | 3 | residual floor | — | 🔒 **GATED: needs explicit "go nuclear" after 1–5 banked + `perfn.sh` residual re-measured** |
@@ -333,6 +333,22 @@ when H<<48 is VFPExpandImm-encodable ∧ xN dead by forward-liveness; 5 teeth te
 sqlite size −106 (289,489→289,383, FP-minor on integer code, as expected). FULL GATE GREEN: cargo 175/0,
 torture 1471/0 FAIL, opt-parity 1552/0 DIVERGE, csmith300 254/0, yarpgen300 300/0. Machine
 translation-validation (pure ISA-immediate identity / value-residency). Advance to next FP-band lever.
+
+**★ 5.1 QUARANTINED + 5.2 (bitfield-write `bfi`) BANKED 2026-08-24 (this session).**
+- **5.1 switch jump-table — QUARANTINED (mis-specified, yield≈0, NO pivot).** Measurement (Law-3):
+  gcc-O1 does NOT jump-table `switch(i&7)` — it uses a *balanced comparison tree*; and the d1
+  perfn 5.33× was an **inlining artifact** (zcc inlines `work` into `main`, gcc keeps main=12).
+  work-to-work is 1.41× = body residency, not dispatch. Advanced per grinding rule.
+- **⚠️ META (data, not a pivot):** several perfn `main` spikes (d1/c2/d4) are inflated by an
+  **inlining-policy mismatch** (zcc inlines more than gcc-O1) ⟹ per-fn static count double-counts
+  ⟹ the 1.77× headline OVERSTATES the true code-quality gap; clean construct deltas are smaller
+  (bitfield *work* 1.9× not 3.1×). An inlining cost-model lever is NOT in the 5.x list — needs an
+  explicit "re-plan" before touching. Flagged only.
+- **5.2 bitfield WRITE → `bfi` BANKED.** `store()` Bitfield arm now emits `ldr; bfi rD,rS,#lsb,#w; str`
+  (was materialize-mask/`bic`/`lsl`/`and`/`orr` = 7–9 insns). Pure ISA identity (BFM alias). Differential
+  MATCH incl. signed/40-bit-x-form/overflow-trunc fields. **sqlite 289,383→288,877 (−506); perfn
+  1.778→1.771.** Gate: cargo 175/0, torture 1471/0 FAIL, opt-parity 1552/0, csmith300 254/0, yarpgen300
+  300/0. NEXT ⬜ = 5.3 struct-by-value (c1/c3) or 5.4 many-args (e2), + FP f3 residual.
 
 **★ LICM — MEASUREMENT CLOSED 2026-08-24, stays OFF (correct).** Fresh best-of-7 sieve(100M): default
 509ms · `ZCC_OPT_ON=licm` 497ms (−2.4%) · gcc-O1 424ms (zcc **1.20×**). sqlite size: default 292,927 ·

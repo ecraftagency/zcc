@@ -1213,19 +1213,23 @@ impl Cg<'_> {
                 );
             }
             Ty::Bitfield(b, boff, w) => {
-                // read-modify-write the containing unit
-                let usz = self.a.tt.size(b);
+                // read-modify-write the containing unit, field-insert via ARMv8 BFI [Phase 5.2].
+                // `bfi rD,rS,#lsb,#width` (BFM alias, ARM DDI0487 C6.2.34) sets rD<lsb+width-1:lsb>
+                // = rS<width-1:0> and leaves every other bit of rD unchanged — EXACTLY the RMW this
+                // used to spell out (materialize mask ; `bic` clear field ; `lsl`+`and` place value's
+                // low `w` bits ; `orr` insert). Translation-validation: pure ISA identity — the old
+                // `and x{s5},x{s5},mask` kept only rS<w-1:0> at [boff,boff+w), which is bfi's
+                // definition. Register form follows the container width (w-form ⟹ boff+w≤32 by
+                // layout; usz=8 ⟹ x-form). Collapses 7–9 insns → 3. s4/s5 scratch now unused.
+                let _ = (s4, s5);
+                let (usz, rw) = (self.a.tt.size(b), if self.a.tt.size(b) == 8 { 'x' } else { 'w' });
                 _ = match usz {
                     1 => writeln!(self.s, "\tldrb w{s3}, [x{ad}]"),
                     2 => writeln!(self.s, "\tldrh w{s3}, [x{ad}]"),
                     4 => writeln!(self.s, "\tldr w{s3}, [x{ad}]"),
                     _ => writeln!(self.s, "\tldr x{s3}, [x{ad}]"),
                 };
-                let mask = ((!0u64 >> (64 - w)) << boff) as i64;
-                self.imm(&format!("x{s4}"), mask);
-                _ = writeln!(self.s, "\tbic x{s3}, x{s3}, x{s4}");
-                _ = writeln!(self.s, "\tlsl x{s5}, x{reg}, #{boff}");
-                _ = writeln!(self.s, "\tand x{s5}, x{s5}, x{s4}\n\torr x{s3}, x{s3}, x{s5}");
+                _ = writeln!(self.s, "\tbfi {rw}{s3}, {rw}{reg}, #{boff}, #{w}");
                 _ = match usz {
                     1 => writeln!(self.s, "\tstrb w{s3}, [x{ad}]"),
                     2 => writeln!(self.s, "\tstrh w{s3}, [x{ad}]"),
