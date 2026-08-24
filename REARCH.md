@@ -13,8 +13,11 @@
 - `main` @ `4fb7a0a` = the old optimizer, sqlite **1.768×** gcc-O1 (static insns), tagged **`rc3`** (pushed).
   It is the fallback. It is NOT to be touched, grinded, or referenced for structure.
 - `mir-rearch` = this branch, created from `rc3`. **It is the repository's DEFAULT branch** (GitHub
-  default + `origin/HEAD`, set 2026-08-24). `main` is frozen at `rc3` and left alone. Nothing
-  implemented yet — only this document.
+  default + `origin/HEAD`, set 2026-08-24). `main` is frozen at `rc3` and left alone.
+  **Progress: R0 (skeleton → hello world) and R0.9 (audit remediation) are ✅ banked and pushed.**
+  The backend is `src/{cfg,mem,compile,emit}.rs` + `src/hir/` + `src/mir/` + `src/isel/` +
+  `src/regalloc/`; `cargo test` 40/40, `tests/cases` 61/81 (the 14 remaining are exactly R1's
+  feature set, each stopped by an explicit `todo!`). Next `⬜` = R1.1.
 - The box: `docker exec zccbox …`, suites cached at `/suites` (`ZCC_SUITE_CACHE=/suites`), build with
   `CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc`.
 
@@ -41,10 +44,15 @@ QBE reaches ~gcc-O1 with ONE SSA IR and allocation ON SSA (chordal → polynomia
 zcc solved the hard version of the problem. This document adopts the right version.
 
 **Next-session checklist:**
-1. `git switch mir-rearch`; read this file fully.
-2. Start §12 **R0** at its first unchecked task. Follow the order; the allocator lands FIRST, not last.
+1. `git switch mir-rearch`; read this file fully. (`CLAUDE.md`'s first paragraph is the branch boot
+   override pointing here; the `[optimizer = main]` paragraph after it describes the DEAD architecture
+   and does not apply on this branch.)
+2. Resume at the first `⬜` in the §12 ladder. **State at 2026-08-24: R0 and R0.9 are ✅ banked and
+   pushed (HEAD `81456c0`); the first `⬜` is R1.1.** Follow the order; the allocator already landed.
 3. Every module ships with its verifier + interpreter-based proof battery before the next module.
 4. Bank each R-milestone with a commit + measurement line in §12; push.
+5. Standing gate for any bank: `cargo test` green · `tests/cases` no regression · `bash
+   tests/determinism.sh` green · box build clean. From R1.5 on, add torture + csmith300 + yarpgen300.
 
 ---
 
