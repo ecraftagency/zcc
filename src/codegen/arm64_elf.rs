@@ -950,21 +950,23 @@ impl Cg<'_> {
     }
     fn store_idx_ext(&mut self, rv: u32, f: &ExtFold, t: TypeId) {
         let (sfx, b, w) = (Self::ext_suffix(f), f.base, f.index_w);
+        let (wv, xv) = (wr(rv), xr(rv)); // rv==31 → wzr/xzr (const-0 store)
         _ = match self.a.tt.size(t) {
-            1 => writeln!(self.s, "\tstrb w{rv}, [x{b}, w{w}{sfx}]"),
-            2 => writeln!(self.s, "\tstrh w{rv}, [x{b}, w{w}{sfx}]"),
-            4 => writeln!(self.s, "\tstr w{rv}, [x{b}, w{w}{sfx}]"),
-            _ => writeln!(self.s, "\tstr x{rv}, [x{b}, w{w}{sfx}]"),
+            1 => writeln!(self.s, "\tstrb {wv}, [x{b}, w{w}{sfx}]"),
+            2 => writeln!(self.s, "\tstrh {wv}, [x{b}, w{w}{sfx}]"),
+            4 => writeln!(self.s, "\tstr {wv}, [x{b}, w{w}{sfx}]"),
+            _ => writeln!(self.s, "\tstr {xv}, [x{b}, w{w}{sfx}]"),
         };
     }
     // Register-offset store (the plain `[Xn, Xm]` form — the store counterpart of load_idx,
     // which was missing). Both 64-bit; value read first (store never clobbers its inputs).
     fn store_idx(&mut self, rv: u32, rbase: u32, rindex: u32, t: TypeId) {
+        let (wv, xv) = (wr(rv), xr(rv)); // rv==31 → wzr/xzr (const-0 store)
         _ = match self.a.tt.size(t) {
-            1 => writeln!(self.s, "\tstrb w{rv}, [x{rbase}, x{rindex}]"),
-            2 => writeln!(self.s, "\tstrh w{rv}, [x{rbase}, x{rindex}]"),
-            4 => writeln!(self.s, "\tstr w{rv}, [x{rbase}, x{rindex}]"),
-            _ => writeln!(self.s, "\tstr x{rv}, [x{rbase}, x{rindex}]"),
+            1 => writeln!(self.s, "\tstrb {wv}, [x{rbase}, x{rindex}]"),
+            2 => writeln!(self.s, "\tstrh {wv}, [x{rbase}, x{rindex}]"),
+            4 => writeln!(self.s, "\tstr {wv}, [x{rbase}, x{rindex}]"),
+            _ => writeln!(self.s, "\tstr {xv}, [x{rbase}, x{rindex}]"),
         };
     }
     // Tier-1 #2 — addressing-mode fold (BURS / maximal munch). Recognize the tree
@@ -1065,13 +1067,13 @@ impl Cg<'_> {
             if !self.scaled_off(off, self.a.tt.size(*sty)) {
                 return None;
             }
-            let rv = self.src_gp(*v, self.fnl);
+            let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, self.fnl) };
             self.store_gp_off(rv, rbase, off, *sty);
             return Some(2);
         }
         // batch#2: `str rv, [base, w-index, extend #s]` (the widening Cast is skipped).
         if let Some(f) = self.ext_fold.get(t).copied() {
-            let rv = self.src_gp(*v, self.fnl);
+            let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, self.fnl) };
             self.store_idx_ext(rv, &f, *sty);
             return Some(2);
         }
@@ -1083,7 +1085,7 @@ impl Cg<'_> {
         let (Some(rbase), Some(rindex)) = (self.gp_home(*ta), self.gp_home(*tb)) else {
             return None;
         };
-        let rv = self.src_gp(*v, self.fnl);
+        let rv = if matches!(v, Val::Imm(0)) { 31 } else { self.src_gp(*v, self.fnl) };
         self.store_idx(rv, rbase, rindex, *sty);
         Some(2)
     }
