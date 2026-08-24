@@ -229,13 +229,52 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 7 | **w-form sxtw elim** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,342 + ldrsw ≈ 12.8k (est. inflated) | MED | MED-HIGH | S+P | ✅ DONE `69c6df5` | **−1,479** (R1 −1,287 + R2 −192; residual fundamental) |
 | 8 | **redundant zero-extend / `uxt` elim** (per-block zfloor, `ldrb/ldrh`→known-zero) — direct, added this session | 3,548 sites | HI | LOW | S | ✅ DONE `236fe5c` | **−3,664** (>100% of ceil) |
 | — | **▲▲▲ END OF DIRECT-PEEPHOLE BAND (1–8 DONE) — everything below needs explicit "re-plan" ▲▲▲** | | | | | | |
-| **9** | **sieve exec-parity front** — merged: `mov#0→wzr` store-fold ⊕ const-materialization hoist (`mov;movk`) ⊕ loop-rotation. One deliverable (sieve inner → gcc's 4-insn form), one gate (sieve exec ≈ gcc). The three only pay off together. | sieve → **1.0× (parity ceiling, not sub-1×)** | HI | LOW-MED | **P** | ☐ planned | — |
-| 10 | local reload elim (keep spilled value resident in-block) | mem **27,116** (measured) | LO | HIGH | S | ☐ planned | — |
-| 11 | coalescing extension (marshalling/param movs) | reg-reg mov **41,399** (measured; ~24.7k ABI-floor) | LO | HIGH | S | ☐ planned | — |
-| 12 | compare-branch / flag-residency remainder (cmp non-cbz) | part of cmp **+8.8k** | LO | MED | S+P | ☐ planned | — |
-| **13** | SSA global register allocator (the rewrite / fork) — ☢ NUCLEAR, endgame, standalone | true 1× | — | HIGHEST | S | ☐ planned | — |
+| **9** | **sieve exec-parity front** — merged: `mov#0→wzr` store-fold ⊕ const-materialization hoist (`mov;movk`) ⊕ triangle if-conversion. | sieve → 1.0× (parity ceiling) | HI | LOW-MED | **P** | ✅ DONE `74146e0` (RC2) | **−291** sqlite; exec geomean 1.04→**1.02×**; sieve 1.18→1.063× |
+| 10–13 | ~~local reload · coalescing · flag-residency · SSA-regalloc~~ | — | — | — | — | **⤵ SUPERSEDED** | absorbed into §0-DDP Phases 1.4 / 6 |
 
-> **Canonical numbering (2026-08-24):** original 1–10 (nuclear last) **+2 inserted mid-run** (6 CBZ −3,435, 8 uxt −3,664) **+1 merged** (9 sieve exec-parity = old #1/#2/#3) = **13 levers**, nuclear fixed at 13. Done = **[1–8]** (peephole band mined out). Planned = **9** (axis-P, the only exec lever) then **[10–13]** (axis-S, the size/residency crank + nuclear). Slot 9 sits next by the do-in-order rule; swap 9↔10 only if size-first is chosen — an explicit re-sequence.
+> **Canonical numbering (2026-08-24):** original 1–10 (nuclear last) **+2 inserted mid-run** (6 CBZ, 8 uxt) **+1 merged** (9 sieve exec-parity). Done = **[1–9]**. **Old 10–13 SUPERSEDED 2026-08-24** by the discovery-driven plan below (§0-DDP) — their intent (reload-elim → Phase 1.4; coalescing/regalloc → Phase 6 nuclear) is absorbed. One plan of record.
+
+---
+
+### ★ §0-DDP — DISCOVERY-DRIVEN PLAN-OF-RECORD (re-plan 2026-08-24, user-authorized; SUPERSEDES old 10–13)
+
+**Why the re-plan:** 4 microbenchmarks can't fairly compare two compilers (they were zcc's *best* cases → misleading 1.02× geomean). New scoreboard = **`tests/bench/perfn.sh`**: 35-program taxonomy suite (10 construct axes), per-function instruction-count diff vs gcc-O1, correctness-gated, ranked by delta. **First run: total ratio 1.963× gcc-O1 across 68 functions** — the honest broad number. Metric = per-function insn count (user decision 2026-08-24: the size+speed proxy; every lever *deletes* redundant insns). **Target = gcc-O1 parity (~1.0×). NOT O2 — unroll/SIMD explicitly out of scope.**
+
+**The 1.963× decomposes into the user's 3 reasons** (evidenced by 2 inspections — `poly` FP-class, `ptr-walk` integer-floor). Reasons 1+2 are the majority and are DIRECT (~100% realizable); reason 3 (nuclear) is the ~15% residual:
+
+| reason | Side | levers | realize |
+|---|---|---|---|
+| **1** theorem missing/loose | I | leaf-frame elim · redundant-sxtw exhaustion · loop-rotation · LICM/dead-move · FP register class · switch-table | direct ~100% |
+| **2** arch/ABI under-leveraged | II | scaled-index fold · mul→shift · fmov-imm · bitfield bfi/bfxil · struct-in-regs (AAPCS64 §5.4) | direct ~100% |
+| **3** architecture (nuclear) | — | caller/callee-save choice · global alloc · fixed-home residency model | structural, GATED |
+
+**LEVER LADDER — broad-floor first (user decision 2026-08-24), do-in-order, each shrinks total insns:**
+
+| phase | lever | reason | targets (measured) | theorem / spec | status |
+|---|---|---|---|---|---|
+| **1.1** | leaf-frame elimination (no prologue/epilogue when no spill + no call) | 1 | every leaf fn (ptr-walk −6) | frame-elim theorem | ⬜ **NEXT** |
+| **1.2** | single frame-adjust (collapse double `sub sp`) | 1 | every framed fn | frame-layout | ⬜ |
+| **1.3** | redundant-sxtw exhaustion (`sxtw;sxtw` double-extend) | 1 | ptr-walk, all sxtw | Law-4 on lever-2/7 | ⬜ |
+| **1.4** | local dead-move / copy-prop (loop-header invariant movs) | 1 | absorbs old-10/11 | value-numbering | ⬜ |
+| **2.1** | loop rotation (conditional branch = back-edge, drop uncond `b`) | 1 | every loop | loop-shape | ⬜ |
+| **2.2** | invariant-setup hoist (address/bound/const out of loop) | 1 | generalize `hoist_loop_consts` | LICM | ⬜ |
+| **2.3** | induction-variable simplification (one IV, cmp ptr-to-end) | 1 | every counted loop | IV theory | ⬜ |
+| **3.1** | scaled-index fold (`base+idx*scale`→`[base,idx,sxtw #k]`) | 2 | B-category | ARMv8 addr modes | ⬜ |
+| **3.2** | strength reduction (`mul` pow2 → shift/scaled) | 2 | ptr-walk, index arith | ARMv8 | ⬜ |
+| **4.1** | FP constant materialization (`fmov d,#imm8` / lit-pool) | 2 | all F (poly 5.5×) | ARM ARM C7.2 fmov-imm | ⬜ |
+| **4.2** | FP value residency (kill `d→x→d` round-trips) | 1 | all F (f3 5.1×) | value-residency + FP class | ⬜ |
+| **4.3** | bounded FP register allocation (v-regs) | 1/3 | all F | AAPCS64 §5.1.2 | ⬜ |
+| **5.1** | switch jump-table (dense → `adr;br` offset table) | 1 | d1 (5.4×) | switch-table theorem | ⬜ |
+| **5.2** | bitfield `bfi`/`bfxil`/`sbfx` | 2 | c2 (3.15×) | ARMv8 bitfield | ⬜ |
+| **5.3** | struct-by-value in registers + HFA | 2 | e3 (4.4×) | AAPCS64 §5.4/§5.5 | ⬜ |
+| **5.4** | many-arg marshalling | 2 | e2 (3.2×) | AAPCS64 §5.5 | ⬜ |
+| **6** | ☢ **SSA global register allocator** (native GP+FP class, coalescing, save-cost model) — REWRITE, standalone, subsumes 4.3 | 3 | residual floor | — | 🔒 **GATED: needs explicit "go nuclear" after 1–5 banked + `perfn.sh` residual re-measured** |
+
+**DISCIPLINE (binds every lever):** cite theorem (r1) / spec line (r2); **predict Δ on cost-model before patching** (Law-3); ship commuting-square / translation-validation proof as inline test; full gate (cargo + opt-parity + torture + csmith300 + yarpgen300); bank ≥0.5%; **re-run `perfn.sh`** — its total ratio is the scoreboard, its worst delta names the next target. NO-PIVOT + BLOCKER-quarantine unchanged. **Nuclear (6) fires ONLY on explicit "go nuclear"** — Phases 1–5 very likely land O1 parity *without* the rewrite (the user's thesis).
+
+**Predicted trajectory (to confirm lever-by-lever, NOT promised):** Phases 1–3 (frame+loop+address, all 68 fns) 1.9×→~1.3× · Phase 4 (float) 4.86×→~1.5× · Phase 5 (spikes) cleared · plausible landing **~1.15–1.25× on direct levers alone**; nuclear optional for the last stretch.
+
+**RESUME POINTER: first `⬜` = Phase 1.1 (leaf-frame elimination).**
 
 **LEVER 3 — ABANDONED, fundamental-limit (Law-4 cat-(a)), measured 2026-08-23 @ `4fa83c8`.**
 Block-local canonical-operand scan of all **1,579** x-form `mul`s in the sqlite stream:
