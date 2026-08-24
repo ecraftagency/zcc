@@ -226,11 +226,13 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 5 | post-index addressing (`mem [xP]; add xP,xP,#k` → `mem [xP],#k`, drop add) | 187 sound (pred) | MED | MED | S+P | ✅ DONE `1709d9c+` | **−102** (hot-loop exec win; caught+fixed a cross-block bug) |
 | — | **▲▲▲ LOCK LINE — 1→7 to death; everything above ships before anything below ▲▲▲** | | | | | | |
 | 6 | **CBZ/CBNZ from bare-truth branches** (`cmp Rn,#0; b.eq/ne` → `cbz/cbnz Rn`, drop cmp) — MISSED-lever audit 2026-08-24, promoted from old-9 core | **3,435 sites** (measured, adjacent+flags-single-use) | HI | LOW | S+P | ✅ DONE `c4acd0e+` | **−3,435** (100% of ceiling — direct site-count) |
-| 7 | **w-form arithmetic** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,342 + ldrsw ≈ **12.8k** | MED | MED-HIGH | S+P | ⬜ TODO | — |
-| 8 | local reload elim (keep spilled value resident in-block) | mem **27,116** (measured) | LO | HIGH | S | ☐ conditional | — |
-| 9 | coalescing extension (marshalling/param movs) | reg-reg mov **41,399** (measured) | LO | HIGH | S | ☐ conditional | — |
-| 10 | compare-branch / flag-residency remainder (old-9 non-cbz) | part of cmp **+8.8k** | LO | MED | S+P | ☐ conditional | — |
+| 7 | **w-form sxtw elim** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,342 + ldrsw ≈ 12.8k (est. inflated) | MED | MED-HIGH | S+P | ✅ DONE `69c6df5` | **−1,479** (R1 −1,287 + R2 −192; residual fundamental) |
+| 8 | **redundant zero-extend / `uxt` elim** (per-block zfloor, `ldrb/ldrh`→known-zero) — direct, added this session | 3,548 sites | HI | LOW | S | ✅ DONE `236fe5c` | **−3,664** (>100% of ceil) |
+| — | **▲▲▲ END OF DIRECT-PEEPHOLE BAND — everything below is size-only, needs explicit "re-plan" ▲▲▲** | | | | | | |
+| 9 | local reload elim (keep spilled value resident in-block) | mem **27,116** (measured) | LO | HIGH | S | ☐ conditional | — |
+| 10 | coalescing extension (marshalling/param movs) | reg-reg mov **41,399** (measured; ~24.7k ABI-floor) | LO | HIGH | S | ☐ conditional | — |
 | 11 | SSA global register allocator (the rewrite / fork) — endgame, standalone | true 1× | — | HIGHEST | S | ☐ conditional | — |
+| E1 | **sieve exec-parity front** (`mov#0→wzr` + const-hoist + loop-rotate) — exec-axis, not size | sieve → **1.0× (parity ceiling)** | HI | LOW-MED | P | ☐ conditional | — |
 
 **LEVER 3 — ABANDONED, fundamental-limit (Law-4 cat-(a)), measured 2026-08-23 @ `4fa83c8`.**
 Block-local canonical-operand scan of all **1,579** x-form `mul`s in the sqlite stream:
@@ -273,7 +275,31 @@ lost its advance → OOB write). Fix = test the label boundary first. This is th
 (`add xP,xP,xM`) and cross-block loop-carried forms are not post-indexed (would need CFG-level IV
 analysis) — category-(b), deferred, not on the 1–6 path.
 
-**★ 1→5 RUN COMPLETE (paused here per user; 6–9 next session).** Ledger deltas below.
+**★ 1→8 RUN COMPLETE + BANKED @ `236fe5c` (origin/ssa-qbe) — sqlite `-c` = 292,927 insn = 1.855× gcc-O1.**
+Ledger deltas below. Direct-peephole band (levers 1–8) is now *mined out*; the three biggest direct
+veins (csel/cbz/uxt) all banked ~100% of ceiling.
+- **Lever 6 (CBZ):** −3,435 (100% of 3,435 ceiling), `c4acd0e`.
+- **Lever 7 (w-form sxtw elim, THE HINGE):** −1,479 (R1 demand-side `drop_wform_sxtw` −1,287 + R2 dead-sxtw
+  liveness −192; R3 residual = x-form-demanded / live-across-boundary = fundamental for intra-block), RC1 `69c6df5`.
+- **Lever 8 (redundant zero-extend / `uxt` elim):** −3,664 (per-block zfloor known-zero tracking;
+  `ldrb`→8/`ldrh`→16 producers; drops `uxtb/uxth wD,wD` when floor already ≤ width), `236fe5c`.
+
+**★ LICM — MEASUREMENT CLOSED 2026-08-24, stays OFF (correct).** Fresh best-of-7 sieve(100M): default
+509ms · `ZCC_OPT_ON=licm` 497ms (−2.4%) · gcc-O1 424ms (zcc **1.20×**). sqlite size: default 292,927 ·
+licm-on 293,267 (**+340 BIGGER**). LICM hoists only the is-base `adrp;add` (the whole 2.4%); it does NOT
+hoist the `mov;movk` LIM constant (address-only hoister) and never `wzr`-folds the zero. Removing 2
+ALU insns/iter bought 2.4% runtime ⟹ **the sieve inner loop is MEMORY-WRITE-BOUND, not issue-bound.**
+
+**★ SIEVE CEILING = PARITY (1.0×), NOT sub-1× — cost-model proof (Law-3, before any build).** gcc's
+inner loop is already minimal: `strb wzr,[x5,x1]; add; cmp; b.le` = **4 insns/iter**, invariants hoisted,
+loop rotated. zcc does the *identical* strided byte stores — zero algorithmic slack. zcc-default inner =
+10 insns/iter; the 6-insn excess = rebuild-bound(2) + rebuild-base(2, LICM fixes) + mov#0(1) + uncond-b(1).
+The three transforms that close it to gcc's 4-insn form: **(#1)** `mov#0→wzr` store-fold (direct peephole,
+**693 sites in sqlite** = 0.24%, ~100% realize), **(#2)** constant-materialization hoisting (extend LICM to
+`mov;movk`), **(#3)** loop rotation (kill uncond back-edge). Applying all three → zcc inner loop **≡ gcc's
+4-insn loop → exec parity**. It reaches gcc, it does NOT pass gcc (identical memory work; beating needs a
+different *algorithm* = source change, not compiler). **Ceiling on the sieve is 1.0×.** These are exec-axis
+levers; #1 is 0.24% on size = below the 0.5% bank threshold as a size lever. Fire only on explicit "re-plan".
 
 **Session-start ritual (every time):** (1) re-read this §0; (2) state which numbered lever is next
 and its ceiling+confidence; (3) work it under the gate; (4) record real banked yield here; (5)
