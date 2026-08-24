@@ -148,7 +148,7 @@
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⚠️ re-eval DONE → stays OFF, deferred → #25 (geo40 +0.31% sub-threshold + size-negative; j2 win needs hotness gating). See note ㉓ |
 | 24 | **loop-value analysis: invariant pure-call hoist** (the 6 `gcc=0ms` cases) | SPEED (asymptotic) | ✅ BANKED — interprocedural purity + loop-invariant pure-call LICM (4-fence commuting square). All 6 gcc-zeroed programs EMPTIED the bucket (j1 103→1ms). See note ㉔✅ |
-| 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | 🔓 FIRING (user "go nuclear" 2026-08-24). Sub-ledger: **㉕.1 ✅ BANKED** (`f6fe7d2`) spill-cost metric, sqlite 1.812×→1.768× (−6,968). Next ⬜ ㉕.2 loop-depth hotness weighting. See note ㉕-SUB |
+| 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | ⏸ PAUSED by user at 1.768× (2026-08-24). **㉕.1 ✅ BANKED** (`f6fe7d2`) spill-cost, sqlite 1.812×→1.768× (−6,968). ㉕.2 hotness ⛔ measured-negative (reverted). Remaining = long tail (splitting HIGH-risk). See note ㉕-SUB |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5×; #25 is the only path to size
@@ -201,16 +201,26 @@ hotness weighting (SPEED arm). #24 ✅ #23 ⚠️→#25 #22 ⚠️→#25 #21 ✅
 >   restores old (reproduces HEAD `.s` byte-exact). Δ sqlite −6,968 (1.812×→1.768×); ldr −5,091 / str
 >   −1,318 = the cost-square confirmation (predicted fewer reloads, `.s` shows it). Proof test
 >   `spill_cost_spills_cheapest`. Correctness-neutral (verify_abi invariant agnostic to spill choice).
-> - **㉕.2 ⬜ NEXT** — loop-depth HOTNESS weighting of cost[] (weight each use/def by ~10^loopdepth via
->   `natural_loop`/`dominators`, already `pub(crate)` in loops.rs). ㉕.1's unweighted count is a SIZE
->   proxy (static reloads); dynamic hotness is the SPEED arm — keep hot-loop temps register-resident so
->   geo40 exec median falls below 1.552. Predict on cost-model, gate, A/B geo40.
-> - **㉕.3+ candidates (re-rank after ㉕.2 via corpus25.sh):** live-range splitting (spill a temp only
->   across its cold interval, not whole-life — note ㉕ part 1); the siblings (shrink-wrap, compare-elim,
->   addressing-fold); turn ON licm+strength_reduce now registers are richer. mov still 70,423 (top
->   absolute) + frame-mem 27,403 = remaining home floor.
-> - **exectime.sh reducer BUG (fix before trusting exec aggregate):** EXEC geomean prints 0.0000 —
->   `log(r)` with an `exec_r=0` sample poisons the product. Use median until fixed (drop-zero/clamp).
+> - **㉕.2 ⛔ MEASURED-NEGATIVE, REVERTED** — loop-depth HOTNESS weighting (weight cost[] by 8^depth via
+>   `natural_loop`/`dominators`). A/B: geo40 exec median 1.557 (weighted) vs 1.546 (flat) = WORSE within
+>   noise; INSN geomean identical 1.5835; sqlite +519 (deterministic worse). Zero deterministic gain. Root
+>   cause (predictable a priori — the ㉕.2 build was avoidable): hotness only changes spill choice in a
+>   function that BOTH spills AND has a hot loop; the geo40 kernels are small and don't spill, so weighting
+>   never fires there, while sqlite (which spills) is scored on STATIC size where ㉕.1's unweighted count is
+>   already the correct proxy. LESSON: predict on the cost-model BEFORE building (Law-3).
+> - **⏸ USER STOP at 1.768× (2026-08-24).** Strategic finding from the ㉕.1/㉕.2 grind: the allocator was
+>   ALREADY Chaitin-Briggs + WIDE + coalescing + ABI-targeting at HEAD — the "nuclear big-bang" premise was
+>   half-wrong for this codebase. ㉕.1 took the one genuine structural win (−2.4%). The REMAINDER is a long
+>   tail of 0.2–0.4% isel levers (exactly CORPUS25 §7's prediction), no second big-bang. Measured buckets
+>   post-㉕.1: reg-reg mov 40,573 (call-marshal + alloc-shuffle; dead-funnel DCE ≈948 predicted removable),
+>   imm mov 22,248, frame-mem 27,403. The ONLY big lever left is **live-range splitting** (frame-mem, −2–4%
+>   potential) but it rewrites the one-home-per-temp `AbiHome` interface = HIGH gate risk + uncertain yield.
+>   User chose to bank ㉕.1 and stop rather than grind the tail or gamble the rewrite.
+> - **㉕.3+ DEFERRED (resume worklist if reopened):** live-range splitting (big, risky); siblings
+>   (addressing-mode fold `[base,idx,lsl]` ~0.2%, compare-elim ~0.2%, shrink-wrap); dead-funnel-mov DCE
+>   (~948, low-risk); turn ON licm+strength_reduce under the richer allocator. Predict-first each.
+> - **exectime.sh reducer BUG (open):** EXEC geomean prints 0.0000 — `log(r)` with an `exec_r=0` sample
+>   poisons the product. Use median until fixed (drop-zero/clamp).
 
 > **㉕-CORPUS — the PROVEN knowledge base for #25 = `tests/bench/CORPUS25.md` (+ runner `corpus25.sh`).**
 > Built + audited this session (HEAD `2af2702`, post-#24). Every number is a grep/awk catamorphism over
