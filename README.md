@@ -33,7 +33,7 @@ The pressure point is the optimizer. Differential-fuzzing studies of production
 compilers (csmith, EMI) consistently locate the majority of *miscompilation*
 bugs not in the parser but in the intermediate representation and its
 transformation passes — the part that separates a translator from a *compiler*.
-zcc carries that part (a typed IR and five optimization passes) precisely
+zcc carries that part (a typed SSA IR and roughly twenty optimization passes) precisely
 because it is the hard part,
 and then makes it the object of proof: each pass carries an **executable
 equivalence check** against a **reference semantics** of the IR. A pass is
@@ -45,7 +45,7 @@ The long-term aim is to retire the test suite by proof.
 
 ## Capabilities
 
-Everything below is what a compiler of roughly **11k lines** does. A ✅ is
+Everything below is what a compiler of roughly **15k lines** does. A ✅ is
 measured and reproducible; a ⏳ is a gate that must close before release.
 
 | | Capability |
@@ -55,10 +55,10 @@ measured and reproducible; a ⏳ is a gate that must close before release.
 | ✅ | **Dependencies:** none — a single Rust crate, zero external crates |
 | ✅ | **Drop-in driver:** `CC=zcc` slots into real build systems (configure/make/cmake) unmodified; drives `as`/`ld` directly |
 | ✅ | **Real software:** compiles and differentially validates real C projects (redis, sqlite, git, nginx, …) |
-| ✅ | **IR + optimization:** a typed intermediate representation with five optimization passes — constant folding, dead-code elimination, copy propagation, common-subexpression elimination (alias-aware), and register allocation (Chaitin–Briggs) |
+| ✅ | **IR + optimization:** a typed SSA intermediate representation with ~20 optimization passes — SSA construction, sparse conditional constant propagation, global value numbering, CSE + alias-aware store→load forwarding, dead-code elimination, CFG simplification, LICM / strength-reduction / pointer-IV, if-conversion, inlining, SROA, and register allocation (Chaitin–Briggs) |
 | ✅ | **Structural-exhaustion gates:** five science-gates exhaust the grammar of each phase (lexer/layout, preprocessor, type derivation, usual-arithmetic-conversions, ABI) |
 | ✅ | **Random differential — csmith:** passing |
-| ✅ | **Mechanized reference semantics:** a formal semantics ⟦·⟧ of the IR (`SEMANTICS.md`) with an executable commuting-square theorem over the optimization passes (312 expressions × 5 passes = 1560 checks) |
+| ✅ | **Mechanized reference semantics:** a formal semantics ⟦·⟧ of the IR (`SEMANTICS.md`) with an executable commuting-square theorem — each ⟦·⟧-preserving pass checked against the reference semantics over a 312-expression battery |
 | ⏳ | **Random differential — yarpgen:** *release gate* |
 | ⏳ | **End-to-end — Linux chroot boot:** *release gate* |
 
