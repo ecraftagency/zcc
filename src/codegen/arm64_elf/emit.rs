@@ -1389,17 +1389,29 @@ impl<'a> Cg<'a> {
                 // (never FP-homed), satisfying src_gp's precondition. Pressure-free.
                 let rc = self.src_gp(*c, self.fnl);
                 let (lt, le) = (self.ir_label(*tb), self.ir_label(*eb));
+                // Mirror emit_cbr's fall-through handling (cbnz ↔ b.cc, cbz ↔ b.¬cc): when a
+                // successor is the ADJACENT block, fall into it and spend ONE conditional branch
+                // on the other edge — the #17 payoff (a rotated loop's latch then costs a single
+                // `cbnz back-edge`, no unconditional `b`). The 2-insn forms survive only where no
+                // successor is adjacent, or in a huge function where `then` may exceed imm19.
                 if ft == Some(*eb) {
-                    // else-edge falls through: c==0 → next block (jump-to-adjacent = fall),
-                    // c!=0 → `b then`. cbz targets the adjacent L{eb} (in range); 2 insns.
-                    _ = writeln!(self.s, "\tcbz x{rc}, {le}\n\tb {lt}");
+                    // else falls through. NEAR: cbnz THEN on c!=0, fall to eb (1 insn). FAR: cbz
+                    // to the adjacent eb (in imm19 range), then `b then` (±128MB).
+                    if self.near_branch {
+                        _ = writeln!(self.s, "\tcbnz x{rc}, {lt}");
+                    } else {
+                        _ = writeln!(self.s, "\tcbz x{rc}, {le}\n\tb {lt}");
+                    }
                 } else if ft == Some(*tb) {
-                    // then-edge falls through: c!=0 → next block, c==0 → `b else`. cbnz targets
-                    // the adjacent L{tb} (in range); 2 insns.
-                    _ = writeln!(self.s, "\tcbnz x{rc}, {lt}\n\tb {le}");
+                    // then falls through. NEAR: cbz ELSE on c==0, fall to tb (1 insn). FAR: cbnz
+                    // to the adjacent tb (in range), then `b else`.
+                    if self.near_branch {
+                        _ = writeln!(self.s, "\tcbz x{rc}, {le}");
+                    } else {
+                        _ = writeln!(self.s, "\tcbnz x{rc}, {lt}\n\tb {le}");
+                    }
                 } else if self.near_branch {
-                    // Small function: every intra-function label is within cb(n)z's ±1MB
-                    // imm19 reach, so branch straight to `then` and `b` the far else. 2 insns.
+                    // Small function, neither successor adjacent: branch to `then`, `b` the else.
                     _ = writeln!(self.s, "\tcbnz x{rc}, {lt}\n\tb {le}");
                 } else {
                     // Huge function (fuzzer -O0): labels may exceed ±1MB. Reach both with `b`

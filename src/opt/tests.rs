@@ -600,6 +600,92 @@ fn hoist_loop_consts_preserves() {
     equiv(&ast.tt, &ir, &opt, "f").expect("const hoisting must preserve ⟦·⟧");
 }
 
+// #17 — LOOP ROTATION. A top-tested while/for loop is rewritten to a bottom-tested loop with
+// an entry guard; asserts it FIRES (the number of unconditional back-edges — Jmp whose target
+// dominates it — drops to 0) and preserves ⟦·⟧ over several operand values. Runs post-out_of_ssa
+// exactly like the shipped pipeline.
+#[test]
+fn loop_rotate_preserves() {
+    for (nm, src, entry, args) in [
+        // strlen-shape: while(*p) p++;  (the diagnostic case behind #17/#18). The nul index is
+        // masked into [0,7] so the walk always terminates in-bounds for EVERY battery input.
+        ("strlen", "int f(int n){int a[9]; int i; for(i=0;i<9;i++)a[i]=1; a[n&7]=0; int c=0,*p=a; \
+                     while(*p){c++;p++;} return c;}", "f", &[3i64][..]),
+        // counted for-loop with a running sum (no memory ⟹ UB-free at any bound)
+        ("forsum", "int f(int n){int s=0,i; for(i=0;i<n;i++) s+=i*i; return s;}", "f", &[6i64][..]),
+        // pointer-walk with an end pointer: while(p<e). The end offset is masked into [0,15].
+        ("ptrwalk", "long f(int n){int a[16]; int i; for(i=0;i<16;i++)a[i]=i; \
+                      long s=0; int *p=a,*e=a+(n&15); while(p<e){s+=*p;p++;} return s;}", "f", &[10i64][..]),
+        // nested loops (rotate must handle each header independently)
+        ("nested", "int f(int n){int s=0,i,j; for(i=0;i<n;i++)for(j=0;j<n;j++)s+=i*j; return s;}", "f", &[5i64][..]),
+        // MULTI-EXIT: a linear search with an early `return` inside the body. The first rotation
+        // moves the `i<8` test into the latch; a second pass must NOT clobber it with the body's
+        // `a[i]==key` early-exit diamond (the regression this row locks down).
+        ("find", "int f(int key){int a[8]; int i; for(i=0;i<8;i++)a[i]=i*2; \
+                   for(i=0;i<8;i++) if(a[i]==key) return i; return -1;}", "f", &[6i64][..]),
+        // MULTI-EXIT: binary search — a while-loop with an interior early return + two updates.
+        ("bsearch", "int f(int key){int a[8]; int i; for(i=0;i<8;i++)a[i]=i*2; \
+                      int lo=0,hi=7; while(lo<=hi){int mid=(lo+hi)>>1; if(a[mid]==key)return mid; \
+                      if(a[mid]<key)lo=mid+1; else hi=mid-1;} return -1;}", "f", &[6i64][..]),
+    ] {
+        let (ast, ir) = compile(nm, src);
+        // Reference: the shipped φ-free pipeline WITHOUT rotation.
+        let mut base = ir.clone();
+        for f in base.iter_mut() {
+            to_ssa(&ast.tt, f);
+            out_of_ssa(f);
+            optimize(&ast.tt, f);
+        }
+        // Rotated: same, then loop_rotate + the cleanup the orchestrator runs.
+        let mut opt = base.clone();
+        let mut fired = 0;
+        for f in opt.iter_mut() {
+            fired += loop_rotate(f);
+            cfg_simplify(f);
+            optimize(&ast.tt, f);
+        }
+        for f in &opt {
+            verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
+        }
+        assert!(fired > 0, "{nm}: loop rotation must fire");
+        // After rotation NO unconditional back-edge remains (Jmp whose target dominates it).
+        for f in &opt {
+            let dom = dominators(f);
+            for (b, blk) in f.blocks.iter().enumerate() {
+                if let Term::Jmp(s) = blk.term {
+                    assert!(!dom[b].contains(&s), "{nm}: an unconditional back-edge survived rotation");
+                }
+            }
+        }
+        equiv(&ast.tt, &base, &opt, entry).unwrap_or_else(|e| panic!("{nm}: rotation must preserve ⟦·⟧: {e}"));
+        // spot-check the concrete value too (interp over the given argument).
+        assert_eq!(
+            interp(&ast.tt, &opt, entry, args).unwrap(),
+            interp(&ast.tt, &base, entry, args).unwrap(),
+            "{nm}: rotated interp value must match"
+        );
+    }
+}
+
+// #17 SAFETY — a header that is a `goto` label target must NOT be rotated (deleting it would
+// orphan the label); a computed-goto function is skipped wholesale (incomplete CFG).
+#[test]
+fn loop_rotate_refuses_label_header() {
+    // A backward `goto` forms a loop whose header carries a named label.
+    let src = "int f(int n){int s=0,i=0; loop: if(i>=n) goto done; s+=i; i++; goto loop; done: return s;}";
+    let (ast, ir) = compile("gotoloop", src);
+    let mut opt = ir.clone();
+    let mut fired = 0;
+    for f in opt.iter_mut() {
+        to_ssa(&ast.tt, f);
+        out_of_ssa(f);
+        optimize(&ast.tt, f);
+        fired += loop_rotate(f);
+    }
+    assert_eq!(fired, 0, "a labelled (goto-target) loop header must not be rotated");
+    equiv(&ast.tt, &ir, &opt, "f").expect("no-op rotation must preserve ⟦·⟧");
+}
+
 // ── B4 SAFETY (the speculation side-condition): a diamond whose arm has a SIDE
 // EFFECT (Store/Call) or a FAULTABLE load (through an unknown pointer, not a local
 // slot) MUST NOT be if-converted — running the not-taken arm would be observable /

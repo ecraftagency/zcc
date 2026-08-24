@@ -140,7 +140,7 @@
 
 | # | lever | dim | batch / note |
 |---|---|---|---|
-| 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⬜ B1 — every loop, −1 branch/iter |
+| 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⚠️ pass shipped PROVEN but default-OFF + ✅ banked spin-off. See note ⓱ |
 | 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⬜ B1 — every ptr-walk, −1 add/iter |
 | 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ⬜ B2 — j5/h1/j2/d2 |
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ⬜ B3 — AAPCS64 §5.4/5.5 |
@@ -152,7 +152,24 @@
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = the first ⬜ (#17, via Batch 0 diagnose → Batch 1).**
+only path to size *and* speed ≈ 1.0×. **RESUME = #18 (loop pointer pre/post-index).**
+
+> **⓱ #17 LOOP ROTATION — outcome (session 2026-08-24).** Implemented `opt::loop_rotate` (post-`out_of_ssa`
+> CFG reshape: top-test → bottom-test + entry guard) with its commuting-square proof (`loop_rotate_preserves`
+> over strlen/for/ptr-walk/nested **and multi-exit find/bsearch** — the last two caught a real miscompile
+> during dev: a fixpoint re-rotating an already-rotated loop clobbered the outer exit test; fixed by the
+> "every latch ends in an unconditional `Jmp(H)`" precondition). Cloning the header with **fresh temps** keeps
+> the condition single-use, so `cbr_relational` fuses `cmp;cset;cbnz`→`cmp;b.cc` and the body reaches
+> gcc-tightness (post-index `ldrsw [p],#4` + one fused conditional back-edge, no `cset`).
+> **MEASURED (arbiter = geo40 exec; perfn = size proxy):** rotation ON = perfn **1.954×** (+297 static insns
+> from the guard duplication) and exec **1.667×**; rotation OFF = perfn **1.767×**, exec **1.672×**. ⟹ rotation
+> is **exec-NEUTRAL (within noise) and size-NEGATIVE** on this naive-slot memory-bound backend — the removed
+> back-edge branch is free on the OoO core. **Proven-but-measured-negative → shipped default-OFF** (like
+> `licm`/`strength_reduce`); one flag (`ZCC_OPT_ON=rotate`) from ON for a register-resident backend (post-#25)
+> where the tighter body would pay. **✅ BANKED spin-off (the real win of the session):** a branch fall-through
+> polarity fix in `emit_term`'s `Br` — `cbz/cbnz` emitted a 2-insn form even when a successor was the ADJACENT
+> block; now mirrors `emit_cbr` (fall into the adjacent successor, one conditional branch). Both-axes win:
+> perfn **1.771×→1.767×**, exec **~1.75×→1.67×**. Full gate green. **RESUME = #18.**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 

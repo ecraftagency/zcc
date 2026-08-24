@@ -1728,3 +1728,232 @@ pub(crate) fn clone_remats_before_term(
     map.len() as u32
 }
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOOP ROTATION (loop inversion) — SUPREME PLAN #17. Convert a TOP-tested loop
+//     PH → H[cond ; Br(c, Body, Exit)]        Latch → Jmp(H)
+// into a BOTTOM-tested loop with an entry GUARD:
+//     PH → [cond ; Br(c, Body, Exit)]         Latch → [cond ; Br(c, Body, Exit)]
+// H is then unreachable and cfg_simplify deletes it. This removes the UNCONDITIONAL
+// back-edge `b` (one fewer branch per iteration) and — the point — puts the loop's
+// increment adjacent to the load inside one block, which the backend pre/post-index fold
+// (#18) then collapses (`add p,#1 ; ldrb [p]` → `ldrb [p,#1]!`), matching gcc-O1's 2-insn
+// strlen inner loop. SPEED lever (geo40); the header duplicates once (guard), so static
+// size is ~neutral (+|H|−1 per loop), exec is −1 branch/iter.
+//
+// GOVERNING THEOREM (CbC, MEASURED by `equiv`): `⟦f⟧ = ⟦loop_rotate(f)⟧`. Loop rotation is
+// a PURE CFG RESHAPING — the DYNAMIC instruction trace is unchanged. The header executes once
+// per VISIT: on loop entry (= the guard, run once) and after each back-edge (= the latch test,
+// run per iteration). Cloning the header into the preheader (reading the entry-edge operand
+// values) and into every latch (reading the back-edge operand values) reproduces exactly those
+// visits, in the same order, with the same per-edge values. No memory operation is reordered
+// across the body; only block LABELS change. Hence ⟦·⟧ holds.
+//
+// PRECONDITIONS (conservative — residual headers are a (b)-truncation for a later exhaustion
+// round, NOT a fundamental limit):
+//   • cfg_complete (no computed goto ⟹ dominance/back-edges sound).
+//   • H ends in Br(cond, T, E) with exactly ONE of {T,E} in the loop body (T_in) and the other
+//     outside (E_out); T_in ≠ H (a self-loop header is already bottom-tested → idempotent skip).
+//   • every temp USED in H is either defined EARLIER within H (cloned along) or has a def-block
+//     ≠ H that DOMINATES H. A dominator of H ≠ H dominates the preheader (idom(H)=PH) and every
+//     latch (H dom latch), so the value is AVAILABLE at the guard and at each latch clone; the
+//     loop-carried value qualifies via its preheader def. Otherwise BAIL (conservative).
+//   • H's instructions are all PURE or Load (no Store/Call/Alloca/exotic side effect) — cloning
+//     is then trivially trace-safe — and H carries no named label (a goto target must not vanish).
+// Runs post-`out_of_ssa` (φ-free executable IR), so no φ surgery is needed.
+// ─────────────────────────────────────────────────────────────────────────────
+pub fn loop_rotate(f: &mut IrFunc) -> u32 {
+    if !cfg_complete(f) {
+        return 0;
+    }
+    let mut rotated = 0u32;
+    // One rotation per round (it reshapes the CFG); recompute and repeat to a fixpoint,
+    // bounded by the block count (each round removes ≥1 header from the candidate set).
+    for _ in 0..f.blocks.len().max(1) {
+        let dom = dominators(f);
+        let backs = back_edges(f, &dom);
+        let mut headers: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+        for (tail, header) in backs {
+            headers.entry(header).or_default().push(tail);
+        }
+        let mut did = false;
+        for (h, latches) in headers {
+            if try_rotate_header(f, h, &latches, &dom) {
+                rotated += 1;
+                did = true;
+                break; // CFG changed — recompute dominance/back-edges from scratch
+            }
+        }
+        if !did {
+            break;
+        }
+    }
+    rotated
+}
+
+/// A header instruction is safe to CLONE into the guard + latches ⟺ pure or a plain Load
+/// (idempotent read). Stores/calls/exotics are excluded so the clone can never duplicate a
+/// side effect (the dynamic-trace argument holds regardless, but this keeps v1 airtight).
+fn rotate_safe_inst(i: &Inst) -> bool {
+    matches!(
+        i,
+        Inst::Bin(..)
+            | Inst::Un(..)
+            | Inst::Copy(..)
+            | Inst::Load(..)
+            | Inst::Cast(..)
+            | Inst::Lea(..)
+            | Inst::Select(..)
+            | Inst::FunAddr(..)
+    )
+}
+
+fn try_rotate_header(f: &mut IrFunc, h: BlockId, latches: &[BlockId], dom: &[HashSet<BlockId>]) -> bool {
+    let (cond, t, e) = match f.blocks[h as usize].term {
+        Term::Br(c, t, e) => (c, t, e),
+        _ => return false, // header does not end in a conditional exit test
+    };
+    if f.labels.iter().any(|(_, b)| *b == h) {
+        return false; // H is a goto target — deleting it would orphan the label
+    }
+    // Loop body = union of the natural loops of every back-edge into H.
+    let mut body: BTreeSet<BlockId> = BTreeSet::new();
+    for &l in latches {
+        for b in natural_loop(f, l, h) {
+            body.insert(b);
+        }
+    }
+    // Exactly one successor in the loop (continue target), one outside (exit).
+    let (t_in, e_out) = match (body.contains(&t), body.contains(&e)) {
+        (true, false) => (t, e),
+        (false, true) => (e, t),
+        _ => return false,
+    };
+    if t_in == h {
+        return false; // self-loop header: already bottom-tested
+    }
+    // Every latch must end in an UNCONDITIONAL Jmp(H) — i.e. the loop is TOP-tested (the exit
+    // branch is at the header). A latch that already ends in a conditional Br carries the exit
+    // test at the BOTTOM ⟹ the loop is already rotated; rotating again would OVERWRITE that
+    // latch's exit terminator (the multi-exit-loop miscompile: the outer `i<n` test lives in the
+    // latch after the first rotation, and a second pass targeting the body's early-exit diamond
+    // would clobber it). This is also what makes the fixpoint idempotent.
+    if latches.iter().any(|&l| !matches!(f.blocks[l as usize].term, Term::Jmp(x) if x == h)) {
+        return false;
+    }
+    // H's instructions must be clone-safe.
+    for i in &f.blocks[h as usize].insts {
+        if !rotate_safe_inst(i) {
+            return false;
+        }
+    }
+    // Def-block map (a temp may be reassigned post-SSA ⟹ multiple def-blocks).
+    let nt = f.temps.len();
+    let mut defblk: Vec<Vec<BlockId>> = vec![Vec::new(); nt];
+    for (bi, blk) in f.blocks.iter().enumerate() {
+        for inst in &blk.insts {
+            if let Some(d) = inst_def(inst) {
+                defblk[d as usize].push(bi as BlockId);
+            }
+        }
+    }
+    // Every use in H available at the guard AND every latch: defined earlier in H, or a
+    // def-block ≠ H dominates H.
+    let ok_use = |u: Tmp, prefix: &HashSet<Tmp>| -> bool {
+        prefix.contains(&u)
+            || defblk[u as usize].iter().any(|&d| d != h && dom[h as usize].contains(&d))
+    };
+    let mut prefix: HashSet<Tmp> = HashSet::new();
+    let mut uses: Vec<Tmp> = Vec::new();
+    for inst in &f.blocks[h as usize].insts {
+        uses.clear();
+        inst_uses(inst, &mut uses);
+        for &u in &uses {
+            if !ok_use(u, &prefix) {
+                return false;
+            }
+        }
+        if let Some(d) = inst_def(inst) {
+            prefix.insert(d);
+        }
+    }
+    uses.clear();
+    term_uses(&f.blocks[h as usize].term, &mut uses);
+    for &u in &uses {
+        if !ok_use(u, &prefix) {
+            return false;
+        }
+    }
+    // The header's DEFINED temps (its condition + any intermediates) must be used ONLY within H.
+    // Then each clone can rename them to FRESH temps, so the cloned condition value stays
+    // SINGLE-USE — the precondition backend `cbr_relational` needs to fuse `cmp;cset;cbnz` into
+    // one `cmp;b.cc`. (Without fresh names the shared temp is used in the guard AND every latch
+    // ⟹ use_count>1 ⟹ the cset survives, bloating and slowing every rotated loop.) A header temp
+    // read downstream can't be renamed (its post-rotation def would vanish) ⟹ bail (conservative).
+    let hdefs: Vec<Tmp> =
+        f.blocks[h as usize].insts.iter().filter_map(inst_def).collect();
+    if !hdefs.is_empty() {
+        let hset: HashSet<Tmp> = hdefs.iter().copied().collect();
+        for (bi, blk) in f.blocks.iter().enumerate() {
+            if bi as BlockId == h {
+                continue; // uses inside H are fine (cloned along + renamed together)
+            }
+            let mut u = Vec::new();
+            for inst in &blk.insts {
+                inst_uses(inst, &mut u);
+            }
+            term_uses(&blk.term, &mut u);
+            if u.iter().any(|t| hset.contains(t)) {
+                return false;
+            }
+        }
+    }
+    // Dedicated preheader (single out-of-loop entry). Computed AFTER the checks so a bail
+    // never perturbs the CFG.
+    let ph = match ensure_preheader(f, h, &body) {
+        Some(p) => p,
+        None => return false,
+    };
+    // Clone H's straight-line body + its conditional exit into the guard and every latch, renaming
+    // H's locally-defined temps to FRESH temps in each copy; H is thereby orphaned (cfg_simplify
+    // deletes it). One clone per target block keeps each condition value single-use.
+    let hinsts = f.blocks[h as usize].insts.clone();
+    let mut fresh_clone = |f: &mut IrFunc| -> (Vec<Inst>, Term) {
+        let mut map: HashMap<Tmp, Tmp> = HashMap::new();
+        for &d in &hdefs {
+            let ty = f.temps[d as usize];
+            let nt = f.temps.len() as Tmp;
+            f.temps.push(ty);
+            map.insert(d, nt);
+        }
+        let mut insts = hinsts.clone();
+        let ren = |v: &mut Val| {
+            if let Val::Tmp(t) = v
+                && let Some(&nt) = map.get(t)
+            {
+                *t = nt;
+            }
+        };
+        for inst in insts.iter_mut() {
+            each_use_mut(inst, ren);
+            each_def_mut(inst, |d| {
+                if let Some(&nt) = map.get(d) {
+                    *d = nt;
+                }
+            });
+        }
+        let mut term = Term::Br(cond, t_in, e_out);
+        each_use_term_mut(&mut term, ren);
+        (insts, term)
+    };
+    let (gi, gt) = fresh_clone(f);
+    f.blocks[ph as usize].insts.extend(gi);
+    f.blocks[ph as usize].term = gt;
+    for &l in latches {
+        let (li, lt) = fresh_clone(f);
+        f.blocks[l as usize].insts.extend(li);
+        f.blocks[l as usize].term = lt;
+    }
+    true
+}

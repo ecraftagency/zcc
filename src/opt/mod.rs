@@ -101,6 +101,7 @@ pub struct Passes {
     pub remat: bool,    // Tier-5 #26: rematerialize pure operand-free defs under pressure (last)
     pub sroa: bool,     // SROA: split non-escaping aggregate locals into per-field slots (before to_ssa)
     pub hoist_const: bool, // lever 9: hoist loop-invariant expensive immediates (bounds) to preheader (last)
+    pub rotate: bool,   // #17: loop rotation (top-test → bottom-test + guard) — kills the back-edge branch
 }
 
 
@@ -127,6 +128,12 @@ impl Default for Passes {
             remat: false, // Tier-5 #26: proven (equiv) but speed-gated on the box A/B (like licm/sr)
             sroa: true,   // SROA: field-split non-escaping aggregates; proven (equiv) — feeds to_ssa
             hoist_const: true, // lever 9: pressure-safe (spill-reload ≤ mov;movk), exec-positive on loop bounds
+            rotate: false, // #17: pure CFG reshape (equiv-proven) — makes loop bodies gcc-tight
+            // (post-index + fused cmp;b.cc), but the entry-guard DUPLICATION costs +297 static
+            // insns on the suite with NO measured exec gain (the back-edge branch is free on the
+            // OoO core; loops are memory-bound). Proven-but-measured-negative on the naive-slot
+            // backend — default OFF like licm/strength_reduce, one flag from ON for a
+            // register-resident backend where the tighter body would pay. See OPT.md #17.
         }
     }
 }
@@ -142,6 +149,7 @@ impl Passes {
             strength_reduce: true,
             pointer_iv: true,
             remat: true,
+            rotate: true,
             ..Passes::default()
         }
     }
@@ -166,6 +174,7 @@ impl Passes {
             "remat" => self.remat = v,
             "sroa" => self.sroa = v,
             "hoist_const" | "hoistconst" | "hc" => self.hoist_const = v,
+            "rotate" | "loop_rotate" | "rot" => self.rotate = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -266,6 +275,14 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
     }
     out_of_ssa(f); // φ → edge copies (swap/critical-edge safe) → executable IR
     optimize(tt, f); // the proven non-SSA cleanup (folds the φ-destruction copies)
+    if p.rotate && loop_rotate(f) > 0 {
+        // #17: post-SSA CFG reshape (top-test → bottom-test + guard). It orphans each rotated
+        // header (cfg_simplify deletes + renumbers) and duplicates the exit test into the guard
+        // and latch, which the following optimize/const-fold/cse folds locally. Runs BEFORE
+        // remat/hoist_const so those see the rotated loop shape.
+        cfg_simplify(f);
+        optimize(tt, f);
+    }
     if p.remat {
         // LAST IR touch (nothing runs after ⟹ no CSE re-merges the clones): shorten the live
         // ranges of pure operand-free values the allocator would otherwise spill. #26.
