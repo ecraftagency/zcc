@@ -182,6 +182,33 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #25 (NUCLEAR — HARD STOP, 
 > pass (closed-form trip count / final value / dead-loop deletion), orthogonal to allocation, and remains
 > its own row. Everything else deferred during 17–23 lands in #25. Fires ONLY on explicit "go nuclear".
 
+> **㉕-CORPUS — the PROVEN knowledge base for #25 = `tests/bench/CORPUS25.md` (+ runner `corpus25.sh`).**
+> Built + audited this session (HEAD `2af2702`, post-#24). Every number is a grep/awk catamorphism over
+> emitted `.s` (Law-3 confirm-not-estimate). The load-bearing facts the #25 session starts from:
+> - **Baseline (PROVEN):** sqlite SIZE 286,129/157,883 = **1.812×**; geo40 EXEC **~1.55×**; INSN geo **1.610×**.
+> - **The gap is 100% backend.** gcc-normalized excess (gap=128,246): mov **36,771**, ldr 14,250, sub
+>   **10,791** (9,337 are `sub xN,xN,#N` = home-address arith), ldp 7,081, sxtw 6,197 (partly fundamental),
+>   add 5,978, cmp 5,429, str 4,209. Top-10 = 72% of gap. zcc's **entire** mem-op excess (30,609) ≈ its
+>   frame-slot traffic (33,836) — the gap IS the home-primary model, not algorithm.
+> - **Allocator-addressable excess ≈ 72,600 = 57% of the gap.** Concentration is BROAD (top-50 fns hold
+>   only 42.5% of frame-mem, top-200 = 61.1%, across 3,398 fns) — the allocator must win corpus-wide, not
+>   on a few monsters.
+> - **#25 is a STRATEGY SWAP, not a rewrite.** Seam = `opt/regalloc.rs::abi_alloc -> Vec<AbiHome>` (already
+>   a partial allocator), gate = `verify_abi` (renaming-bisimulation, reused free), choke = `emit.rs::ld_val`.
+>   Inherited intact: all frontend + SSA/analysis passes. `peephole.rs` (2,034 LOC) SHRINKS.
+> - **INHERITANCE LEVER #1 (near-zero code):** `GP_BUDGET_WIDE {k:18,ncaller:8}` (x0–x7 + x19–x28) is
+>   ALREADY in `encoding.rs:34`, UNUSED — active budget is the NARROW `{k:10,ncaller:0}` (x19–x28 only).
+>   This is the charter's own Article-E convenience-truncation. Flip narrow→wide, measure. Also: `licm` +
+>   `strength_reduce` are BUILT-but-OFF (spill-negative on naive backend) — flip positive once registers exist.
+> - **Coverage audit:** zcc's pass set is NOT "more than O1" — it ≈ matches the tree-SSA half (gvn/cse/
+>   load_elim/sroa/if_convert/pointer_iv/sccp/dce all present) and is MISSING the backend/RTL half:
+>   global allocation (#25 core), shrink-wrap, compare-elim (cmp 5.4k), auto-inc-dec, addressing-mode fold
+>   (add 6k), combine-stack-adjustments, code-sinking. The 1.81× gap lives entirely in that missing half.
+> - **HONEST projection (recalibrated vs 11.5% sxtw realize-rate — NO bold single number):** ceiling (perfect
+>   alloc) = **1.35×** sqlite; honest band (40–70% realize) = **1.49–1.63×**. #25 ALONE does not reach 1.3×
+>   or 1.0×; 1.0× needs #25 + siblings + isel long-tail, each a small proof-carrying lever. Method: ship
+>   toggle-gated, measure A/B, bank the real number. Re-run corpus25.sh after each bank to re-rank the tail.
+
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
 > check is a SAME-SESSION A/B against a rebuilt pre-change baseline, OR the gcc-normalized ratio which
