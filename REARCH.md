@@ -560,7 +560,7 @@ a human misses. The table is complete when every remaining excess is category (a
 
 ---
 
-## §15 Reading list (theorems to realize — cite in code comments as `THEORY <ref>`)
+## §18 Reading list (theorems to realize — cite in code comments as `THEORY <ref>`)
 
 - Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau 2013 — Simple and Efficient Construction of SSA Form (CC'13).
 - Hack 2007 — Register Allocation for Programs in SSA Form (PhD, Karlsruhe): chordality, dominance
