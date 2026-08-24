@@ -4701,6 +4701,37 @@ fn parse_frame_ldst(t: &str) -> Option<(bool, u32, &str)> {
     mem.starts_with("[sp,").then_some((is_load, n, mem))
 }
 
+/// FRAME-ADJUST FUSION [Phase 1.2]. The prologue subtracts the fixed frame (`sub sp,sp,#fframe`)
+/// and the IR body then subtracts its temp-spill slab (`sub sp,sp,#ir_tspill`) — two phases of
+/// frame sizing emit two adjustments. When they land ADJACENT (nothing in between depends on the
+/// intermediate sp — the case whenever emit_params spilled nothing, i.e. every promoted-param
+/// leaf), they fuse to one `sub sp,sp,#(a+b)`. Pure sp-arithmetic identity: sp is lowered by the
+/// same total and no instruction reads the intermediate value, so the x29-based CFA and every
+/// baked `[sp,#k]` slot offset are unchanged. Fires only when a+b ≤ 4095 (imm12 single-sub range);
+/// a larger total keeps two subs (the second `sub sp,sp,#b` case emits its own encoding). Strict
+/// adjacency is the soundness fence — a spilled-param function (subs not adjacent) is left as-is
+/// (a peephole truncation; the universal single-sub frame layout is deferred to a frame-layout
+/// pass). Volatile-independent (touches only sp arithmetic).
+fn fuse_sp_adjust(body: &str) -> String {
+    let parse = |t: &str| -> Option<u32> { t.trim().strip_prefix("sub sp, sp, #")?.parse().ok() };
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let (Some(a), Some(b)) = (parse(lines[i]), lines.get(i + 1).and_then(|l| parse(l))) {
+            if a + b <= 4095 {
+                _ = writeln!(out, "\tsub sp, sp, #{}", a + b);
+                i += 2;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// Delete every `ldr xN,[sp,#m]` immediately preceded by `str xN,[sp,#m]` (store→load
 /// identity, see the block comment). Airtight and value-independent; the single largest
 /// measured reduction in the load stream.
@@ -4963,6 +4994,7 @@ pub fn emit_ir(ast: &Ast) -> String {
         g.fframe = funcs[fi].frame;
         g.fvariadic = f.variadic;
         g.fhasvla = f.has_vla;
+        let fn_start = g.s.len(); // start of THIS function's text (for the post-emit sp-fuse)
         if !f.is_static {
             _ = writeln!(g.s, ".globl {}", f.name);
             if f.is_inline || f.is_weak {
@@ -5061,6 +5093,13 @@ pub fn emit_ir(ast: &Ast) -> String {
             ));
         }
         g.s.push_str(&body);
+        // Phase 1.2: the prologue's `sub sp,sp,#fframe` (emitted before body_start) and the IR
+        // body's leading `sub sp,sp,#ir_tspill` are two frame-sizing phases that straddle the
+        // body boundary; now that the full function text is rejoined they are adjacent and fuse
+        // to one sub (pure sp-arith identity — see fuse_sp_adjust). Scoped to THIS function's
+        // region so strict adjacency can never span a function boundary.
+        let fused = fuse_sp_adjust(&g.s.split_off(fn_start));
+        g.s.push_str(&fused);
         g.s += "\t.cfi_endproc\n";
         _ = writeln!(g.s, "\t.size {0}, .-{0}", f.name);
     }
@@ -5296,6 +5335,37 @@ mod tests {
     fn redundant_load_survives_directive() {
         let out = drop_redundant_loads("\tstr x0, [sp, #24]\n\t.p2align 3\n\tldr x0, [sp, #24]\n");
         assert_eq!(count(&out, "ldr x0, [sp, #24]"), 0, "a directive does not break adjacency");
+    }
+
+    use super::fuse_sp_adjust;
+
+    // Phase 1.2: two adjacent frame subtractions (prologue fframe + IR temp-spill slab) fuse to
+    // one — the intermediate sp is never observed, so it is a pure arithmetic identity.
+    #[test]
+    fn sp_adjust_fuses_adjacent() {
+        let body = "\tmov x29, sp\n\tsub sp, sp, #32\n\tsub sp, sp, #16\n\tmov x19, x0\n";
+        let out = fuse_sp_adjust(body);
+        assert_eq!(count(&out, "sub sp, sp, #48"), 1, "the two subs fuse to #48");
+        assert_eq!(count(&out, "sub sp, sp, #32"), 0);
+        assert_eq!(count(&out, "sub sp, sp, #16"), 0);
+    }
+
+    // TEETH: non-adjacent subs (a spill sits between) must NOT fuse — the intermediate sp value
+    // is live (the spill addresses it), so merging would move the store's target.
+    #[test]
+    fn sp_adjust_keeps_nonadjacent() {
+        let body = "\tsub sp, sp, #32\n\tstr x19, [sp, #8]\n\tsub sp, sp, #16\n";
+        let out = fuse_sp_adjust(body);
+        assert_eq!(count(&out, "sub sp, sp, #32"), 1, "non-adjacent ⟹ left as-is");
+        assert_eq!(count(&out, "sub sp, sp, #16"), 1);
+    }
+
+    // TEETH: a fused total beyond imm12 (4095) has no single-sub encoding — keep both.
+    #[test]
+    fn sp_adjust_respects_imm12() {
+        let body = "\tsub sp, sp, #4000\n\tsub sp, sp, #200\n";
+        let out = fuse_sp_adjust(body);
+        assert_eq!(count(&out, "sub sp, sp, #4000"), 1, "4200 > 4095 ⟹ no fuse");
     }
 
     use super::drop_dead_moves;
