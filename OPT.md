@@ -252,11 +252,11 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 
 | phase | lever | reason | targets (measured) | theorem / spec | status |
 |---|---|---|---|---|---|
-| **1.1** | leaf-frame elimination (no prologue/epilogue when no spill + no call) | 1 | every leaf fn (ptr-walk −6) | frame-elim theorem | ⬜ **NEXT** |
+| **1.1** | leaf-frame elimination | 1/3 | 34/70 leaves framed | frame-elim | ⚠️ **QUARANTINED 2026-08-24** — Part A (leaf caller-widening) **BLOCKED** (x9–x17 = hardwired lowering scratch, x9 160×; co-managing scratch = Phase-6 nuclear, NOT a peephole). Part B (frame-pointer omission) = real ~150–250 insn prize but a SUB-PROJECT: 34 x29-emit sites × 3 offset conventions + emit-pipeline reorder (reserve frame before emit_params). Safe subset = 1 fn (<0.5%). **Deferred to a dedicated FPO session or folded into Phase 6.** Advance, no pivot. |
 | **1.2** | single frame-adjust (collapse double `sub sp`) | 1 | every framed fn | frame-layout | ⬜ |
 | **1.3** | redundant-sxtw exhaustion (`sxtw;sxtw` double-extend) | 1 | ptr-walk, all sxtw | Law-4 on lever-2/7 | ⬜ |
 | **1.4** | local dead-move / copy-prop (loop-header invariant movs) | 1 | absorbs old-10/11 | value-numbering | ⬜ |
-| **2.1** | loop rotation (conditional branch = back-edge, drop uncond `b`) | 1 | every loop | loop-shape | ⬜ |
+| **2.1** | loop rotation (conditional branch = back-edge, drop uncond `b`) | 1 | every loop | loop-shape | ⬜ **NEXT** (broadest low-risk floor win; ptr-walk `b .Lir_work_1`) |
 | **2.2** | invariant-setup hoist (address/bound/const out of loop) | 1 | generalize `hoist_loop_consts` | LICM | ⬜ |
 | **2.3** | induction-variable simplification (one IV, cmp ptr-to-end) | 1 | every counted loop | IV theory | ⬜ |
 | **3.1** | scaled-index fold (`base+idx*scale`→`[base,idx,sxtw #k]`) | 2 | B-category | ARMv8 addr modes | ⬜ |
