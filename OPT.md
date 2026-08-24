@@ -344,16 +344,27 @@ Ratio = zcc_time / gcc_time (**lower is faster; 1.0 = parity**). Measured bench,
 
 | kernel | **vs gcc-O1 (TARGET)** | was 2026-08-22 | note |
 |---|---|---|---|
-| fib    | **1.03 — ✅ PARITY** | 1.06 | O1≈O0 here |
-| loops  | **0.95 — ✅ FASTER** | 1.02 | beats gcc-O1 |
-| matmul | **0.99 — ✅ PARITY** | 1.71 | post-index + imm-forwarding tightened the k-loop |
-| sieve  | **1.21 — ⬇ closing** | 2.10 | residual = index arith + mem |
-| **geomean** | **1.04× (target 1.0)** | 1.40× | measured 2026-08-24 @ `cc29874`, quiet box, best-of-3 ×3 stable |
+| fib    | **1.04 — ✅ PARITY** | 1.06 | O1≈O0 here |
+| loops  | **0.96 — ✅ FASTER** | 1.02 | beats gcc-O1 |
+| matmul | **1.00 — ✅ PARITY** | 1.71 | post-index + imm-forwarding tightened the k-loop |
+| sieve  | **1.08 — ⬇ closing** | 2.10 | lever-9 csel+const-hoist; residual = loop-3 uncond back-edge + dup IV |
+| **geomean** | **1.02× (target 1.0)** | 1.40× | measured 2026-08-24 @ `5863e85` (RC2), quiet box, best-of-3 ×3 stable (1.02/1.01/1.01) |
 
-**Reading it:** **fib + loops + matmul are at/under gcc-O1** (1.03, 0.95, 0.99); sieve alone (1.21)
-carries the residual. Geomean **1.40→1.04×** since the 1→5 run — post-index (L5) and immediate-offset
-forwarding (L4) directly tightened the two loop-nest kernels. **EXEC is now effectively at O1 parity
-(1.04×).** The remaining work is the SIZE axis (1.916×), which is runtime-free residency tax, not cycles.
+**Reading it:** **fib + loops + matmul are at/under gcc-O1** (1.04, 0.96, 1.00); sieve alone (1.08)
+carries the residual. Geomean **1.40→1.02×** since the 1→5 run — post-index (L5), immediate-offset
+forwarding (L4), and **lever-9 triangle if-conversion + const-hoist** tightened the loop-nest kernels.
+sieve(100M) big-input best-of-15 interleaved: zcc 456ms · gcc-O1 429ms = **1.063×** (was 1.18–1.20×).
+**EXEC is now effectively at O1 parity (1.02×).** The remaining work is the SIZE axis (1.855×), which is
+runtime-free residency tax, not cycles.
+
+**★ RC2 (2026-08-24, `5863e85`) — lever 9 (the sole exec lever) delivered, exec geomean 1.04→1.02×.**
+Three pieces on top of RC1: **#1** `mov#0→wzr` indexed store-fold (`da5c497`, −346 sqlite); **#2**
+loop-invariant immediate hoist (`hoist_loop_consts` — expensive `cmp` bounds lifted to preheader);
+**#3** triangle if-conversion (`if(c) stmt;` no-else → branchless `csel`, gated to in-loop ∧
+load-derived-cond = the unpredictable-branch profitable case; cut sqlite regression +472→+65). Net
+sqlite −291 (292,927→292,636). Both transforms ship commuting-square inline tests (cargo 140→142).
+Gate green: opt-parity 1552/0, torture 0 FAIL, csmith 254/0, yarpgen 300/0. sieve residual to true 1.0×
+(loop-3 uncond back-edge + duplicate `i` IV) is an exhaustion follow-on, parked pending user "grind" call.
 
 **SIZE axis (the second finish-line number — must ALSO reach 1.0; user: "match O1 on size AND speed").**
 Metric = instruction count on sqlite3.c (amalgamation, musl headers), same mnemonic-line count on
