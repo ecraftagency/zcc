@@ -148,12 +148,39 @@
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⚠️ re-eval DONE → stays OFF, deferred → #25 (geo40 +0.31% sub-threshold + size-negative; j2 win needs hotness gating). See note ㉓ |
 | 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
-| 25 | ☢ **NUCLEAR — SSA global register allocator** (GP+FP class, coalescing, spill-cost model) — subsumes 4.3, kills the uniform residency floor | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
+| 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
 only path to size *and* speed ≈ 1.0×. **RESUME = #24 (SCEV final-value + loop-DCE, NEW infra).
 #23 ⚠️ re-eval DONE → LICM stays OFF → #25. #22 ⚠️ DEFERRED → #25 (FP residency). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
+
+> **㉕ #25 NUCLEAR — CONSOLIDATED SCOPE (what the 17–24 grind proved belongs HERE, not in a peephole).**
+> The grind's recurring verdict: the remaining size↔speed gap is one root cause — zcc's **home-primary
+> value model** (every temp/param/local lives in a stack home, reloaded on each use), which no bounded
+> peephole can remove because the fix is a *register-primary* allocator. #25 is that rewrite. It must
+> deliver, as ONE pass with its commuting-square / translation-validation proof:
+> 1. **GP global register allocation** (SSA-based, live-range coalescing, spill-cost model) — kills the
+>    per-use reload floor measured at #17 (loop rotation exec-neutral because body is reload-bound), #18
+>    (pointer post-index exec-neutral, memory-bound), #19 (sxtw residency — only the safe in-place subset
+>    was bankable; the invariant `adrp/add` hoist + scaled-index-on-global need register residency).
+> 2. **Native FP register class (v-regs)** with the same allocation — ABSORBS **#22**: keeps `float`
+>    locals in s-regs (kills f3's float→double→float per-use churn at the root) and holds double
+>    accumulators/coefficients resident (f2). Cross-block FP value-residency falls out of SSA liveness,
+>    which the block-local peephole provably could not reach.
+> 3. **Hotness / iteration-aware placement** — ABSORBS **#23 LICM**: with a spill-cost + loop-depth model
+>    the invariant-address hoist (j2_histogram −13.6%) becomes net-positive on BOTH axes instead of the
+>    current size-negative flat-cost flip; hoist fires only where it pays.
+> 4. **Composite parallel-move over the FP/GP/memory mix** — ABSORBS **#21's residual**: the many-arg GP
+>    parallel-move shipped, but a hazard call MIXING GP with struct/HFA/Q reg-args still falls back to the
+>    spill-all stack scheme; a real allocator does the full simultaneous copy (GP + d-reg dests + memory
+>    sources, cycle-broken) with no round-trip.
+> 5. **Register-resident struct/param bodies** — ABSORBS the #20 residual: a callee like `sum(struct V)`
+>    should extract fields from the incoming x0:x1 (gcc's `asr 32`) instead of spilling the pair to a home
+>    and reloading each field.
+> NOTE: **#24 (SCEV final-value + loop-DCE) is NOT absorbed by #25** — it is a distinct loop-value-analysis
+> pass (closed-form trip count / final value / dead-loop deletion), orthogonal to allocation, and remains
+> its own row. Everything else deferred during 17–23 lands in #25. Fires ONLY on explicit "go nuclear".
 
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
@@ -580,7 +607,7 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | **5.2** | bitfield `bfi`/`bfxil`/`sbfx` | 2 | c2 (3.15×) | ARMv8 bitfield | ✅ **WRITE side DONE** (`store()` Bitfield → single `bfi rD,rS,#lsb,#w`, was 7–9-insn imm/bic/lsl/and/orr RMW; read side already fused via `ubfx`/`sbfx`). sqlite −506, c2 main 106→95, perfn 1.778→1.771. Residual = `sxtw/ubfx` value-prep before bfi (value-residency floor). |
 | **5.3** | struct-by-value in registers + HFA | 2 | e3 (4.4×) | AAPCS64 §5.4/§5.5 | ⬜ |
 | **5.4** | many-arg marshalling | 2 | e2 (3.2×) | AAPCS64 §5.5 | ⬜ |
-| **6** | ☢ **SSA global register allocator** (native GP+FP class, coalescing, save-cost model) — REWRITE, standalone, subsumes 4.3 | 3 | residual floor | — | 🔒 **GATED: needs explicit "go nuclear" after 1–5 banked + `perfn.sh` residual re-measured** |
+| **6** | ☢ **SSA global register allocator** (native GP+FP class, coalescing, save-cost model) — REWRITE, standalone. = **spine #25**; full absorbed scope (#17/#18/#19/#21/#22/#23 residuals) is in **note ㉕**, not "subsumes 4.3" alone | 3 | residual floor | — | 🔒 **GATED: needs explicit "go nuclear" after 1–5 banked + `perfn.sh` residual re-measured** |
 
 **DISCIPLINE (binds every lever):** cite theorem (r1) / spec line (r2); **predict Δ on cost-model before patching** (Law-3); ship commuting-square / translation-validation proof as inline test; full gate (cargo + opt-parity + torture + csmith300 + yarpgen300); bank ≥0.5%; **re-run `perfn.sh`** — its total ratio is the scoreboard, its worst delta names the next target. NO-PIVOT + BLOCKER-quarantine unchanged. **Nuclear (6) fires ONLY on explicit "go nuclear"** — Phases 1–5 very likely land O1 parity *without* the rewrite (the user's thesis).
 
