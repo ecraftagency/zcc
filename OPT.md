@@ -41,6 +41,41 @@
 > insns. Measure geo40 exec (box harness) as the scoreboard each lever; perfn insn-count stays a
 > cheap proxy but exec-time is the arbiter. See [[zcc-speed-metric-geo40]].
 
+### 🏁 SPEED-FIRST BATCH PLAN (authored 2026-08-24 S4 for next session; RESUME at first ⬜)
+
+> **Ranked by EXEC-speed impact (geo40), grounded in the S4 timing run + `mystrlen` hot-loop
+> diagnosis.** Each batch: full gate (cargo + torture + opt-parity + csmith300 + yarpgen300) then
+> re-measure geo40 (`/tmp/exectime.sh` in `zccbox`, or rebuild it — see [[zcc-ssa-qbe-ops-resume]]).
+> Bank per commit. NO-PIVOT still binds: a low-yield batch is quarantine-mark-advance, not a re-plan.
+> **DIAGNOSTIC PROOF (`mystrlen`, the pattern):** zcc inner loop = `ldrb [x0]; cbnz; add x0,#1; b`
+> = 4 insn / 2 branches per iter; gcc = `ldrb [x1,1]!; cbnz` = 2 insn / 1 branch. The 2× is exactly
+> loop-rotation (kill the uncond back-edge `b`) + pointer index-fold (`[p],#1`). Loop levers were
+> LOW priority for sqlite *size* but are #1 for *speed* — the pivot promotes them to the front.
+
+- **⬜ Batch 0 — DIAGNOSE (½ session, cheap, aims everything).** Dump the hot loop of every suite
+  program with exec-ratio > 1.5× (j5, g2✓, h1, i1, f2, e2, d2, d3, g3). Classify each: loop-shape /
+  index-arith / call-boundary / FP / loop-value. Write findings here. Do NOT build blind.
+- **⬜ Batch 1 — LOOP SHAPE (highest-confidence speed win).** (a) **loop-rotation** (catalog 2.1):
+  make the conditional branch the back-edge, delete the unconditional `b` — −1 branch/iter, EVERY
+  loop. (b) **pointer pre/post-index**: fuse `add p,#k` into the mem op → `ldrb [p],#k` / `[p,#k]!`
+  — −1 add/iter, every ptr-walk. Hits: g2 (2.0×→~1.15), g3_reverse (1.69), b1_ptr_walk, d1/d2/d3.
+  **Predicted geo40 → ~1.58×.**
+- **⬜ Batch 2 — HOT-LOOP BODY** (index-arith address-recompute, strength-reduction 2.3, redundant
+  in-loop sxtw/spill). Hits: j5_insertion_sort (3.95×, the 3.7 s monster), h1_popcount (1.89×),
+  j2_histogram (1.70×), d2_nested_loops (2.0×). **Predicted geo40 → ~1.48×.**
+- **⬜ Batch 3 — CALL-BOUNDARY + FP** (5.4 many-arg marshalling, 5.3 struct-by-value/HFA, FP value
+  residency). Hits: e2_many_args (5.5×), i1_global_acc (4.3×), f2_double_poly (3.8×). **Predicted
+  geo40 → ~1.35–1.45×** (optimistic; spikes may floor higher on the residency tax).
+- **⬜ Batch 4 — LOOP-VALUE ANALYSIS (SCEV final-value + loop-DCE) — NEW infra, needs explicit go.**
+  The `gcc=0ms` cases where gcc-O1 computes a loop's closed-form result / deletes a dead loop and zcc
+  runs it full (j1_reduction, c2-loop, f3, b4). Big lift, biggest per-program speed prize. NOT in the
+  old catalog — flag to user before building.
+
+**ESTIMATE (honest):** **~1.5× is the solid target** for the in-scope loop+call batches (B1–B3, no
+nuclear). **1.4× stretch** if spikes compress cleanly; **1.6× floor** if only B1 lands. Below 1.4×
+→ 1.0× needs Batch 4 (SCEV) AND the nuclear SSA regalloc (Phase 6, 🔒 still gated) for the
+per-iteration residency floor. **RESUME POINTER (speed track): Batch 0 (diagnose) → Batch 1.**
+
 ---
 
 ### ⏱ OVERNIGHT AUTONOMOUS RUNBOOK (started 2026-08-24, user asleep → target: RC1 push)
