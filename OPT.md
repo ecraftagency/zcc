@@ -228,11 +228,14 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | 6 | **CBZ/CBNZ from bare-truth branches** (`cmp Rn,#0; b.eq/ne` → `cbz/cbnz Rn`, drop cmp) — MISSED-lever audit 2026-08-24, promoted from old-9 core | **3,435 sites** (measured, adjacent+flags-single-use) | HI | LOW | S+P | ✅ DONE `c4acd0e+` | **−3,435** (100% of ceiling — direct site-count) |
 | 7 | **w-form sxtw elim** (kill 64-bit sxtw contract) — THE HINGE | sxtw 8,342 + ldrsw ≈ 12.8k (est. inflated) | MED | MED-HIGH | S+P | ✅ DONE `69c6df5` | **−1,479** (R1 −1,287 + R2 −192; residual fundamental) |
 | 8 | **redundant zero-extend / `uxt` elim** (per-block zfloor, `ldrb/ldrh`→known-zero) — direct, added this session | 3,548 sites | HI | LOW | S | ✅ DONE `236fe5c` | **−3,664** (>100% of ceil) |
-| — | **▲▲▲ END OF DIRECT-PEEPHOLE BAND — everything below is size-only, needs explicit "re-plan" ▲▲▲** | | | | | | |
-| 9 | local reload elim (keep spilled value resident in-block) | mem **27,116** (measured) | LO | HIGH | S | ☐ conditional | — |
-| 10 | coalescing extension (marshalling/param movs) | reg-reg mov **41,399** (measured; ~24.7k ABI-floor) | LO | HIGH | S | ☐ conditional | — |
-| 11 | SSA global register allocator (the rewrite / fork) — endgame, standalone | true 1× | — | HIGHEST | S | ☐ conditional | — |
-| E1 | **sieve exec-parity front** (`mov#0→wzr` + const-hoist + loop-rotate) — exec-axis, not size | sieve → **1.0× (parity ceiling)** | HI | LOW-MED | P | ☐ conditional | — |
+| — | **▲▲▲ END OF DIRECT-PEEPHOLE BAND (1–8 DONE) — everything below needs explicit "re-plan" ▲▲▲** | | | | | | |
+| **9** | **sieve exec-parity front** — merged: `mov#0→wzr` store-fold ⊕ const-materialization hoist (`mov;movk`) ⊕ loop-rotation. One deliverable (sieve inner → gcc's 4-insn form), one gate (sieve exec ≈ gcc). The three only pay off together. | sieve → **1.0× (parity ceiling, not sub-1×)** | HI | LOW-MED | **P** | ☐ planned | — |
+| 10 | local reload elim (keep spilled value resident in-block) | mem **27,116** (measured) | LO | HIGH | S | ☐ planned | — |
+| 11 | coalescing extension (marshalling/param movs) | reg-reg mov **41,399** (measured; ~24.7k ABI-floor) | LO | HIGH | S | ☐ planned | — |
+| 12 | compare-branch / flag-residency remainder (cmp non-cbz) | part of cmp **+8.8k** | LO | MED | S+P | ☐ planned | — |
+| **13** | SSA global register allocator (the rewrite / fork) — ☢ NUCLEAR, endgame, standalone | true 1× | — | HIGHEST | S | ☐ planned | — |
+
+> **Canonical numbering (2026-08-24):** original 1–10 (nuclear last) **+2 inserted mid-run** (6 CBZ −3,435, 8 uxt −3,664) **+1 merged** (9 sieve exec-parity = old #1/#2/#3) = **13 levers**, nuclear fixed at 13. Done = **[1–8]** (peephole band mined out). Planned = **9** (axis-P, the only exec lever) then **[10–13]** (axis-S, the size/residency crank + nuclear). Slot 9 sits next by the do-in-order rule; swap 9↔10 only if size-first is chosen — an explicit re-sequence.
 
 **LEVER 3 — ABANDONED, fundamental-limit (Law-4 cat-(a)), measured 2026-08-23 @ `4fa83c8`.**
 Block-local canonical-operand scan of all **1,579** x-form `mul`s in the sqlite stream:
