@@ -12,7 +12,9 @@
 **State at the time of writing (2026-08-24, evening):**
 - `main` @ `4fb7a0a` = the old optimizer, sqlite **1.768×** gcc-O1 (static insns), tagged **`rc3`** (pushed).
   It is the fallback. It is NOT to be touched, grinded, or referenced for structure.
-- `mir-rearch` = this branch, created from `rc3`. Nothing implemented yet — only this document.
+- `mir-rearch` = this branch, created from `rc3`. **It is the repository's DEFAULT branch** (GitHub
+  default + `origin/HEAD`, set 2026-08-24). `main` is frozen at `rc3` and left alone. Nothing
+  implemented yet — only this document.
 - The box: `docker exec zccbox …`, suites cached at `/suites` (`ZCC_SUITE_CACHE=/suites`), build with
   `CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc`.
 
