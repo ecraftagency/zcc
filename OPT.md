@@ -261,8 +261,8 @@ projection (apply the 5–10% haircut). Axes: **S+P** = size and speed; **S** = 
 | **2.3** | induction-variable simplification (one IV, cmp ptr-to-end) | 1 | every counted loop | IV theory | ⬜ |
 | **3.1** | scaled-index fold (`base+idx*scale`→`[base,idx,sxtw #k]`) | 2 | B-category | ARMv8 addr modes | ⬜ |
 | **3.2** | strength reduction (`mul` pow2 → shift/scaled) | 2 | ptr-walk, index arith | ARMv8 | ⬜ |
-| **4.1** | FP constant materialization (`fmov d,#imm8` / lit-pool) | 2 | all F (poly 5.5×) | ARM ARM C7.2 fmov-imm | ⬜ |
-| **4.2** | FP value residency (kill `d→x→d` round-trips) | 1 | all F (f3 5.1×) | value-residency + FP class | ⬜ |
+| **4.1** | FP constant materialization (`fmov d,#imm8` / lit-pool) | 2 | all F (poly 5.5×) | ARM ARM C7.2 fmov-imm | ✅ DONE (`fold_fp_imm`, VFPExpandImm imm8 + dead-scratch forward-liveness; 5 teeth tests) |
+| **4.2** | FP value residency (kill `d→x→d` round-trips) | 1 | all F (f3 5.1×) | value-residency + FP class | ✅ DONE (`collapse_fp_bridge`, d→x→d bridge collapse) |
 | **4.3** | bounded FP register allocation (v-regs) | 1/3 | all F | AAPCS64 §5.1.2 | ⬜ |
 | **5.1** | switch jump-table (dense → `adr;br` offset table) | 1 | d1 (5.4×) | switch-table theorem | ⬜ |
 | **5.2** | bitfield `bfi`/`bfxil`/`sbfx` | 2 | c2 (3.15×) | ARMv8 bitfield | ⬜ |
@@ -325,6 +325,14 @@ veins (csel/cbz/uxt) all banked ~100% of ceiling.
   liveness −192; R3 residual = x-form-demanded / live-across-boundary = fundamental for intra-block), RC1 `69c6df5`.
 - **Lever 8 (redundant zero-extend / `uxt` elim):** −3,664 (per-block zfloor known-zero tracking;
   `ldrb`→8/`ldrh`→16 producers; drops `uxtb/uxth wD,wD` when floor already ≤ width), `236fe5c`.
+
+**★ FP BAND 4.1+4.2 BANKED 2026-08-24 (this session — the hung-session WIP, gated + committed).**
+Two passes on top of `a856326`: **4.1** `fold_fp_imm` (`mov#0;movk#H,lsl#48;fmov dM,xN` → `fmov dM,#imm8`
+when H<<48 is VFPExpandImm-encodable ∧ xN dead by forward-liveness; 5 teeth tests) + **4.2**
+`collapse_fp_bridge` (d→x→d round-trip elim). **perfn geomean 1.812×→1.778× gcc-O1** (−0.034, ~1.9%);
+sqlite size −106 (289,489→289,383, FP-minor on integer code, as expected). FULL GATE GREEN: cargo 175/0,
+torture 1471/0 FAIL, opt-parity 1552/0 DIVERGE, csmith300 254/0, yarpgen300 300/0. Machine
+translation-validation (pure ISA-immediate identity / value-residency). Advance to next FP-band lever.
 
 **★ LICM — MEASUREMENT CLOSED 2026-08-24, stays OFF (correct).** Fresh best-of-7 sieve(100M): default
 509ms · `ZCC_OPT_ON=licm` 497ms (−2.4%) · gcc-O1 424ms (zcc **1.20×**). sqlite size: default 292,927 ·

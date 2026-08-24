@@ -1,151 +1,57 @@
-oracle-invalid	20000412-3	referee-reject: 20000412-3.c:14:10: error: implicit declaration of function 'f' [-Wimplicit-function-declaration]
-oracle-invalid	20000717-3	referee-reject: 20000717-3.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	20001009-2	referee-reject: 20001009-2.c:11:5: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	20001009-2	referee-reject: 20001009-2.c:11:11: error: expected ')' before ':' token
 oracle-invalid	20001121-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	20010122-1	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	20010605-2	referee-reject: 20010605-2.c:18:3: error: implicit declaration of function 'exit' [-Wimplicit-function-declaration]
-oracle-invalid	20020107-1	referee-reject: 20020107-1.c:20:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	20020314-1	referee-reject: 20020314-1.c:14:7: error: implicit declaration of function 'alloca' [-Wimplicit-function-declaration]
-oracle-invalid	20020412-1	referee-reject: 20020412-1.c:30:19: error: unknown type name 'typeof'; did you mean '__typeof__'?
-oracle-invalid	20020819-1	referee-reject: 20020819-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
+oracle-invalid	20020107-1	referee-reject: 20020107-1.c:20:10: error: expected ')' before ':' token
+oracle-invalid	20020314-1	referee-reject: collect2: error: ld returned 1 exit status
+oracle-invalid	20020412-1	referee-reject: 20020412-1.c:30:19: error: unknown type name 'typeof'
 oracle-invalid	20021127-1	gcc-ext: UB redefine reserved `llabs` (C99 7.1.3); gcc+clang fold builtin dropping the user definition, zcc calls the real one → abort
-oracle-invalid	20030222-1	referee-reject: 20030222-1.c:16:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	20031211-2	referee-reject: 20031211-2.c:13:3: error: implicit declaration of function 'foo' [-Wimplicit-function-declaration]
-oracle-invalid	20040223-1	referee-reject: 20040223-1.c:9:5: error: implicit declaration of function 'abort' [-Wimplicit-function-declaration]
-oracle-invalid	20041019-1	referee-reject: 20041019-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	20050203-1	referee-reject: 20050203-1.c:12:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	20030222-1	referee-reject: 20030222-1.c:16:10: error: expected ')' before ':' token
+oracle-invalid	20040223-1	referee-reject: collect2: error: ld returned 1 exit status
+oracle-invalid	20050203-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	20061031-1	referee-reject: 20061031-1.c:8:5: error: 'asm' undeclared (first use in this function)
 oracle-invalid	20061220-1	referee-reject: 20061220-1.c:16:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	20071220-1	referee-reject: 20071220-1.c:10:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	20071220-2	referee-reject: 20071220-2.c:9:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	20080122-1	referee-reject: 20080122-1.c:13:5: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	20120427-1	referee-reject: 20120427-1.c:9:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	20120427-2	referee-reject: 20120427-2.c:9:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920409-1	referee-reject: 920409-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920411-1	referee-reject: 920411-1.c:17:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920415-1	referee-reject: 920415-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920428-1	referee-reject: 920428-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920428-2	referee-reject: 920428-2.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920429-1	referee-reject: 920429-1.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920501-1	referee-reject: 920501-1.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920501-7	referee-reject: 920501-7.c:12:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920501-9	referee-reject: 920501-9.c:11:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920520-1	referee-reject: 920520-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920603-1	referee-reject: 920603-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920721-2	referee-reject: 920721-2.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920721-3	referee-reject: 920721-3.c:2:15: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920728-1	referee-reject: 920728-1.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920730-1	referee-reject: 920730-1.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920731-1	referee-reject: 920731-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920812-1	referee-reject: 920812-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920908-2	referee-reject: 920908-2.c:20:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	920909-1	referee-reject: 920909-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921013-1	referee-reject: 921013-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921017-1	referee-reject: 921017-1.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921110-1	referee-reject: 921110-1.c:8:3: error: implicit declaration of function 'exit' [-Wimplicit-function-declaration]
-oracle-invalid	921123-1	referee-reject: 921123-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921124-1	referee-reject: 921124-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921202-1	referee-reject: 921202-1.c:10:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921207-1	referee-reject: 921207-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921208-2	referee-reject: 921208-2.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921215-1	referee-reject: 921215-1.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921218-1	referee-reject: 921218-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	921218-2	referee-reject: 921218-2.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930106-1	referee-reject: 930106-1.c:15:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930111-1	referee-reject: 930111-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930208-1	referee-reject: 930208-1.c:8:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930429-2	referee-reject: 930429-2.c:4:1: error: type of 'b' defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930513-1	referee-reject: 930513-1.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930513-2	referee-reject: 930513-2.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930518-1	referee-reject: 930518-1.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
+oracle-invalid	20080122-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	930526-1	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	930527-1	referee-reject: 930527-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930603-1	referee-reject: 930603-1.c:9:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930603-3	referee-reject: 930603-3.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930621-1	referee-reject: 930621-1.c:11:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930622-1	referee-reject: 930622-1.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930630-1	referee-reject: 930630-1.c:11:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930702-1	referee-reject: 930702-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930713-1	referee-reject: 930713-1.c:16:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930718-1	referee-reject: 930718-1.c:22:3: error: implicit declaration of function 'abort' [-Wimplicit-function-declaration]
-oracle-invalid	930719-1	referee-reject: 930719-1.c:4:1: error: type of 'foo' defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930818-1	referee-reject: 930818-1.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930916-1	referee-reject: 930916-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930921-1	referee-reject: 930921-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930929-1	referee-reject: 930929-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	930930-1	referee-reject: 930930-1.c:10:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931009-1	referee-reject: 931009-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931012-1	referee-reject: 931012-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931017-1	referee-reject: 931017-1.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931018-1	referee-reject: 931018-1.c:6:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931031-1	referee-reject: 931031-1.c:28:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931102-1	referee-reject: 931102-1.c:10:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931102-2	referee-reject: 931102-2.c:12:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931208-1	referee-reject: 931208-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	931228-1	referee-reject: 931228-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	940115-1	referee-reject: 940115-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	940122-1	referee-reject: 940122-1.c:6:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	941101-1	referee-reject: 941101-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	941110-1	referee-reject: 941110-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	941202-1	referee-reject: 941202-1.c:2:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	950322-1	referee-reject: 950322-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	950426-1	referee-reject: 950426-1.c:10:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	950512-1	referee-reject: 950512-1.c:4:1: error: type of 'x' defaults to 'int' [-Wimplicit-int]
-oracle-invalid	950605-1	referee-reject: 950605-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	950621-1	referee-reject: 950621-1.c:10:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	960218-1	referee-reject: 960218-1.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	960312-1	referee-reject: 960312-1.c:18:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	960402-1	referee-reject: 960402-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	960830-1	referee-reject: 960830-1.c:20:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	961112-1	referee-reject: 961112-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
+oracle-invalid	941202-1	referee-reject: collect2: error: ld returned 1 exit status
+oracle-invalid	960312-1	referee-reject: 960312-1.c:18:9: error: expected ')' before ':' token
 oracle-invalid	961223-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	980608-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	980709-1	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	990106-1	referee-reject: 990106-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	990130-1	referee-reject: 990130-1.c:17:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	990130-1	referee-reject: 990130-1.c:17:9: error: expected ')' before ':' token
 oracle-invalid	990413-2	referee-reject: 990413-2.c:19:3: error: unknown register name 'st(1)' in 'asm'
 oracle-invalid	bcp-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	bitfld-3	gcc-ext: reduced-precision long-long-bitfield *,+,-: clang+zcc abort (C99 6.3.1.1, 64-bit), gcc outlier
-oracle-invalid	bitfld-5	referee-reject: bitfld-5.c:15:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	builtin-types-compatible-p	referee-reject: builtin-types-compatible-p.c:8:51: error: unknown type name 'typeof'; did you mean '__typeof__'?
-oracle-invalid	cmpdi-1	referee-reject: cmpdi-1.c:6:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	cmpsf-1	referee-reject: cmpsf-1.c:8:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	cmpsi-1	referee-reject: cmpsi-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	cmpsi-2	referee-reject: cmpsi-2.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	comp-goto-2	referee-reject: comp-goto-2.c:14:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	dbra-1	referee-reject: dbra-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	divmod-1	referee-reject: divmod-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
+oracle-invalid	bitfld-5	referee-reject: collect2: error: ld returned 1 exit status
+oracle-invalid	builtin-types-compatible-p	referee-reject: builtin-types-compatible-p.c:8:51: error: unknown type name 'typeof'
 oracle-invalid	eeprof-1	referee-run-fail(UB?)
 oracle-invalid	float-floor	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	inst-check	referee-reject: inst-check.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	int-compare	referee-reject: int-compare.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	loop-2	referee-reject: loop-2.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
 oracle-invalid	loop-2c	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	loop-2d	referee-reject: loop-2d.c:5:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	loop-3	referee-reject: loop-3.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	loop-3b	referee-reject: loop-3b.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	loop-3c	referee-reject: loop-3c.c:7:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	medce-1	opt-dependent: referee DCE [link_error ], zcc at -O0 keeps the reference
-oracle-invalid	memclr	referee-reject: memclr.c:45:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	memcpy-a1	referee-reject: memcpy-ax.h:55:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	memcpy-a2	referee-reject: memcpy-ax.h:55:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	memcpy-a4	referee-reject: memcpy-ax.h:55:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	memcpy-a8	referee-reject: memcpy-ax.h:55:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	misalign	referee-reject: misalign.c:30:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	mod-1	referee-reject: mod-1.c:3:1: error: return type defaults to 'int' [-Wimplicit-int]
+oracle-invalid	memclr	referee-reject: memclr.c:45:15: error: expected ')' before ':' token
+oracle-invalid	memcpy-a1	referee-reject: memcpy-ax.h:55:15: error: expected ')' before ':' token
+oracle-invalid	memcpy-a2	referee-reject: memcpy-ax.h:55:15: error: expected ')' before ':' token
+oracle-invalid	memcpy-a4	referee-reject: memcpy-ax.h:55:15: error: expected ')' before ':' token
+oracle-invalid	memcpy-a8	referee-reject: memcpy-ax.h:55:15: error: expected ')' before ':' token
+oracle-invalid	misalign	referee-reject: misalign.c:30:15: error: expected ')' before ':' token
 oracle-invalid	p18298	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr103376	referee-reject: pr103376.c:9:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr105777	referee-reject: pr105777.c:3:10: fatal error: ../../gcc.dg/tree-ssa/pr105777.c: No such file or directory
 oracle-invalid	pr108498-1	referee-reject: pr108498-1.c:69:3: error: 'asm' undeclared (first use in this function)
+oracle-invalid	pr108789	referee-run-fail(UB?)
 oracle-invalid	pr109938	referee-reject: pr109938.c:4:10: fatal error: ../../gcc.dg/tree-ssa/pr109938.c: No such file or directory
 oracle-invalid	pr109986	referee-reject: pr109986.c:4:10: fatal error: ../../gcc.dg/tree-ssa/pr109986.c: No such file or directory
-oracle-invalid	pr110252-2	referee-reject: pr110252-2.c:7:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr110252-2	referee-reject: pr110252-2.c:7:9: error: expected ')' before ':' token
+oracle-invalid	pr111151	referee-run-fail(UB?)
 oracle-invalid	pr114552	referee-reject: pr114552.c:10:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr117432	referee-reject: pr117432.c:35:15: error: macro "va_start" requires 2 arguments, but only 1 given
+oracle-invalid	pr117432	referee-reject: pr117432.c:32:6: error: ISO C requires a named argument before '...'
 oracle-invalid	pr121957	referee-reject: pr121957.c:15:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr123625-3	referee-reject: pr123625-3.c:13:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr123864	referee-run-fail(UB?)
-oracle-invalid	pr22061-1	referee-reject: pr22061-1.c:11:7: error: implicit declaration of function 'alloca' [-Wimplicit-function-declaration]
+oracle-invalid	pr123864	referee-reject: pr123864.c:3:6: error: expected ']' before ':' token
+oracle-invalid	pr123978	referee-reject: pr123978.c:5:6: error: expected ']' before ':' token
+oracle-invalid	pr124358	referee-reject: pr124358.c:3:6: error: expected ']' before ':' token
+oracle-invalid	pr125291	referee-reject: pr125291.c:9:6: error: expected ']' before ':' token
+oracle-invalid	pr22061-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr30314	referee-reject: pr30314.c:3:10: fatal error: ../../gcc.dg/tree-ssa/pr30314.c: No such file or directory
 oracle-invalid	pr32244-1	gcc-ext: reduced-precision long-long-bitfield <<: clang+zcc abort (C99 6.3.1.1, 64-bit), gcc 40-bit outlier
 oracle-invalid	pr34971	gcc-ext: reduced-precision long-long-bitfield: clang+zcc abort (C99 6.3.1.1, 64-bit), gcc outlier
@@ -153,44 +59,44 @@ oracle-invalid	pr38533	referee-reject: pr38533.c:3:11: error: 'asm' undeclared (
 oracle-invalid	pr40022	referee-reject: pr40022.c:17:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr40657	referee-reject: pr40657.c:11:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr41239	referee-reject: pr41239.c:41:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr43385	referee-reject: pr43385.c:27:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	pr43560	referee-reject: pr43560.c:25:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	pr44852	referee-reject: pr44852.c:4:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr43385	referee-reject: pr43385.c:27:10: error: expected ')' before ':' token
+oracle-invalid	pr43560	referee-reject: pr43560.c:25:10: error: expected ')' before ':' token
+oracle-invalid	pr44852	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr45695	referee-reject: pr45695.c:8:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr46309	referee-reject: pr46309.c:18:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr47925	referee-reject: pr47925.c:6:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr49218	referee-reject: pr49218.c:16:9: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr49218	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr49279	referee-reject: pr49279.c:10:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr49390	referee-reject: pr49390.c:81:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	pr51581-1	referee-reject: pr51581-1.c:118:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	pr51581-2	referee-reject: pr51581-2.c:133:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr49390	referee-reject: pr49390.c:81:10: error: expected ')' before ':' token
+oracle-invalid	pr51581-1	referee-reject: collect2: error: ld returned 1 exit status
+oracle-invalid	pr51581-2	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr51877	referee-reject: pr51877.c:22:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr51933	referee-reject: pr51933.c:16:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr52286	referee-reject: pr52286.c:10:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr52286	referee-reject: pr52286.c:10:10: error: expected ')' before ':' token
 oracle-invalid	pr53645	referee-reject: pr53645.c:61:5: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr53645-2	referee-reject: pr53645-2.c:61:5: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr55875	referee-reject: pr55875.c:4:1: error: return type defaults to 'int' [-Wimplicit-int]
 oracle-invalid	pr56205	referee-reject: pr56205.c:12:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr56866	referee-reject: pr56866.c:22:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr57344-1	referee-reject: pr57344-1.c:21:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr57344-2	referee-reject: pr57344-2.c:22:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr57344-3	referee-reject: pr57344-3.c:17:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr57344-4	referee-reject: pr57344-4.c:17:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr58277-1	referee-reject: pr58277-1.c:20:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr58277-1	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr58419	referee-reject: pr58419.c:5:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr63641	referee-reject: pr63641.c:46:3: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr65053-1	referee-reject: pr65053-1.c:24:7: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr65053-1	referee-reject: pr65053-1.c:24:14: error: expected ')' before ':' token
 oracle-invalid	pr65053-2	referee-reject: pr65053-2.c:9:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr65648	referee-reject: pr65648.c:13:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr65956	referee-reject: pr65956.c:17:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr68328	referee-reject: pr68328.c:6:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr69320-2	referee-reject: pr69320-2.c:12:6: error: 'asm' undeclared (first use in this function)
-oracle-invalid	pr69691	referee-reject: pr69691.c:117:6: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
+oracle-invalid	pr69691	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	pr78438	referee-reject: pr78438.c:15:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr78726	referee-reject: pr78726.c:18:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr79354	referee-reject: pr79354.c:24:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr79737-2	referee-reject: pr79737-2.c:44:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr80421	referee-reject: pr80421.c:6:3: error: 'asm' undeclared (first use in this function)
+oracle-invalid	pr80692	referee-reject: pr80692.c:5:9: error: decimal floating-point not supported for this target
 oracle-invalid	pr82954	referee-reject: pr82954.c:17:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr84478	referee-reject: pr84478.c:45:3: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr84524	referee-reject: pr84524.c:31:11: error: 'asm' undeclared (first use in this function)
@@ -201,117 +107,117 @@ oracle-invalid	pr93945	referee-reject: pr93945.c:15:3: error: 'asm' undeclared (
 oracle-invalid	pr94130	referee-reject: pr94130.c:14:5: error: 'asm' undeclared (first use in this function)
 oracle-invalid	pr98304-2	referee-reject: pr98304-2.c:3:10: fatal error: ../../gcc.dg/pr98304-1.c: No such file or directory
 oracle-invalid	restrict-1	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	stkalign	referee-reject: stkalign.c:15:3: error: implicit declaration of function 'asm' [-Wimplicit-function-declaration]
-oracle-invalid	strct-pack-3	referee-reject: strct-pack-3.c:9:1: error: return type defaults to 'int' [-Wimplicit-int]
-oracle-invalid	tstdi-1	referee-reject: tstdi-1.c:6:1: error: return type defaults to 'int' [-Wimplicit-int]
+oracle-invalid	stkalign	referee-reject: stkalign.c:15:10: error: expected ')' before ':' token
 oracle-invalid	unroll-1	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	va-arg-22	referee-reject: va-arg-22.c:43:22: error: unknown type name 'typeof'; did you mean '__typeof__'?
+oracle-invalid	va-arg-22	referee-reject: va-arg-22.c:43:22: error: unknown type name 'typeof'
 oracle-invalid	va-arg-7	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	va-arg-8	referee-reject: collect2: error: ld returned 1 exit status
-zcc-reject	20000822-1	20000822-1.c:15: nested function (GNU): not supported
-zcc-reject	20010209-1	20010209-1.c:9: nested function (GNU): not supported
-zcc-reject	20010605-1	20010605-1.c:6: nested function (GNU): not supported
-zcc-reject	20020411-1	20020411-1.c:13: __builtin_conjf: builtin not yet supported
-zcc-reject	20030501-1	20030501-1.c:11: nested function (GNU): not supported
-zcc-reject	20040308-1	20040308-1.c:6: VLA in struct/union (GNU): not yet supported
-zcc-reject	20040423-1	20040423-1.c:8: VLA in struct/union (GNU): not yet supported
-zcc-reject	20040520-1	20040520-1.c:7: nested function (GNU): not supported
-zcc-reject	20041124-1	20041124-1.c:4: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	20041201-1	20041201-1.c:3: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	20041218-2	20041218-2.c:5: VLA in struct/union (GNU): not yet supported
-zcc-reject	20050121-1	20050121-1.c:33: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	20050316-1	20050316-1.c:7: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	20050316-2	20050316-2.c:8: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	20050316-3	20050316-3.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	20050604-1	20050604-1.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	20050607-1	20050607-1.c:5: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	20060420-1	20060420-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	20070919-1	20070919-1.c:28: VLA in struct/union (GNU): not yet supported
-zcc-reject	20090219-1	20090219-1.c:13: nested function (GNU): not supported
-zcc-reject	20230630-2	20230630-2.c:13: __attribute__((scalar_storage_order)): byte-order reversal (GNU): not yet supported
-zcc-reject	20230630-4	20230630-4.c:17: __attribute__((scalar_storage_order)): byte-order reversal (GNU): not yet supported
-zcc-reject	920612-2	920612-2.c:11: nested function (GNU): not supported
-zcc-reject	920721-4	920721-4.c:9: nested function (GNU): not supported
-zcc-reject	931002-1	931002-1.c:15: nested function (GNU): not supported
+zcc-reject	20000822-1	20000822-1.c:15: nested function (GNU) not supported
+zcc-reject	20010209-1	20010209-1.c:9: nested function (GNU) not supported
+zcc-reject	20010605-1	20010605-1.c:6: nested function (GNU) not supported
+zcc-reject	20020411-1	20020411-1.c:13: __builtin_conjf: builtin not supported
+zcc-reject	20030501-1	20030501-1.c:11: nested function (GNU) not supported
+zcc-reject	20040308-1	20040308-1.c:6: VLA in struct/union (GNU) not supported
+zcc-reject	20040423-1	20040423-1.c:8: VLA in struct/union (GNU) not supported
+zcc-reject	20040520-1	20040520-1.c:7: nested function (GNU) not supported
+zcc-reject	20041124-1	20041124-1.c:4: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	20041201-1	20041201-1.c:3: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	20041218-2	20041218-2.c:5: VLA in struct/union (GNU) not supported
+zcc-reject	20050121-1	20050121-1.c:33: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	20050316-1	20050316-1.c:7: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	20050316-2	20050316-2.c:8: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	20050316-3	20050316-3.c:4: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	20050604-1	20050604-1.c:9: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	20050607-1	20050607-1.c:5: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	20060420-1	20060420-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	20070919-1	20070919-1.c:28: VLA in struct/union (GNU) not supported
+zcc-reject	20090219-1	20090219-1.c:13: nested function (GNU) not supported
+zcc-reject	20230630-2	20230630-2.c:13: __attribute__((scalar_storage_order)): byte-order reversal (GNU) not supported
+zcc-reject	20230630-4	20230630-4.c:17: __attribute__((scalar_storage_order)): byte-order reversal (GNU) not supported
+zcc-reject	920415-1	920415-1.c:3: nested function (GNU) not supported
+zcc-reject	920428-2	920428-2.c:5: nested function (GNU) not supported
+zcc-reject	920501-7	920501-7.c:16: nested function (GNU) not supported
+zcc-reject	920612-2	920612-2.c:11: nested function (GNU) not supported
+zcc-reject	920721-4	920721-4.c:9: nested function (GNU) not supported
+zcc-reject	921017-1	921017-1.c:8: nested function (GNU) not supported
+zcc-reject	921215-1	921215-1.c:7: nested function (GNU) not supported
+zcc-reject	931002-1	931002-1.c:15: nested function (GNU) not supported
 zcc-reject	991014-1	991014-1.c:12: member 'buf' >4GB: object exceeds zcc's u32 size limit
-zcc-reject	align-3	align-3.c:13: __alignof__ of a function (GNU function-alignment): not yet supported
-zcc-reject	align-nest	align-nest.c:10: VLA in struct/union (GNU): not yet supported
+zcc-reject	align-3	align-3.c:13: __alignof__ of function (GNU function-alignment) not supported
+zcc-reject	align-nest	align-nest.c:10: VLA in struct/union (GNU) not supported
 zcc-reject	bf-pack-1	bf-pack-1.c:7: expected Punct(";"), found Some(Ident("__attribute__"))
-zcc-reject	built-in-setjmp	built-in-setjmp.c:13: __builtin_longjmp: builtin not yet supported
-zcc-reject	builtin-bitops-1	builtin-bitops-1.c:189: __builtin_clrsb: builtin not yet supported
-zcc-reject	complex-6	complex-6.c:42: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	frame-address	frame-address.c:21: __builtin_frame_address: builtin not yet supported
-zcc-reject	nest-align-1	nest-align-1.c:26: nested function (GNU): not supported
-zcc-reject	nest-stdar-1	nest-stdar-1.c:10: nested function (GNU): not supported
-zcc-reject	nestfunc-1	nestfunc-1.c:20: nested function (GNU): not supported
-zcc-reject	nestfunc-2	nestfunc-2.c:17: nested function (GNU): not supported
-zcc-reject	nestfunc-3	nestfunc-3.c:16: nested function (GNU): not supported
-zcc-reject	nestfunc-5	nestfunc-5.c:11: nested function (GNU): not supported
-zcc-reject	nestfunc-6	nestfunc-6.c:15: nested function (GNU): not supported
-zcc-reject	nestfunc-7	nestfunc-7.c:16: nested function (GNU): not supported
-zcc-reject	packed-aligned	packed-aligned.c:3: expected parameter type
-zcc-reject	pr103405	pr103405.c:25: nested function (GNU): not supported
-zcc-reject	pr104604	pr104604.c:7: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	pr105613	pr105613.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr105984	pr105984.c:8: __builtin_mul_overflow_p: builtin not yet supported
-zcc-reject	pr108292	pr108292.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr109040	pr109040.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr110817-1	pr110817-1.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr110817-2	pr110817-2.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr110817-3	pr110817-3.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr123625	pr123625.c:24: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr123625-2	pr123625-2.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr123753	pr123753.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr123978	pr123978.c:5: expected name in declarator, found Some(Punct("["))
-zcc-reject	pr124358	pr124358.c:3: expected name in declarator, found Some(Punct("["))
-zcc-reject	pr125291	pr125291.c:9: expected name in declarator, found Some(Punct("["))
-zcc-reject	pr126405	pr126405.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr126405-2	pr126405-2.c:7: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr126405-3	pr126405-3.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr19449	pr19449.c:6: __builtin_choose_expr: builtin not yet supported
-zcc-reject	pr22061-3	pr22061-3.c:7: nested function (GNU): not supported
-zcc-reject	pr22061-4	pr22061-4.c:7: nested function (GNU): not supported
-zcc-reject	pr23135	pr23135.c:16: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr24135	pr24135.c:11: nested function (GNU): not supported
-zcc-reject	pr38151	pr38151.c:8: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	pr39120	pr39120.c:6: expected parameter type
-zcc-reject	pr39228	pr39228.c:9: __builtin_isinff: builtin not yet supported
-zcc-reject	pr41935	pr41935.c:9: VLA in struct/union (GNU): not yet supported
+zcc-reject	built-in-setjmp	built-in-setjmp.c:13: __builtin_longjmp: builtin not supported
+zcc-reject	builtin-bitops-1	builtin-bitops-1.c:189: __builtin_clrsb: builtin not supported
+zcc-reject	comp-goto-2	comp-goto-2.c:18: nested function (GNU) not supported
+zcc-reject	complex-6	complex-6.c:42: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	frame-address	frame-address.c:21: __builtin_frame_address: builtin not supported
+zcc-reject	nest-align-1	nest-align-1.c:26: nested function (GNU) not supported
+zcc-reject	nest-stdar-1	nest-stdar-1.c:10: nested function (GNU) not supported
+zcc-reject	nestfunc-1	nestfunc-1.c:20: nested function (GNU) not supported
+zcc-reject	nestfunc-2	nestfunc-2.c:17: nested function (GNU) not supported
+zcc-reject	nestfunc-3	nestfunc-3.c:16: nested function (GNU) not supported
+zcc-reject	nestfunc-5	nestfunc-5.c:11: nested function (GNU) not supported
+zcc-reject	nestfunc-6	nestfunc-6.c:15: nested function (GNU) not supported
+zcc-reject	nestfunc-7	nestfunc-7.c:16: nested function (GNU) not supported
+zcc-reject	packed-aligned	packed-aligned.c:3: parameter type required
+zcc-reject	pr103405	pr103405.c:25: nested function (GNU) not supported
+zcc-reject	pr104604	pr104604.c:7: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	pr105613	pr105613.c:4: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr105984	pr105984.c:8: __builtin_mul_overflow_p: builtin not supported
+zcc-reject	pr108292	pr108292.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr109040	pr109040.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr110817-1	pr110817-1.c:1: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr110817-2	pr110817-2.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr110817-3	pr110817-3.c:1: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr123625	pr123625.c:24: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr123625-2	pr123625-2.c:9: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr123753	pr123753.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr126405	pr126405.c:9: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr126405-2	pr126405-2.c:7: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr126405-3	pr126405-3.c:9: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr19449	pr19449.c:6: __builtin_choose_expr: builtin not supported
+zcc-reject	pr22061-3	pr22061-3.c:7: nested function (GNU) not supported
+zcc-reject	pr22061-4	pr22061-4.c:7: nested function (GNU) not supported
+zcc-reject	pr23135	pr23135.c:16: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr24135	pr24135.c:11: nested function (GNU) not supported
+zcc-reject	pr38151	pr38151.c:8: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	pr39120	pr39120.c:6: parameter type required
+zcc-reject	pr39228	pr39228.c:9: __builtin_isinff: builtin not supported
+zcc-reject	pr41935	pr41935.c:9: VLA in struct/union (GNU) not supported
 zcc-reject	pr42833	pr42833.c:1: expected Punct(";"), found Some(Ident("int8_t"))
-zcc-reject	pr47237	pr47237.c:16: __builtin_apply: builtin not yet supported
-zcc-reject	pr51447	pr51447.c:22: nested function (GNU): not supported
-zcc-reject	pr56837	pr56837.c:2: _Complex integer (GNU extension outside C99 6.2.5): not yet supported
-zcc-reject	pr60003	pr60003.c:11: __builtin_longjmp: builtin not yet supported
-zcc-reject	pr60960	pr60960.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr64242	pr64242.c:5: expected parameter type
-zcc-reject	pr65427	pr65427.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr68532	pr68532.c:5: expected parameter type
-zcc-reject	pr70903	pr70903.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr71494	pr71494.c:10: nested function (GNU): not supported
-zcc-reject	pr71626-1	pr71626-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr71626-2	pr71626-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr80692	pr80692.c:5: undeclared variable: _Decimal64
-zcc-reject	pr81588	pr81588.c:6: asm: constraint "g" not yet supported
-zcc-reject	pr82210	pr82210.c:8: VLA in struct/union (GNU): not yet supported
-zcc-reject	pr84521	pr84521.c:9: __builtin_longjmp: builtin not yet supported
+zcc-reject	pr47237	pr47237.c:16: __builtin_apply: builtin not supported
+zcc-reject	pr51447	pr51447.c:22: nested function (GNU) not supported
+zcc-reject	pr56837	pr56837.c:2: integer _Complex (GNU extension outside C99 6.2.5): not supported
+zcc-reject	pr60003	pr60003.c:11: __builtin_longjmp: builtin not supported
+zcc-reject	pr60960	pr60960.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr64242	pr64242.c:5: parameter type required
+zcc-reject	pr65427	pr65427.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr68532	pr68532.c:5: parameter type required
+zcc-reject	pr70903	pr70903.c:1: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr71494	pr71494.c:10: nested function (GNU) not supported
+zcc-reject	pr71626-1	pr71626-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr71626-2	pr71626-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr81588	pr81588.c:6: asm: constraint "g" not supported
+zcc-reject	pr82210	pr82210.c:8: VLA in struct/union (GNU) not supported
+zcc-reject	pr84521	pr84521.c:9: __builtin_longjmp: builtin not supported
 zcc-reject	pr84748	pr84748.c:3: expected Punct(";"), found Some(Ident("u128"))
-zcc-reject	pr85169	pr85169.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr85331	pr85331.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr86659-1	pr86659-1.c:3: expected parameter type
-zcc-reject	pr86659-2	pr86659-2.c:3: expected parameter type
-zcc-reject	pr87623	pr87623.c:8: __attribute__((scalar_storage_order)): byte-order reversal (GNU): not yet supported
-zcc-reject	pr92618	pr92618.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
+zcc-reject	pr85169	pr85169.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr85331	pr85331.c:4: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr86659-1	pr86659-1.c:3: parameter type required
+zcc-reject	pr86659-2	pr86659-2.c:3: parameter type required
+zcc-reject	pr87623	pr87623.c:8: __attribute__((scalar_storage_order)): byte-order reversal (GNU) not supported
+zcc-reject	pr92618	pr92618.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
 zcc-reject	pr93213	pr93213.c:8: expected Punct(";"), found Some(Ident("u128"))
-zcc-reject	pr94412	pr94412.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr94524-1	pr94524-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr94524-2	pr94524-2.c:3: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	pr94591	pr94591.c:1: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	scal-to-vec1	scal-to-vec1.c:34: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	scal-to-vec2	scal-to-vec2.c:35: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	scal-to-vec3	scal-to-vec3.c:20: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	simd-1	simd-1.c:10: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	simd-2	simd-2.c:9: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	simd-4	simd-4.c:6: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	simd-5	simd-5.c:5: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	simd-6	simd-6.c:4: __attribute__((vector_size)): SIMD vector type (GNU): not yet supported
-zcc-reject	va-arg-pack-1	va-arg-pack-1.c:125: __builtin_va_arg_pack: builtin not yet supported
+zcc-reject	pr94412	pr94412.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr94524-1	pr94524-1.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr94524-2	pr94524-2.c:3: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	pr94591	pr94591.c:1: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	scal-to-vec1	scal-to-vec1.c:34: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	scal-to-vec2	scal-to-vec2.c:35: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	scal-to-vec3	scal-to-vec3.c:20: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	simd-1	simd-1.c:10: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	simd-2	simd-2.c:9: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	simd-4	simd-4.c:6: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	simd-5	simd-5.c:5: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	simd-6	simd-6.c:4: __attribute__((vector_size)): SIMD vector type (GNU) not supported
+zcc-reject	va-arg-pack-1	va-arg-pack-1.c:125: __builtin_va_arg_pack: builtin not supported

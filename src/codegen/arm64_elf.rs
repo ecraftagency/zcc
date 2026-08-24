@@ -4854,6 +4854,192 @@ fn fmov_residency(body: &str) -> String {
     out
 }
 
+/// FP CONSTANT MATERIALIZATION [Phase 4.1]. zcc lowers an f64 constant as its 64-bit bit pattern in
+/// a GPR (a `mov`/`movk` chain) then bridges it with `fmov dM, xN`. When the double is one of the
+/// 256 values the AArch64 scalar FP immediate encodes (VFPExpandImm: sign · 3-bit exp · 4-bit
+/// mantissa; the low 48 fraction bits are always zero), gcc emits a single `fmov dM, #imm`. An imm8
+/// double therefore materializes as EXACTLY the shape
+///     mov xN, #0 ; movk xN, #H, lsl #48 ; fmov dM, xN     →     fmov dM, #<val>
+/// (only the top 16-bit lane is nonzero, so the low three `movk` lanes never appear). SOUND iff (a)
+/// the reconstructed value H<<48 is imm8-encodable and (b) xN is dead after the fmov — a fresh
+/// scratch, redefined before any read (a forward liveness scan like post_index's; a boundary or a
+/// read of xN before a write ⟹ DECLINE). Machine translation-validation (pure ISA-immediate
+/// identity). 3 insns → 1.
+fn fold_fp_imm(body: &str) -> String {
+    // f64 bit pattern → Some(value) iff encodable as an AArch64 scalar FP `#imm8`, else None.
+    // Decode obligation (ARM DDI0487 VFPExpandImm, N=64): frac<47:0>=0; exp<10:0> must equal
+    // NOT(b) : b(×8) : xx — i.e. bits<9:2> all == b and bit<10> == !b (the two free bits are xx).
+    fn imm8(bits: u64) -> Option<f64> {
+        if bits & 0x0000_ffff_ffff_ffff != 0 {
+            return None;
+        }
+        let exp = (bits >> 52) & 0x7ff;
+        let b = (exp >> 9) & 1;
+        if (exp >> 2) & 0xff != if b == 1 { 0xff } else { 0 } {
+            return None;
+        }
+        if (exp >> 10) & 1 != b ^ 1 {
+            return None;
+        }
+        Some(f64::from_bits(bits))
+    }
+    // `mov xN, #0` → N.
+    fn p_mov0(t: &str) -> Option<u32> {
+        let (n, rest) = t.strip_prefix("mov x")?.split_once(", #0")?;
+        rest.is_empty().then_some(())?;
+        n.parse().ok()
+    }
+    // `movk xN, #H, lsl #48` → (N, H).
+    fn p_movk48(t: &str) -> Option<(u32, u64)> {
+        let rest = t.strip_prefix("movk x")?;
+        let mut it = rest.split(", ");
+        let n: u32 = it.next()?.parse().ok()?;
+        let h: u64 = it.next()?.strip_prefix('#')?.parse().ok()?;
+        (it.next()? == "lsl #48" && it.next().is_none()).then_some((n, h))
+    }
+    // `fmov dM, xN` → (M, N).
+    fn p_fmov(t: &str) -> Option<(u32, u32)> {
+        let (m, n) = t.strip_prefix("fmov d")?.split_once(", x")?;
+        Some((m.parse().ok()?, n.parse().ok()?))
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut drop = vec![false; lines.len()];
+    let mut repl: Vec<Option<String>> = vec![None; lines.len()];
+    for i in 0..lines.len().saturating_sub(1) {
+        // The materialization is an adjacent `mov xN,#0 ; movk xN,#H,lsl #48` (imm() emits the two
+        // consecutively; no pass reorders inside it). The consuming `fmov dM,xN` is NOT necessarily
+        // adjacent — scheduling interposes an FP bridge — so scan forward for it.
+        let (Some(n0), Some((n1, h))) = (p_mov0(lines[i].trim()), p_movk48(lines[i + 1].trim()))
+        else {
+            continue;
+        };
+        if n0 != n1 {
+            continue;
+        }
+        let Some(v) = imm8(h << 48) else { continue }; // not an imm8 double — leave the chain
+        // Forward scan: xN's ONLY readers until it is redefined must be `fmov dM,xN` bridges (each
+        // rewritable to the immediate). Any other read, or a boundary/label, ⟹ xN escapes the idiom
+        // ⟹ decline (leave the materialization). A write of xN ends the live range (dead ⟹ fold).
+        let mut consumers: Vec<(usize, u32)> = Vec::new();
+        let mut ok = true;
+        for (off, lj) in lines[i + 2..].iter().enumerate() {
+            let t = lj.trim();
+            if t.is_empty() || (t.starts_with('.') && !t.ends_with(':')) {
+                continue;
+            }
+            if t.ends_with(':') {
+                ok = false;
+                break;
+            }
+            let (reads, writes, boundary) = reg_uses(t);
+            if boundary {
+                // reg_uses bails on writeback (`[xB],#k` / `]!`) and control-flow lines. Be precise
+                // about xN. A line that never names xN as a register token neither reads nor writes
+                // it. `ret` ends the function (a caller-saved scratch xN is dead); a call clobbers
+                // caller-saved regs (x0..x18) so xN is dead past it iff caller-saved; any in-block
+                // branch (b/b.cc/br) reaches another block where xN might be live ⟹ decline.
+                let touches = |t: &str, n: u32| {
+                    t.split(|c: char| !c.is_ascii_alphanumeric()).any(|tok| {
+                        tok.strip_prefix('x').or_else(|| tok.strip_prefix('w'))
+                            .and_then(|s| s.parse::<u32>().ok()) == Some(n)
+                    })
+                };
+                let mn = t.split_whitespace().next().unwrap_or("");
+                if touches(t, n1) {
+                    ok = false;
+                } else if mn == "ret" {
+                    // fall through: function end, xN dead — break with `ok` intact (fold)
+                } else if (mn == "bl" || mn == "blr") && n1 <= 18 {
+                    // call clobbers caller-saved xN — dead past here
+                } else if mn == "b" || mn == "br" || mn.starts_with("b.") || mn == "bl" || mn == "blr" {
+                    ok = false; // inter-block edge / callee-saved across call ⟹ cannot prove dead
+                } else {
+                    continue; // writeback mem op not naming xN — xN untouched, keep scanning
+                }
+                break;
+            }
+            if reads.contains(&n1) {
+                match p_fmov(t) {
+                    Some((m, nn)) if nn == n1 => consumers.push((i + 2 + off, m)),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if writes.contains(&n1) {
+                break; // xN redefined ⟹ live range closed, materialization now dead
+            }
+        }
+        if !ok || consumers.is_empty() {
+            continue;
+        }
+        let s = format!("{v}");
+        let s = if s.contains(['.', 'e', 'E']) { s } else { format!("{s}.0") };
+        drop[i] = true;
+        drop[i + 1] = true;
+        for (j, m) in consumers {
+            repl[j] = Some(format!("\tfmov d{m}, #{s}"));
+        }
+    }
+    let mut out = String::with_capacity(body.len());
+    for (i, line) in lines.iter().enumerate() {
+        if drop[i] {
+            continue;
+        }
+        match &repl[i] {
+            Some(r) => {
+                out.push_str(r);
+                out.push('\n');
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// FP BRIDGE COLLAPSE [Phase 4.3]. Absent an FP register class, zcc funnels an FP value from one
+/// d-reg to another through a GP scratch: `fmov xN, dS ; fmov dD, xN` (dS → xN → dD). Since dS is
+/// unchanged between the two adjacent copies, the second may read dS directly — `fmov dD, dS` — and
+/// the GP hop `fmov xN, dS` becomes dead (reaped by the following drop_dead_moves when xN is unused
+/// elsewhere). Pure 64-bit register-copy identity (the same bits reach dD either way); the GP hop
+/// is only kept when xN has another consumer, in which case the rewrite is still value-preserving.
+fn collapse_fp_bridge(body: &str) -> String {
+    fn p_xd(t: &str) -> Option<(u32, u32)> {
+        let (n, s) = t.strip_prefix("fmov x")?.split_once(", d")?;
+        Some((n.parse().ok()?, s.parse().ok()?))
+    }
+    fn p_dx(t: &str) -> Option<(u32, u32)> {
+        let (d, m) = t.strip_prefix("fmov d")?.split_once(", x")?;
+        Some((d.parse().ok()?, m.parse().ok()?))
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if i + 1 < lines.len() {
+            if let (Some((n, s)), Some((d, m))) =
+                (p_xd(lines[i].trim()), p_dx(lines[i + 1].trim()))
+            {
+                if m == n {
+                    out.push_str(lines[i]); // keep the GP hop; drop_dead_moves reaps it if xN dies
+                    out.push('\n');
+                    _ = writeln!(out, "\tfmov d{d}, d{s}"); // dD reads dS directly
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// SHIFTED-REGISTER ARITHMETIC FUSION [Phase 3.1]. ARMv8 add/sub take a shifted second source in
 /// ONE instruction: `add Xd, Xn, Xm, lsl #s`. A strength-reduced scaled index emits `lsl xT,xM,#s
 /// ; add xD,xA,xT` (base + index·2^s). When the add OVERWRITES the shift's destination (xD==xT)
@@ -5353,6 +5539,12 @@ pub fn emit_ir(ast: &Ast) -> String {
             // …and drop redundant fmov round-trips (d→GP→d spill/reload) via 64-bit x+d
             // value-equivalence (Phase 4.2 FP residency; pure register identity, volatile-safe).
             body = fmov_residency(&body);
+            // …then collapse an imm8-encodable double built as mov/movk/fmov-x into one
+            // `fmov d, #imm` (Phase 4.1 FP-constant materialization; volatile-safe ISA identity).
+            body = fold_fp_imm(&body);
+            // …and collapse a d→x→d GP bridge `fmov xN,dS; fmov dD,xN` → `fmov dD,dS` (Phase 4.3;
+            // the dead GP hop is reaped by the dead-def sweep below). Pure register-copy identity.
+            body = collapse_fp_bridge(&body);
             // …then a SECOND dead-def sweep: residency deletes the reads that kept a write-only FP
             // home (`fmov d17,x10` never reloaded) alive, so its stores are now provably dead. The
             // in-peephole pass ran before residency, when the read still stood — re-run to reap them.
@@ -5677,6 +5869,76 @@ mod tests {
         let body = "\tmov x1, x0\n\tstr w10, [x0, #8]!\n\tmov x0, x1\n";
         let out = fmov_residency(body);
         assert_eq!(count(&out, "mov x0, x1"), 1, "pre-index writeback changes x0 ⟹ keep restore");
+    }
+
+    use super::fold_fp_imm;
+
+    // Phase 4.1: the imm8-encodable double 3.0 (bits 0x4008..., built as mov#0/movk#0x4008<<48/fmov)
+    // collapses to one `fmov d1, #3.0`. xN is redefined (mov x11,#5) before any read ⟹ dead ⟹ safe.
+    #[test]
+    fn fp_imm_folds_encodable_double() {
+        let body = "\tmov x11, #0\n\tmovk x11, #16392, lsl #48\n\tfmov d1, x11\n\tmov x11, #5\n";
+        let out = fold_fp_imm(body);
+        assert_eq!(count(&out, "fmov d1, #3.0"), 1, "3.0 is imm8-encodable ⟹ one fmov #imm");
+        assert_eq!(count(&out, "movk x11, #16392, lsl #48"), 0, "the movk is folded away");
+        assert_eq!(count(&out, "mov x11, #0"), 0, "the mov#0 is folded away");
+    }
+
+    // TEETH: a top-lane value with frac low bits zero but a NON-imm8 exponent (0xFA0<<48) must NOT
+    // fold — the exp field fails VFPExpandImm, so no `#imm8` exists; leave the chain untouched.
+    #[test]
+    fn fp_imm_declines_non_encodable() {
+        let body = "\tmov x11, #0\n\tmovk x11, #4000, lsl #48\n\tfmov d1, x11\n\tmov x11, #5\n";
+        let out = fold_fp_imm(body);
+        assert_eq!(count(&out, "movk x11, #4000, lsl #48"), 1, "not imm8 ⟹ chain left intact");
+    }
+
+    // TEETH: if xN is READ after the fmov before any redefinition, folding would drop a live GPR
+    // value — decline. (Here `str x11,[x0]` reads x11 after the bridge.)
+    #[test]
+    fn fp_imm_declines_when_base_read_after() {
+        let body = "\tmov x11, #0\n\tmovk x11, #16392, lsl #48\n\tfmov d1, x11\n\tstr x11, [x0]\n";
+        let out = fold_fp_imm(body);
+        assert_eq!(count(&out, "fmov d1, x11"), 1, "x11 live after ⟹ do not fold");
+    }
+
+    // Phase 4.1: xN stays dead THROUGH a writeback epilogue (`ldp …[sp],#16`) that reg_uses flags
+    // as a boundary but which never names xN — the fold must still fire (the last-constant tail).
+    #[test]
+    fn fp_imm_folds_through_writeback_epilogue() {
+        let body = "\tmov x11, #0\n\tmovk x11, #16422, lsl #48\n\tfmov d1, x11\n\tfadd d0, d0, d1\n\tldp x29, x30, [sp], #16\n\tret\n";
+        let out = fold_fp_imm(body);
+        assert_eq!(count(&out, "fmov d1, #11.0"), 1, "11.0 folds; the ldp writeback does not touch x11");
+        assert_eq!(count(&out, "movk x11, #16422, lsl #48"), 0);
+    }
+
+    // TEETH: a writeback that DOES name xN (`str w0,[x11],#8`) keeps it live ⟹ decline.
+    #[test]
+    fn fp_imm_declines_writeback_on_base() {
+        let body = "\tmov x11, #0\n\tmovk x11, #16384, lsl #48\n\tfmov d0, x11\n\tstr w0, [x11], #8\n";
+        let out = fold_fp_imm(body);
+        assert_eq!(count(&out, "fmov d0, x11"), 1, "x11 is a live writeback base ⟹ do not fold");
+    }
+
+    use super::collapse_fp_bridge;
+
+    // Phase 4.3: `fmov x11,d16; fmov d1,x11` (d16→x11→d1) collapses to `fmov d1,d16` reading d16
+    // directly; the GP hop stays for the dead-def sweep to reap (here it would then be dead).
+    #[test]
+    fn fp_bridge_collapses_dxd() {
+        let body = "\tfmov x11, d16\n\tfmov d1, x11\n\tfmul d0, d0, d1\n";
+        let out = collapse_fp_bridge(body);
+        assert_eq!(count(&out, "fmov d1, d16"), 1, "d1 reads d16 directly");
+        assert_eq!(count(&out, "fmov d1, x11"), 0, "the GP-sourced copy is rewritten away");
+    }
+
+    // TEETH: the second copy must read the SAME xN the first wrote (xM==xN) — an unrelated
+    // `fmov x11,d16; fmov d1,x12` is not a bridge and is left untouched.
+    #[test]
+    fn fp_bridge_declines_mismatched_reg() {
+        let body = "\tfmov x11, d16\n\tfmov d1, x12\n";
+        let out = collapse_fp_bridge(body);
+        assert_eq!(count(&out, "fmov d1, x12"), 1, "x12 ≠ x11 ⟹ not a bridge ⟹ unchanged");
     }
 
     use super::fuse_sxtw_extend;
