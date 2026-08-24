@@ -370,16 +370,22 @@ pub enum MInst {
         b: Rhs,
         flags: Reg,
     },
-    /// `movz/movn/movk` — the constant-materialization chain
+    /// Materialize an integer constant. ONE instruction here, expanded by the
+    /// emitter into the `movz/movn/movk` chain `isa::mov_chain` computes — the
+    /// chain is a read-modify-write of one register and so is not expressible in
+    /// SSA. Its cost is not hidden: `isa::mov_chain(imm).len()` gives the exact
+    /// instruction count before anything is emitted, which is what the cost
+    /// square (REARCH §10) needs.
     MovImm {
         w: Width,
         dst: Reg,
-        kind: MovKind,
-        imm: u16,
-        shift: u8,
+        imm: i64,
     },
+    /// `sxtb/sxth/sxtw/uxtb/uxth`; `w` is the DESTINATION width, which chooses
+    /// the `w` or `x` form (`sxtb x0, w0` differs from `sxtb w0, w0`).
     Ext {
         op: ExtOp,
+        w: Width,
         dst: Reg,
         src: Reg,
     },
@@ -690,13 +696,7 @@ impl MInst {
                 visit_rhs!(b, g);
                 g(flags, Constraint::Def);
             }
-            // `movk` merges into its destination, so the destination is also a use.
-            MInst::MovImm { dst, kind, .. } => {
-                if *kind == MovKind::K {
-                    g(dst, Constraint::Use);
-                }
-                g(dst, Constraint::Def);
-            }
+            MInst::MovImm { dst, .. } => g(dst, Constraint::Def),
             MInst::Ext { dst, src, .. } | MInst::Copy { dst, src, .. } => {
                 g(src, Constraint::Use);
                 g(dst, Constraint::Def);
@@ -793,12 +793,7 @@ impl MInst {
                 visit_rhs!(b, f);
                 f(flags, Constraint::Def);
             }
-            MInst::MovImm { dst, kind, .. } => {
-                if *kind == MovKind::K {
-                    f(dst, Constraint::Use);
-                }
-                f(dst, Constraint::Def);
-            }
+            MInst::MovImm { dst, .. } => f(dst, Constraint::Def),
             MInst::Ext { dst, src, .. } | MInst::Copy { dst, src, .. } => {
                 f(src, Constraint::Use);
                 f(dst, Constraint::Def);

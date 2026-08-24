@@ -108,6 +108,11 @@ pub fn verify(f: &MFunc) -> Result<(), String> {
                 ));
             }
             for (a, p) in t.args.iter().zip(want) {
+                // Only virtual registers carry a width; a physical register (xzr
+                // as a constant-zero argument) takes the parameter's form.
+                if a.preg().is_some() || p.preg().is_some() {
+                    continue;
+                }
                 if width_of(f, *a) != width_of(f, *p) {
                     return err(format!(
                         "edge bb{}→bb{}: {:?} of width {:?} passed to {:?} of width {:?}",

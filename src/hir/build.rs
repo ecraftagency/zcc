@@ -372,12 +372,13 @@ impl<'a> B<'a> {
         }
         // C99 6.3.1.2: (_Bool)x is x != 0, not a truncation.
         if matches!(self.tt().tys[to as usize], ast::Ty::Bool) {
+            let (a, ft) = self.promote(a, ft, src_unsigned_of(self.tt(), from));
             let z = if ft.is_float() {
                 Operand::Fimm(0)
             } else {
                 Operand::Imm(0)
             };
-            let op = if ft.is_float() { CmpOp::FOne } else { CmpOp::Ne };
+            let op = if ft.is_float() { CmpOp::FUne } else { CmpOp::Ne };
             let c = self.def(Ty::I32, |dst| Inst::Cmp {
                 dst,
                 op,
@@ -412,6 +413,19 @@ impl<'a> B<'a> {
         self.conv(op, ft, tt_, a)
     }
 
+    /// HIR invariant (relied on by isel and by `⟦hir⟧ = ⟦mir⟧`): `Cmp` and `Bin`
+    /// never appear at I8/I16. C99 6.3.1.1 promotes every narrow operand to int
+    /// before any operation, so this only makes the invariant explicit — but it
+    /// is what lets isel compare in a `w` register with no re-extension.
+    fn promote(&mut self, a: Operand, t: Ty, unsigned: bool) -> (Operand, Ty) {
+        if matches!(t, Ty::I8 | Ty::I16) {
+            let op = if unsigned { CvtOp::Zext } else { CvtOp::Sext };
+            (self.conv(op, t, Ty::I32, a), Ty::I32)
+        } else {
+            (a, t)
+        }
+    }
+
     fn conv(&mut self, op: CvtOp, from: Ty, to: Ty, a: Operand) -> Operand {
         self.def(to, |dst| Inst::Cvt {
             dst,
@@ -430,6 +444,9 @@ impl<'a> B<'a> {
         if let Some(cmp) = cmp_op(op, fp, uns) {
             let a = self.expr(l);
             let b = self.expr(r);
+            let (a, pt) = self.promote(a, ot, uns);
+            let (b, ot) = self.promote(b, ot, uns);
+            debug_assert_eq!(pt, ot);
             let c = self.def(Ty::I32, |dst| Inst::Cmp {
                 dst,
                 op: cmp,
@@ -523,12 +540,18 @@ impl<'a> B<'a> {
     /// wider or floating operand must first be compared.
     fn cond_value(&mut self, n: NodeId) -> Operand {
         let t = self.hty(n);
+        let uns = self.tt().is_unsigned(self.ty(n));
         let v = self.expr(n);
         if t == Ty::I32 {
             return v;
         }
+        // ≠0 is preserved by any widening, so the promotion is free of choice
+        let (v, t) = self.promote(v, t, uns);
+        if t == Ty::I32 {
+            return v;
+        }
         let (op, zero) = if t.is_float() {
-            (CmpOp::FOne, Operand::Fimm(0))
+            (CmpOp::FUne, Operand::Fimm(0))
         } else {
             (CmpOp::Ne, Operand::Imm(0))
         };
@@ -544,22 +567,31 @@ impl<'a> B<'a> {
     fn postfix(&mut self, op: &'static str, lv: NodeId, delta: i64) -> Operand {
         let lty = self.ty(lv);
         let t = hty(self.tt(), lty);
+        let uns = self.tt().is_unsigned(lty);
         let vol = self.tt().is_volatile(lty);
         let a = self.addr(lv);
         let old = self.load(t, a, vol);
-        let one = if t.is_float() {
-            Operand::Fimm(fbits(t, delta as f64))
+        // C99 6.5.2.4: x++ is x = x + 1 with the usual promotion, then the
+        // conversion back — which keeps the HIR "no narrow arithmetic" invariant.
+        let (v, at) = self.promote(old, t, uns);
+        let one = if at.is_float() {
+            Operand::Fimm(fbits(at, delta as f64))
         } else {
             Operand::Imm(delta)
         };
-        let bop = match (op, t.is_float()) {
+        let bop = match (op, at.is_float()) {
             ("+", false) => BinOp::Add,
             ("-", false) => BinOp::Sub,
             ("+", true) => BinOp::FAdd,
             ("-", true) => BinOp::FSub,
             _ => panic!("hir::build: postfix {:?}", op),
         };
-        let new = self.bin(bop, t, old, one);
+        let new = self.bin(bop, at, v, one);
+        let new = if at == t {
+            new
+        } else {
+            self.conv(CvtOp::Trunc, at, t, new)
+        };
         self.store(t, a, new, vol);
         old
     }
@@ -825,6 +857,10 @@ impl<'a> B<'a> {
     }
 }
 
+fn src_unsigned_of(tt: &ast::TyTab, t: TypeId) -> bool {
+    tt.is_unsigned(t)
+}
+
 fn cmp_op(op: &str, fp: bool, uns: bool) -> Option<CmpOp> {
     Some(match (op, fp, uns) {
         ("==", false, _) => CmpOp::Eq,
@@ -838,7 +874,7 @@ fn cmp_op(op: &str, fp: bool, uns: bool) -> Option<CmpOp> {
         (">", false, true) => CmpOp::Ugt,
         (">=", false, true) => CmpOp::Uge,
         ("==", true, _) => CmpOp::FOeq,
-        ("!=", true, _) => CmpOp::FOne,
+        ("!=", true, _) => CmpOp::FUne,
         ("<", true, _) => CmpOp::FOlt,
         ("<=", true, _) => CmpOp::FOle,
         (">", true, _) => CmpOp::FOgt,

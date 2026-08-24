@@ -134,6 +134,10 @@ pub enum CmpOp {
     FOle,
     FOgt,
     FOge,
+    /// C99 6.5.9: `a != b` is `!(a == b)`, which is TRUE when either operand is
+    /// NaN — an UNORDERED not-equal, not the ordered one. Keeping both spellings
+    /// makes the difference impossible to lose in isel.
+    FUne,
     /// unordered: true iff either operand is NaN
     FUno,
 }
@@ -148,6 +152,7 @@ impl CmpOp {
                 | CmpOp::FOle
                 | CmpOp::FOgt
                 | CmpOp::FOge
+                | CmpOp::FUne
                 | CmpOp::FUno
         )
     }

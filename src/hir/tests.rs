@@ -11,47 +11,21 @@
 // running BOTH sides here and comparing, which is the commuting square ⟦f⟧=⟦P f⟧.
 use super::interp::{Trap, new_machine};
 use super::{build, verify};
-use crate::{parser, preprocess};
+use crate::testutil::frontend;
 
 /// Frontend + lowering + verifier, on a source string.
 fn hir_of(src: &str) -> super::Module {
-    let dir = std::env::temp_dir().join("zcc-hir-battery");
-    std::fs::create_dir_all(&dir).unwrap();
-    // one file per source so concurrent test threads cannot collide
-    let mut h: u64 = 1469598103934665603;
-    for b in src.as_bytes() {
-        h = (h ^ *b as u64).wrapping_mul(1099511628211);
-    }
-    let path = dir.join(format!("t{:016x}.c", h));
-    std::fs::write(&path, src).unwrap();
-    let p = path.to_str().unwrap().to_string();
-    let incs = vec!["\u{1}nostdinc".to_string()];
-    let (toks, locs, files) = preprocess::preprocess(&p, &[], &[], &incs).expect("preprocess");
-    let ast = parser::parse(&toks, &locs, &files).expect("parse");
+    let ast = frontend(src);
     let m = build::build(&ast);
     for f in &m.funcs {
         verify::verify(f).expect("hir verifier");
     }
-    // keep the module alive together with the machine's view of the AST
-    let mach = new_machine(&m, &ast);
-    drop(mach);
     m
 }
 
 /// Run `main()` under ⟦hir⟧ and return its value.
 fn run(src: &str) -> Result<i64, Trap> {
-    let dir = std::env::temp_dir().join("zcc-hir-battery");
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut h: u64 = 1469598103934665603;
-    for b in src.as_bytes() {
-        h = (h ^ *b as u64).wrapping_mul(1099511628211);
-    }
-    let path = dir.join(format!("t{:016x}.c", h));
-    std::fs::write(&path, src).unwrap();
-    let p = path.to_str().unwrap().to_string();
-    let incs = vec!["\u{1}nostdinc".to_string()];
-    let (toks, locs, files) = preprocess::preprocess(&p, &[], &[], &incs).expect("preprocess");
-    let ast = parser::parse(&toks, &locs, &files).expect("parse");
+    let ast = frontend(src);
     let m = build::build(&ast);
     for f in &m.funcs {
         verify::verify(f).unwrap_or_else(|e| panic!("{}", e));

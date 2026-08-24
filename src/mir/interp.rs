@@ -319,24 +319,11 @@ impl<'a> Machine<'a> {
                 };
                 self.set(fr, *flags, nz);
             }
-            MInst::MovImm {
-                w,
-                dst,
-                kind,
-                imm,
-                shift,
-            } => {
-                let v = match kind {
-                    MovKind::Z => (*imm as u64) << shift,
-                    MovKind::N => !((*imm as u64) << shift),
-                    MovKind::K => {
-                        let old = self.get(fr, *dst);
-                        (old & !(0xffffu64 << shift)) | ((*imm as u64) << shift)
-                    }
-                };
-                self.set(fr, *dst, trunc(v, *w));
+            MInst::MovImm { w, dst, imm } => {
+                let v = trunc(*imm as u64, *w);
+                self.set(fr, *dst, v);
             }
-            MInst::Ext { op, dst, src } => {
+            MInst::Ext { op, w, dst, src } => {
                 let x = self.get(fr, *src);
                 let v = match op {
                     ExtOp::Sxtb => x as u8 as i8 as i64 as u64,
@@ -345,7 +332,7 @@ impl<'a> Machine<'a> {
                     ExtOp::Uxtb => x & 0xff,
                     ExtOp::Uxth => x & 0xffff,
                 };
-                self.set(fr, *dst, v);
+                self.set(fr, *dst, trunc(v, *w));
             }
             MInst::Load { op, dst, mem, .. } => {
                 let (a, wb) = self.addr(fr, mem, op.bytes())?;

@@ -245,9 +245,7 @@ fn block_parameters_carry_values_across_edges() {
     f.blocks[bt as usize].insts = vec![MInst::MovImm {
         w: Width::W64,
         dst: a,
-        kind: MovKind::Z,
         imm: 100,
-        shift: 0,
     }];
     f.blocks[bt as usize].term = MTerm::B(MTarget {
         block: bj,
@@ -256,9 +254,7 @@ fn block_parameters_carry_values_across_edges() {
     f.blocks[be as usize].insts = vec![MInst::MovImm {
         w: Width::W64,
         dst: b,
-        kind: MovKind::Z,
         imm: 200,
-        shift: 0,
     }];
     f.blocks[be as usize].term = MTerm::B(MTarget {
         block: bj,

@@ -403,6 +403,7 @@ fn eval_cmp(op: CmpOp, ty: Ty, x: u64, y: u64) -> u32 {
         match op {
             FOeq => a == b,
             FOne => a != b && !a.is_nan() && !b.is_nan(),
+            FUne => a != b,
             FOlt => a < b,
             FOle => a <= b,
             FOgt => a > b,

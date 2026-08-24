@@ -11,11 +11,14 @@ mod compile;
 mod emit;
 mod ext;
 mod hir;
+mod isel;
 mod lexer;
 mod mem;
 mod mir;
 mod parser;
 mod preprocess;
+#[cfg(test)]
+mod testutil;
 use std::{env, fs, process::Command, process::ExitCode};
 
 fn run(cmd: &str, args: &[&str]) -> bool {
