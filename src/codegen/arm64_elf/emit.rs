@@ -708,6 +708,60 @@ impl<'a> Cg<'a> {
                     ASlot::Q(..) | ASlot::S(..) | ASlot::StS(..) => unreachable!(),
                 }
             }
+        } else if regargs.iter().all(|(_, sl)| matches!(sl, ASlot::G(_))) {
+            // MANY-ARG GP PARALLEL MOVE (#21). All reg-args are plain GP (the >8-arg overflow
+            // shape; e2). The register allocator may have homed the arg temps IN the arg-register
+            // file (register-targeting), so the destinations x0..x{gp-1} form a permutation of the
+            // sources — the spill-all/pop-reverse scheme below would round-trip every one through
+            // the stack (xS→x9→[sp]→xD). Instead sequentialize the simultaneous copy directly: emit
+            // any move whose target is not still needed as a source, and break a residual register
+            // cycle by parking one source in x8 (the sret reg, set only AFTER this phase — free
+            // here; never a home; stack-arg staging via x8 already completed above). This is the
+            // SAME parallel move already proven for scalar calls in marshal_call_args. ⟦·⟧: the
+            // emitted moves realize the same register←source function as the simultaneous copy.
+            let mut mv: Vec<(u32, Val, Option<u32>)> = regargs
+                .iter()
+                .map(|&(v, sl)| {
+                    let ASlot::G(k) = sl else { unreachable!() };
+                    (k, v, if let Val::Tmp(t) = v { self.gp_home(t) } else { None })
+                })
+                .collect();
+            let mut done = vec![false; mv.len()];
+            let mut left = mv.len();
+            while left > 0 {
+                let mut progressed = false;
+                for i in 0..mv.len() {
+                    if done[i] {
+                        continue;
+                    }
+                    let tk = mv[i].0;
+                    if mv.iter().enumerate().any(|(j, m)| !done[j] && j != i && m.2 == Some(tk)) {
+                        continue; // x{tk} is still a live source — writing it now would clobber
+                    }
+                    match mv[i].2 {
+                        Some(p) => {
+                            if p != tk {
+                                _ = writeln!(self.s, "\tmov x{tk}, x{p}");
+                            }
+                        }
+                        None => self.ld_val(mv[i].1, &format!("x{tk}")),
+                    }
+                    done[i] = true;
+                    left -= 1;
+                    progressed = true;
+                }
+                if !progressed {
+                    // pure register cycle — park one source in x8, redirect its readers, resume.
+                    let i = (0..mv.len()).find(|&i| !done[i] && mv[i].2.is_some()).unwrap();
+                    let p = mv[i].2.unwrap();
+                    _ = writeln!(self.s, "\tmov x8, x{p}");
+                    for m in mv.iter_mut() {
+                        if m.2 == Some(p) {
+                            m.2 = Some(8);
+                        }
+                    }
+                }
+            }
         } else {
             for &(val, sl) in &regargs {
                 self.ld_val(val, "x9"); // struct: x9 = address (home-safe staging, see ASlot::S)

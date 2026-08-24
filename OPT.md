@@ -144,7 +144,7 @@
 | 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⛔ same-block core already ✅ (lever 5, 147 folds); cross-block extension ABANDONED — measured exec-NEUTRAL + unsafe-dominant. See note ⓲ |
 | 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ✅ BANKED (`463d90c`) — sxtw-canonical residency (and/uxt/ubfx) default-ON, +both axes (size −13 insns, exec +0.09%); IV-simpl (2.3) already fired via 5/6/13; remaining residency (invariant adrp/add hoist + scaled-index-on-global) = memory-bound floor → #23/#25. See note ⓳ |
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ✅ BANKED — composite-marshal no-hazard fast path (skip stack round-trip). See note ⓴ |
-| 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5. NB e2's args ARE arg-reg-homed ⟹ hazard ⟹ needs composite parallel-move (bigger than #20's fast path) |
+| 21 | **many-arg marshalling** (5.4) | BOTH | ✅ BANKED — GP parallel-move for the >8-arg hazard path (was spill-all/pop-reverse). See note ㉑ |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⬜ B3 — f2/f3 |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⬜ re-eval under speed metric (was size-negative → parked; speed lever now) |
 | 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
@@ -152,8 +152,8 @@
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #21 (many-arg marshalling). #20 ✅ BANKED (composite-marshal
-no-hazard fast path); its remaining residency (sum-body home-reload) = the #25 regalloc floor, NOT a #20 lever.**
+only path to size *and* speed ≈ 1.0×. **RESUME = #22 (bounded FP register allocation / FP loop residency).
+#21 ✅ BANKED (GP parallel-move on the many-arg hazard path — sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
 
 > **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
 > ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
@@ -253,6 +253,29 @@ no-hazard fast path); its remaining residency (sum-body home-reload) = the #25 r
 > home-primary regalloc floor (#17/#18/#19 all hit it), falls only to #25 nuclear, NOT a struct lever.
 > **e2 (#21) did NOT take the fast path** — its 8+ args overflow and ARE homed in arg registers ⟹
 > hazard ⟹ stayed on the proven stack scheme; #21 needs a composite parallel-move (bigger). **RESUME = #21.**
+
+> **㉑ #21 MANY-ARG MARSHALLING — outcome (session 2026-08-24).** e2 (`mix(a..j)`, 10 int args = 8
+> in x0..x7 + 2 on stack) measured **5.5× vs gcc-O1** (33ms/6ms, 107 insns/46). Cause: the register
+> allocator register-TARGETS the arg temps into the arg-register file (`add w7,w0,#3` writes the value
+> straight into x7 = its home), so at the call the 8 reg-args are a PERMUTATION of x0..x7 (here two
+> 2-cycles x3↔x7, x4↔x6). The composite path `ir_call_abi` handled this hazard with the push-all/
+> pop-reverse STACK scheme — spilling every arg reg to the stack and reloading it (xS→x9→[sp]→xD),
+> 24 insns of pure round-trip per call. **✅ BANKED — GP parallel move on the hazard path.** When all
+> reg-args are plain GP (the >8-arg overflow shape; struct/HFA/Q stay on the proven stack fallback),
+> sequentialize the simultaneous arg-register copy directly: emit any move whose target is not still a
+> live source, break a residual register cycle by parking one source in x8 (sret reg, set only after
+> this phase). This is the SAME parallel move already proven for ≤8-arg scalar calls in
+> `marshal_call_args` (⟦·⟧: the moves realize the same register←source function; a parallel move is
+> always ≤ the spill-all it replaces, so the transform is monotone — no call gets worse). e2's 24-insn
+> round-trip → **8 movs** (2 x8-parks for the swaps, identities elided). **MEASURED (same-session A/B
+> vs the rebuilt #20 baseline):** sqlite 286,805→**285,899 (−906** — sqlite is dense with >8-arg /
+> hazard-composite calls); perfn 1.758×→**1.748×**; e2 exec best-of-7 **33→13ms** (5.5×→~1.85× vs gcc).
+> FULL GATE GREEN (cargo 181/0, opt-parity 1552/0, torture 1471/0 FAIL, csmith300 254/0, yarpgen300
+> 300/0). A big both-axes win. **RESIDUAL:** hazard calls that MIX GP with struct/HFA/Q reg-args still
+> take the spill-all fallback (a full composite parallel move — GP+mem+d-reg dests with cycles — is a
+> bigger, rarer case; deferred, not on the near path). The two dead `mov x9,xN` before each stack-arg
+> store are the pre-existing DCE-after-forward gap (peephole forwards x9→xN for the str, leaves the mov),
+> shared with #20; a separate small dead-move lever, not #21. **RESUME = #22 (bounded FP regalloc).**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 
