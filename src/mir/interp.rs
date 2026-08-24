@@ -476,6 +476,36 @@ impl<'a> Machine<'a> {
                     self.set(fr, r, x);
                 }
             }
+            MInst::Bfx { signed, w, dst, src, lsb, width } => {
+                let v = self.get(fr, *src) >> *lsb as u32;
+                let m = if *width >= 64 { u64::MAX } else { (1u64 << *width) - 1 };
+                let x = v & m;
+                let x = if *signed && *width < 64 && (x >> (*width - 1)) & 1 == 1 {
+                    x | !m
+                } else {
+                    x
+                };
+                let x = if *w == Width::W32 { x & 0xffff_ffff } else { x };
+                self.set(fr, *dst, x);
+            }
+            // `ldp`/`stp`: the second register sits one element past the first.
+            MInst::Pair { w, load, a, b, mem } => {
+                let n = w.bytes();
+                let (base, wb) = self.addr(fr, mem, n)?;
+                let step = n as u64;
+                if *load {
+                    let (x, y) = (self.mem.load(base, n)?, self.mem.load(base + step, n)?);
+                    self.set(fr, *a, x);
+                    self.set(fr, *b, y);
+                } else {
+                    let (x, y) = (self.get(fr, *a), self.get(fr, *b));
+                    self.mem.store(base, n, x)?;
+                    self.mem.store(base + step, n, y)?;
+                }
+                if let Some((r, x)) = wb {
+                    self.set(fr, r, x);
+                }
+            }
             MInst::Adrp { dst, sym, .. } => {
                 let a = self.sym_addr(sym);
                 self.set(fr, *dst, a);

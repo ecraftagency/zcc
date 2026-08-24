@@ -76,6 +76,7 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
             f.slots[f.fp_slot as usize].off
         );
     }
+    let mut tables: Vec<(String, Vec<MBlockId>)> = Vec::new();
     let order: Vec<MBlockId> = if f.order.is_empty() {
         (0..f.blocks.len() as MBlockId).collect()
     } else {
@@ -100,9 +101,20 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
             emit_inst(s, ast, f, inst);
         }
         let next = order.get(i + 1).copied();
-        emit_term(s, f, &name, &f.blocks[b as usize].term, next);
+        emit_term(s, f, &name, &f.blocks[b as usize].term, next, &mut tables);
     }
     let _ = writeln!(s, "\t.size {}, .-{}", name, name);
+    // The jump tables this function's switches read. `.rodata`, position
+    // independent: each entry is the SIGNED 32-bit distance from the table to
+    // its block, so the sequence needs no relocation at run time and the table
+    // survives `-fpic` unchanged.
+    for (label, blocks) in tables {
+        let _ = writeln!(s, "\t.section .rodata\n\t.p2align 2\n{}:", label);
+        for b in blocks {
+            let _ = writeln!(s, "\t.word .L{}_{} - {}", name, b, label);
+        }
+        s.push_str("\t.text\n");
+    }
 }
 
 /// The register every static stack object is addressed from: sp in an ordinary
@@ -522,6 +534,27 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
                 addr(ast, f, mem)
             );
         }
+        MInst::Bfx { signed, w, dst, src, lsb, width } => {
+            let _ = writeln!(
+                s,
+                "\t{} {}, {}, #{}, #{}",
+                if *signed { "sbfx" } else { "ubfx" },
+                reg(*dst, *w),
+                reg(*src, *w),
+                lsb,
+                width
+            );
+        }
+        MInst::Pair { w, load, a, b, mem } => {
+            let _ = writeln!(
+                s,
+                "\t{} {}, {}, {}",
+                if *load { "ldp" } else { "stp" },
+                reg(*a, *w),
+                reg(*b, *w),
+                addr(ast, f, mem)
+            );
+        }
         MInst::Adrp { dst, sym, got } => {
             let n = sym_text(ast, sym, &f.name);
             let _ = if *got {
@@ -757,7 +790,14 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
     }
 }
 
-fn emit_term(s: &mut String, f: &MFunc, name: &str, t: &MTerm, next: Option<MBlockId>) {
+fn emit_term(
+    s: &mut String,
+    f: &MFunc,
+    name: &str,
+    t: &MTerm,
+    next: Option<MBlockId>,
+    tables: &mut Vec<(String, Vec<MBlockId>)>,
+) {
     let lbl = |b: MBlockId| format!(".L{}_{}", name, b);
     let jump = |s: &mut String, b: MBlockId| {
         if Some(b) != next {
@@ -798,10 +838,20 @@ fn emit_term(s: &mut String, f: &MFunc, name: &str, t: &MTerm, next: Option<MBlo
             );
             jump(s, y.block);
         }
-        MTerm::Switch { .. } => {
-            // R3.3 lowers a dense switch to adr+ldr+br; until then isel never
-            // builds this terminator (it emits a compare chain instead).
-            let _ = writeln!(s, "\t<switch table not lowered>");
+        // A dense switch: `adrp`/`add` the table, read the entry for the index,
+        // and branch to `table + entry`. IP0/IP1 (x16/x17) are reserved exactly
+        // so a sequence like this needs no allocated register (REARCH §5.1), and
+        // a terminator is the one place both are certainly free.
+        MTerm::Switch { idx, table, .. } => {
+            let label = format!(".Ljt_{}_{}", name, tables.len());
+            let _ = writeln!(
+                s,
+                "\tadrp x16, {0}\n\tadd x16, x16, :lo12:{0}\n\tldrsw x17, [x16, {1}, lsl #2]\n\
+                 \tadd x16, x16, x17\n\tbr x16",
+                label,
+                reg(*idx, Width::W64)
+            );
+            tables.push((label, table.iter().map(|t| t.block).collect()));
         }
         MTerm::Ret => {
             if f.dyn_stack {

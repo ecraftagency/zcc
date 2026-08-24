@@ -614,3 +614,164 @@ fn an_aliased_global_is_one_object_under_two_names() {
     assert!(stores >= 1, "the increment through the alias is observable");
     square(src, 42);
 }
+
+// ── if_convert ─────────────────────────────────────────────────────────────
+
+#[test]
+fn ifconv_turns_a_diamond_into_a_select() {
+    let src = "int f(int a,int b){int m;if(a<b)m=a;else m=b;return m;}\
+               int main(void){return f(42,50);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    assert_eq!(count(f, |i| matches!(i, Inst::Select { .. })), 1, "the diamond must become a select");
+    assert_eq!(nlive_blocks(f), 1, "and the branch must be gone");
+    square(src, 42);
+}
+
+#[test]
+fn ifconv_refuses_a_side_effecting_arm() {
+    // A store on one side is not speculatable: executing it unconditionally
+    // would write on a path that never wrote.
+    let src = "int g;int f(int c){if(c)g=1;return g;}int main(void){g=42;return f(0);}";
+    let after = module(src, true);
+    assert!(
+        count(func(&after, "f"), |i| matches!(i, Inst::Store { .. })) >= 1,
+        "the store must stay, and stay conditional"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn ifconv_refuses_a_faulting_arm() {
+    // C99 6.5.5p5: `a/b` with b == 0 is undefined, so it may not be speculated
+    // onto the path that avoided it.
+    let src = "int f(int a,int b){int r;if(b)r=a/b;else r=42;return r;}\
+               int main(void){return f(1,0);}";
+    let after = module(src, true);
+    assert!(
+        count(func(&after, "f"), |i| matches!(i, Inst::Bin { op: BinOp::SDiv, .. })) >= 1
+            && nlive_blocks(func(&after, "f")) > 1,
+        "the division must stay behind its branch"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn ifconv_leaves_a_float_diamond_to_the_branch() {
+    // `fcsel` is a different instruction on a different register file, and MIR
+    // has no form for it — recorded as a residual rather than mis-selected.
+    let src = "double f(int c,double a,double b){double r;if(c)r=a;else r=b;return r;}\
+               int main(void){return (int)f(1,42.0,0.0);}";
+    square(src, 42);
+}
+
+#[test]
+fn a_select_of_one_and_zero_is_not_its_condition() {
+    // `select c, 1, 0` tests `c ≠ 0` exactly as a branch does, so it equals `c`
+    // only when `c` is ALREADY 0 or 1. `x && y` supplies a whole value, and
+    // rewriting it away returned 3 where C99 6.5.13 says 1 (torture pr10352-1).
+    // (The torture case itself uses a static initializer holding an ADDRESS,
+    // which ⟦hir⟧ does not materialize — the end-to-end confirmation for that
+    // shape is the suite. What is checkable here is the rewrite itself.)
+    let s2 = "int f(int x){int t = x?1:0;return t;}int main(void){return f(3)==1?42:0;}";
+    square(s2, 42);
+    let s3 = "int f(int x,int y){return (x && y) == 1;}int main(void){return f(3,5)?42:0;}";
+    square(s3, 42);
+}
+
+#[test]
+fn a_logical_instruction_takes_no_extended_operand() {
+    // DDI 0487 C6.2: only ADD/SUB take an extended register. `orr x0, x1, w3,
+    // uxtw` is not an instruction, and the munch table has to know the
+    // difference (torture bswap-1, cbrt, and thirteen others).
+    let src = "unsigned long f(unsigned long a,unsigned b){return a|b;}\
+               int main(void){return f(0x100,0x2a)==0x12a?42:0;}";
+    square(src, 42);
+    let s2 = "long f(long a,int b){return (a&b)|(a^b);}\
+              int main(void){return f(6,3)==7?42:0;}";
+    square(s2, 42);
+}
+
+// ── sink ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn sink_moves_a_computation_to_the_block_that_needs_it() {
+    // Not an instruction-count win: it removes nothing. It shortens a LIVE
+    // RANGE, which is what §13b measured as the largest remaining item.
+    let src = "int f(int a,int b,int c){int t=a*b;if(c)return t+1;return c;}\
+               int main(void){return f(6,7,1)-1;}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let entry = f.entry as usize;
+    assert_eq!(
+        f.blocks[entry]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Bin { op: BinOp::Mul, .. }))
+            .count(),
+        0,
+        "the product is needed on one path only and must move there"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn sink_does_not_move_a_computation_into_a_loop() {
+    // Sinking into a deeper loop would execute it every iteration — the exact
+    // inverse of licm, and the reason the depth is checked.
+    let src = "int f(int a,int b,int n){int t=a*b;int i,s=0;for(i=0;i<n;i++)s+=t;return s;}\
+               int main(void){return f(6,7,1);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    let in_loop = lf.loops.iter().any(|l| {
+        l.body.iter().any(|&b| {
+            f.blocks[b as usize]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Bin { op: BinOp::Mul, .. }))
+        })
+    });
+    assert!(!in_loop, "the product must stay outside the loop");
+    square(src, 42);
+}
+
+#[test]
+fn sink_keeps_a_faulting_computation_where_it_was() {
+    // Moving a fault ONTO a path is illegal; the divisor is not a known non-zero
+    // literal, so the division stays where the program put it. (The square is
+    // not the check here: the ORIGINAL program divides by zero, which is ⊥, and
+    // any refinement of ⊥ is legal — so only the structure can say whether the
+    // pass obeyed its own rule.)
+    let src = "int f(int a,int b,int c){int t=a/b;if(c)return t;return 42;}\
+               int main(void){return f(1,2,1);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let entry = f.entry as usize;
+    assert_eq!(
+        f.blocks[entry]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Bin { op: BinOp::SDiv, .. }))
+            .count(),
+        1,
+        "a division that may fault stays on the path that already ran it"
+    );
+    square(src, 0);
+    // a literal non-zero divisor cannot fault, so that one does move
+    let ok = "int f(int a,int c){int t=a/2;if(c)return t;return 42;}\
+              int main(void){return f(84,1);}";
+    let m2 = module(ok, true);
+    let g = func(&m2, "f");
+    assert_eq!(
+        g.blocks[g.entry as usize]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Bin { op: BinOp::SDiv, .. }))
+            .count(),
+        0
+    );
+    square(ok, 42);
+}

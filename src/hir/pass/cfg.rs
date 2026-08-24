@@ -170,6 +170,22 @@ fn merge(f: &mut Func) -> bool {
                 Term::Jmp(t) => t.args.clone(),
                 _ => unreachable!(),
             };
+            // Substituting a parameter by its argument is only a renaming when
+            // the two have the SAME type. `build` occasionally hands an edge a
+            // value wider than the parameter it feeds (a promoted `char`), which
+            // is harmless while the parameter exists to narrow it and ill-typed
+            // the moment it does not.
+            let typed = f.blocks[s as usize]
+                .params
+                .iter()
+                .zip(args.iter())
+                .all(|(p, a)| match a.val() {
+                    Some(v) => f.ty_of(v) == f.ty_of(*p),
+                    None => true,
+                });
+            if !typed {
+                continue;
+            }
             let succ = std::mem::replace(
                 &mut f.blocks[s as usize],
                 Block { params: Vec::new(), insts: Vec::new(), term: Term::Unreachable, labels: Vec::new(), weight: 1 },

@@ -123,7 +123,7 @@ pub fn verify(f: &Func) -> Result<(), String> {
                 return err(e);
             }
             if let Err(e) = check_types(f, inst) {
-                return err(format!("bb{}[{}]: {}", b, i, e));
+                return err(format!("bb{}[{}]: {} — {:?}", b, i, e, inst));
             }
         }
         // the terminator uses values at the very end of the block

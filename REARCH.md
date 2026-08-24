@@ -14,13 +14,17 @@
   It is the fallback. It is NOT to be touched, grinded, or referenced for structure.
 - `mir-rearch` = this branch, created from `rc3`. **It is the repository's DEFAULT branch** (GitHub
   default + `origin/HEAD`, set 2026-08-24). `main` is frozen at `rc3` and left alone.
-  **Progress: R0, R0.9, ALL of R1, and R2.1 + R2.2 are ✅ banked.**
+  **Progress: R0, R0.9, ALL of R1, R2.1, R2.2, and most of R2.3/R2.4/R3 are ✅ banked** —
+  what remains is listed as `⬜` inside those §12 rows (iv/LFTR, rotate/final-value,
+  auto_inc, shrink-wrap).
   The backend is `src/{cfg,mem,compile,emit}.rs` + `src/hir/` (with `hir/pass/` = the §4
-  ladder) + `src/mir/` + `src/isel/` + `src/regalloc/`; `cargo test` **86/86**,
-  `tests/cases` 74/75 (only the adjudicated `float_h`), `tests/ext` 19/19, all five
-  science gates PASS, torture **1471 pass / 0 FAIL**, opt-parity 1552/0, csmith300 254/0,
-  yarpgen300 300/0, determinism 85 × 8. sqlite **322,606 = 2.043×** gcc-O1, geo40 INSN
-  **1.5244** (rc3: 1.768× / 1.5835). Next `⬜` = **R2.3**.
+  ladder) + `src/mir/` (with `mir/pass/` = the §8 machine passes) + `src/isel/` +
+  `src/regalloc/`; `cargo test` **116/116**, `tests/cases` 74/75 (only the adjudicated
+  `float_h`), `tests/ext` 19/19, all five science gates PASS, torture **1471 pass / 0
+  FAIL**, opt-parity 1552/0, csmith300 254/0, yarpgen300 300/0, determinism 85 × 8.
+  sqlite **241,055 = 1.527×** gcc-O1, geo40 INSN **1.2982**, EXEC **1.5857**
+  (rc3: 1.768× / 1.5835; the R1 origin: 2.997× / 2.5168 / 4.4077). Next: the §13b
+  worklist — spill traffic, then copies, then layout.
 - The box: `docker exec zccbox …`, suites cached at `/suites` (`ZCC_SUITE_CACHE=/suites`), build with
   `CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc`.
 
@@ -51,14 +55,13 @@ zcc solved the hard version of the problem. This document adopts the right versi
    override pointing here; the `[optimizer = main]` paragraph after it describes the DEAD architecture
    and does not apply on this branch.)
 2. Resume at the first `⬜` in the §12 ladder. **State at 2026-08-25: R0, R0.9,
-   R1.1–R1.6, the R1 measurement, R2.1 and R2.2 are ✅ banked; the first `⬜` is
-   R2.3.** §13a is the R1 GROUND METRIC (the unoptimized origin) and the R2.2 row
-   of §12 records where the numbers stand now. The fact to carry into R2.3/R3 is
-   that the composition INVERTED: `add` fell from 28.2% to 11.0% and `ldr` from
-   19.2% to 19.6% of a much smaller total, while **`mov` is now the largest
-   killable class at 21.1%** (68,138) — reg-reg copies the biased colourer did
-   not manage to coalesce, which is R3's target, not another HIR pass. §15b is
-   the defect ledger for this milestone; read it before touching `regalloc/`.
+   R1, R2.1, R2.2 and most of R2.3/R2.4/R3 are ✅ banked.** §13a is the R1 GROUND
+   METRIC (the unoptimized origin); **§13b is the current excess histogram and IS
+   the worklist** — spill traffic (+24.5k), then copies (+33.5k, of which ~13k are
+   the truncating `mov w, w` A64 requires), then block layout, then the remaining
+   addressing modes. §15b and §15c are the defect ledgers; read §15c before
+   touching `regalloc/` or `isel/munch`, because five of its six entries are
+   rules that only became REACHABLE once an earlier layer started optimizing.
 3. Every module ships with its verifier + interpreter-based proof battery before the next module.
 4. Bank each R-milestone with a commit + measurement line in §12; push.
 5. Standing gate for any bank: `cargo test` green · `tests/cases` no regression · `bash
@@ -212,6 +215,7 @@ Order mirrors gcc -O1 (`-ftree-*`). Bounded fixpoint over the sequence, max 3 ro
 | 9 | iv / strength-reduce / pointer-iv / LFTR | `pass/iv.rs` | derived IV rewrite, address recurrence, linear-function test replacement | battery |
 | 10 | if_convert | `pass/ifconv.rs` | side-effect-free diamond → `select` | battery |
 | 11 | rotate / final-value / invariant-pure-call hoist | `pass/loop.rs` | loop rotation; the #24 4-fence theorem; SCEV closed forms for counted loops | battery |
+| 12 | sink | `pass/sink.rs` | the dual of licm: a pure trap-free instruction with ONE using block, dominated by here and no deeper in a loop, moves down to it. Added at R3 rather than planned: §13b measured register pressure as the largest remaining item, and this is the cheapest thing that shortens a live range | battery |
 
 Battery = the existing method: small-domain-exhaustive inputs + boundary values, `⟦f⟧ ≡ ⟦P f⟧` on every
 corpus function, run under `cargo test`. Ported in spirit from `opt/tests.rs`; the *tests* are theorems
@@ -454,16 +458,16 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R2.1 cfg_simplify, sccp, gvn, dce (+ batteries) | ✅ `e7473c9`. `cargo test` 52 → 67: `hir::tests::check` now runs EVERY battery program through both sides of ⟦f⟧=⟦P f⟧, and `isel`/`regalloc` do the same, so the R0/R1 corpus became the ladder's proof corpus at no authoring cost. Yield on its own is ~0 (every local is still a memory cell — that is what R2.2 fixes); one defect found: a literal address rode in ZR, which `Rn=31` decodes as SP (torture `930719-1`), now refused by `mir::verify` |
 | R2.2 sroa+mem2reg, load_elim/dse, alias oracle. **Blocking prerequisite**: mem2reg is what first creates long-lived values, so Braun & Hack 2009 proper — per-block working set across edges, Belady MIN eviction, rematerialization of pure producers, SSA reconstruction (Braun 2013) — must land in `regalloc/spill.rs` FIRST, with its own battery. **The rc3 allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573) is measured here**, not at R1 | ✅ sqlite **473,253 → 322,606** (2.997× → **2.043×**), geo40 INSN **2.5168 → 1.5244** (rc3 was 1.5835). `add` 133,264 → 35,357, `ldr` 90,906 → 63,286, frame-slot mem-ops 12,253 → 64,185 (the spill traffic promotion creates), reg-reg+imm `mov` 59,224 → 68,138 — the new top of the killable floor, and R3's target. Deviation from the plan, recorded: SSA RECONSTRUCTION was not needed and is not there. A reload's fresh register is used only inside the block that created it, so its live range is dominated by its definition and SSA holds by construction; a value that stays in the working set across an edge keeps its ORIGINAL name. The price is one reload per block-residency instead of one per program region. What the milestone did NOT anticipate, and what the measurement forced: (a) a spilled BLOCK PARAMETER cannot be stored at its definition — the parameter is removed and each predecessor writes the slot; (b) a join can be wider than the register file, and no eviction relieves an edge argument, so the successor's parameter is spilled instead; (c) one slot per SSA WEB, merged only where the members do not interfere — without it a spilled parameter copies between slots on every edge, which cost `sqlite3VdbeExec` 110,000 stores and made the milestone a REGRESSION (571,648) before it was a win |
 | R2.3 inline (+purity), licm (unconditional), iv/pointer-iv/LFTR | 🔨 inline + licm banked; **iv/strength-reduction/LFTR still ⬜**. licm: EXEC geo40 1.9415 → 1.8374 (−5.4%) for +0.011 INSN and +0.75% sqlite — banked because §13a's directive makes EXEC the target and size the byproduct. inline: the bound is DERIVED, not tuned — a body no larger than the call sequence it replaces (`params + 2`: one instruction to place each argument, the `bl`, one to take the result) cannot grow the program — plus gcc-O1's own `-finline-functions-called-once`. Net EXEC 1.8374 → 1.7468, INSN 1.5357 → 1.5148, sqlite 315,665 → 317,285. A called-once callee must also be DELETED once its last call site is gone, or the rule is a pure size loss: sqlite grew 25% before that existed |
-| R2.4 if_convert, rotate/final-value/pure-call hoist | ⬜ |
-| R2 gate + measurement | opt-parity (passes off vs on) 0 DIVERGE; csmith/yarpgen 0 DIVERGE. KPI: INSN geo ≤ 1.58 (rc3), sqlite ≤ 1.5×. **Merge-to-main eligibility starts here** | ⬜ |
+| R2.4 if_convert, rotate/final-value/pure-call hoist (+ sink, added) | 🔨 if_convert and sink banked (`pass/ifconv.rs`): a side-effect-free diamond becomes `select`, speculating at most two pure trap-free instructions per arm. Refuses a store, a load, a division whose divisor is not a non-zero literal, and — for now — a FLOAT diamond, since `fcsel` has no MIR form yet. `pass/sink.rs` is licm's dual and was added here rather than planned: §13b ranked register pressure as the largest remaining item, and sinking is the cheapest thing that shortens a live range. **rotate / final-value / invariant-pure-call hoist still ⬜** |
+| R2 gate + measurement | opt-parity (passes off vs on) 0 DIVERGE; csmith/yarpgen 0 DIVERGE. KPI: INSN geo ≤ 1.58 (rc3), sqlite ≤ 1.5×. **Merge-to-main eligibility starts here** | ✅ **both KPIs met and passed**: opt-parity 1552/0, csmith300 254/0, yarpgen300 300/0, torture 1471/0. See the R3 measurement row for the numbers — R2 and R3 were measured together because the isel and MIR rows landed in the same session |
 
 ### R3 — machine passes (§8) + isel munch table complete (§6)
 | task | status |
 |---|---|
-| R3.1 munch patterns: addressing modes, cmp-branch fusion, csel forms, madd/msub, bfx, extend folding, mul-by-const | ⬜ |
-| R3.2 cmp_elim, auto_inc, ext_lattice, ldst_pair | ⬜ |
-| R3.3 switch jump tables, block layout, shrink-wrap | ⬜ |
-| R3 measurement | `corpus25.sh` excess histogram per mnemonic; each class classified fundamental vs convenience (Law-4). Band: sqlite ≤ 1.3×, geo40 INSN/EXEC ≤ 1.2 | ⬜ |
+| R3.1 munch patterns: addressing modes, cmp-branch fusion, csel forms, madd/msub, bfx, extend folding, mul-by-const | ✅ `isel::munch` — one pre-pass deciding which producers each consumer absorbs, because the producer is emitted first and the consumer's choice has to be known before its turn comes. Two licences, not interchangeable: an ADDRESS folds when EVERY use of it is a memory operand (folding into some while still computing it for others only duplicates work); an ALU operand folds on a SINGLE use (the shift or extension happens inside the consumer). Rows: `[base, #off]`, `[slot, #off]`, `[base, idx, ext #shift]`, `add/sub … , sxtw`, `op … , lsl #k`, `madd`/`msub`, `cmp`+`b.cc`, `cbz`/`cbnz`, `cmp`+`csel`. `mul(x, 2^k) → shl` is an HIR canonicalization (`fold::canon`) because only the shift form folds into an address. **bfx still ⬜** |
+| R3.2 cmp_elim, auto_inc, ext_lattice, ldst_pair | 🔨 `ext_lattice` (`mir/pass/ext.rs`) and `ldst_pair` (`mir/pass/ldstp.rs`) banked — `uxtb` 3,918 → 344, `uxth` 1,357 → 142, and 7,097 `ldp` + 3,225 `stp` where there were none. **cmp_elim and auto_inc still ⬜** |
+| R3.3 switch jump tables, block layout, shrink-wrap | 🔨 jump tables banked: a switch with ≥4 cases occupying ≥half its span becomes `sub`/`cmp`/`b.hi` + `adrp`/`ldrsw`/`br` over a `.rodata` table of signed 32-bit offsets (position-independent, no run-time relocation). Block layout was already R0's. **shrink-wrap still ⬜** |
+| R3 measurement | `corpus25.sh` excess histogram per mnemonic; each class classified fundamental vs convenience (Law-4). Band: sqlite ≤ 1.3×, geo40 INSN/EXEC ≤ 1.2 | 🔨 sqlite **241,055 = 1.527×** (R1 origin 2.997×, rc3 1.768×), geo40 INSN **1.2982** (origin 2.5168, rc3 1.5835), geo40 EXEC **1.5857** (origin 4.4077). Band (≤1.3× / ≤1.2) not yet met — see §13b for the excess histogram and what each class is |
 
 ### R4 — exhaustion toward 1×
 The excess histogram is the worklist: attack the largest class with one proof-carrying lever, re-measure,
@@ -607,6 +611,50 @@ storage model keeps every C local in memory.
   DIVERGE** · yarpgen300 **300 PARITY / 0 DIVERGE**.
 - Reproduce: `ZCC=/usr/local/bin/zcc GCC=gcc SQLITE=/suites/sqlite/sqlite3.c sh
   tests/bench/corpus25.sh` and `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
+
+---
+
+## §15c R2.4/R3 defect ledger — what the new layers got wrong
+
+The same pattern as §15b, one layer down: every entry is a wrong-code bug that
+only became REACHABLE once an earlier layer optimized, and each is now refused
+at the layer that owns the rule.
+
+| defect | the rule that was missing |
+|---|---|
+| `select c, 1, 0 → c`. A select tests its condition ≠ 0 exactly as a branch does, so the rewrite holds only when `c` is ALREADY 0 or 1 — and `x && y` supplies a whole value. The row is deleted, not narrowed: `fold_inst` sees an operand, never the instruction that produced it (torture `pr10352-1`) | a fold may only use what its own arguments say |
+| `orr x0, x1, w3, uxtw`. DDI 0487 C6.2: only ADD/SUB take an EXTENDED register operand; the logical instructions take a shifted one and nothing else (torture `bswap-1`, `cbrt`, thirteen others) | the munch table is a table of the ISA's forms, not of shapes that look plausible |
+| An arm's instructions moved into the head of a diamond whose join parameter had a NARROWER type than the argument. `build` occasionally hands an edge a value wider than the parameter it feeds; that is tolerable while the parameter exists to narrow it and ill-typed the moment `select` or a block merge removes it | a substitution is a renaming only when the types agree — now checked in both `ifconv` and `cfg_simplify` |
+| LICM hoisting an instruction whose operand was "outside the loop" but did not DOMINATE the preheader. The two are equivalent for a reducible loop and not in general (csmith `c0019`) | the property the verifier checks is dominance, so dominance is the property to test |
+| `sxtb w0, w1` recorded as "sign-extended from 8 bits". A `w`-form instruction sign-extends inside the low 32 bits and ZEROES bits 63:32 (DDI 0487 B1.2.1), so a later `sxtw` looked redundant when it was precisely the instruction that would fill the upper half — wrong on every negative value (yarpgen: 45 of 300 diverged) | the extension lattice states its fact about the 64-bit register, and a fact that only holds below bit 32 is restated before an `x`-form consumer reads it |
+| A self-move deleted when it was a TRUNCATION. `mov w0, w0` zeroes bits 63:32 (DDI 0487 B1.2.1), so it is only redundant when nobody reads the register wider — and that question is not local: in `t1 = (int)x; t2 = t1; use64(t2)`, `t1` looks 32-bit-only until `t2`'s copy is deleted and `t1` inherits its 64-bit reader. Latent until biased colouring began handing a copy its source's own register on purpose; yarpgen then diverged on 45 of 300 (`s0131` and nine others after the first fix) | the decision moved into `destruct::apply_colors`, the one place that has BOTH the virtual identity (how wide the value is ever read) and the colour (whether the move is a self-move at all), and it is computed as a FIXPOINT over the chain |
+| Biased colouring taking a copy partner's register when the partner was `Reg::P(ZR)`. An integer constant zero IS the zero register, so an edge argument holding one handed x31 to a real value — `cmp wzr, #5` for a loop counter | a hint is filtered through `alloc_mask`, and `color::check` now refuses a non-allocatable colour outright |
+
+The last two are the argument for the verifiers of §15b in one line: neither was
+found by reading the pass, and both were named by a checker at the layer that
+owns the invariant rather than by a suite three layers away.
+
+---
+
+## §13b R3 EXCESS HISTOGRAM (box, 2026-08-25) — what is left, and what each class is
+
+sqlite, zcc **241,055** vs gcc-O1 **157,883** = **1.527×**. The excess is 83,172
+instructions, and it is NOT diffuse — four classes carry 80% of it. Law-4
+demands each be classified *fundamental* (a real ISA/ABI boundary) or
+*convenience* (an incomplete realization); only the second kind is work.
+
+| class | zcc | gcc | excess | classification |
+|---|---|---|---|---|
+| `ldr` + `str` (frame mem-ops 44,394 of them) | 58,218 | 33,653 | **+24,565** | **convenience** — spill traffic. The allocator keeps one reload per block-residency and has no cross-block SSA reconstruction (see §7's recorded deviation), so a value used in five blocks is reloaded five times. This is the single largest item and the one with a named fix |
+| `mov` + `movz` (immediates and copies) | 67,552 | 34,065 | **+33,487** | **mixed, and the largest single named residual**. Part is rematerialization, a WIN traded against the reload it replaces. Part is copies biased colouring did not manage — aggressive (Boissinot) coalescing is the named fix. And about 13,000 are the TRUNCATION `mov w, w` that A64 requires whenever a 64-bit value is narrowed and then read wide again: `Cvt::Trunc` emits a real instruction because the width-typed virtual register cannot express "the same register under a narrower name". Making truncation a rename is the fix, and it needs the block-parameter width rule relaxed first |
+| `b` | 14,290 | 8,459 | +5,831 | **convenience** — block layout only inverts a conditional whose taken target is next; it does not choose the order to maximize fall-through, and it does not tail-duplicate |
+| `add` | 17,567 | 11,654 | +5,913 | **convenience** — address arithmetic the munch table does not yet reach: `bfx`, pre/post-index (`auto_inc`), and a scaled index whose base is a global |
+| `csel` | 4,400 | 570 | +3,830 | **judgement, not excess** — zcc if-converts more than gcc -O1 does. It buys the `b` and the misprediction; whether it is a win is an EXEC question, and the exec number says yes |
+| `cmp` | 10,150 | 6,999 | +3,151 | **convenience** — `cmp_elim` (`subs`/`ands` instead of a separate compare) is not written yet |
+| everything else | | | +5,608 | small; `mul` +623 is a strength-reduction gap, `sxtw` +797 the residue `ext_lattice` cannot see across blocks |
+
+The ranking is the R4 worklist, in order: spill traffic, then copies, then
+layout, then the remaining addressing modes.
 
 ---
 

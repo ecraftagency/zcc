@@ -14,12 +14,14 @@ pub mod cfg;
 pub mod dce;
 pub mod fold;
 pub mod gvn;
+pub mod ifconv;
 pub mod inline;
 pub mod licm;
 pub mod mem;
 #[cfg(test)]
 mod tests;
 pub mod sccp;
+pub mod sink;
 pub mod sroa;
 
 use super::*;
@@ -71,13 +73,20 @@ pub fn run(f: &mut Func) {
             changed |= sccp::run(f);
         }
         if on("gvn") {
+            changed |= fold::canon(f);
             changed |= gvn::run(f);
         }
         if on("mem") {
             changed |= mem::run(f);
         }
+        if on("ifconv") {
+            changed |= ifconv::run(f);
+        }
         if on("licm") {
             changed |= licm::run(f);
+        }
+        if on("sink") {
+            changed |= sink::run(f);
         }
         if on("dce") {
             changed |= dce::run(f);

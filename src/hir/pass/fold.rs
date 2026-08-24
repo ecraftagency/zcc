@@ -57,9 +57,13 @@ pub fn fold_inst(inst: &Inst) -> Option<Operand> {
             Some(0) => Some(*b),
             Some(_) => Some(*a),
             None if a == b => Some(*a),
-            // `select c, 1, 0` at an integer type is the condition itself: the
-            // condition is already C's 0/1 (`Cmp` defines it that way).
-            None if !ty.is_float() && *a == Operand::Imm(1) && *b == Operand::Imm(0) => Some(*c),
+            // NOT here: `select c, 1, 0 → c`. A select tests its condition ≠ 0,
+            // exactly as a branch does, so the rewrite holds only when `c` is
+            // ALREADY 0 or 1 — and `fold_inst` sees an operand, not the
+            // instruction that produced it. `c` is routinely a whole value
+            // (`x && y` tests one), and the rewrite would then return 3 where C
+            // says 1. Belongs in gvn, which has the definition to hand; recorded
+            // as a residual rather than shipped unsound (torture pr10352-1).
             None => None,
         },
         _ => None,
@@ -115,4 +119,41 @@ fn fold_cmp(op: CmpOp, ty: Ty, a: Operand, b: Operand) -> Option<Operand> {
         Uge if b == Operand::Imm(0) => t,
         _ => None,
     }
+}
+
+/// Canonicalization: rewrites that change the OPCODE rather than replace the
+/// instruction, so they cannot be expressed as "this value equals that operand".
+/// Run as part of the ladder, before value numbering, so the canonical form is
+/// what gets numbered.
+pub fn canon(f: &mut Func) -> bool {
+    let mut changed = false;
+    for b in f.blocks.iter_mut() {
+        for inst in b.insts.iter_mut() {
+            if let Inst::Bin { op, ty, a, b: rhs, .. } = inst {
+                // `x * 2^k = x << k` in two's complement, at every width. Worth a
+                // rule of its own because it is what lets isel see an ARRAY
+                // INDEX: `a[i]` is `base + i * elemsize`, and only the SHIFT form
+                // folds into an addressing mode.
+                if *op == BinOp::Mul && !ty.is_float() {
+                    if let Operand::Imm(k) = *rhs {
+                        if k > 1 && k & (k - 1) == 0 {
+                            *op = BinOp::Shl;
+                            *rhs = Operand::Imm(k.trailing_zeros() as i64);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                    if let (Operand::Imm(k), Operand::Val(v)) = (*a, *rhs) {
+                        if k > 1 && k & (k - 1) == 0 {
+                            *op = BinOp::Shl;
+                            *a = Operand::Val(v);
+                            *rhs = Operand::Imm(k.trailing_zeros() as i64);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
 }

@@ -333,3 +333,61 @@ fn an_indirect_callee_may_share_the_result_register() {
          int main(void){return f(1)==8?0:1;}",
     );
 }
+
+#[test]
+fn a_coalescing_hint_never_offers_a_reserved_register() {
+    // Biased colouring takes a copy partner's register, and a partner can be a
+    // PHYSICAL one the allocator would never offer: an integer constant zero is
+    // `Reg::P(ZR)`, so an edge argument holding one would hand the zero register
+    // to a real value — `cmp wzr, #5` for a loop counter that is never anything
+    // but zero. The hint is filtered through `alloc_mask` for that reason, and
+    // `color::check` refuses a non-allocatable colour outright.
+    same("int main(void){int a=1,b=2,i;for(i=0;i<5;i++){int t=a;a=b;b=t;}return a*10+b;}");
+    same("int main(void){int s=0,i;for(i=0;i<4;i++){int j=0;while(j<i){s+=j;j++;}}return s;}");
+}
+
+#[test]
+fn a_w_form_extension_is_not_a_64_bit_one() {
+    // `sxtb w0, w1` sign-extends inside the low 32 bits and ZEROES bits 63:32
+    // (DDI 0487 B1.2.1). Recording that as "sign-extended from 8 bits" makes a
+    // later `sxtw` look redundant when it is precisely the instruction that
+    // would fill the upper half — a wrong-code bug on every negative value
+    // (yarpgen s0009 and forty-four others). `same` runs the whole backend, so
+    // the MIR extension lattice is under test here.
+    same("int main(void){signed char c=-3;int i=c;long l=i;return (int)(l>>32)==-1;}");
+    same("int main(void){short s=-2;int i=s;long l=i;return (int)(l>>32)==-1;}");
+    same("int main(void){signed char c=-1;unsigned u=(unsigned char)c;long l=u;return (int)(l==255);}");
+    same("int main(void){signed char c=-5;long l=c;return (int)(l>>40)==-1;}");
+    same("int f(int x){signed char c=(signed char)x;long l=c;return (int)(l>>32);}\
+          int main(void){return f(-1)+1;}");
+}
+
+#[test]
+fn a_truncating_self_move_is_not_a_no_op() {
+    // DDI 0487 B1.2.1: every 32-bit write ZEROES bits 63:32, so `mov w0, w0`
+    // TRUNCATES — it is redundant only when the source was itself produced at 32
+    // bits. Deleting it unconditionally left the upper half of a 64-bit value
+    // alive under a 32-bit name. Latent until biased colouring started handing a
+    // copy its source's own register on purpose (yarpgen s0131 and nine others).
+    same("unsigned f(unsigned long x){unsigned a=(unsigned)x;return a;}\
+          int main(void){return f(0x1234567800000042UL)==0x42u?0:1;}");
+    same("int main(void){unsigned long x=0xffffffff00000001UL;unsigned a=x;unsigned long y=a;\
+          return y==1?0:1;}");
+    same("unsigned g(unsigned long a,unsigned long b){unsigned x=a;unsigned y=b;return x+y;}\
+          int main(void){return g(0xff00000001UL,0xee00000002UL)==3u?0:1;}");
+}
+
+#[test]
+fn a_chain_of_narrowing_copies_keeps_one_truncation() {
+    // `mov w0, w0` TRUNCATES. Deleting a self-move is right only when nobody
+    // reads the register wider — and that question is not local: with
+    // `t1 = (int)x; t2 = t1; use64(t2)`, `t1` looks 32-bit-only until `t2`'s copy
+    // is deleted and `t1` inherits its 64-bit reader. The decision is a fixpoint
+    // for that reason (yarpgen s0131).
+    same("long f(long x){int t=(int)x;unsigned u=(unsigned)t;return (long)u;}\
+          int main(void){return f(0x1234567800000005L)==5?0:1;}");
+    same("unsigned long f(long x){int a=(int)(-x);unsigned b=a;return (unsigned long)b;}\
+          int main(void){return f(0x100000001L)==0xffffffffUL?0:1;}");
+    same("long g(long a,long b){int x=(int)a;int y=x;long z=(unsigned)y;return z-b;}\
+          int main(void){return g(0xff00000007L,7)==0?0:1;}");
+}

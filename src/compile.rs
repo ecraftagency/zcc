@@ -94,6 +94,13 @@ pub fn backend(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
 /// frame/layout square (`⟦mir_p⟧ = ⟦mir_final⟧`) has two sides to compare.
 pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
     let mut m = phase("isel", || crate::isel::lower(h));
+    // MIR passes on SSA, before allocation (REARCH §8, the pre-allocation half).
+    phase("mir::pass", || {
+        for f in m.funcs.iter_mut() {
+            crate::mir::pass::ext::run(f);
+            crate::mir::pass::cmpelim::run(f);
+        }
+    });
     phase("mir::verify", || {
         for f in &m.funcs {
             crate::mir::verify::verify(f)?;
@@ -110,6 +117,7 @@ pub fn finish(m: &mut crate::mir::MModule) {
         for f in m.funcs.iter_mut() {
             crate::mir::pass::frame::run(f);
             crate::mir::pass::legalize::run(f);
+            crate::mir::pass::ldstp::run(f);
             crate::mir::pass::layout::run(f);
         }
     });

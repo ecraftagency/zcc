@@ -363,3 +363,103 @@ fn a_null_address_is_materialized_not_ridden_in_zr() {
     equiv("int f(int c){if(c) *(char *)0 = 0; return c;}int main(void){return f(0);}");
     equiv("int f(int c){if(c) return *(char *)0; return 7;}int main(void){return f(0);}");
 }
+
+#[test]
+fn an_address_rides_in_the_memory_operand() {
+    // The R1 ground metric measured `add` at 28.2% of sqlite's instructions,
+    // every one of them computing an address the load could have held itself.
+    // These are the shapes that must fold: a frame object at a constant
+    // displacement, and a pointer plus a constant.
+    equiv("int main(void){int a[4];a[0]=1;a[1]=2;a[2]=3;a[3]=4;return a[0]+a[1]+a[2]+a[3];}");
+    equiv("struct P{int x,y,z;};int f(struct P*p){return p->x+p->y+p->z;}\
+           int main(void){struct P p;p.x=1;p.y=2;p.z=3;return f(&p);}");
+    // …and the shape that must NOT: a displacement past the encodable range
+    // (DDI 0487 C3.2 scales the unsigned form by the access size).
+    equiv("int f(int*p){return p[100000];}\
+           int main(void){int a[1];a[0]=7;return f(a-100000);}");
+}
+
+#[test]
+fn a_compare_feeding_only_a_branch_needs_no_cset() {
+    // `cmp` + `b.cc`, not `cmp` + `cset` + `cbnz`. The fusion is legal only when
+    // the compare has ONE use — otherwise the 0/1 value is still needed.
+    equiv("int f(int a,int b){if(a<b)return 1;return 2;}int main(void){return f(1,2);}");
+    equiv("int f(unsigned a,unsigned b){if(a>=b)return 1;return 2;}int main(void){return f(1,2);}");
+    equiv("double f(double a,double b){if(a<b)return 1;return 2;}int main(void){return (int)f(1,2);}");
+    // two uses: the value is materialized AND branched on
+    equiv("int f(int a,int b){int c=a<b;if(c)return c+1;return c+2;}int main(void){return f(1,2);}");
+    // NaN: an unordered compare must keep its own condition code
+    equiv("int f(double a,double b){if(a!=b)return 1;return 2;}int main(void){return f(0.0,0.0);}");
+}
+
+#[test]
+fn a_dense_switch_becomes_a_jump_table() {
+    // A compare chain costs one test per case on the way to the right arm; a
+    // table costs four instructions whatever the case. The range check is part
+    // of the theorem, not an optimization: `sub` then an UNSIGNED compare
+    // rejects everything outside [lo, hi] in one branch, because a value below
+    // `lo` wraps to a huge unsigned number.
+    equiv(
+        "int f(int x){switch(x){case 0:return 10;case 1:return 11;case 2:return 12;\
+         case 3:return 13;case 4:return 14;case 5:return 15;default:return 99;}}\
+         int main(void){int s=0,i;for(i=-2;i<9;i++)s+=f(i);return s;}",
+    );
+    // a NEGATIVE base: the subtraction is what makes the table start at zero
+    equiv(
+        "int f(int x){switch(x){case -3:return 1;case -2:return 2;case -1:return 3;\
+         case 0:return 4;case 1:return 5;default:return 0;}}\
+         int main(void){int s=0,i;for(i=-5;i<4;i++)s+=f(i);return s;}",
+    );
+    // SPARSE: a table would be mostly padding, so the chain must survive
+    equiv(
+        "int f(int x){switch(x){case 1:return 1;case 1000:return 2;case 100000:return 3;\
+         default:return 4;}}\
+         int main(void){return f(1)+f(1000)+f(100000)+f(7);}",
+    );
+    // too FEW cases for a table
+    equiv("int f(int x){switch(x){case 1:return 5;case 2:return 6;default:return 7;}}\
+           int main(void){return f(1)+f(2)+f(3);}");
+}
+
+#[test]
+fn adjacent_accesses_become_a_pair() {
+    // `ldp`/`stp`: the shape the prologue, the epilogue and the spiller all
+    // produce. The battery's obligation is the square; the counts are on the
+    // corpus.
+    equiv("struct P{long a,b;};long f(struct P*p){return p->a+p->b;}\
+           int main(void){struct P p;p.a=40;p.b=2;return (int)f(&p);}");
+    equiv("void g(long*p){p[0]=1;p[1]=2;}\
+           int main(void){long a[2];g(a);return (int)(a[0]*10+a[1]);}");
+    // a byte access has no paired form
+    equiv("void g(char*p){p[0]=1;p[1]=2;}\
+           int main(void){char a[2];g(a);return a[0]*10+a[1];}");
+}
+
+#[test]
+fn a_compare_feeding_only_a_select_needs_no_cset() {
+    // `cmp` + `csel`, not `cmp` + `cset` + `cmp` + `csel`. The compare is
+    // RE-EMITTED at its consumer rather than moved, so its flags live for one
+    // instruction — NZCV is a register class of size one, and a compare that
+    // travelled would collide with the next one.
+    equiv("int f(int a,int b){return a<b?a:b;}int main(void){return f(42,50);}");
+    equiv("unsigned f(unsigned a,unsigned b){return a>b?a-b:b-a;}\
+           int main(void){return (int)f(50,8);}");
+    equiv("int f(int a,int b,int c){return (a==b)?c:(a<b?c+1:c+2);}\
+           int main(void){return f(1,2,41);}");
+}
+
+#[test]
+fn a_bitfield_read_is_one_instruction() {
+    // C spells a bitfield read as a shift and a mask, or as a pair of shifts;
+    // A64 has `ubfx`/`sbfx` for each (DDI 0487 C6.2.398). The chained case is
+    // the one that broke first: a fold that has itself absorbed something may
+    // not be absorbed again, or the value it swallowed is defined nowhere.
+    equiv("struct B{int a:3;unsigned b:5;int c:10;};\
+           int main(void){struct B s;s.a=-2;s.b=19;s.c=-300;return s.a*10000+s.b*100+s.c;}");
+    equiv("unsigned f(unsigned x){return (x>>7)&0x1f;}\
+           int main(void){return (int)f(0xabcdu);}");
+    equiv("int f(int x){return (x<<20)>>27;}int main(void){return f(-1)+f(1024);}");
+    equiv("unsigned f(unsigned x){return (x<<20)>>27;}int main(void){return (int)f(0xffffffffu);}");
+    // an offset past the register: not a bitfield, and must not become one
+    equiv("unsigned f(unsigned x){return (x>>30)&0xff;}int main(void){return (int)f(0xc0000000u);}");
+}

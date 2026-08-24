@@ -311,3 +311,4 @@ fn verifier_rejects_broken_ssa() {
     g.blocks[b as usize].term = MTerm::Ret;
     assert!(verify::verify(&g).is_err(), "class violation accepted");
 }
+

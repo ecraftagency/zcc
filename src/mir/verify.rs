@@ -194,6 +194,24 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
                 return Err(format!("integer ALU at width {:?}", w));
             }
         }
+        MInst::Bfx { w, dst, src, lsb, width, .. } => {
+            want(*dst, Class::Gpr, "dst")?;
+            want(*src, Class::Gpr, "src")?;
+            let bits = if *w == Width::W32 { 32 } else { 64 };
+            if *width == 0 || *lsb as u32 + *width as u32 > bits {
+                return Err(format!("bfx #{}:#{} outside a {}-bit register", lsb, width, bits));
+            }
+        }
+        MInst::Pair { w, a, b, .. } => {
+            let c = if w.class() == Class::Fpr { Class::Fpr } else { Class::Gpr };
+            want(*a, c, "first")?;
+            want(*b, c, "second")?;
+            // DDI 0487 C6.2.130: `ldp` with two identical destinations is
+            // CONSTRAINED UNPREDICTABLE.
+            if *a == *b {
+                return Err("a pair may not name one register twice".into());
+            }
+        }
         MInst::StackAlloc { dst, size } => {
             want(*dst, Class::Gpr, "dst")?;
             want(*size, Class::Gpr, "size")?;
@@ -323,7 +341,9 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
 /// Every memory operand an instruction carries.
 fn check_mem(f: &MFunc, i: &MInst) -> Result<(), String> {
     match i {
-        MInst::Load { mem, .. } | MInst::Store { mem, .. } => check_addr(f, mem),
+        MInst::Load { mem, .. } | MInst::Store { mem, .. } | MInst::Pair { mem, .. } => {
+            check_addr(f, mem)
+        }
         _ => Ok(()),
     }
 }

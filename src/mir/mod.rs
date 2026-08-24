@@ -397,6 +397,18 @@ pub enum MInst {
         dst: Reg,
         imm: i64,
     },
+    /// `ubfx`/`sbfx` — take `width` bits starting at bit `lsb` and place them at
+    /// the bottom, zero- or sign-extended (DDI 0487 C6.2.398/C6.2.317). One
+    /// instruction for what C spells as a shift and a mask, which is how every
+    /// bitfield read is written.
+    Bfx {
+        signed: bool,
+        w: Width,
+        dst: Reg,
+        src: Reg,
+        lsb: u8,
+        width: u8,
+    },
     /// `sxtb/sxth/sxtw/uxtb/uxth`; `w` is the DESTINATION width, which chooses
     /// the `w` or `x` form (`sxtb x0, w0` differs from `sxtb w0, w0`).
     Ext {
@@ -416,6 +428,18 @@ pub enum MInst {
         src: Reg,
         mem: AddrMode,
         vol: bool,
+    },
+    /// `ldp`/`stp` — two registers at consecutive addresses in one instruction
+    /// (DDI 0487 C6.2.130). `mem` names the FIRST of the two; the second is at
+    /// `+w.bytes()`. Only the 32- and 64-bit integer and the S/D/Q float forms
+    /// exist, so `w` is the pair's element width rather than a `MemOp`.
+    Pair {
+        w: Width,
+        /// true = load into `a`/`b`; false = store them
+        load: bool,
+        a: Reg,
+        b: Reg,
+        mem: AddrMode,
     },
     /// `adrp dst, sym` — the page address; pairs with `AddrMode::SymLo12`
     Adrp {
@@ -755,6 +779,8 @@ impl MInst {
         match self {
             MInst::Load { vol: true, .. } | MInst::Store { vol: true, .. } => MemEffect::Barrier,
             MInst::Load { .. } | MInst::Reload { .. } => MemEffect::Read,
+            MInst::Pair { load: true, .. } => MemEffect::Read,
+            MInst::Pair { load: false, .. } => MemEffect::Write,
             MInst::Store { .. } | MInst::Spill { .. } => MemEffect::Write,
             MInst::Call { .. }
             | MInst::StackAlloc { .. }
@@ -777,6 +803,20 @@ impl MInst {
                 if let Some(fl) = flags {
                     g(fl, Constraint::Def);
                 }
+            }
+            MInst::Pair { a, b, mem, load, .. } => {
+                if *load {
+                    g(a, Constraint::Def);
+                    g(b, Constraint::Def);
+                } else {
+                    g(a, Constraint::Use);
+                    g(b, Constraint::Use);
+                }
+                visit_addr!(mem, g);
+            }
+            MInst::Bfx { dst, src, .. } => {
+                g(src, Constraint::Use);
+                g(dst, Constraint::Def);
             }
             MInst::Alu3 { dst, a, b, c, .. } => {
                 g(a, Constraint::Use);
@@ -907,6 +947,20 @@ impl MInst {
                 if let Some(fl) = flags {
                     f(fl, Constraint::Def);
                 }
+            }
+            MInst::Pair { a, b, mem, load, .. } => {
+                if *load {
+                    f(a, Constraint::Def);
+                    f(b, Constraint::Def);
+                } else {
+                    f(a, Constraint::Use);
+                    f(b, Constraint::Use);
+                }
+                visit_addr!(mem, f);
+            }
+            MInst::Bfx { dst, src, .. } => {
+                f(src, Constraint::Use);
+                f(dst, Constraint::Def);
             }
             MInst::Alu3 { dst, a, b, c, .. } => {
                 f(a, Constraint::Use);

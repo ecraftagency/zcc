@@ -26,6 +26,7 @@ use crate::mir::*;
 pub fn allocate(f: &mut MFunc) -> Result<(), String> {
     use crate::compile::phase;
     prune_unreachable(f);
+    prune_dead_params(f);
     destruct::split_critical_edges(f);
     let (col, lv) = spill_and_color(f)?;
     phase("  colour-check", || color::check(f, &lv, &col))?;
@@ -130,6 +131,80 @@ fn spill_and_color(f: &mut MFunc) -> Result<(color::Coloring, live::Liveness), S
         }
     }
     Err(format!("{}: register allocation did not converge", f.name))
+}
+
+/// Drop block parameters nothing reads, together with the arguments every edge
+/// passes them. SSA destruction turns a parameter into a real copy on every
+/// incoming edge, so an unread parameter is not merely a wasted colour — it is a
+/// `mov` per edge, and it forces the colourer to keep a register live for it.
+/// mem2reg produces them in quantity: a variable live around one join is given a
+/// parameter at every join in its iterated dominance frontier, whether or not
+/// that particular join is where it is read.
+fn prune_dead_params(f: &mut MFunc) {
+    loop {
+        let mut used = vec![false; f.vregs.len()];
+        for b in &f.blocks {
+            for inst in &b.insts {
+                inst.visit(&mut |r, c| {
+                    if let (Reg::V(v), Constraint::Use | Constraint::UseFixed(_)) = (r, c) {
+                        used[v as usize] = true;
+                    }
+                });
+            }
+            b.term.visit(&mut |r, _| {
+                if let Reg::V(v) = r {
+                    used[v as usize] = true;
+                }
+            });
+            // an argument is a use of the value, but only while the PARAMETER it
+            // feeds survives — so it is counted in the second pass below
+            for t in b.term.targets() {
+                for a in &t.args {
+                    if let Reg::V(v) = a {
+                        used[*v as usize] = true;
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for b in 0..f.blocks.len() {
+            let keep: Vec<bool> = f.blocks[b]
+                .params
+                .iter()
+                .map(|p| p.vreg().is_none_or(|v| used[v as usize]))
+                .collect();
+            if keep.iter().all(|k| *k) {
+                continue;
+            }
+            let mut i = 0;
+            f.blocks[b].params.retain(|_| {
+                i += 1;
+                keep[i - 1]
+            });
+            for p in 0..f.blocks.len() {
+                let mut term = f.blocks[p].term.clone();
+                let mut edited = false;
+                for t in term.targets_mut() {
+                    if t.block as usize != b {
+                        continue;
+                    }
+                    edited = true;
+                    let mut i = 0;
+                    t.args.retain(|_| {
+                        i += 1;
+                        keep[i - 1]
+                    });
+                }
+                if edited {
+                    f.blocks[p].term = term;
+                }
+            }
+            changed = true;
+        }
+        if !changed {
+            return;
+        }
+    }
 }
 
 /// Empty every block the entry cannot reach. `hir::build` leaves such blocks

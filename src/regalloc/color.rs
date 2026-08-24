@@ -61,6 +61,7 @@ fn class_of(f: &MFunc, r: Reg) -> Class {
 
 pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorErr> {
     let sp = lv.sp;
+    let partners = copy_partners(f, sp);
     // Once the function contains a call the file is partitioned (see
     // `isa::caller_saved_mask`): values live across a call take the callee-saved
     // half, everything else the caller-saved half. In a call-free function no
@@ -92,16 +93,15 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
         super::live::last_use_into(f, sp, lv, bi, &mut lu);
         let last = &lu.at;
 
-        // Block parameters are defined at the block's entry. One that this block
-        // never reads and that does not escape is dead immediately — the same
-        // rule the instruction loop applies to a dead definition, and without it
-        // the parameter's register is held for the whole block.
+        // Block parameters are defined at the block's entry. A parameter always
+        // OCCUPIES its register for the length of the block, even when nothing
+        // reads it: SSA destruction materializes an edge copy into it either way,
+        // so letting a second parameter share the register would let one copy
+        // destroy the other. (Dead parameters are removed before colouring —
+        // `regalloc::prune_dead_params` — so this is not a lost opportunity.)
         for &p in &blk.params {
-            assign(f, lv, &mut color, &mut used, &mut occ, p, None, has_calls)
+            assign(f, lv, &mut color, &mut used, &mut occ, p, &partners, has_calls)
                 .map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
-            if last[sp.idx(p)].is_none() {
-                continue;
-            }
             if live_here.insert(sp.idx(p)) {
                 if let Some(c) = color_of(&color, sp, sp.idx(p)) {
                     occ.add(c);
@@ -110,16 +110,25 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
         }
 
         for (i, inst) in blk.insts.iter().enumerate() {
-            // the coalescing hint: a copy wants its partner's colour
-            let hint = match inst {
-                MInst::Copy { src, .. } | MInst::FMov { src, .. } => phys_of(&color, sp, *src),
-                _ => None,
-            };
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
+            // A PLAIN copy whose source dies here may hand its register straight
+            // to the destination — the two are not simultaneous, so the register
+            // is free the instant the copy has read it, and taking it turns the
+            // copy into a self-move that `sequentialize` deletes. The
+            // conservative "free dying operands only after the definitions" order
+            // is kept for everything else, and above all for a PARALLEL copy,
+            // whose assignments really are simultaneous.
+            if let MInst::Copy { src, .. } | MInst::FMov { src, .. } = inst {
+                if last[sp.idx(*src)] == Some(i) && live_here.remove(&sp.idx(*src)) {
+                    if let Some(p) = color_of(&color, sp, sp.idx(*src)) {
+                        occ.sub(p);
+                    }
+                }
+            }
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
-                    assign(f, lv, &mut color, &mut used, &mut occ, *r, hint, has_calls)
+                    assign(f, lv, &mut color, &mut used, &mut occ, *r, &partners, has_calls)
                         .map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
                     if live_here.insert(sp.idx(*r)) {
                         if let Some(p) = color_of(&color, sp, sp.idx(*r)) {
@@ -161,6 +170,44 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
         }
     }
     Ok(Coloring { color, used })
+}
+
+/// Registers that hold the SAME value at some program point and would therefore
+/// become a `mov` if they were given different colours.
+fn copy_partners(f: &MFunc, sp: Space) -> Vec<Vec<Reg>> {
+    let mut out: Vec<Vec<Reg>> = vec![Vec::new(); sp.nv];
+    let mut link = |a: Reg, b: Reg, out: &mut Vec<Vec<Reg>>| {
+        if let Reg::V(v) = a {
+            if !out[v as usize].contains(&b) {
+                out[v as usize].push(b);
+            }
+        }
+    };
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match inst {
+                MInst::Copy { dst, src, .. } | MInst::FMov { dst, src, .. } => {
+                    link(*dst, *src, &mut out);
+                    link(*src, *dst, &mut out);
+                }
+                MInst::ParallelCopy(pairs) => {
+                    for (d, s, _) in pairs {
+                        link(*d, *s, &mut out);
+                        link(*s, *d, &mut out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for t in b.term.targets() {
+            let params = &f.blocks[t.block as usize].params;
+            for (p, a) in params.iter().zip(&t.args) {
+                link(*p, *a, &mut out);
+                link(*a, *p, &mut out);
+            }
+        }
+    }
+    out
 }
 
 /// Fill in the values that were holding a register of the failing class, so the
@@ -249,11 +296,7 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
         let last = &lu.at;
         let mut live: BTreeSet<usize> = lv.live_in[bi].clone();
         for &p in &f.blocks[bi].params {
-            // a parameter this block never reads and that does not escape is dead
-            // at the head — the colourer frees it there, so the check must too
-            if last[sp.idx(p)].is_some() {
-                live.insert(sp.idx(p));
-            }
+            live.insert(sp.idx(p));
         }
         let mut probe = |live: &BTreeSet<usize>, at: String, note: &str| -> Result<(), String> {
             let mut seen: Vec<(PReg, usize)> = Vec::new();
@@ -278,6 +321,17 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
             }
             Ok(())
         };
+        // every colour must be one the allocator was allowed to hand out
+        for &x in live.iter() {
+            if let (Reg::V(v), Some(p)) = (sp.reg(x), color_of(&col.color, sp, x)) {
+                if isa::alloc_mask(p.class) & (1 << p.num) == 0 {
+                    return Err(format!(
+                        "{}: v{} was given {:?}{}, which is not allocatable",
+                        f.name, v, p.class, p.num
+                    ));
+                }
+            }
+        }
         probe(&live, format!("bb{} head", bi), "block entry")?;
         for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
             let mut ops = Vec::new();
@@ -335,7 +389,7 @@ fn assign(
     used: &mut RegSet,
     occ: &mut Occupancy,
     r: Reg,
-    hint: Option<PReg>,
+    partners: &[Vec<Reg>],
     has_calls: bool,
 ) -> Result<(), ColorErr> {
     let v = match r {
@@ -378,6 +432,7 @@ fn assign(
             ),
         ));
     }
+    let sp = lv.sp;
     let conflict = lv.phys_conflict[v as usize];
     // The partition, as one predicate: a value live across a call may take only a
     // callee-saved register, and — once the function has a call at all — a value
@@ -386,13 +441,27 @@ fn assign(
     // the values that have nowhere else to go, which greedy in dominance order
     // cannot undo.
     let free = |p: PReg, occ: &Occupancy| -> bool {
-        !occ.taken(p)
+        // The hint path reaches registers `alloc_order` would never offer — a
+        // constant-zero operand is `Reg::P(ZR)`, and an edge argument holding one
+        // would otherwise hand the zero register to a real value.
+        isa::alloc_mask(p.class) & (1 << p.num) != 0
+            && !occ.taken(p)
             && !conflict.has(p)
             && !(avoid_caller_saved && !isa::is_callee_saved(p))
     };
     let _ = has_calls;
-    let pick = hint
-        .filter(|h| h.class == class && free(*h, occ))
+    // COALESCING is biased colouring (§7.4): take a copy partner's colour when
+    // it is free. The partner set is not just `Copy` — it is every place two
+    // registers hold the same value at some point: a parallel copy's pairs (call
+    // argument setup) and, above all, a block PARAMETER and the arguments its
+    // edges pass it. SSA destruction turns each of those pairs into a `mov`
+    // AFTER colouring, so a colourer that only hints on instructions it can see
+    // is blind to the largest source of copies there is — mem2reg gives every
+    // join one parameter per live local.
+    let pick = partners[v as usize]
+        .iter()
+        .filter_map(|q| phys_of(color, sp, *q))
+        .find(|h| h.class == class && free(*h, occ))
         .or_else(|| {
             isa::alloc_order(class)
                 .iter()

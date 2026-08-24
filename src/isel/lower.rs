@@ -83,6 +83,419 @@ enum Place {
     Slot(SlotId),
 }
 
+/// An address the memory operand can express by itself (REARCH §6, the
+/// addressing-mode rows of the munch table). Folding it is what removes the
+/// `add` the R1 ground metric measured at 28.2% of sqlite's instructions.
+#[derive(Clone, Copy)]
+enum Folded {
+    /// a frame object at a constant displacement
+    Slot(u32, i32),
+    /// a register base at a constant displacement
+    Base(ValueId, i32),
+    /// `[base, idx, ext #shift]` — an array subscript, addressed directly
+    Indexed {
+        base: ValueId,
+        idx: ValueId,
+        ext: Option<ExtKind>,
+        shift: u8,
+    },
+}
+
+/// An instruction whose SECOND operand is produced by another instruction A64
+/// can perform as part of this one: a shift, a 32→64 extension, or a whole
+/// multiply (`madd`/`msub`).
+#[derive(Clone, Copy)]
+enum AluFold {
+    /// `ubfx`/`sbfx`: a shift-and-mask pair that is one instruction
+    Bfx(bool, ValueId, u8, u8),
+    /// `a op (b <shift> amt)`
+    Shifted(Operand, ValueId, ShiftKind, u8),
+    /// `a op (b <ext>)`
+    Extended(Operand, ValueId, ExtKind),
+    /// `a*b + c` / `c − a*b`
+    Mul3(Alu3Op, ValueId, ValueId, Operand),
+}
+
+/// A compare whose single use is a branch or a select: `(op, compared type,
+/// lhs, rhs)`. It is not emitted where it stands — it is RE-EMITTED at its
+/// consumer, so the flags live for one instruction and can never collide with
+/// another compare (NZCV is a register class of size one).
+type CmpSrc = (hir::CmpOp, hir::Ty, Operand, Operand);
+
+#[derive(Default)]
+struct Munch {
+    addr: std::collections::HashMap<ValueId, Folded>,
+    alu: std::collections::HashMap<ValueId, AluFold>,
+    /// a block whose branch tests a single-use compare directly
+    br: std::collections::HashMap<hir::BlockId, CmpSrc>,
+    /// a select whose condition is a single-use compare
+    sel: std::collections::HashMap<ValueId, CmpSrc>,
+    /// producers whose every use folded, so they are never emitted
+    dead: std::collections::HashSet<ValueId>,
+}
+
+/// The munch table's single pass: decide, for every consumer, which producers it
+/// absorbs. It has to be a PASS rather than a decision taken at emission time
+/// because the producer is emitted first — the consumer's choice has to be known
+/// before the producer's turn comes.
+///
+/// Two different licences appear here and they are not interchangeable:
+///   * an ADDRESS folds when EVERY use of it is a memory operand that can hold
+///     it — folding into some uses while still computing it for others would
+///     only duplicate work;
+///   * an ALU operand folds when it has exactly ONE use, since the shift or
+///     extension is performed inside the consumer and is not available to
+///     anyone else.
+fn munch(h: &hir::Func) -> Munch {
+    use std::collections::{HashMap, HashSet};
+    let n = h.values.len();
+    let mut uses = vec![0u32; n];
+    let mut def: Vec<Option<&hir::Inst>> = vec![None; n];
+    for b in &h.blocks {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst() {
+                def[d as usize] = Some(inst);
+            }
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    uses[v as usize] += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                uses[v as usize] += 1;
+            }
+        });
+    }
+    let bin = |v: ValueId| -> Option<(hir::BinOp, hir::Ty, Operand, Operand)> {
+        match def.get(v as usize)?.as_ref()? {
+            hir::Inst::Bin { op, ty, a, b, .. } => Some((*op, *ty, *a, *b)),
+            _ => None,
+        }
+    };
+    let cvt = |v: ValueId| -> Option<(hir::CvtOp, hir::Ty, hir::Ty, Operand)> {
+        match def.get(v as usize)?.as_ref()? {
+            hir::Inst::Cvt { op, from, to, a, .. } => Some((*op, *from, *to, *a)),
+            _ => None,
+        }
+    };
+    // `sext`/`zext` from I32 to I64 — the two extensions the operand field holds
+    let ext_of = |v: ValueId| -> Option<(ValueId, ExtKind)> {
+        let (op, from, to, a) = cvt(v)?;
+        let src = a.val()?;
+        if from != hir::Ty::I32 || to != hir::Ty::I64 {
+            return None;
+        }
+        match op {
+            hir::CvtOp::Sext => Some((src, ExtKind::Sxtw)),
+            hir::CvtOp::Zext => Some((src, ExtKind::Uxtw)),
+            _ => None,
+        }
+    };
+    // `x << k`, possibly of an extended value
+    let scaled = |v: ValueId| -> Option<(ValueId, Option<ExtKind>, u8)> {
+        match bin(v) {
+            Some((hir::BinOp::Shl, hir::Ty::I64, a, Operand::Imm(k))) if (0..=4).contains(&k) => {
+                let src = a.val()?;
+                match ext_of(src) {
+                    Some((s, e)) if uses[src as usize] == 1 => Some((s, Some(e), k as u8)),
+                    _ => Some((src, None, k as u8)),
+                }
+            }
+            _ => match ext_of(v) {
+                Some((s, e)) => Some((s, Some(e), 0)),
+                None => None,
+            },
+        }
+    };
+
+    let mut m = Munch::default();
+    // ── compares that feed exactly one consumer ────────────────────────────
+    // A `cmp` followed by `cset` followed by `cbnz` is three instructions where
+    // the machine wants one compare and one conditional branch; sqlite paid
+    // 3,859 `cset` against gcc's 374 for it.
+    let cmp_of = |v: ValueId| -> Option<CmpSrc> {
+        if uses[v as usize] != 1 {
+            return None;
+        }
+        match def.get(v as usize)?.as_ref()? {
+            hir::Inst::Cmp { op, ty, a, b, .. } => Some((*op, *ty, *a, *b)),
+            _ => None,
+        }
+    };
+    for (bi, b) in h.blocks.iter().enumerate() {
+        if let Term::Br(Operand::Val(c), ..) = &b.term {
+            if let Some(src) = cmp_of(*c) {
+                m.br.insert(bi as hir::BlockId, src);
+                m.dead.insert(*c);
+            }
+        }
+        for inst in &b.insts {
+            if let hir::Inst::Select { dst, c: Operand::Val(c), .. } = inst {
+                if let Some(src) = cmp_of(*c) {
+                    m.sel.insert(*dst, src);
+                    m.dead.insert(*c);
+                }
+            }
+        }
+    }
+    // ── addresses ──────────────────────────────────────────────────────────
+    let mut cand: HashMap<ValueId, Folded> = HashMap::new();
+    for b in &h.blocks {
+        for inst in &b.insts {
+            match inst {
+                hir::Inst::SlotAddr { dst, slot, off } => {
+                    if let Ok(o) = i32::try_from(*off) {
+                        cand.insert(*dst, Folded::Slot(*slot, o));
+                    }
+                }
+                hir::Inst::Bin { dst, op: hir::BinOp::Add, ty: hir::Ty::I64, a, b } => {
+                    let plan = match (*a, *b) {
+                        (Operand::Val(v), Operand::Imm(k)) | (Operand::Imm(k), Operand::Val(v)) => {
+                            i32::try_from(k).ok().map(|o| Folded::Base(v, o))
+                        }
+                        (Operand::Val(x), Operand::Val(y)) => {
+                            // `base + index*scale`: whichever side is the scaled
+                            // one is the index
+                            let pick = |i: ValueId, base: ValueId| {
+                                if uses[i as usize] != 1 {
+                                    return None;
+                                }
+                                let (idx, ext, shift) = scaled(i)?;
+                                Some(Folded::Indexed { base, idx, ext, shift })
+                            };
+                            pick(y, x).or_else(|| pick(x, y))
+                        }
+                        _ => None,
+                    };
+                    if let Some(p) = plan {
+                        cand.insert(*dst, p);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut bad: Vec<ValueId> = Vec::new();
+    let mut seen: HashSet<ValueId> = HashSet::new();
+    for b in &h.blocks {
+        for inst in &b.insts {
+            let mem = match inst {
+                hir::Inst::Load { ty, addr: Operand::Val(v), .. } => Some((*v, ty.bytes())),
+                hir::Inst::Store { ty, addr: Operand::Val(v), .. } => Some((*v, ty.bytes())),
+                _ => None,
+            };
+            if let Some((v, size)) = mem {
+                seen.insert(v);
+                match cand.get(&v) {
+                    // DDI 0487 C3.2 bounds the displacement by the access size;
+                    // `legalize` rescues a FRAME offset after layout, but a
+                    // register base has no such second chance.
+                    Some(Folded::Base(_, off)) if !isa::mem_off_ok(*off, size) => bad.push(v),
+                    // C6.2: the register-offset form scales by exactly log2 of
+                    // the access size, or not at all.
+                    Some(Folded::Indexed { shift, .. })
+                        if *shift != 0 && 1u32 << *shift != size =>
+                    {
+                        bad.push(v)
+                    }
+                    _ => {}
+                }
+            }
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    let is_addr = match (inst, mem) {
+                        (hir::Inst::Load { addr, .. }, Some(_)) => *addr == Operand::Val(v),
+                        (hir::Inst::Store { addr, val, .. }, Some(_)) => {
+                            *addr == Operand::Val(v) && *val != Operand::Val(v)
+                        }
+                        _ => false,
+                    };
+                    if !is_addr {
+                        bad.push(v);
+                    }
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                bad.push(v);
+            }
+        });
+    }
+    for v in bad {
+        cand.remove(&v);
+    }
+    cand.retain(|v, _| seen.contains(v));
+    for (v, p) in &cand {
+        m.dead.insert(*v);
+        // the scale computation belongs to the address too
+        if let Folded::Indexed { .. } = p {
+            if let Some((_, _, _, Operand::Val(y))) = bin(*v) {
+                if uses[y as usize] == 1 {
+                    m.dead.insert(y);
+                    if let Some((hir::BinOp::Shl, _, Operand::Val(inner), _)) = bin(y) {
+                        if uses[inner as usize] == 1 && ext_of(inner).is_some() {
+                            m.dead.insert(inner);
+                        }
+                    }
+                }
+            }
+            if let Some((_, _, Operand::Val(x), _)) = bin(*v) {
+                if uses[x as usize] == 1 && (scaled(x).is_some() && ext_of(x).is_some()) {
+                    m.dead.insert(x);
+                }
+            }
+        }
+    }
+    m.addr = cand;
+
+    // ── ALU operands ───────────────────────────────────────────────────────
+    // A producer may be absorbed only if it is single-use AND has not itself
+    // already absorbed something: folding a consumer into a further consumer
+    // would leave the value IT swallowed defined nowhere. (`(x << k) >> s` folded
+    // into a `bfx`, then that `bfx` folded into an `and`, and `x << k` was gone.)
+    let foldable = |v: ValueId, m: &Munch| {
+        uses[v as usize] == 1 && !m.dead.contains(&v) && !m.alu.contains_key(&v)
+    };
+    let mut m2 = m;
+    for b in &h.blocks {
+        for inst in &b.insts {
+            let (dst, op, ty, a, bb) = match inst {
+                hir::Inst::Bin { dst, op, ty, a, b } if !ty.is_float() => (*dst, *op, *ty, *a, *b),
+                _ => continue,
+            };
+            // A BITFIELD read: C spells it as a shift and a mask, or as a pair of
+            // shifts, and A64 has one instruction for each (DDI 0487 C6.2.398).
+            let bits = ty.bits();
+            let bfx = match (op, a, bb) {
+                // `(x >> s) & ((1 << w) - 1)`
+                (hir::BinOp::And, Operand::Val(v), Operand::Imm(m))
+                | (hir::BinOp::And, Operand::Imm(m), Operand::Val(v))
+                    if m > 0 && (m as u64 + 1).is_power_of_two() =>
+                {
+                    let width = (m as u64 + 1).trailing_zeros() as u8;
+                    match bin(v) {
+                        Some((hir::BinOp::LShr, t, Operand::Val(x), Operand::Imm(sh)))
+                            if t == ty
+                                && foldable(v, &m2)
+                                && sh >= 0
+                                && sh as u32 + width as u32 <= bits =>
+                        {
+                            Some((v, false, x, sh as u8, width))
+                        }
+                        _ => None,
+                    }
+                }
+                // `(x << k1) >> k2`, arithmetic or logical
+                (hir::BinOp::AShr | hir::BinOp::LShr, Operand::Val(v), Operand::Imm(k2))
+                    if k2 >= 0 && (k2 as u32) < bits =>
+                {
+                    match bin(v) {
+                        Some((hir::BinOp::Shl, t, Operand::Val(x), Operand::Imm(k1)))
+                            if t == ty && foldable(v, &m2) && k1 >= 0 && k2 >= k1 =>
+                        {
+                            let width = (bits - k2 as u32) as u8;
+                            let lsb = (k2 - k1) as u8;
+                            if width >= 1 && lsb as u32 + width as u32 <= bits {
+                                Some((v, op == hir::BinOp::AShr, x, lsb, width))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some((v, signed, x, lsb, width)) = bfx {
+                m2.dead.insert(v);
+                m2.alu.insert(dst, AluFold::Bfx(signed, x, lsb, width));
+                continue;
+            }
+            // `a*b + c` and `c − a*b`: one instruction instead of two, and the
+            // product's register disappears with it.
+            let mul_of = |v: Operand| -> Option<(ValueId, ValueId)> {
+                let v = v.val()?;
+                if !foldable(v, &m2) {
+                    return None;
+                }
+                match bin(v)? {
+                    (hir::BinOp::Mul, t, x, y) if t == ty => Some((v, x.val()?)).map(|(p, _)| {
+                        let _ = p;
+                        (x.val().unwrap(), y.val().unwrap_or(u32::MAX))
+                    }),
+                    _ => None,
+                }
+            };
+            let mul3 = match op {
+                hir::BinOp::Add => mul_of(bb)
+                    .map(|p| (p, a))
+                    .or_else(|| mul_of(a).map(|p| (p, bb))),
+                hir::BinOp::Sub => mul_of(bb).map(|p| (p, a)),
+                _ => None,
+            };
+            if let Some(((x, y), c)) = mul3 {
+                if y != u32::MAX {
+                    let k = if op == hir::BinOp::Add { Alu3Op::Madd } else { Alu3Op::Msub };
+                    let prod = if op == hir::BinOp::Add {
+                        bb.val().filter(|v| bin(*v).is_some_and(|t| t.0 == hir::BinOp::Mul))
+                            .or_else(|| a.val())
+                    } else {
+                        bb.val()
+                    };
+                    if let Some(p) = prod {
+                        m2.dead.insert(p);
+                        m2.alu.insert(dst, AluFold::Mul3(k, x, y, c));
+                        continue;
+                    }
+                }
+            }
+            if !matches!(
+                op,
+                hir::BinOp::Add
+                    | hir::BinOp::Sub
+                    | hir::BinOp::And
+                    | hir::BinOp::Or
+                    | hir::BinOp::Xor
+            ) {
+                continue;
+            }
+            // `op a, b, sxtw` / `op a, b, lsl #k`
+            let rhs = bb.val().filter(|v| foldable(*v, &m2));
+            if let Some(v) = rhs {
+                // DDI 0487 C6.2: only ADD/SUB (and their flag-setting forms)
+                // take an EXTENDED register operand. The logical instructions
+                // take a shifted one and nothing else — `orr x0, x1, w3, uxtw`
+                // is not an instruction, and the assembler says so.
+                if ty == hir::Ty::I64 && matches!(op, hir::BinOp::Add | hir::BinOp::Sub) {
+                    if let Some((src, e)) = ext_of(v) {
+                        m2.dead.insert(v);
+                        m2.alu.insert(dst, AluFold::Extended(a, src, e));
+                        continue;
+                    }
+                }
+                if let Some((sop, st, sa, Operand::Imm(k))) = bin(v) {
+                    let kind = match sop {
+                        hir::BinOp::Shl => Some(ShiftKind::Lsl),
+                        hir::BinOp::LShr => Some(ShiftKind::Lsr),
+                        hir::BinOp::AShr => Some(ShiftKind::Asr),
+                        _ => None,
+                    };
+                    if let (Some(kind), Some(src)) = (kind, sa.val()) {
+                        if st == ty && k >= 0 && (k as u32) < ty.bits() {
+                            m2.dead.insert(v);
+                            m2.alu.insert(dst, AluFold::Shifted(a, src, kind, k as u8));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    m2
+}
+
 struct L<'a> {
     h: &'a hir::Func,
     f: MFunc,
@@ -95,6 +508,20 @@ struct L<'a> {
     sret_ptr: Option<Reg>,
     in_args_slot: Option<SlotId>,
     va_slot: Option<SlotId>,
+    /// Addresses that are FOLDED into the memory operand of every access that
+    /// uses them, so the `add` that would have computed them is never emitted.
+    fold: std::collections::HashMap<ValueId, Folded>,
+    /// Instructions whose second operand is performed inside them: a shift, a
+    /// 32→64 extension, or a whole multiply.
+    alu: std::collections::HashMap<ValueId, AluFold>,
+    /// Producers every use of which folded, so they are never emitted at all.
+    dead: std::collections::HashSet<ValueId>,
+    /// per block: a compare whose only use is that block's branch
+    br: std::collections::HashMap<hir::BlockId, CmpSrc>,
+    /// per select: a compare that is its only condition
+    sel: std::collections::HashMap<ValueId, CmpSrc>,
+    /// the current block's fused compare, taken by `terminator`
+    fuse: Option<CmpSrc>,
 }
 
 impl<'a> L<'a> {
@@ -172,6 +599,30 @@ impl<'a> L<'a> {
     /// address once the HIR ladder folds the cast.)
     fn base(&mut self, o: Operand) -> Reg {
         self.reg_nonzr(o, hir::Ty::I64)
+    }
+
+    /// The memory operand for an access at this address: the folded form when
+    /// `fold_addrs` proved every use of the address is a memory operand, and the
+    /// plain register base otherwise.
+    fn addr_mode(&mut self, o: Operand) -> AddrMode {
+        if let Operand::Val(v) = o {
+            match self.fold.get(&v).copied() {
+                Some(Folded::Slot(slot, off)) => return AddrMode::Slot { slot, off },
+                Some(Folded::Base(b, off)) => {
+                    let base = self.base(Operand::Val(b));
+                    return AddrMode::BaseImm { base, off };
+                }
+                Some(Folded::Indexed { base, idx, ext, shift }) => {
+                    let b = self.base(Operand::Val(base));
+                    let t = if ext.is_some() { hir::Ty::I32 } else { hir::Ty::I64 };
+                    let i = self.reg(Operand::Val(idx), t);
+                    return AddrMode::BaseReg { base: b, idx: i, ext, shift };
+                }
+                None => {}
+            }
+        }
+        let base = self.base(o);
+        AddrMode::BaseImm { base, off: 0 }
     }
 
     /// An operand that may ride in an immediate field of `op`.
@@ -254,12 +705,12 @@ impl<'a> L<'a> {
                 vol,
                 ..
             } => {
-                let base = self.base(*addr);
+                let mem = self.addr_mode(*addr);
                 let d = self.dst_of(*dst);
                 self.push(MInst::Load {
                     op: memop(*ty),
                     dst: d,
-                    mem: AddrMode::BaseImm { base, off: 0 },
+                    mem,
                     vol: *vol,
                 });
             }
@@ -270,12 +721,12 @@ impl<'a> L<'a> {
                 vol,
                 ..
             } => {
-                let base = self.base(*addr);
+                let mem = self.addr_mode(*addr);
                 let v = self.reg(*val, *ty);
                 self.push(MInst::Store {
                     op: memop(*ty),
                     src: v,
-                    mem: AddrMode::BaseImm { base, off: 0 },
+                    mem,
                     vol: *vol,
                 });
             }
@@ -327,7 +778,10 @@ impl<'a> L<'a> {
             }
             Inst::Select { dst, ty, c, a, b } => {
                 let d = self.dst_of(*dst);
-                let fl = self.test(*c);
+                let (fl, cc) = match self.sel.get(dst).copied() {
+                    Some((op, cty, x, y)) => (self.compare(op, cty, x, y), cc_of(op)),
+                    None => (self.test(*c), CC::Ne),
+                };
                 let (x, y) = (self.reg(*a, *ty), self.reg(*b, *ty));
                 self.push(MInst::CSel {
                     op: CSelOp::Csel,
@@ -335,7 +789,7 @@ impl<'a> L<'a> {
                     dst: d,
                     a: x,
                     b: y,
-                    cc: CC::Ne,
+                    cc,
                     flags: fl,
                 });
             }
@@ -480,6 +934,49 @@ impl<'a> L<'a> {
             BinOp::AShr => AluOp::Asr,
             _ => unreachable!(),
         };
+        // The munch table's ALU rows: a shift, a 32→64 extension, or a whole
+        // multiply performed inside this instruction rather than before it.
+        if let Some(plan) = self.alu.get(&dst).copied() {
+            match plan {
+                AluFold::Bfx(signed, x, lsb, width) => {
+                    let sr = self.reg_nonzr(Operand::Val(x), ty);
+                    self.push(MInst::Bfx { signed, w, dst: d, src: sr, lsb, width });
+                    return;
+                }
+                AluFold::Mul3(k, x, y, c) => {
+                    let (xr, yr) = (self.reg(Operand::Val(x), ty), self.reg(Operand::Val(y), ty));
+                    let cr = self.reg(c, ty);
+                    self.push(MInst::Alu3 { op: k, w, dst: d, a: xr, b: yr, c: cr });
+                    return;
+                }
+                AluFold::Extended(base, src, e) => {
+                    let br = self.reg_nonzr(base, ty);
+                    let sr = self.reg(Operand::Val(src), hir::Ty::I32);
+                    self.push(MInst::Alu {
+                        op: aop,
+                        w,
+                        dst: d,
+                        a: br,
+                        b: Rhs::Extended(sr, e, 0),
+                        flags: None,
+                    });
+                    return;
+                }
+                AluFold::Shifted(base, src, k, amt) => {
+                    let br = self.reg(base, ty);
+                    let sr = self.reg(Operand::Val(src), ty);
+                    self.push(MInst::Alu {
+                        op: aop,
+                        w,
+                        dst: d,
+                        a: br,
+                        b: Rhs::Shifted(sr, k, amt),
+                        flags: None,
+                    });
+                    return;
+                }
+            }
+        }
         let y = self.rhs(b, ty, aop);
         let x = match (aop, &y) {
             (AluOp::Add | AluOp::Sub, Rhs::Imm(_)) => self.reg_nonzr(a, ty),
@@ -1059,6 +1556,89 @@ impl<'a> L<'a> {
         });
     }
 
+    /// A DENSE switch becomes a table lookup: `sub` the smallest label, one
+    /// unsigned compare against the span (which also rejects everything below
+    /// the smallest — DDI 0487 C6.2.24's `b.hi` reads the subtraction as
+    /// unsigned), then an indexed branch. `layout` and `emit` turn the
+    /// terminator into `adr`/`ldr`/`br` over a `.rodata` table of offsets.
+    ///
+    /// The density rule is gcc's: at least four cases, and at least half the
+    /// span occupied. Below that the table is mostly padding and a compare chain
+    /// is both smaller and — for a handful of cases — no slower.
+    fn jump_table(
+        &mut self,
+        x: Reg,
+        ty: hir::Ty,
+        arms: &[(i64, hir::Target)],
+        dflt: &MTarget,
+    ) -> Option<MTerm> {
+        const MIN_CASES: usize = 4;
+        if arms.len() < MIN_CASES {
+            return None;
+        }
+        let lo = arms.iter().map(|(k, _)| *k).min()?;
+        let hi = arms.iter().map(|(k, _)| *k).max()?;
+        let span = hi.checked_sub(lo)?.checked_add(1)?;
+        if span > (arms.len() as i64).checked_mul(2)? || span > 4096 {
+            return None;
+        }
+        // An arm that carries edge ARGUMENTS cannot be reached through a table:
+        // there is nowhere to put the copies. `destruct::split_critical_edges`
+        // would give each one its own block, but it runs later — so for now such
+        // a switch keeps its compare chain.
+        if arms.iter().any(|(_, t)| !t.args.is_empty()) || !dflt.args.is_empty() {
+            return None;
+        }
+        let w = wid(ty);
+        // `v - lo`, then the unsigned range test against the span. A 32-bit `sub`
+        // zeroes bits 63:32 (DDI 0487 B1.2.1), so its result is already the
+        // 64-bit index the table wants and no extension instruction is needed —
+        // but a table starting at zero needs no subtraction at all, and then the
+        // 32-bit value has to be widened after all.
+        let idx = if lo == 0 && w == Width::W64 {
+            x
+        } else {
+            let d = self.tmp(w);
+            let rhs = match imm::as_rhs(AluOp::Sub, lo, w) {
+                Some(r) => r,
+                None => {
+                    let g = self.tmp(w);
+                    self.push(imm::materialize(g, lo, w));
+                    Rhs::Reg(g)
+                }
+            };
+            self.push(MInst::Alu { op: AluOp::Sub, w, dst: d, a: x, b: rhs, flags: None });
+            d
+        };
+        let fl = self.f.new_flags();
+        let bound = match imm::as_rhs(AluOp::Sub, span - 1, w) {
+            Some(r) => r,
+            None => {
+                let g = self.tmp(w);
+                self.push(imm::materialize(g, span - 1, w));
+                Rhs::Reg(g)
+            }
+        };
+        self.push(MInst::Cmp { kind: CmpKind::Cmp, w, a: idx, b: bound, flags: fl });
+        let body = self.f.new_block();
+        let out = MTerm::Bcc(
+            CC::Hi,
+            fl,
+            dflt.clone(),
+            MTarget { block: body, args: vec![] },
+        );
+        let mut table: Vec<MTarget> = vec![dflt.clone(); span as usize];
+        for (k, t) in arms {
+            table[(k - lo) as usize] = self.target(t);
+        }
+        self.f.blocks[body as usize].term = MTerm::Switch {
+            idx,
+            table,
+            default: dflt.clone(),
+        };
+        Some(out)
+    }
+
     fn call(
         &mut self,
         dst: Option<ValueId>,
@@ -1279,17 +1859,58 @@ impl<'a> L<'a> {
             }
             // The condition is an I32 that C says is "nonzero = true": `cbnz`
             // tests it directly, with no compare instruction at all.
-            Term::Br(c, x, y) => {
-                let r = self.reg(*c, hir::Ty::I32);
-                let (x, y) = (self.target(x), self.target(y));
-                MTerm::Cbz {
-                    w: Width::W32,
-                    reg: r,
-                    zero: false,
-                    t: x,
-                    f: y,
+            Term::Br(c, x, y) => match self.fuse.take() {
+                // `x == 0` / `x != 0` needs no compare at all: `cbz`/`cbnz` test
+                // the register and branch in one instruction (DDI 0487 C6.2.42).
+                // `x < 0` and `x >= 0` are a single bit: `tbnz`/`tbz` on the
+                // sign bit, with no compare at all (DDI 0487 C6.2.375).
+                Some((op, ty, a, Operand::Imm(0)))
+                    if matches!(op, hir::CmpOp::Slt | hir::CmpOp::Sge) && !ty.is_float() =>
+                {
+                    let r = self.reg_nonzr(a, ty);
+                    let (x, y) = (self.target(x), self.target(y));
+                    MTerm::Tb {
+                        w: wid(ty),
+                        reg: r,
+                        bit: (ty.bits() - 1) as u8,
+                        set: op == hir::CmpOp::Slt,
+                        t: x,
+                        f: y,
+                    }
                 }
-            }
+                Some((op, ty, a, b))
+                    if matches!(op, hir::CmpOp::Eq | hir::CmpOp::Ne)
+                        && !ty.is_float()
+                        && (a == Operand::Imm(0) || b == Operand::Imm(0)) =>
+                {
+                    let v = if a == Operand::Imm(0) { b } else { a };
+                    let r = self.reg_nonzr(v, ty);
+                    let (x, y) = (self.target(x), self.target(y));
+                    MTerm::Cbz {
+                        w: wid(ty),
+                        reg: r,
+                        zero: op == hir::CmpOp::Eq,
+                        t: x,
+                        f: y,
+                    }
+                }
+                Some((op, ty, a, b)) => {
+                    let fl = self.compare(op, ty, a, b);
+                    let (x, y) = (self.target(x), self.target(y));
+                    MTerm::Bcc(cc_of(op), fl, x, y)
+                }
+                None => {
+                    let r = self.reg(*c, hir::Ty::I32);
+                    let (x, y) = (self.target(x), self.target(y));
+                    MTerm::Cbz {
+                        w: Width::W32,
+                        reg: r,
+                        zero: false,
+                        t: x,
+                        f: y,
+                    }
+                }
+            },
             Term::Ret(v) => {
                 let rt = self.h.sig.ret.clone();
                 match (rt, v) {
@@ -1361,6 +1982,10 @@ impl<'a> L<'a> {
                 // may not be the zero register (see `reg_nonzr`)
                 let x = self.reg_nonzr(*c, *ty);
                 let dflt = self.target(d);
+                if let Some(t) = self.jump_table(x, *ty, arms, &dflt) {
+                    self.f.blocks[self.cur as usize].term = t;
+                    return;
+                }
                 let mut next = dflt;
                 let arms: Vec<(i64, MTarget)> = arms
                     .iter()
@@ -1446,6 +2071,7 @@ fn lower_func(h: &hir::Func) -> MFunc {
     // temporary the allocator happens to colour x1 could destroy the second
     // argument before it has been read.
     let asn = abi::classify(&h.sig);
+    let m = munch(h);
     let mut l = L {
         h,
         f,
@@ -1455,6 +2081,12 @@ fn lower_func(h: &hir::Func) -> MFunc {
         sret_ptr: None,
         in_args_slot: None,
         va_slot: None,
+        fold: m.addr,
+        alu: m.alu,
+        br: m.br,
+        sel: m.sel,
+        dead: m.dead,
+        fuse: None,
     };
     let mut pairs = Vec::new();
     // (destination value, the registers holding the composite, its shape)
@@ -1647,6 +2279,23 @@ fn lower_func(h: &hir::Func) -> MFunc {
             vol: false,
         });
     }
+    // how many times each value is read — the single-use test the munch table
+    // needs before it may fold a producer into its consumer
+    let mut uses = vec![0u32; h.values.len()];
+    for b in &h.blocks {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    uses[v as usize] += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                uses[v as usize] += 1;
+            }
+        });
+    }
     let mut prologue: Vec<MInst> = std::mem::take(&mut l.f.blocks[h.entry as usize].insts);
     for (bi, b) in h.blocks.iter().enumerate() {
         l.cur = bi as MBlockId;
@@ -1654,10 +2303,17 @@ fn lower_func(h: &hir::Func) -> MFunc {
             let p = std::mem::take(&mut prologue);
             l.f.blocks[bi].insts = p;
         }
-        for i in &b.insts {
+        l.fuse = l.br.get(&(bi as hir::BlockId)).copied();
+        for i in b.insts.iter() {
+            if let Some(d) = i.dst() {
+                if l.dead.contains(&d) {
+                    continue; // it rides inside the instruction that consumes it
+                }
+            }
             l.inst(i);
         }
         l.terminator(&b.term);
+        l.fuse = None;
     }
     l.f
 }
