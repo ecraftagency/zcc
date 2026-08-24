@@ -43,6 +43,31 @@
 
 ### 📜 THE SUPREME PLAN — the single spine + the one iteration process (constitutional; parallel to the three Laws)
 
+> **▶ BOOT — when the user prompts "execute the plan" (or "continue"/"resume"/"grind"), do EXACTLY this, no questions:**
+> 1. Read this SUPREME PLAN table. Find the **first ⬜ row** — that is the work (currently **#17,
+>    loop rotation**). Nothing else is "the plan."
+> 2. Confirm the box is live + build current: `docker exec zccbox sh -c 'cd /work && CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc'` (recipes: [[zcc-ssa-qbe-ops-resume]]).
+> 3. Run THE ONE ITERATION PROCESS (below) on that row: predict Δ → implement + inline proof →
+>    full gate → re-measure geo40 → **bank** (commit, flip row ✅, record Δ) **or quarantine**
+>    (revert, mark ⚠️) → advance to the next ⬜. Loop until the user stops or the row is #25.
+> 4. Autonomy: a low yield / miscompile / wall is bank-or-quarantine-then-advance — NEVER a question,
+>    NEVER a re-plan. Only "re-plan" reorders the spine; only "go nuclear" fires #25. Bank every
+>    positive; one commit per lever so revert = reset to last green. **That is the entire protocol —
+>    "execute the plan" needs no other input.**
+>
+> **▶▶ AUTONOMOUS GRIND MODE (user directive 2026-08-24): on "execute the plan", grind rows #17 → #24
+> to completion without checking in — bank each, advance, keep going across context resets (status =
+> memory; every reset re-reads this table + continues at the first ⬜). Push after each bank.**
+> **HARD STOP only at these three points — nothing else pauses the grind:**
+> 1. **Reaching #25 (nuclear).** STOP. Rows 17–24 are done/quarantined. Report the geo40 landing +
+>    the remaining size↔speed gap, and WAIT for the user to type "go nuclear". Do NOT start #25.
+> 2. **Every remaining row is ⚠️ QUARANTINED / 🔒 blocked** (no ⬜ left below #25). STOP, report.
+> 3. **A gate cannot go green** on a lever after one bounded Law-2 debug attempt ⟹ quarantine THAT
+>    row (revert to last green, mark ⚠️ + reason) and ADVANCE; only if that leaves nothing actionable
+>    does it become a stop. A miscompile is NEVER shipped — correctness gate is the one hard wall.
+> The user may instead run `/loop execute the plan` for hands-off multi-session grinding; same stops apply.
+
+
 > **Why this exists (the anti-drift constitution).** The Laws (`CLAUDE.md`) are the supreme *law* —
 > what is true. THIS is the supreme *plan* — what we DO, and in what order, forever, until gcc-O1
 > parity. We lost the thread repeatedly because the plan kept getting RE-NUMBERED in new sections
