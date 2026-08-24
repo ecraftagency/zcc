@@ -148,12 +148,19 @@
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⚠️ re-eval DONE → stays OFF, deferred → #25 (geo40 +0.31% sub-threshold + size-negative; j2 win needs hotness gating). See note ㉓ |
 | 24 | **loop-value analysis: invariant pure-call hoist** (the 6 `gcc=0ms` cases) | SPEED (asymptotic) | ✅ BANKED — interprocedural purity + loop-invariant pure-call LICM (4-fence commuting square). All 6 gcc-zeroed programs EMPTIED the bucket (j1 103→1ms). See note ㉔✅ |
-| 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
+| 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | 🔓 FIRING (user "go nuclear" 2026-08-24). Sub-ledger: **㉕.1 ✅ BANKED** (`f6fe7d2`) spill-cost metric, sqlite 1.812×→1.768× (−6,968). Next ⬜ ㉕.2 loop-depth hotness weighting. See note ㉕-SUB |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
-and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #25 (NUCLEAR — HARD STOP, wait for "go nuclear").
-#24 ✅ BANKED (invariant pure-call hoist: 6 gcc-zeroed programs emptied, j1 103→1ms; INSN geo 1.71→1.58; sqlite +230 negligible; full gate green). #23 ⚠️ re-eval DONE → LICM stays OFF → #25. #22 ⚠️ DEFERRED → #25 (FP residency). #21 ✅ BANKED (sqlite −906, e2 33→13ms). #20 ✅ BANKED.**
+and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5×; #25 is the only path to size
+*and* speed ≈ 1.0×. **RESUME = #25 (NUCLEAR — FIRING, user said "go nuclear"). Sub-ledger below.
+㉕.1 ✅ BANKED (`f6fe7d2`) spill-cost metric: sqlite 279,161 = 1.768× (was 1.812×, −6,968; ldr −5,091,
+str −1,318, frame-mem −6,433); INSN geo 1.610→1.5835; exec median 1.552 flat (SIZE arm). Full gate
+green (cargo 184/0, opt-parity 1552/0, csmith300 254/0, yarpgen300 300/0). NEXT ⬜ ㉕.2 = loop-depth
+hotness weighting (SPEED arm). #24 ✅ #23 ⚠️→#25 #22 ⚠️→#25 #21 ✅ #20 ✅.**
+> **⚠️ PRE-EXISTING (NOT #25) — 4 torture runtime FAIL carried at HEAD ff40a6b:** `20021127-1`,
+> `bitfld-3`, `pr32244-1`, `pr34971` — identical under `ZCC_SPILL=degree` (== pristine HEAD), so
+> orthogonal to allocation. Memory's "torture 1471/0" was stale. Separate Law-2 triage, own investigation;
+> the #25 grind does NOT introduce or touch them (NO-PIVOT: quarantine to their own worklist).
 
 > **㉕ #25 NUCLEAR — CONSOLIDATED SCOPE (what the 17–24 grind proved belongs HERE, not in a peephole).**
 > The grind's recurring verdict: the remaining size↔speed gap is one root cause — zcc's **home-primary
@@ -181,6 +188,29 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #25 (NUCLEAR — HARD STOP, 
 > NOTE: **#24 (SCEV final-value + loop-DCE) is NOT absorbed by #25** — it is a distinct loop-value-analysis
 > pass (closed-form trip count / final value / dead-loop deletion), orthogonal to allocation, and remains
 > its own row. Everything else deferred during 17–23 lands in #25. Fires ONLY on explicit "go nuclear".
+
+> **㉕-SUB — the nuclear SUB-LEDGER (fired 2026-08-24 on user "go nuclear").** #25 is not one atomic
+> commit; it is a sequence of proof-carrying sub-levers, each toggle-gated + full-gated + banked, edited
+> IN PLACE here (anti-fragmentation: these are ㉕.N, never a new section). Discovery on entry: **WIDE
+> budget (`GP_BUDGET_WIDE {k:18}`) was ALREADY live at HEAD** (`emit.rs:1716` `gp_wide=regalloc&&!heavy`)
+> — CORPUS25's "inheritance lever #1 = flip narrow→wide, UNUSED" was STALE; verified before acting
+> (Law-2 measurement). So the allocator already had graph-coloring + Briggs coalescing + ABI-targeting +
+> WIDE; the true residual is the SPILL STRATEGY (choice + splitting) and hotness.
+> - **㉕.1 ✅ BANKED `f6fe7d2`** — spill-cost metric. Optimistic spill was cost-blind max-degree; now
+>   min cost/degree (Chaitin-Briggs), cost=static use+def count per rep. Toggle `ZCC_SPILL=degree`
+>   restores old (reproduces HEAD `.s` byte-exact). Δ sqlite −6,968 (1.812×→1.768×); ldr −5,091 / str
+>   −1,318 = the cost-square confirmation (predicted fewer reloads, `.s` shows it). Proof test
+>   `spill_cost_spills_cheapest`. Correctness-neutral (verify_abi invariant agnostic to spill choice).
+> - **㉕.2 ⬜ NEXT** — loop-depth HOTNESS weighting of cost[] (weight each use/def by ~10^loopdepth via
+>   `natural_loop`/`dominators`, already `pub(crate)` in loops.rs). ㉕.1's unweighted count is a SIZE
+>   proxy (static reloads); dynamic hotness is the SPEED arm — keep hot-loop temps register-resident so
+>   geo40 exec median falls below 1.552. Predict on cost-model, gate, A/B geo40.
+> - **㉕.3+ candidates (re-rank after ㉕.2 via corpus25.sh):** live-range splitting (spill a temp only
+>   across its cold interval, not whole-life — note ㉕ part 1); the siblings (shrink-wrap, compare-elim,
+>   addressing-fold); turn ON licm+strength_reduce now registers are richer. mov still 70,423 (top
+>   absolute) + frame-mem 27,403 = remaining home floor.
+> - **exectime.sh reducer BUG (fix before trusting exec aggregate):** EXEC geomean prints 0.0000 —
+>   `log(r)` with an `exec_r=0` sample poisons the product. Use median until fixed (drop-zero/clamp).
 
 > **㉕-CORPUS — the PROVEN knowledge base for #25 = `tests/bench/CORPUS25.md` (+ runner `corpus25.sh`).**
 > Built + audited this session (HEAD `2af2702`, post-#24). Every number is a grep/awk catamorphism over
