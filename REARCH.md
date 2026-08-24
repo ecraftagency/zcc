@@ -14,10 +14,11 @@
   It is the fallback. It is NOT to be touched, grinded, or referenced for structure.
 - `mir-rearch` = this branch, created from `rc3`. **It is the repository's DEFAULT branch** (GitHub
   default + `origin/HEAD`, set 2026-08-24). `main` is frozen at `rc3` and left alone.
-  **Progress: R0 (skeleton → hello world) and R0.9 (audit remediation) are ✅ banked and pushed.**
+  **Progress: R0, R0.9 and ALL of R1 (R1.1–R1.6 + the measurement) are ✅ banked.**
   The backend is `src/{cfg,mem,compile,emit}.rs` + `src/hir/` + `src/mir/` + `src/isel/` +
-  `src/regalloc/`; `cargo test` 40/40, `tests/cases` 61/81 (the 14 remaining are exactly R1's
-  feature set, each stopped by an explicit `todo!`). Next `⬜` = R1.1.
+  `src/regalloc/`; `cargo test` **52/52**, `tests/cases` 74/75 (only the adjudicated
+  `float_h`), `tests/ext` 19/19, all five science gates PASS, torture 1470 pass / 0 FAIL,
+  csmith300 254/0, yarpgen300 300/0, determinism 85 × 8. Next `⬜` = **R2.1**.
 - The box: `docker exec zccbox …`, suites cached at `/suites` (`ZCC_SUITE_CACHE=/suites`), build with
   `CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc`.
 
@@ -47,8 +48,15 @@ zcc solved the hard version of the problem. This document adopts the right versi
 1. `git switch mir-rearch`; read this file fully. (`CLAUDE.md`'s first paragraph is the branch boot
    override pointing here; the `[optimizer = main]` paragraph after it describes the DEAD architecture
    and does not apply on this branch.)
-2. Resume at the first `⬜` in the §12 ladder. **State at 2026-08-24: R0 and R0.9 are ✅ banked and
-   pushed (HEAD `81456c0`); the first `⬜` is R1.1.** Follow the order; the allocator already landed.
+2. Resume at the first `⬜` in the §12 ladder. **State at 2026-08-25: R0, R0.9,
+   R1.1–R1.6 and the R1 measurement are ✅ banked (HEAD `7279b36`); the first
+   `⬜` is R2.1.** The R1 GROUND METRIC is §13a — the origin every R2/R3 pass is
+   measured against; the one fact to carry into R2 is that `add` is **28.2%** of
+   sqlite's instructions because every local is addressed through the frame
+   block, which R2.2 (SROA+mem2reg) and R3.1 (addressing modes) between them
+   remove. Note R2.2's own BLOCKING prerequisite is still open: Braun-Hack
+   proper in `regalloc/spill.rs` (today's spiller is sound and enforces both
+   ceilings, but is spill-at-def / reload-per-use).
 3. Every module ships with its verifier + interpreter-based proof battery before the next module.
 4. Bank each R-milestone with a commit + measurement line in §12; push.
 5. Standing gate for any bank: `cargo test` green · `tests/cases` no regression · `bash
@@ -430,7 +438,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R1.4 science gates green: `abi.sh alg.sh cpp.sh shape.sh decay.sh`; `tests/ext` 21/21 | ✅ abi/alg/cpp/shape/decay all PASS · `tests/cases` 74/75 (only the adjudicated `float_h`) · `tests/ext` 19/19 (2 SKIP: `cc` rejects them) · determinism 85 progs × 8 fresh processes |
 | R1.5 torture ≥ 1471 pass (the `rc3` count; the 4 pre-existing runtime FAIL `20021127-1 bitfld-3 pr32244-1 pr34971` are a bonus if they pass), csmith300 0 DIVERGE, yarpgen300 0 DIVERGE | ✅ torture **1470 pass / 0 FAIL** / 224 not-impl — the not-impl manifest is BYTE-IDENTICAL to the committed `torture.not-impl` (rc3's, `423a42d`), and rc3's 4 runtime FAIL are gone; csmith300 **254 PARITY / 0 DIVERGE** (46 SKIP = `gcc` itself fails the sample; exactly rc3's 254/0); yarpgen300 **300 PARITY / 0 DIVERGE**. 13 torture defects were found and fixed on the way — see `§15` |
 | R1.6 close the §15 PROOF DEBT: teach `hir::interp` the intrinsics so no R1 feature is ⊥ on both sides, then one battery per §15 row. Ordered BEFORE the measurement because a battery's job is to DISCOVER a lowering defect, and a fix moves the emitted code — a number taken first would be stale. Ordered before R2 because every R2 pass owes `⟦f⟧=⟦P f⟧` under this interpreter: while it traps on `Inst::Intrinsic`, each of the eleven batteries would hold VACUOUSLY over every variadic / long-double / atomic function | ✅ `cargo test` 40 → **52**; three defects found, one of them a latent MISCOMPILE (call-crossing values exceeding the callee-saved count at a non-call point). See §15 |
-| R1 measurement | sqlite static insns + `corpus25.sh` excess histogram + `exectime.sh` paired geo40, all with HIR passes OFF. Record here as the correctness-parity data point. **The allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573 at rc3) is NOT readable here**: per §14, R0/R1 keep every local in memory, so the allocator sees only expression temporaries. That KPI is measured at R2.2, immediately after SROA+mem2reg | ⬜ |
+| R1 measurement | sqlite static insns + `corpus25.sh` excess histogram + `exectime.sh` paired geo40, all with HIR passes OFF (there are none yet — that IS the point: this is the unoptimized-parity origin every R2/R3 pass is measured against). **The allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573 at rc3) is NOT readable here**: per §14, R0/R1 keep every local in memory, so the allocator sees only expression temporaries. That KPI is measured at R2.2, immediately after SROA+mem2reg | ✅ recorded in §13a |
 
 ### R2 — tree-SSA parity (port the A7 ladder onto HIR, §4 order)
 | task | status |
@@ -512,6 +520,53 @@ It is also not width-aware: a `q` value crossing a call has no legal colour at
 all (AAPCS64 §6.1.2 preserves only the low half of v8–v15), which isel avoids by
 parking every quad in memory and `color.rs` now reports as a named error rather
 than silently truncating.
+
+---
+
+## §13a R1 GROUND METRIC (box, 2026-08-25, HEAD `7279b36`) — the origin for R2
+
+The number every R2/R3 pass is measured against. It is *deliberately* the worst
+this branch will ever look: R1 has NO optimization pass at all, and §14's
+storage model keeps every C local in memory.
+
+- **sqlite3.c static insns**: zcc **473,253** vs gcc-O1 **157,883** = **2.997×**
+  (rc3, fully optimized, was 279,161 = 1.768×). gcc's count reproduces §13's
+  157,883 exactly, which is what validates the counting method.
+- **geo40 INSN** (deterministic, all 35): geomean **2.5168**, median 2.400,
+  worst `c2_bitfield` 3.981, 35/35 above 1.1×.
+- **geo40 EXEC** (noisy arbiter, 19 measurable): geomean **4.4077**, median
+  6.133, worst `g3_reverse` 8.231. Nine programs in the **gcc-zeroed bucket**
+  (gcc-O1 deletes the loop entirely) — asymptotic, kept out of the geomean.
+- **Mnemonic composition of sqlite** — the fact that steers R2/R3, because it
+  says WHERE the mass is rather than that there is mass:
+
+  | mnemonic | count | share |
+  |---|---|---|
+  | `add` | 133,264 | **28.2%** |
+  | `ldr` | 90,906 | 19.2% |
+  | `mov` | 59,224 | 12.5% |
+  | `str` | 31,128 | 6.6% |
+  | `cmp` | 14,470 | 3.1% |
+  | `cset` | 13,161 | 2.8% |
+  | `bl` | 13,078 | 2.8% |
+  | `sxtw` | 11,477 | 2.4% |
+  | `ldp`/`stp`/`csel`/`ldrsw` | 0 | — |
+
+  `add` at 28% is one fact, not a diffuse cost: every local access is a
+  `SlotAddr` (one `add`, two when the frame exceeds imm12) followed by a `ldr`,
+  because R0/R1 address every local through the parser's frame block. Two
+  scheduled passes remove almost all of it — **R2.2 SROA+mem2reg** (the local
+  stops being memory) and **R3.1 addressing modes** (`Slot{s,off}` folds into
+  the load, deleting the `add` even where the local stays). The four zeros are
+  the R3.2/R3.1 rows that have not been written yet, not a measurement gap.
+- frame-slot mem-ops 12,253 — recorded but NOT the rc3-comparable KPI (see the
+  R1 measurement row).
+- Gate at this commit: cargo **52/0** · cases 74/75 (only the adjudicated
+  `float_h`) · ext 19/19 · abi/alg/cpp/shape/decay PASS · determinism 85 × 8 ·
+  torture **1470 pass / 0 FAIL** / 224 not-impl · csmith300 **254 PARITY / 0
+  DIVERGE** · yarpgen300 **300 PARITY / 0 DIVERGE**.
+- Reproduce: `ZCC=/usr/local/bin/zcc GCC=gcc SQLITE=/suites/sqlite/sqlite3.c sh
+  tests/bench/corpus25.sh` and `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
 
 ---
 
