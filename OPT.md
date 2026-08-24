@@ -22,7 +22,18 @@
 > not. Every session opens by re-reading §0. Every lever starts from §0's ledger. We drifted
 > before because the plan lived in conversation and vanished — this section is the fix.
 
-### ⚡ PRIMARY TARGET = EXEC SPEED (user directive 2026-08-24, standing) — SIZE FOLLOWS, IS NOT THE TARGET
+### 🎯 THE ULTIMATUM (user, 2026-08-24) — grind to **1× on BOTH size AND speed** vs gcc-O1, formally verified throughout
+
+> **The finish line (điểm dừng) is: sqlite size ≈ 1.0× AND geo40 exec ≈ 1.0× vs gcc-O1, with the
+> compiler's correctness-by-construction INTACT — every pass shipped under its commuting-square /
+> translation-validation proof (Law 3). Both axes to 1×, or it is not done.** This is the ultimate
+> goal; it does NOT stop at a speed number. SPEED is the current *ordering* focus (⚡ below) because
+> speed wins drag size down as a byproduct — but the *stopping point* is BOTH at 1×. The last stretch
+> to size-1× requires the nuclear SSA regalloc (#25), which is gated on the user's "go nuclear"; the
+> autonomous grind takes 17→24 as far as it can, then waits at #25. Formal verification is never
+> traded for a number — a pass that cannot ship its proof does not ship.
+
+### ⚡ CURRENT FOCUS = EXEC SPEED (ordering lever toward the ultimatum) — SIZE FOLLOWS, BOTH must reach 1×
 
 > **From now on the finish-line metric is EXEC SPEED vs gcc-O1, measured as the geomean over the
 > ~35-program taxonomy suite (`tests/bench/suite/*.c`) = "geo40" — NEVER the 4-kernel `bench.sh`
