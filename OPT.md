@@ -141,7 +141,7 @@
 | # | lever | dim | batch / note |
 |---|---|---|---|
 | 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⚠️ pass shipped PROVEN but default-OFF + ✅ banked spin-off. See note ⓱ |
-| 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⬜ B1 — every ptr-walk, −1 add/iter |
+| 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⛔ same-block core already ✅ (lever 5, 147 folds); cross-block extension ABANDONED — measured exec-NEUTRAL + unsafe-dominant. See note ⓲ |
 | 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ⬜ B2 — j5/h1/j2/d2 |
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ⬜ B3 — AAPCS64 §5.4/5.5 |
 | 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5 |
@@ -152,7 +152,7 @@
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #18 (loop pointer pre/post-index).**
+only path to size *and* speed ≈ 1.0×. **RESUME = #19 (hot-loop body: IV-simplification + in-loop strength-reduce + residency).**
 
 > **⓱ #17 LOOP ROTATION — outcome (session 2026-08-24).** Implemented `opt::loop_rotate` (post-`out_of_ssa`
 > CFG reshape: top-test → bottom-test + entry guard) with its commuting-square proof (`loop_rotate_preserves`
@@ -170,6 +170,28 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #18 (loop pointer pre/post-i
 > polarity fix in `emit_term`'s `Br` — `cbz/cbnz` emitted a 2-insn form even when a successor was the ADJACENT
 > block; now mirrors `emit_cbr` (fall into the adjacent successor, one conditional branch). Both-axes win:
 > perfn **1.771×→1.767×**, exec **~1.75×→1.67×**. Full gate green. **RESUME = #18.**
+
+> **⓲ #18 POINTER PRE/POST-INDEX — outcome (session 2026-08-24). ⛔ ABANDONED on the default-ON path;
+> the valuable core was already shipped.** Decomposed the residual of the existing same-block `post_index`
+> peephole (asm layer, `peephole.rs`) against the live suite:
+> - **Same-block adjacent `mem [xP]; add xP,xP,#k` → ALREADY FOLDS** (lever 5). Empirically **147 post-index
+>   folds already fire** across the 35-program suite (`grep '], #k'`). The clean, high-value case is DONE.
+> - **Cross-block, IV-live-at-exit (the strlen/find shape) → FUNDAMENTALLY UNSAFE (Law-4 category (a), a
+>   semantic boundary — NOT a convenience truncation).** In the unrotated bottom-test loop the exit branch
+>   (`cbz`) fires BEFORE the latch's `add xP,#k`; the base points at the sentinel and is LIVE at exit
+>   (`sub x0,x19,x1`). Post-indexing writes back on the exiting iteration → base one PAST the sentinel →
+>   `p-s` off-by-one. Proven at the middle (Law 3), no build needed. gcc reaches strlen-tightness only via
+>   ROTATION (#17) — which we measured exec-neutral and shipped default-OFF.
+> - **Cross-block, IV-dead-at-exit (redux shape) → SAFE but needs CFG+liveness infra (not a peephole), and
+>   MEASURED exec-NEUTRAL.** Hand-applied BOTH available folds to a redux hot loop (2 adds/iter → 0, the
+>   best case) and timed base vs folded (both correct, exit 0): base best **4596ms**, folded best **4662ms**
+>   — neutral-to-slightly-negative. The loop is bound by its two `ldrsw` loads; the ALU adds hide in the
+>   load-latency shadow (memory-bound backend). Identical arbiter verdict to #17.
+> ⟹ Building a CFG-level IV-post-index dataflow pass would ship a size-only, **exec-arbiter-NULL** transform
+> with real miscompile risk on the dominant (strlen) shape, during the SPEED-focused era. NO-PIVOT: measured
+> neutral → quarantine-mark-advance. No `src/` change; tree unchanged at `d4461a1` (still fully green). The
+> per-iteration residency floor these loop-shape levers keep hitting only falls to **#25 (nuclear regalloc,
+> home-primary → register-primary)** — the backend value-model rewrite, not a loop-shape peephole. **RESUME = #19.**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 
