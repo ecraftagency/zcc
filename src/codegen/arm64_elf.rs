@@ -4701,6 +4701,117 @@ fn parse_frame_ldst(t: &str) -> Option<(bool, u32, &str)> {
     mem.starts_with("[sp,").then_some((is_load, n, mem))
 }
 
+/// SHIFTED-REGISTER ARITHMETIC FUSION [Phase 3.1]. ARMv8 add/sub take a shifted second source in
+/// ONE instruction: `add Xd, Xn, Xm, lsl #s`. A strength-reduced scaled index emits `lsl xT,xM,#s
+/// ; add xD,xA,xT` (base + index·2^s). When the add OVERWRITES the shift's destination (xD==xT)
+/// and its first source is independent (xA≠xT), the shift folds into the add and the `lsl` is
+/// deleted. Soundness: xM is unchanged between the (adjacent) shift and add, so the fused
+/// `add xD,xA,xM,lsl #s` reads the same value the `lsl` did; xT's shifted value had exactly one
+/// consumer (this add) and xD==xT redefines it, so no later reader sees the removed intermediate.
+/// Identical for `sub`. Register width (x/w) must match across all three.
+fn fuse_shifted_arith(body: &str) -> String {
+    // "lsl {r}D, {r}M, #s" with D,M same width prefix → (r, D, M, s)
+    fn plsl(t: &str) -> Option<(char, u32, u32, u32)> {
+        let rest = t.trim().strip_prefix("lsl ")?;
+        let mut it = rest.split(',');
+        let (d, m, s) = (it.next()?.trim(), it.next()?.trim(), it.next()?.trim());
+        if it.next().is_some() {
+            return None; // a 4th operand ⟹ already shifted — not our form
+        }
+        let (r, rm) = (d.chars().next()?, m.chars().next()?);
+        let sh: u32 = s.strip_prefix('#')?.parse().ok()?;
+        (r == rm).then_some((r, d[1..].parse().ok()?, m[1..].parse().ok()?, sh))
+    }
+    // "add|sub {r}D, {r}A, {r}T" — three PLAIN regs, no shift/imm/memory → (mn, r, D, A, T)
+    fn padd(t: &str) -> Option<(&str, char, u32, u32, u32)> {
+        let t = t.trim();
+        let (mn, rest) = t
+            .strip_prefix("add ")
+            .map(|r| ("add", r))
+            .or_else(|| t.strip_prefix("sub ").map(|r| ("sub", r)))?;
+        let mut it = rest.split(',');
+        let (d, a, s) = (it.next()?.trim(), it.next()?.trim(), it.next()?.trim());
+        if it.next().is_some() || s.contains('#') || s.contains('[') || s.contains(' ') {
+            return None;
+        }
+        let r = d.chars().next()?;
+        (a.chars().next()? == r && s.chars().next()? == r)
+            .then_some((mn, r, d[1..].parse().ok()?, a[1..].parse().ok()?, s[1..].parse().ok()?))
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let (Some((r1, dl, m, s)), Some((mn, r2, dd, a, tt))) =
+            (plsl(lines[i]), lines.get(i + 1).and_then(|l| padd(l)))
+        {
+            if r1 == r2 && dd == dl && tt == dl && a != dl {
+                _ = writeln!(out, "\t{mn} {r1}{dd}, {r1}{a}, {r1}{m}, lsl #{s}");
+                i += 2;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
+/// EXTENDED-REGISTER ARITHMETIC FUSION [Phase 3.1, sxtw arm]. ARMv8 add/sub take a sign-extended
+/// 32-bit second source with a scale in ONE instruction: `add Xd, Xn, Wm, sxtw #k` (k ∈ 0..=4).
+/// A scaled index off a signed `int` emits `sxtw xT,wS ; add xD,xB,xT[,lsl #k]` (widen the index,
+/// then base + index·2^k). When the add OVERWRITES the sxtw dest (xD==xT) and the base is
+/// independent (xB≠xT), both fold: the sxtw and the shift vanish into the add's extend field.
+/// Soundness: xT = sext(wS), so xB + (xT≪k) = xB + (sext(wS)≪k) — exactly the extended-add; wS is
+/// unchanged across the adjacent pair, and xT (single-consumer, redefined by xD==xT) leaves no
+/// later reader. Only fires for k ≤ 4 (the extend-shift encoding range). Identical for `sub`.
+fn fuse_sxtw_extend(body: &str) -> String {
+    // "sxtw xT, wS" → (T, S)
+    fn psxtw(t: &str) -> Option<(u32, u32)> {
+        let mut it = t.trim().strip_prefix("sxtw ")?.split(',');
+        let d = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
+        let s = it.next()?.trim().strip_prefix('w')?.parse().ok()?;
+        it.next().is_none().then_some((d, s))
+    }
+    // "add|sub xD, xB, xT[, lsl #k]" (x-form) → (mn, D, B, T, k); k defaults 0, capped ≤4.
+    fn paddx(t: &str) -> Option<(&str, u32, u32, u32, u32)> {
+        let t = t.trim();
+        let (mn, rest) = t
+            .strip_prefix("add ")
+            .map(|r| ("add", r))
+            .or_else(|| t.strip_prefix("sub ").map(|r| ("sub", r)))?;
+        let mut it = rest.split(',');
+        let d = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
+        let b = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
+        let tt = it.next()?.trim().strip_prefix('x')?.parse().ok()?;
+        let k: u32 = match it.next() {
+            None => 0,
+            Some(sh) => sh.trim().strip_prefix("lsl #")?.parse().ok()?,
+        };
+        (it.next().is_none() && k <= 4).then_some((mn, d, b, tt, k))
+    }
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if let (Some((tt, s)), Some((mn, d, b, t2, k))) =
+            (psxtw(lines[i]), lines.get(i + 1).and_then(|l| paddx(l)))
+        {
+            if d == tt && t2 == tt && b != tt {
+                let sh = if k == 0 { String::new() } else { format!(" #{k}") };
+                _ = writeln!(out, "\t{mn} x{d}, x{b}, w{s}, sxtw{sh}");
+                i += 2;
+                continue;
+            }
+        }
+        out.push_str(lines[i]);
+        out.push('\n');
+        i += 1;
+    }
+    out
+}
+
 /// FRAME-ADJUST FUSION [Phase 1.2]. The prologue subtracts the fixed frame (`sub sp,sp,#fframe`)
 /// and the IR body then subtracts its temp-spill slab (`sub sp,sp,#ir_tspill`) — two phases of
 /// frame sizing emit two adjustments. When they land ADJACENT (nothing in between depends on the
@@ -5072,6 +5183,12 @@ pub fn emit_ir(ast: &Ast) -> String {
             }
             // …and collapse `cmp Rn,#0; b.eq/ne` → `cbz/cbnz Rn` (pure control flow, volatile-safe).
             body = cbz_fuse(&body);
+            // …and fuse a strength-reduced scaled index `lsl xT,xM,#s; add xD,xA,xT` (xD==xT)
+            // into one shifted-register `add xD,xA,xM,lsl #s` (pure ISA identity, volatile-safe).
+            body = fuse_shifted_arith(&body);
+            // …then absorb a preceding signed-index widening `sxtw xT,wS; add xD,xB,xT[,lsl #k]`
+            // (k≤4) into the add's extend field: `add xD,xB,wS,sxtw #k` (drops the sxtw + shift).
+            body = fuse_sxtw_extend(&body);
         }
         let c_move = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.ldst_pair && !f.has_volatile {
@@ -5335,6 +5452,82 @@ mod tests {
     fn redundant_load_survives_directive() {
         let out = drop_redundant_loads("\tstr x0, [sp, #24]\n\t.p2align 3\n\tldr x0, [sp, #24]\n");
         assert_eq!(count(&out, "ldr x0, [sp, #24]"), 0, "a directive does not break adjacency");
+    }
+
+    use super::fuse_sxtw_extend;
+
+    // Phase 3.1 (sxtw arm): `sxtw xT,wS; add xD,xB,xT,lsl #k` (xD==xT) folds to one extended-add
+    // `add xD,xB,wS,sxtw #k` — the widen and the shift both vanish.
+    #[test]
+    fn sxtw_extend_fuses_scaled_index() {
+        let body = "\tsxtw x0, w20\n\tadd x0, x19, x0, lsl #2\n";
+        let out = fuse_sxtw_extend(body);
+        assert_eq!(count(&out, "add x0, x19, w20, sxtw #2"), 1, "sxtw+shift fold into extend");
+        assert_eq!(count(&out, "sxtw x0, w20"), 0);
+    }
+
+    // k=0 (element size 1): a plain `sxtw xT,wS; add xD,xB,xT` folds to `add xD,xB,wS,sxtw`.
+    #[test]
+    fn sxtw_extend_k0() {
+        let body = "\tsxtw x5, w6\n\tadd x5, x7, x5\n";
+        let out = fuse_sxtw_extend(body);
+        assert_eq!(count(&out, "add x5, x7, w6, sxtw"), 1, "no shift ⟹ bare sxtw extend");
+        assert_eq!(count(&out, "sxtw x5, w6"), 0, "the standalone widen is gone");
+    }
+
+    // TEETH: extend-shift encoding is 0..4 — a larger scale (#5) has no extended-add form, keep.
+    #[test]
+    fn sxtw_extend_respects_shift_range() {
+        let body = "\tsxtw x0, w1\n\tadd x0, x2, x0, lsl #5\n";
+        let out = fuse_sxtw_extend(body);
+        assert_eq!(count(&out, "sxtw x0, w1"), 1, "shift 5 > 4 ⟹ no extended-add ⟹ keep");
+    }
+
+    // TEETH: base must differ from the widened index (xB≠xT) or the fold reads the wrong slot.
+    #[test]
+    fn sxtw_extend_keeps_when_base_is_index() {
+        let body = "\tsxtw x0, w1\n\tadd x0, x0, x0, lsl #2\n";
+        let out = fuse_sxtw_extend(body);
+        assert_eq!(count(&out, "sxtw x0, w1"), 1, "xB==xT ⟹ no fuse");
+    }
+
+    use super::fuse_shifted_arith;
+
+    // Phase 3.1: a scaled index `lsl xT,xM,#s; add xD,xA,xT` with the add overwriting the shift
+    // dest (xD==xT) fuses to one `add xD,xA,xM,lsl #s`; the lsl is deleted.
+    #[test]
+    fn shifted_add_fuses_scaled_index() {
+        let body = "\tsxtw x0, w20\n\tlsl x0, x0, #2\n\tadd x0, x19, x0\n";
+        let out = fuse_shifted_arith(body);
+        assert_eq!(count(&out, "add x0, x19, x0, lsl #2"), 1, "shift folds into the add");
+        assert_eq!(count(&out, "lsl x0, x0, #2"), 0, "the lsl is removed");
+    }
+
+    // w-form and sub variants fuse the same way.
+    #[test]
+    fn shifted_sub_wform_fuses() {
+        let body = "\tlsl w3, w4, #3\n\tsub w3, w5, w3\n";
+        let out = fuse_shifted_arith(body);
+        assert_eq!(count(&out, "sub w3, w5, w4, lsl #3"), 1);
+    }
+
+    // TEETH: the add must OVERWRITE the shift dest (xD==xT). If xD≠xT the shifted value xT may be
+    // read later — fusing would drop a live definition. Left untouched.
+    #[test]
+    fn shifted_add_keeps_when_dest_differs() {
+        let body = "\tlsl x0, x1, #2\n\tadd x2, x19, x0\n";
+        let out = fuse_shifted_arith(body);
+        assert_eq!(count(&out, "lsl x0, x1, #2"), 1, "xD≠xT ⟹ xT may be live ⟹ no fuse");
+        assert_eq!(count(&out, "add x2, x19, x0"), 1);
+    }
+
+    // TEETH: the add's FIRST source must not be the shift dest (xA≠xT) — else the fused add would
+    // read xT's pre-shift value from the wrong slot.
+    #[test]
+    fn shifted_add_keeps_when_first_src_is_shift() {
+        let body = "\tlsl x0, x1, #2\n\tadd x0, x0, x0\n";
+        let out = fuse_shifted_arith(body);
+        assert_eq!(count(&out, "lsl x0, x1, #2"), 1, "xA==xT ⟹ unsafe ⟹ no fuse");
     }
 
     use super::fuse_sp_adjust;

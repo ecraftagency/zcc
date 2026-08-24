@@ -52,6 +52,19 @@ pub(crate) fn algebraic_identity(d: Tmp, op: Op, ty: TypeId, a: Val, b: Val) -> 
             if is0(a) || is0(b) { return zero; } // x * 0 = 0 (absorbing)
             if is1(b) { return copy(a); }
             if is1(a) { return copy(b); }
+            // STRENGTH REDUCTION x * 2^k → x << k (THEORY §A7, ℤ/2^n): over two's-complement
+            // the low `width` bits of x·2^k and x≪k are IDENTICAL for signed AND unsigned
+            // (signed overflow is UB, so ≪ is always a valid realization of the product). Only a
+            // constant power-of-two operand; the shift amount is the trailing-zero count. This
+            // is the size/speed win — the backend lowers Shl(x,Imm k) to one `lsl` (no `mov #c;
+            // mul`). Not applied to Div (signed ÷2^k rounds toward 0, ≫ toward −∞ — unsound).
+            let pow2 = |c: i64| c > 0 && (c & (c - 1)) == 0;
+            if let Val::Imm(c) = b {
+                if pow2(c) { return Some(Inst::Bin(d, Op::Shl, ty, a, Val::Imm(c.trailing_zeros() as i64))); }
+            }
+            if let Val::Imm(c) = a {
+                if pow2(c) { return Some(Inst::Bin(d, Op::Shl, ty, b, Val::Imm(c.trailing_zeros() as i64))); }
+            }
         }
         Op::Div => {
             if is1(b) { return copy(a); } // x / 1 = x  (NOT x/−1: INT_MIN UB)
