@@ -191,6 +191,25 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #24 (SCEV final-value + loop
 >   SAME-SESSION vs the rebuilt pre-#19 baseline **1.6484×** ⟹ Δ −0.09% (neutral, NO regression).
 >   NB the #17 note's "~1.67×" was a different session/machine — do NOT diff absolute numbers across
 >   sessions; rebuild `zcc_old` and A/B, as done here.
+>
+> **📏📏 HONEST SCOREBOARD — POST #20/#21, PAIRED METRIC (session S5, 2026-08-24; via the patched
+> `tests/bench/exectime.sh`). The single-number geo40 was FLATTERING — it hid zcc's worst cases. The
+> paired, hole-closed picture (user directive: "the worst thing is action on wrong information"):**
+> - **INSN 1.71× — deterministic, over ALL 34 matched programs** (static `-S` user-code insn ratio, zero
+>   timer noise; median 1.68, worst f3_float_minmax 3.28, **34 of 34 above 1.1×** — EVERY program emits
+>   more than gcc-O1). **THIS is the trustworthy headline** — a catamorphism over the emitted stream, not
+>   a clock. It cannot see memory-boundedness, so it is a proxy, not the arbiter.
+> - **EXEC 1.55× — the arbiter but NOISY, only 19 timeable programs** (median 1.41, worst i1_global_acc
+>   4.37, 12>1.1×). Below ~30ms wall-time the ms-granularity ratio is ±25% noise (e3/e4/a1–a4 etc = not
+>   trustworthy alone → read their INSN column). EXEC<INSN because it (a) excludes the 6 gcc-zeroed cases
+>   and (b) gives memory-bound insns a free pass.
+> - **gcc-ZEROED bucket (6): b4/c1/c2/c3/f3/j1 — gcc≈0ms, zcc 23–103ms** (gcc-O1 eliminated the loop via
+>   SCEV final-value / loop-DCE; asymptotic O(1)-vs-O(n) gaps, NOT constant-factor). These were SILENTLY
+>   SKIPPED by the old harness — the largest real gaps, now COUNTED. Closing them = **#24**.
+> - **VERDICT on "is geo40≈1× = gcc-O1 parity?" → NO.** Parity requires ALL of: exec≈1.0 AND insn≈1.0
+>   AND a flat distribution (nothing systematically >1.1×) AND the gcc-zeroed bucket EMPTY AND sqlite
+>   size≈1.0. Today: insn 1.71 (all lose), exec 1.55 (fat tail to 4.37), 6 asymptotic gaps, size ~1.75×.
+>   Complement with `perfn.sh` for the per-FUNCTION insn breakdown (finer than per-program).
 
 > **⓱ #17 LOOP ROTATION — outcome (session 2026-08-24).** Implemented `opt::loop_rotate` (post-`out_of_ssa`
 > CFG reshape: top-test → bottom-test + entry guard) with its commuting-square proof (`loop_rotate_preserves`
