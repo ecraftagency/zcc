@@ -41,40 +41,104 @@
 > insns. Measure geo40 exec (box harness) as the scoreboard each lever; perfn insn-count stays a
 > cheap proxy but exec-time is the arbiter. See [[zcc-speed-metric-geo40]].
 
-### 🏁 SPEED-FIRST BATCH PLAN (authored 2026-08-24 S4 for next session; RESUME at first ⬜)
+### 📜 THE SUPREME PLAN — the single spine + the one iteration process (constitutional; parallel to the three Laws)
 
-> **Ranked by EXEC-speed impact (geo40), grounded in the S4 timing run + `mystrlen` hot-loop
-> diagnosis.** Each batch: full gate (cargo + torture + opt-parity + csmith300 + yarpgen300) then
-> re-measure geo40 (`/tmp/exectime.sh` in `zccbox`, or rebuild it — see [[zcc-ssa-qbe-ops-resume]]).
-> Bank per commit. NO-PIVOT still binds: a low-yield batch is quarantine-mark-advance, not a re-plan.
-> **DIAGNOSTIC PROOF (`mystrlen`, the pattern):** zcc inner loop = `ldrb [x0]; cbnz; add x0,#1; b`
-> = 4 insn / 2 branches per iter; gcc = `ldrb [x1,1]!; cbnz` = 2 insn / 1 branch. The 2× is exactly
-> loop-rotation (kill the uncond back-edge `b`) + pointer index-fold (`[p],#1`). Loop levers were
-> LOW priority for sqlite *size* but are #1 for *speed* — the pivot promotes them to the front.
+> **Why this exists (the anti-drift constitution).** The Laws (`CLAUDE.md`) are the supreme *law* —
+> what is true. THIS is the supreme *plan* — what we DO, and in what order, forever, until gcc-O1
+> parity. We lost the thread repeatedly because the plan kept getting RE-NUMBERED in new sections
+> each session (old `[0–9]` → Phases `1.x–5.x` → batches `B0–B4` = three schemes for one body of
+> work). **That fragmentation is now forbidden.** There is exactly ONE numbered spine below
+> `[1…25]`; every other plan-shaped thing in this file (the §1 ledger, the §0-DDP catalog, the
+> batch plan) is SUBORDINATE — provenance and execution-grouping, never a parallel authority.
+>
+> **THE ANTI-FRAGMENTATION LAW (binds every future session):**
+> 1. **One spine.** The table below is the ONLY sequence-of-record. Never author a new numbering
+>    scheme in a new section. To change the plan you EDIT THIS TABLE IN PLACE — append a row, flip a
+>    status, retag a dimension. A session that invents `B5`/`Phase 6.2`/`lever 26` in prose instead
+>    of editing this table has already drifted.
+> 2. **Status is the memory.** Each row carries ✅ DONE / ⬜ TODO / ⚠️ QUARANTINED / ⛔ ABANDONED /
+>    🔒 GATED. Resume = the first ⬜. No session re-derives "where are we" from chat — it reads this.
+> 3. **Nuclear is always last** (#25). Nothing is appended after it; new levers insert BEFORE it.
+> 4. **Dimension tag is mandatory** on every row: **SIZE** (static insns only) · **SPEED** (hot-path
+>    cycles only) · **BOTH**. It records which axis the lever strikes so a focus-shift re-ranks, never
+>    re-writes.
+>
+> **THE ONE ITERATION PROCESS (every lever, no exceptions — Law 3 made mechanical):**
+> `pick first ⬜ → cite theorem(r1)/spec(r2) → PREDICT Δ on the cost-model BEFORE patching →
+> implement + ship its commuting-square / translation-validation as an inline test → FULL GATE
+> (cargo + torture + opt-parity + csmith300 + yarpgen300) → re-measure the scoreboard (geo40 exec,
+> the arbiter; perfn/sqlite = cheap proxies) → BANK (commit, flip row to ✅, record Δ) OR
+> QUARANTINE (revert to last green, mark ⚠️ with reason) → ADVANCE to next ⬜.` A low yield / a
+> miscompile / a wall is NEVER a re-plan — it is bank-or-quarantine-then-advance (NO-PIVOT §0). The
+> only thing that reorders the spine is the user typing **"re-plan"**; the only thing that fires #25
+> is the user typing **"go nuclear."**
+>
+> **Focus pivoted size→speed at row #17 (2026-08-24):** everything ≤16 was banked under the SIZE
+> metric (history); everything ≥17 is ranked by EXEC-SPEED (geo40). The pivot re-ranked the spine —
+> it did NOT renumber it. That is the anti-fragmentation law working as intended.
 
-- **⬜ Batch 0 — DIAGNOSE (½ session, cheap, aims everything).** Dump the hot loop of every suite
-  program with exec-ratio > 1.5× (j5, g2✓, h1, i1, f2, e2, d2, d3, g3). Classify each: loop-shape /
-  index-arith / call-boundary / FP / loop-value. Write findings here. Do NOT build blind.
-- **⬜ Batch 1 — LOOP SHAPE (highest-confidence speed win).** (a) **loop-rotation** (catalog 2.1):
-  make the conditional branch the back-edge, delete the unconditional `b` — −1 branch/iter, EVERY
-  loop. (b) **pointer pre/post-index**: fuse `add p,#k` into the mem op → `ldrb [p],#k` / `[p,#k]!`
-  — −1 add/iter, every ptr-walk. Hits: g2 (2.0×→~1.15), g3_reverse (1.69), b1_ptr_walk, d1/d2/d3.
-  **Predicted geo40 → ~1.58×.**
-- **⬜ Batch 2 — HOT-LOOP BODY** (index-arith address-recompute, strength-reduction 2.3, redundant
-  in-loop sxtw/spill). Hits: j5_insertion_sort (3.95×, the 3.7 s monster), h1_popcount (1.89×),
-  j2_histogram (1.70×), d2_nested_loops (2.0×). **Predicted geo40 → ~1.48×.**
-- **⬜ Batch 3 — CALL-BOUNDARY + FP** (5.4 many-arg marshalling, 5.3 struct-by-value/HFA, FP value
-  residency). Hits: e2_many_args (5.5×), i1_global_acc (4.3×), f2_double_poly (3.8×). **Predicted
-  geo40 → ~1.35–1.45×** (optimistic; spikes may floor higher on the residency tax).
-- **⬜ Batch 4 — LOOP-VALUE ANALYSIS (SCEV final-value + loop-DCE) — NEW infra, needs explicit go.**
-  The `gcc=0ms` cases where gcc-O1 computes a loop's closed-form result / deletes a dead loop and zcc
-  runs it full (j1_reduction, c2-loop, f3, b4). Big lift, biggest per-program speed prize. NOT in the
-  old catalog — flag to user before building.
+**━━ PART A · DONE (size era, banked — history) ━━**
 
-**ESTIMATE (honest):** **~1.5× is the solid target** for the in-scope loop+call batches (B1–B3, no
-nuclear). **1.4× stretch** if spikes compress cleanly; **1.6× floor** if only B1 lands. Below 1.4×
-→ 1.0× needs Batch 4 (SCEV) AND the nuclear SSA regalloc (Phase 6, 🔒 still gated) for the
-per-iteration residency floor. **RESUME POINTER (speed track): Batch 0 (diagnose) → Batch 1.**
+| # | lever | dim | status / banked |
+|---|---|---|---|
+| 1 | csel → sxtw dead-extend elim | SIZE | ✅ −3,381 (`c7cf2f3`) |
+| 2 | `ubfx`/`sbfiz` fuse (shift+mask→1) | BOTH | ✅ −252 |
+| 3 | redundant-sxtw peephole (ldrsw/double/bitwise) | BOTH | ✅ −410 |
+| 4 | `smull`/`umull` fuse (ext+mul→1) | BOTH | ⛔ ABANDONED (fundamental-limit) |
+| 5 | immediate-offset addr forwarding (`t=base+#off`→`[base,#off]`) | SIZE | ✅ −1,664 (`4fa83c8`) |
+| 6 | post-index addressing (`mem[xP]; add xP,#k`→`mem[xP],#k`) | BOTH (hot-loop) | ✅ −102 (`1709d9c`) |
+| 7 | CBZ/CBNZ from bare-truth branches | BOTH | ✅ −3,435 (`c4acd0e`) |
+| 8 | w-form sxtw elim (THE HINGE) | BOTH | ✅ −1,479 (`69c6df5`) |
+| 9 | redundant zero-extend / `uxt` elim | SIZE | ✅ −3,664 (`236fe5c`) |
+| 10 | sieve exec-parity front (`mov#0→wzr` ⊕ const-hoist ⊕ triangle `csel`) | SPEED | ✅ −291 (RC2 `74146e0`) |
+| 11 | single frame-adjust (collapse double `sub sp`) | SIZE | ✅ (`0f09146`) |
+| 12 | local dead-move / cross-block φ-copy DCE | BOTH | ✅ (`0b7ebe9`) |
+| 13 | scaled-index fold + strength-reduce (Phase 3.1/3.2) | BOTH | ✅ (`8cbed69`) |
+| 14 | FP const materialization `fmov d,#imm8` (fold_fp_imm) | BOTH (FP) | ✅ (`423a42d`) |
+| 15 | FP value residency — fmov-residency + `d→x→d` collapse | BOTH (FP) | ✅ (`7259a9b`..`423a42d`) |
+| 16 | bitfield-write `bfi` (RMW 7–9→3) | BOTH | ✅ (`0100982`) |
+| — | leaf-frame elimination (1.1) | SIZE | ⚠️ QUARANTINED (FPO sub-project) |
+| — | switch jump-table (5.1) | SIZE | ⚠️ QUARANTINED (mis-spec: gcc-O1 uses balanced tree, not a table) |
+
+**━━ PART B · TODO (speed era — ranked by geo40 exec impact; = batches B1–B4 below) ━━**
+
+| # | lever | dim | batch / note |
+|---|---|---|---|
+| 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⬜ B1 — every loop, −1 branch/iter |
+| 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⬜ B1 — every ptr-walk, −1 add/iter |
+| 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ⬜ B2 — j5/h1/j2/d2 |
+| 20 | **struct-by-value + HFA** (5.3) | BOTH | ⬜ B3 — AAPCS64 §5.4/5.5 |
+| 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5 |
+| 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⬜ B3 — f2/f3 |
+| 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⬜ re-eval under speed metric (was size-negative → parked; speed lever now) |
+| 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
+| 25 | ☢ **NUCLEAR — SSA global register allocator** (GP+FP class, coalescing, spill-cost model) — subsumes 4.3, kills the uniform residency floor | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
+
+**Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
+and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
+only path to size *and* speed ≈ 1.0×. **RESUME = the first ⬜ (#17, via Batch 0 diagnose → Batch 1).**
+
+#### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
+
+> The "batch" names are just how the spine rows get grouped into sessions; they carry NO independent
+> numbering. Resume order is always the spine's first ⬜, never a batch letter. Kept here only for the
+> diagnostic proof + estimate. **DIAGNOSTIC PROOF (`mystrlen`, the pattern behind #17/#18):** zcc inner
+> loop = `ldrb [x0]; cbnz; add x0,#1; b` = 4 insn / 2 branches per iter; gcc = `ldrb [x1,1]!; cbnz` =
+> 2 insn / 1 branch. The 2× is exactly loop-rotation (#17, kill the uncond back-edge `b`) + pointer
+> index-fold (#18, `[p],#1`). Loop levers were LOW priority for sqlite *size* but are #1 for *speed*.
+
+- **Batch 0 = diagnose** (do first, cheap, no row): dump the hot loop of every suite program with
+  exec-ratio > 1.5× (j5, g2✓, h1, i1, f2, e2, d2, d3, g3); classify loop-shape / index-arith /
+  call-boundary / FP / loop-value; write findings into the row notes. Do NOT build blind.
+- **Batch 1 = rows #17 + #18** (loop shape) → predicted geo40 **~1.58×**. Hits g2/g3/b1/d1-d3.
+- **Batch 2 = row #19** (hot-loop body) → **~1.48×**. Hits j5 (3.7 s monster)/h1/j2/d2.
+- **Batch 3 = rows #20 + #21 + #22** (call-boundary + FP) → **~1.35–1.45×**. Hits e2/i1/f2/f3.
+- **Batch 4 = row #24** (SCEV final-value + loop-DCE) — NEW infra, the `gcc=0ms` cases (j1/c2/f3/b4);
+  needs explicit user go. (Row #23 LICM slots wherever its speed re-eval lands.)
+
+**ESTIMATE (honest):** **~1.5× solid target** for the in-scope rows 17–22 (no nuclear). **1.4× stretch**
+if spikes compress cleanly; **1.6× floor** if only #17/#18 land. Below 1.4× → 1.0× needs #24 (SCEV) AND
+#25 (nuclear regalloc) for the per-iteration residency floor. **RESUME = spine's first ⬜ = #17.**
 
 ---
 
