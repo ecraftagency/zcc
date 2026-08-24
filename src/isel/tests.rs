@@ -14,10 +14,22 @@ use crate::hir::{self, interp as hi};
 use crate::mir::{interp as mi, verify as mv};
 use crate::testutil::frontend;
 
-/// Run `main` through both layers and require agreement.
+/// Run `main` through both layers and require agreement — once on raw HIR and
+/// once on HIR after the §4 pass ladder, because a selection rule can be
+/// unreachable until a pass folds its input into shape (the literal-address case
+/// below is exactly that).
 fn equiv(src: &str) {
+    equiv_side(src, false);
+    equiv_side(src, true);
+}
+
+fn equiv_side(src: &str, opt: bool) {
     let ast = frontend(src);
-    let h = hir::build::build(&ast);
+    let mut h = hir::build::build(&ast);
+    if opt {
+        hir::pass::run_module(&mut h);
+    }
+    let h = h;
     for f in &h.funcs {
         hir::verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
     }
@@ -337,4 +349,17 @@ fn abi_classification_matches_the_spec() {
     // the counters `va_start` publishes, after the NAMED parameters only
     let a = classify(&sig(vec![PTy::S(Ty::I32), PTy::S(Ty::F64), PTy::S(Ty::I32)], None));
     assert_eq!((a.ngrn, a.nsrn, a.nsaa), (2, 1, 0));
+}
+
+#[test]
+fn a_null_address_is_materialized_not_ridden_in_zr() {
+    // DDI 0487 C1.2.5: Rn = 31 in a load/store decodes as SP, not ZR. A data
+    // operand may ride in the zero register for free; a BASE may not. The HIR
+    // ladder is what makes this reachable — `*(char *)0 = 0` only becomes a
+    // literal address after the cast folds (torture 930719-1). `mir::verify`
+    // now refuses it, so this battery fails at the MIR layer rather than in the
+    // assembler.
+    equiv("int main(void){char *p = (char *)0; if (0) *p = 0; return 0;}");
+    equiv("int f(int c){if(c) *(char *)0 = 0; return c;}int main(void){return f(0);}");
+    equiv("int f(int c){if(c) return *(char *)0; return 7;}int main(void){return f(0);}");
 }

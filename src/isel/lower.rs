@@ -164,6 +164,16 @@ impl<'a> L<'a> {
         }
     }
 
+    /// The BASE register of a memory access. DDI 0487 C1.2.5: in the load/store
+    /// addressing forms, register 31 in the Rn field decodes as SP, not ZR — so a
+    /// null address folded to `Imm(0)` must be materialized into a real register
+    /// rather than ridden for free in the zero register the way a data operand is.
+    /// (Found by torture `930719-1`, whose `*(char *)0 = 0` only becomes a literal
+    /// address once the HIR ladder folds the cast.)
+    fn base(&mut self, o: Operand) -> Reg {
+        self.reg_nonzr(o, hir::Ty::I64)
+    }
+
     /// An operand that may ride in an immediate field of `op`.
     fn rhs(&mut self, o: Operand, t: hir::Ty, op: AluOp) -> Rhs {
         if let Operand::Imm(k) = o {
@@ -244,7 +254,7 @@ impl<'a> L<'a> {
                 vol,
                 ..
             } => {
-                let base = self.reg(*addr, hir::Ty::I64);
+                let base = self.base(*addr);
                 let d = self.dst_of(*dst);
                 self.push(MInst::Load {
                     op: memop(*ty),
@@ -260,7 +270,7 @@ impl<'a> L<'a> {
                 vol,
                 ..
             } => {
-                let base = self.reg(*addr, hir::Ty::I64);
+                let base = self.base(*addr);
                 let v = self.reg(*val, *ty);
                 self.push(MInst::Store {
                     op: memop(*ty),
@@ -672,7 +682,7 @@ impl<'a> L<'a> {
             // never stays live across another call (AAPCS64 §6.1.2 preserves
             // only the low half of v8–v15, so a live quad has no home).
             hir::IntrinKind::LdLoad => {
-                let a = self.reg(args[0], hir::Ty::I64);
+                let a = self.base(args[0]);
                 let q = self.tmp(Width::Q);
                 self.push(MInst::Load {
                     op: MemOp::Q,
@@ -691,7 +701,7 @@ impl<'a> L<'a> {
                 });
             }
             hir::IntrinKind::LdStore => {
-                let a = self.reg(args[0], hir::Ty::I64);
+                let a = self.base(args[0]);
                 let v = self.reg(args[1], hir::Ty::F64);
                 self.push(MInst::ParallelCopy(vec![(Reg::P(PReg::fpr(0)), v, Width::D)]));
                 self.fp_libcall("__extenddftf2");
@@ -783,11 +793,11 @@ impl<'a> L<'a> {
             });
             // the argument list runs in operand order (see `IntrinKind::Asm`)
             if o.mem {
-                let a = self.reg(args[at], hir::Ty::I64);
+                let a = self.base(args[at]);
                 at += 1;
                 ins.push((Reg::P(reg), a, Width::W64));
             } else if o.out {
-                let a = self.reg(args[at], hir::Ty::I64);
+                let a = self.base(args[at]);
                 at += 1;
                 if o.rw {
                     let v = self.reg(args[at], o.ty);
@@ -1105,12 +1115,12 @@ impl<'a> L<'a> {
                         first, n, esz, ..
                     },
                 ) => {
-                    let a = self.reg(*o, hir::Ty::I64);
+                    let a = self.base(*o);
                     let mut ps = self.agg_regs(a, *first, *n, *esz, *size, true);
                     pairs.append(&mut ps);
                 }
                 (hir::PTy::Agg { size, .. }, Loc::StackAgg { off, .. }) => {
-                    let a = self.reg(*o, hir::Ty::I64);
+                    let a = self.base(*o);
                     self.copy_agg(Place::Out(*off), Place::At(a), *size);
                 }
                 (hir::PTy::LDouble, _) => {

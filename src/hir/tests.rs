@@ -23,23 +23,45 @@ fn hir_of(src: &str) -> super::Module {
     m
 }
 
-/// Run `main()` under ⟦hir⟧ and return its value.
-fn run(src: &str) -> Result<i64, Trap> {
+/// Run `main()` under ⟦hir⟧ and return its value. `opt` selects the side of the
+/// commuting square: `false` is `build(parse(src))`, `true` is the same module
+/// after the whole §4 pass ladder.
+fn run_side(src: &str, opt: bool) -> Result<i64, Trap> {
     let ast = frontend(src);
-    let m = build::build(&ast);
+    let mut m = build::build(&ast);
+    if opt {
+        super::pass::run_module(&mut m);
+    }
     for f in &m.funcs {
-        verify::verify(f).unwrap_or_else(|e| panic!("{}", e));
+        verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
     }
     let mut mach = new_machine(&m, &ast);
     mach.call("main", &[]).map(|r| r.unwrap_or(0) as i32 as i64)
 }
 
-/// `src` must evaluate to `want` — the value C99 assigns it.
+fn run(src: &str) -> Result<i64, Trap> {
+    run_side(src, false)
+}
+
+/// `src` must evaluate to `want` — the value C99 assigns it — AND the pass
+/// ladder must not change that.
+///
+/// The second half is the commuting square ⟦f⟧ = ⟦P f⟧ of REARCH §10, applied to
+/// EVERY program in this file rather than to a separate handful: each case was
+/// written to pin one C construct against the standard, so running it on both
+/// sides turns the whole battery into the ladder's proof corpus at no extra
+/// authoring cost. `verify` runs on the optimized side too, so a pass that
+/// breaks dominance or edge arity fails here rather than in isel.
 fn check(src: &str, want: i64) {
-    match run(src) {
+    match run_side(src, false) {
         Ok(got) if got == want => {}
         Ok(got) => panic!("⟦hir⟧ = {} but C99 says {}\n{}", got, want, src),
         Err(t) => panic!("⟦hir⟧ trapped: {:?}\n{}", t, src),
+    }
+    match run_side(src, true) {
+        Ok(got) if got == want => {}
+        Ok(got) => panic!("⟦P f⟧ = {} but ⟦f⟧ = {} — a pass changed the meaning\n{}", got, want, src),
+        Err(t) => panic!("⟦P f⟧ trapped ({:?}) where ⟦f⟧ did not\n{}", t, src),
     }
 }
 

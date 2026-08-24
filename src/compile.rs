@@ -12,9 +12,21 @@
 use crate::ast::Ast;
 
 pub fn compile(ast: &Ast) -> String {
-    let h = phase("hir::build", || crate::hir::build::build(ast));
+    let mut h = phase("hir::build", || crate::hir::build::build(ast));
+    if optimize() {
+        phase("hir::pass", || crate::hir::pass::run_module(&mut h));
+    }
+    let h = h;
     let m = backend(&h).unwrap_or_else(|e| panic!("zcc: internal: {}", e));
     phase("emit", || crate::emit::emit(ast, &m))
+}
+
+/// The HIR pass ladder is ON unless `ZCC_O0` says otherwise. The switch exists
+/// for ONE reason: `tests/opt-parity.sh` compiles every torture program twice and
+/// compares the two runs, which is the whole-compiler confirmation that the
+/// ladder preserves meaning (REARCH §10 — it CONFIRMS; the batteries discover).
+pub fn optimize() -> bool {
+    std::env::var_os("ZCC_O0").is_none()
 }
 
 /// Wall-clock per pipeline stage, printed when `ZCC_TIME` is set. A performance

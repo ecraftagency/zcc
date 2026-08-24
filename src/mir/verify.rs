@@ -80,6 +80,9 @@ pub fn verify(f: &MFunc) -> Result<(), String> {
             if let Err(e) = check_classes(f, inst) {
                 return err(format!("bb{}[{}]: {}", b, i, e));
             }
+            if let Err(e) = check_mem(f, inst) {
+                return err(format!("bb{}[{}]: {}", b, i, e));
+            }
         }
         let at = blk.insts.len() as u32 + 1;
         let mut bad = None;
@@ -317,8 +320,24 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
     Ok(())
 }
 
+/// Every memory operand an instruction carries.
+fn check_mem(f: &MFunc, i: &MInst) -> Result<(), String> {
+    match i {
+        MInst::Load { mem, .. } | MInst::Store { mem, .. } => check_addr(f, mem),
+        _ => Ok(()),
+    }
+}
+
 fn check_addr(f: &MFunc, m: &AddrMode) -> Result<(), String> {
     let gpr = |r: Reg| -> Result<(), String> {
+        // DDI 0487 C1.2.5: in the Rn field of a load/store, register 31 decodes
+        // as SP, NOT as ZR. An address that folded to a literal zero must be
+        // materialized; riding it for free in the zero register — legal for a
+        // data operand — silently assembles as an SP-relative access or is
+        // rejected outright (`strb wzr, [xzr]`, torture 930719-1).
+        if r == Reg::P(crate::mir::isa::ZR) {
+            return Err("zero register used as a memory base (Rn=31 means SP)".into());
+        }
         if f.class_of(r) == Class::Gpr {
             Ok(())
         } else {

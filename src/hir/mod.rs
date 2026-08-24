@@ -14,6 +14,7 @@
 pub mod build;
 pub mod dom;
 pub mod interp;
+pub mod pass;
 #[cfg(test)]
 mod tests;
 pub mod verify;
@@ -77,7 +78,7 @@ impl Operand {
 /// A linker-visible address. `Global`/`Str` index into the `Ast`; `Func`/`Label`
 /// carry the emitted symbol name (a call may name a function never declared as a
 /// global).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Sym {
     Global(u32),
     /// EXT(gcc) `__thread`: the same global, reached through the thread pointer
@@ -667,7 +668,7 @@ impl Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Module {
     pub funcs: Vec<Func>,
 }

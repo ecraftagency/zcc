@@ -382,14 +382,7 @@ impl<'a> Machine<'a> {
             }
             Inst::Un { dst, op, ty, a } => {
                 let x = get(a, vals);
-                vals[*dst as usize] = match op {
-                    UnOp::Neg => mask(0u64.wrapping_sub(x), *ty),
-                    UnOp::Not => mask(!x, *ty),
-                    UnOp::FNeg => match ty {
-                        Ty::F32 => (x as u32 ^ 0x8000_0000) as u64,
-                        _ => x ^ 0x8000_0000_0000_0000,
-                    },
-                };
+                vals[*dst as usize] = eval_un(*op, *ty, x);
             }
             Inst::Cmp { dst, op, ty, a, b } => {
                 let (x, y) = (get(a, vals), get(b, vals));
@@ -606,10 +599,10 @@ pub fn mask(v: u64, ty: Ty) -> u64 {
         _ => v,
     }
 }
-fn sext(v: u64, ty: Ty) -> i64 {
+pub fn sext(v: u64, ty: Ty) -> i64 {
     mask(v, ty) as i64
 }
-fn zext(v: u64, ty: Ty) -> u64 {
+pub fn zext(v: u64, ty: Ty) -> u64 {
     match ty {
         Ty::I8 => v & 0xff,
         Ty::I16 => v & 0xffff,
@@ -624,7 +617,18 @@ fn f64of(v: u64) -> f64 {
     f64::from_bits(v)
 }
 
-fn eval_bin(op: BinOp, ty: Ty, x: u64, y: u64) -> Result<u64, Trap> {
+pub fn eval_un(op: UnOp, ty: Ty, x: u64) -> u64 {
+    match op {
+        UnOp::Neg => mask(0u64.wrapping_sub(x), ty),
+        UnOp::Not => mask(!x, ty),
+        UnOp::FNeg => match ty {
+            Ty::F32 => (x as u32 ^ 0x8000_0000) as u64,
+            _ => x ^ 0x8000_0000_0000_0000,
+        },
+    }
+}
+
+pub fn eval_bin(op: BinOp, ty: Ty, x: u64, y: u64) -> Result<u64, Trap> {
     use BinOp::*;
     if ty.is_float() {
         let r = if ty == Ty::F32 {
@@ -697,7 +701,7 @@ fn eval_bin(op: BinOp, ty: Ty, x: u64, y: u64) -> Result<u64, Trap> {
     Ok(mask(v, ty))
 }
 
-fn eval_cmp(op: CmpOp, ty: Ty, x: u64, y: u64) -> u32 {
+pub fn eval_cmp(op: CmpOp, ty: Ty, x: u64, y: u64) -> u32 {
     use CmpOp::*;
     let r = if op.is_float() {
         let (a, b) = if ty == Ty::F32 {
@@ -736,7 +740,7 @@ fn eval_cmp(op: CmpOp, ty: Ty, x: u64, y: u64) -> u32 {
     r as u32
 }
 
-fn eval_cvt(op: CvtOp, from: Ty, to: Ty, x: u64) -> u64 {
+pub fn eval_cvt(op: CvtOp, from: Ty, to: Ty, x: u64) -> u64 {
     use CvtOp::*;
     match op {
         Sext => mask(sext(x, from) as u64, to),

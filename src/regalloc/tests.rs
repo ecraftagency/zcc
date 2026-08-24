@@ -16,9 +16,21 @@ use crate::mir::interp as mi;
 use crate::testutil::frontend;
 
 /// Compile to virtual MIR, allocate, and require both to compute the same value.
+/// Run on both sides of the §4 pass ladder: optimization changes the shape of
+/// the live ranges the allocator sees (longer values, more pressure), so the
+/// unoptimized side alone would not exercise it the way real code does.
 fn same(src: &str) {
+    same_side(src, false);
+    same_side(src, true);
+}
+
+fn same_side(src: &str, opt: bool) {
     let ast = frontend(src);
-    let h = hir::build::build(&ast);
+    let mut h = hir::build::build(&ast);
+    if opt {
+        hir::pass::run_module(&mut h);
+    }
+    let h = h;
     for f in &h.funcs {
         hir::verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
     }

@@ -28,7 +28,6 @@ oracle-invalid	builtin-types-compatible-p	referee-reject: builtin-types-compatib
 oracle-invalid	eeprof-1	referee-run-fail(UB?)
 oracle-invalid	float-floor	referee-reject: collect2: error: ld returned 1 exit status
 oracle-invalid	loop-2c	referee-reject: collect2: error: ld returned 1 exit status
-oracle-invalid	medce-1	opt-dependent: referee DCE [link_error ], zcc -O0 keeps ref
 oracle-invalid	memclr	referee-reject: memclr.c:45:15: error: expected ')' before ':' token
 oracle-invalid	memcpy-a1	referee-reject: memcpy-ax.h:55:15: error: expected ')' before ':' token
 oracle-invalid	memcpy-a2	referee-reject: memcpy-ax.h:55:15: error: expected ')' before ':' token
