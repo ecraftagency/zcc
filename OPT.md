@@ -147,7 +147,7 @@
 | 21 | **many-arg marshalling** (5.4) | BOTH | ✅ BANKED — GP parallel-move for the >8-arg hazard path (was spill-all/pop-reverse). See note ㉑ |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⚠️ DEFERRED → #25 (FP arm of nuclear regalloc; bounded peephole provably can't fire — cross-block anchor). See note ㉒ |
 | 23 | **LICM / invariant-setup hoist** (2.2) | SPEED | ⚠️ re-eval DONE → stays OFF, deferred → #25 (geo40 +0.31% sub-threshold + size-negative; j2 win needs hotness gating). See note ㉓ |
-| 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED | ⬜ B4 — NEW infra, needs explicit go; the `gcc=0ms` cases (j1/c2/f3/b4) |
+| 24 | **loop-value analysis: SCEV final-value + loop-DCE** | SPEED (asymptotic) | ⬜ B4 — NEW infra, needs explicit go; the 6 `gcc=0ms` cases. FULL EXECUTION BRIEF (target · projection · SUCCESS-KPI · ABANDON-KPI) = note ㉔ |
 | 25 | ☢ **NUCLEAR — SSA global register allocator** (native GP+FP register class, coalescing, spill-cost + hotness model) — the register-primary rewrite that kills the uniform home-primary residency floor. **ABSORBS the deferred residuals of #17/#18/#19/#21/#22/#23** (see note ㉕) | BOTH | 🔒 LAST. GATED on explicit "go nuclear" after 17–24 measured |
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
@@ -357,6 +357,47 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #24 (SCEV final-value + loop
 > size regression on the other ultimatum axis. The j2-class hot-loop win is real but needs a
 > hotness/pressure cost-model to hoist selectively (net-positive on BOTH axes) — that is #25's regalloc
 > cost model, not a bounded flip. NO-PIVOT: measured, sub-threshold, deferred. **RESUME = #24.**
+
+> **㉔ #24 SCEV FINAL-VALUE + LOOP-DCE — EXECUTION BRIEF (authored 2026-08-24 S5; the next session opens HERE).**
+> **NATURE (read first, do not misfile):** #24 is an **ASYMPTOTIC EXEC** lever (kills O(n)→O(1) gaps), NOT
+> a size lever. Its size drop is a byproduct of the eliminated loop. The constant-factor geo40 *geomean*
+> structurally CANNOT display its win (it excludes the affected programs), so judge #24 by the per-program
+> exec + the bucket + absolute total wall-time, NEVER by the geomean headline.
+>
+> **TARGET = the 6 gcc-zeroed programs** (gcc-O1 eliminates the loop; zcc runs full O(n)):
+> `b4_ptr_diff` 27ms · `c1_struct_sum` 25ms · `c2_bitfield` 43ms · `c3_nested_struct` 23ms · `f3_float_minmax` 48ms · `j1_reduction` 103ms (≈269ms total). Most share ONE shape: an outer driver loop
+> `for(k=0;k<K;k++) s += work(a,…)` where `work` is a **loop-invariant PURE call** ⟹ gcc hoists it and
+> multiplies by trip count (invariant-call LICM + reduction final-value). ⟹ #24 likely needs **purity/no-
+> side-effect analysis of the callee** (and possibly **inlining**), not only classic scalar SCEV. Confirm
+> the exact mechanism per case at the middle (Law-3) BEFORE building.
+>
+> **PROJECTION (cost-model, verify lever-by-lever — NOT promised):** on a *successful* #24 —
+> - EXEC geo40 (19-timeable geomean): **1.55× → ~1.53×** (≈flat; the 6 aren't in this sample).
+> - SIZE geo40 INSN (all-34 geomean): **1.71× → ~1.52×** (the 6 worst-insn programs collapse to gcc's form).
+> - **Absolute total suite wall-time: drops sharply** (~269ms of the 6 → ~0) — THIS is the honest #24 instrument.
+> - gcc-zeroed bucket: **6 → 0**. sqlite size: **~1.81× UNCHANGED** (#24 doesn't touch sqlite's loop shapes).
+>
+> **SUCCESS KPI (bank only when ALL hold):**
+> 1. Ships the commuting-square proof `⟦loop⟧ = ⟦closed-form⟧` as an inline test (a wrong final-value
+>    formula is a MISCOMPILE — the proof is the real bar, not the insn count).
+> 2. FULL GATE GREEN: cargo · opt-parity 1552/0 · torture 0 FAIL · csmith300 0 DIVERGE · yarpgen300 0 DIVERGE.
+> 3. The non-fundamental subset of the 6 reaches gcc's reduced form: per-program **insn ratio → ~1.0** and
+>    **exec → ~0ms**; bucket shrinks 6→0 (minus any category-(a) case, see below).
+> 4. Absolute total suite wall-time measurably drops (run `tests/bench/exectime.sh`, watch the ZEROED bucket
+>    empty); INSN-geomean drops (any real ≥0.5% = bankable).
+> 5. Law-4 residual measured: EACH of the 6 is either matched (banked) or classified **category-(a)
+>    fundamental** — no case left as an unexplained (b) truncation.
+>
+> **ABANDON / QUARANTINE KPI (sub-case granularity — quarantine the CASE, keep the lever; NO-PIVOT):**
+> - A case's gcc-zeroing needs infra out of #24's scope (interprocedural purity + inlining zcc won't do)
+>   ⟹ classify **category-(a)**, mark, bank the cases that DON'T need it, advance. If ALL 6 need out-of-scope
+>   infra ⟹ #24 yields ≈0 ⟹ quarantine the ROW (mark ⚠️ + reason), advance to #25.
+> - The transform is not provably correct in general (can't ship the commuting square) ⟹ do NOT ship
+>   (correctness is the one hard wall) ⟹ quarantine.
+> - Gate goes red and ONE bounded Law-2 fix doesn't green it ⟹ revert-to-green, quarantine, advance.
+> - Realized yield < 20% of the 6 AND the rest are (b)-truncations uncracked after exactly ONE review-push
+>   round ⟹ bank whatever's positive, advance.
+> **GATE COMMAND CRIB** (box): rebuild → `docker exec zccbox sh -c 'cd /work && CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc'`; gate runners in §0 GATE block; scoreboard `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 
