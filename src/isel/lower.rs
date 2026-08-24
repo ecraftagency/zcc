@@ -516,10 +516,14 @@ impl<'a> L<'a> {
     }
 
     fn libcall(&mut self, name: &str, args: &[Reg]) {
-        let uses = args
+        let pairs: Vec<(Reg, Reg, Width)> = args
             .iter()
             .enumerate()
-            .map(|(i, r)| (*r, PReg::gpr(i as u8)))
+            .map(|(i, r)| (Reg::P(PReg::gpr(i as u8)), *r, Width::W64))
+            .collect();
+        self.push(MInst::ParallelCopy(pairs));
+        let uses = (0..args.len())
+            .map(|i| (Reg::P(PReg::gpr(i as u8)), PReg::gpr(i as u8)))
             .collect();
         self.push(MInst::Call {
             callee: CallTarget::Direct(name.to_string()),
@@ -539,7 +543,13 @@ impl<'a> L<'a> {
         args: &[Operand],
     ) {
         let asn = abi::classify(sig);
-        let mut uses = Vec::with_capacity(args.len());
+        // Hack 2007 §4: a constrained instruction is preceded by ONE parallel
+        // copy that puts every operand where the ABI wants it. The allocator
+        // then sees no fixed constraint at all — the argument registers are
+        // ordinary physical registers with very short live ranges, and a cycle
+        // among them (f(b, a) where a is in x1 and b in x0) is resolved by the
+        // same windmill sequentialization every block edge uses.
+        let mut pairs = Vec::with_capacity(args.len());
         for ((o, p), loc) in args.iter().zip(&sig.params).zip(&asn.args) {
             let t = match p {
                 hir::PTy::S(t) => *t,
@@ -547,7 +557,7 @@ impl<'a> L<'a> {
             };
             let r = self.reg(*o, t);
             match loc {
-                Loc::Reg(p, _) => uses.push((r, *p)),
+                Loc::Reg(p, w) => pairs.push((Reg::P(*p), r, *w)),
                 Loc::Stack(..) => todo!("R1.2: stack arguments"),
             }
         }
@@ -555,9 +565,19 @@ impl<'a> L<'a> {
             hir::Callee::Direct(n) => CallTarget::Direct(n.clone()),
             hir::Callee::Indirect(o) => CallTarget::Indirect(self.reg(*o, hir::Ty::I64)),
         };
-        let defs = match (dst, asn.ret) {
-            (Some(v), Some(Loc::Reg(p, _))) => vec![(self.dst_of(v), p)],
-            (Some(_), Some(Loc::Stack(..))) => todo!("R1.2: indirect return"),
+        if !pairs.is_empty() {
+            self.push(MInst::ParallelCopy(pairs));
+        }
+        let uses = asn
+            .args
+            .iter()
+            .filter_map(|l| match l {
+                Loc::Reg(p, _) => Some((Reg::P(*p), *p)),
+                Loc::Stack(..) => None,
+            })
+            .collect();
+        let defs = match asn.ret {
+            Some(Loc::Reg(p, _)) if dst.is_some() => vec![(Reg::P(p), p)],
             _ => vec![],
         };
         self.push(MInst::Call {
@@ -568,6 +588,20 @@ impl<'a> L<'a> {
             stack_bytes: asn.stack_bytes,
             tail: false,
         });
+        // and one copy out of the result register
+        if let (Some(v), Some(Loc::Reg(p, w))) = (dst, asn.ret) {
+            let d = self.dst_of(v);
+            if p.class == Class::Fpr {
+                self.push(MInst::FMov {
+                    dw: w,
+                    sw: w,
+                    dst: d,
+                    src: Reg::P(p),
+                });
+            } else {
+                self.push(MInst::Copy { w, dst: d, src: Reg::P(p) });
+            }
+        }
     }
 
     fn target(&mut self, t: &hir::Target) -> MTarget {
@@ -726,32 +760,24 @@ fn lower_func(h: &hir::Func) -> MFunc {
     // the entry block copies it into its virtual register. The copies are what
     // the allocator later coalesces away when the value happens to stay put.
     let asn = abi::classify(&h.sig);
-    let mut prologue = Vec::new();
+    // The incoming arguments arrive together, so they leave together: ONE
+    // parallel copy, for the same reason as at a call site.
+    let mut pairs = Vec::new();
     for (i, vi) in h.values.iter().enumerate() {
         if let hir::Def::FuncParam(k) = vi.def {
             let d = l.vmap[i];
             match asn.args.get(k as usize) {
-                Some(Loc::Reg(p, w)) => {
-                    if p.class == Class::Fpr {
-                        prologue.push(MInst::FMov {
-                            dw: *w,
-                            sw: *w,
-                            dst: d,
-                            src: Reg::P(*p),
-                        });
-                    } else {
-                        prologue.push(MInst::Copy {
-                            w: *w,
-                            dst: d,
-                            src: Reg::P(*p),
-                        });
-                    }
-                }
+                Some(Loc::Reg(p, w)) => pairs.push((d, Reg::P(*p), *w)),
                 Some(Loc::Stack(..)) => todo!("R1.2: incoming stack arguments"),
                 None => {}
             }
         }
     }
+    let mut prologue: Vec<MInst> = if pairs.is_empty() {
+        Vec::new()
+    } else {
+        vec![MInst::ParallelCopy(pairs)]
+    };
     for (bi, b) in h.blocks.iter().enumerate() {
         l.cur = bi as MBlockId;
         if bi == h.entry as usize {

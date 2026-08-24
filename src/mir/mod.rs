@@ -16,6 +16,7 @@
 // through `effect`. No component outside `isa.rs` matches on an opcode.
 pub mod interp;
 pub mod isa;
+pub mod pass;
 #[cfg(test)]
 mod tests;
 pub mod verify;

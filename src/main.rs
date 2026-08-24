@@ -17,6 +17,7 @@ mod mem;
 mod mir;
 mod parser;
 mod preprocess;
+mod regalloc;
 #[cfg(test)]
 mod testutil;
 use std::{env, fs, process::Command, process::ExitCode};

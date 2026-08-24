@@ -12,6 +12,18 @@
 use crate::ast::Ast;
 
 pub fn compile(ast: &Ast) -> String {
-    let module = crate::hir::build::build(ast);
-    crate::emit::emit(ast, &module)
+    let h = crate::hir::build::build(ast);
+    let m = backend(&h).unwrap_or_else(|e| panic!("zcc: internal: {}", e));
+    crate::emit::emit(ast, &m)
+}
+
+/// HIR → final MIR. Separated from `compile` so every battery can drive the
+/// exact pipeline the compiler drives, rather than an approximation of it.
+pub fn backend(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
+    let mut m = crate::isel::lower(h);
+    crate::regalloc::allocate_module(&mut m)?;
+    for f in m.funcs.iter_mut() {
+        crate::mir::pass::frame::run(f);
+    }
+    Ok(m)
 }
