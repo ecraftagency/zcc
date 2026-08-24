@@ -295,7 +295,7 @@ pub fn emit_ir(ast: &Ast) -> String {
                 // known here. Passing the SMALLER budget makes licm/SR's pressure guard a
                 // conservative LOWER bound: k=10 ≤ whatever the allocator ends up with, so the
                 // guard can only under-hoist, never over-pressure. Correctness is k-independent
-                // (opt.rs:2326); size impact ≈ 0 (hoists are size-neutral).
+                // (loops.rs::hoist_loop_consts); size impact ≈ 0 (hoists are size-neutral).
                 crate::opt::optimize_ssa(&ast.tt, f, &passes, GP_BUDGET.k);
                 debug_assert!(ir::verify(f).is_ok(), "opt produced broken IR: {}", f.name);
             }

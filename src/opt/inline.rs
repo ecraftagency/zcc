@@ -279,27 +279,3 @@ pub fn dead_static_fns(funcs: &[IrFunc], is_static: &[bool], root_syms: &HashSet
     }
     (0..funcs.len()).map(|i| is_static.get(i).copied().unwrap_or(false) && !reach[i]).collect()
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
-// point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
-// return to executable (φ-free) IR and do a final non-SSA cleanup.
-//
-//   optimize_ssa = to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ dce ∘ cfg ∘ licm)* ▸ out_of_ssa ▸ optimize
-//
-// Each stage is an INDIVIDUALLY-PROVEN semantics-preserving rewrite (⟦·⟧-invariant,
-// gated by `equiv`); the COMPOSITE is therefore semantics-preserving, and this is
-// re-checked end-to-end by `optimize_ssa_preserves` — composition of commuting squares
-// is a commuting square, but we MEASURE it anyway (never trust by reasoning). This is
-// the artifact Stage 5 wires into the backend behind an optimization flag.
-//
-// INDUSTRIAL TOGGLEABLE PIPELINE (cf. gcc `-fno-<pass>` / LLVM PassBuilder): every stage
-// is a switch in `Passes`, so any element can be disabled independently. This matters
-// because a pass may be ⟦·⟧-CORRECT yet not a MEASURED win on a given backend — the
-// constitution ships only a proven-AND-measured win. `licm` is exactly that case: proven
-// (0 FAIL / 0 DIVERGE) but MEASURED to regress the memory-bound naive-slot backend
-// (hoisting trades a cheap address recompute for a per-iteration reload + more spill
-// pressure), so it defaults OFF and is one flag from ON for when a register-resident
-// backend makes hoisting pay. All other proven passes default ON.
-// ─────────────────────────────────────────────────────────────────────────────
-

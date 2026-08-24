@@ -923,7 +923,7 @@ pub fn pointer_iv(tt: &TyTab, f: &mut IrFunc, _gp_k: u32) -> u32 {
                     &mut lin,
                 ) && lin.len() == 1
                     && lin[0].1 != 0
-                    // THEOREM PRECONDITION (opt.rs:2625): the transform reduces `base + iv·stride`
+                    // THEOREM PRECONDITION (pointer_iv, below): the transform reduces `base + iv·stride`
                     // where `base` is a loop-invariant address to be FOLDED into the pointer init.
                     // `base = ∅` ⟹ the "address" is a bare induction variable (incl. a marching
                     // pointer this pass already produced) — nothing to fold, the theorem does not
@@ -1257,6 +1257,32 @@ pub(crate) fn speculatable(tt: &TyTab, al: &AliasInfo, i: &Inst) -> bool {
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — IF-CONVERSION (B4; branch → data-select).
+//
+// Theorem (control→data): a DIAMOND
+//     h: … ; Br(c, T, E)
+//     T: s_T ; Jmp M          E: s_E ; Jmp M          M: φ(d,[(T,vT),(E,vE)]) …
+// where every instruction of the two arms s_T, s_E is PURE and NON-FAULTING is
+// semantically equal to executing BOTH arms unconditionally (speculation) and then
+// selecting per c:  ⟦diamond⟧ = ⟦ h;s_T;s_E ; Select(d,c,vT,vE) ; M∖φ ⟧.
+// Justification: a pure, non-faulting instruction has NO observable effect when its
+// result is unused (Law-1 Side-I: ⟦·⟧ is a function of the live result only) — so
+// running the not-taken arm is invisible, and the φ (which picks the value of the
+// edge actually taken) becomes exactly `c ? vT : vE`. The commuting square
+// ⟦f⟧ = ⟦if_convert(f)⟧ is unit-tested (`if_convert_semantics`).
+//
+// NON-FAULTING (the speculation-safety side-condition, the ONLY subtle premise):
+//   • Bin(Div|Rem) on an INTEGER type traps on /0 → NOT speculatable.
+//   • Load(addr) faults on a bad address → speculatable ONLY when B1's oracle proves
+//     `addr` is a mapped location (a stack slot or a symbol) — `fault_free`. THIS is
+//     where B4 consumes B1 (the ★★★★★ enabler): without the alias oracle no ternary
+//     over memory could be if-converted.
+//   • Store/Call/Memcpy/Zero/Va*/Sync/Asm/Alloca/GotoPtr — side effects → NOT arms.
+// The produced Select is restricted to NON-FLOAT scalars (the backend lowers it to
+// integer `csel`); a float φ keeps its branch.
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn if_convert(tt: &TyTab, f: &mut IrFunc) -> u32 {
     let al = alias_info(f);

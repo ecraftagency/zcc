@@ -180,36 +180,3 @@ pub fn cse(tt: &TyTab, f: &mut IrFunc) -> u32 {
     }
     n
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// B1 — LIGHTWEIGHT ALIAS ANALYSIS (the memory oracle; the enabler for B2 load-elim).
-// [Side-I theorem — OPT.md §5 (B1), ported from QBE `alias.c` but
-//  re-derived as a theorem in zcc's IR, not transliterated.]
-//
-// THEOREM. Aliasing is a TOTAL DECIDABLE relation over a 4-point base lattice + an
-// integer offset — no points-to graph, no fixpoint, ONE pass. Every address value
-// gets a descriptor (base, offset):
-//   Loc(off) — a stack slot at frame offset `off`  (QBE ALoc; provably local unless it escapes)
-//   Sym(k,i) — a global (k=0) / string-literal (k=1) symbol address  (QBE ASym)
-//   Con      — a pure integer-constant address, no symbolic base      (QBE ACon)
-//   Unk(t)   — unknown; the base is the temp `t` itself                (QBE AUnk)
-// plus `escaped`: the set of stack slots whose address LEAKED (passed to a call,
-// stored through a pointer, returned, or mixed into an untracked pointer). A
-// non-escaped Loc is PROVABLY disjoint from every unknown pointer — QBE's key move.
-//
-// The relation alias((p,sp),(q,sq)) ∈ {No, Must, May} (sp/sq = access widths):
-//   • two different stack slots            → No     (disjoint frame regions)
-//   • same base (slot/sym/con/unk-temp)    → overlap ? Must : No   (offsets decide)
-//   • different symbols                    → May    (conservative; QBE)
-//   • one Unknown vs a provably-local slot → No     (the local never leaked)
-//   • one Unknown vs anything else         → May    (conservative)
-//   • two disjoint kinds (loc/sym/con)     → No     (distinct memory regions)
-// where overlap = ap.off < aq.off+sq ∧ aq.off < ap.off+sp.
-//
-// SOUNDNESS (the CbC obligation, unit-tested `alias_soundness`): the oracle NEVER
-// answers No/Must when two accesses can actually alias at runtime — `May` is always a
-// safe reply, and every non-May verdict is backed by a disjointness/identity proof.
-// This is an ANALYSIS, not a transform: it emits no code, so it carries no
-// improvement obligation — its correctness IS the proof obligation (Law 3).
-// ─────────────────────────────────────────────────────────────────────────────
-

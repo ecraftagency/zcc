@@ -117,7 +117,7 @@ impl Default for Passes {
             cfg_simplify: true,
             licm: false, // proven-correct but measured-negative on the naive-slot backend
             strength_reduce: false, // same: proven, but the accumulator φ costs spill on this backend
-            pointer_iv: true, // base-fold SR + LFTR; theorem-precondition base≠∅ (opt.rs:2933) —
+            pointer_iv: true, // base-fold SR + LFTR; theorem-precondition base≠∅ (loops.rs::pointer_iv) —
             // matmul 3.44→1.71×, sieve 2.60→2.10× vs O1 at k=10, spill-free (measured box best-of-3)
             coalesce: true,
             peephole: true, // measured win: removes the x0-funnel redundant reg-reg moves
@@ -186,32 +186,30 @@ impl Passes {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pass — IF-CONVERSION (B4; branch → data-select).
-//
-// Theorem (control→data): a DIAMOND
-//     h: … ; Br(c, T, E)
-//     T: s_T ; Jmp M          E: s_E ; Jmp M          M: φ(d,[(T,vT),(E,vE)]) …
-// where every instruction of the two arms s_T, s_E is PURE and NON-FAULTING is
-// semantically equal to executing BOTH arms unconditionally (speculation) and then
-// selecting per c:  ⟦diamond⟧ = ⟦ h;s_T;s_E ; Select(d,c,vT,vE) ; M∖φ ⟧.
-// Justification: a pure, non-faulting instruction has NO observable effect when its
-// result is unused (Law-1 Side-I: ⟦·⟧ is a function of the live result only) — so
-// running the not-taken arm is invisible, and the φ (which picks the value of the
-// edge actually taken) becomes exactly `c ? vT : vE`. The commuting square
-// ⟦f⟧ = ⟦if_convert(f)⟧ is unit-tested (`if_convert_semantics`).
-//
-// NON-FAULTING (the speculation-safety side-condition, the ONLY subtle premise):
-//   • Bin(Div|Rem) on an INTEGER type traps on /0 → NOT speculatable.
-//   • Load(addr) faults on a bad address → speculatable ONLY when B1's oracle proves
-//     `addr` is a mapped location (a stack slot or a symbol) — `fault_free`. THIS is
-//     where B4 consumes B1 (the ★★★★★ enabler): without the alias oracle no ternary
-//     over memory could be if-converted.
-//   • Store/Call/Memcpy/Zero/Va*/Sync/Asm/Alloca/GotoPtr — side effects → NOT arms.
-// The produced Select is restricted to NON-FLOAT scalars (the backend lowers it to
-// integer `csel`); a float φ keeps its branch.
-// ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SSA OPTIMIZATION PIPELINE (the QBE-level projection, under CbC). The whole
+// point of Stages 1–4: build SSA, run the SSA-strength passes to a fixpoint, then
+// return to executable (φ-free) IR and do a final non-SSA cleanup.
+//
+//   optimize_ssa = [sroa] ▸ to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ load_elim ∘ dce ∘ cfg_simplify ∘ licm ∘ strength_reduce ∘ pointer_iv)*
+//                  ▸ [if_convert] ▸ out_of_ssa ▸ optimize ▸ [remat ∘ hoist_const]   ([·] = toggled in `Passes`)
+//
+// Each stage is an INDIVIDUALLY-PROVEN semantics-preserving rewrite (⟦·⟧-invariant,
+// gated by `equiv`); the COMPOSITE is therefore semantics-preserving, and this is
+// re-checked end-to-end by `optimize_ssa_preserves` — composition of commuting squares
+// is a commuting square, but we MEASURE it anyway (never trust by reasoning). This is
+// the artifact Stage 5 wires into the backend behind an optimization flag.
+//
+// INDUSTRIAL TOGGLEABLE PIPELINE (cf. gcc `-fno-<pass>` / LLVM PassBuilder): every stage
+// is a switch in `Passes`, so any element can be disabled independently. This matters
+// because a pass may be ⟦·⟧-CORRECT yet not a MEASURED win on a given backend — the
+// constitution ships only a proven-AND-measured win. `licm` is exactly that case: proven
+// (0 FAIL / 0 DIVERGE) but MEASURED to regress the memory-bound naive-slot backend
+// (hoisting trades a cheap address recompute for a per-iteration reload + more spill
+// pressure), so it defaults OFF and is one flag from ON for when a register-resident
+// backend makes hoisting pay. All other proven passes default ON.
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
     if p.sroa {

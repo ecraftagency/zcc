@@ -5,6 +5,26 @@
 
 use super::*;
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 5 — REGISTER ALLOCATION (graph coloring, Chaitin–Briggs).
+//
+// NP-complete (THEORY §C2 — graph coloring) ⟹ use a HEURISTIC simplify/spill, NOT
+// demanding a strict optimum. But CORRECTNESS (a valid coloring) is verifiable in P.
+//
+// Correctness here DIFFERS from the four passes above: interp does NOT model
+// registers, so ⟦before⟧=⟦after⟧ cannot be used. The correctness invariant is
+// RENAMING BISIMULATION (THEORY §A7): the register-assigned program is bisimilar to
+// the temporary program ⟺ two SIMULTANEOUSLY LIVE temporaries always occupy DIFFERENT
+// locations (a live value is never overwritten). We check the INTERFERENCE INVARIANT
+// mechanically:
+//   ∀ edge (u,v) ∈ interference-graph, color[u] ≠ color[v]  (a spill = its own slot, never overwritten).
+//
+// Chain of theorems: liveness (monotone dataflow, Kleene fixpoint) → interference
+// graph (u interferes with v ⟺ both live at some def) → coloring (simplify degree<k / spill) → verify.
+// ─────────────────────────────────────────────────────────────────────────────
+
+
 /// Flow-SENSITIVE liveness (backward dataflow, THEORY §B3 fixpoint over the lattice 2^Tmp).
 /// Only live-OUT is consumed downstream (interference is built at defs, scanning tailward);
 /// live-IN is the fixpoint's working set, not exported.
