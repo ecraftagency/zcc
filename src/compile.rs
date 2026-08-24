@@ -20,11 +20,23 @@ pub fn compile(ast: &Ast) -> String {
 /// HIR → final MIR. Separated from `compile` so every battery can drive the
 /// exact pipeline the compiler drives, rather than an approximation of it.
 pub fn backend(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
+    let mut m = allocated(h)?;
+    finish(&mut m);
+    Ok(m)
+}
+
+/// HIR → physical MIR, stopping BEFORE frame lowering. Split out so the
+/// frame/layout square (`⟦mir_p⟧ = ⟦mir_final⟧`) has two sides to compare.
+pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
     let mut m = crate::isel::lower(h);
     crate::regalloc::allocate_module(&mut m)?;
+    Ok(m)
+}
+
+/// Frame lowering and block layout: physical MIR → final MIR.
+pub fn finish(m: &mut crate::mir::MModule) {
     for f in m.funcs.iter_mut() {
         crate::mir::pass::frame::run(f);
         crate::mir::pass::layout::run(f);
     }
-    Ok(m)
 }

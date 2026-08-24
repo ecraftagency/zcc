@@ -16,6 +16,15 @@ use std::collections::HashMap;
 
 pub type Bits = u64;
 
+/// The interpreter's step budget. A non-terminating run is ⊥ for proof
+/// purposes, and every commuting square compares only runs where neither side
+/// traps — so the exact number is not a semantic constant, only a bound on how
+/// long a battery may spend before declaring ⊥. 5·10^7 steps is roughly a
+/// second of interpretation, which is far past anything a battery program does
+/// (the heaviest today, fib(15), is ~10^5).
+pub const STEP_BUDGET: u64 = 50_000_000;
+
+
 /// NZCV, packed as in the PSTATE encoding: N=8, Z=4, C=2, V=1.
 const N: u64 = 8;
 const Z: u64 = 4;
@@ -57,7 +66,6 @@ pub fn new_machine<'a>(m: &'a MModule, ast: &Ast) -> Machine<'a> {
 struct Frame {
     vals: Vec<u64>,
     slot_addr: Vec<u64>,
-    base: u64,
 }
 
 impl<'a> Machine<'a> {
@@ -127,9 +135,34 @@ impl<'a> Machine<'a> {
 
     fn call_index(&mut self, fi: usize) -> Result<(), Trap> {
         let f = &self.m.funcs[fi];
+        // A function that has not been through `pass/frame.rs` has no prologue,
+        // so nothing in it preserves the callee-saved registers — yet the
+        // allocator already relied on AAPCS64 §6.1.1 saying they are preserved.
+        // Before frame lowering that promise is a CONTRACT the interpreter
+        // honors; after it, real `Spill`/`Reload` instructions honor it. That is
+        // exactly the obligation of frame lowering, and comparing the two runs
+        // is its commuting square (`mir/pass/tests.rs`).
+        let contract = !f.laid_out;
+        let saved: Vec<(PReg, u64)> = if contract {
+            (19..=28u8)
+                .map(PReg::gpr)
+                .chain((8..=15u8).map(PReg::fpr))
+                .chain(std::iter::once(isa::LR))
+                .map(|p| {
+                    let v = match p.class {
+                        Class::Fpr => self.fpr[p.num as usize],
+                        _ => self.gpr[p.num as usize],
+                    };
+                    (p, v)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let f = &self.m.funcs[fi];
         // Before `frame` runs, each stack object is its own region; afterwards
         // `frame_size` is the whole frame and slots carry offsets into it.
-        let (frame_bytes, per_slot): (u64, bool) = if f.frame_size > 0 {
+        let (frame_bytes, per_slot): (u64, bool) = if f.laid_out {
             (f.frame_size as u64, false)
         } else {
             (
@@ -151,10 +184,15 @@ impl<'a> Machine<'a> {
         let mut fr = Frame {
             vals: vec![0; f.vregs.len()],
             slot_addr,
-            base,
         };
         let r = self.run(fi, &mut fr);
         self.mem.pop_frame(frame_bytes);
+        for (p, v) in saved {
+            match p.class {
+                Class::Fpr => self.fpr[p.num as usize] = v,
+                _ => self.gpr[p.num as usize] = v,
+            }
+        }
         r
     }
 
@@ -164,7 +202,7 @@ impl<'a> Machine<'a> {
             let nin = self.m.funcs[fi].blocks[b as usize].insts.len();
             for i in 0..nin {
                 self.steps += 1;
-                if self.steps > 50_000_000 {
+                if self.steps > STEP_BUDGET {
                     return Err(Trap::OutOfSteps);
                 }
                 let inst = self.m.funcs[fi].blocks[b as usize].insts[i].clone();
@@ -272,8 +310,10 @@ impl<'a> Machine<'a> {
     /// `sp` and `x29` are addresses, not ordinary register contents.
     fn base_of(&self, fr: &Frame, r: Reg) -> u64 {
         match r {
+            // sp is an address, not register contents. x29 is NOT special: this
+            // backend has no frame pointer (`pass/frame.rs`), every stack object
+            // is addressed from sp.
             Reg::P(p) if p.class == Class::Gpr && p.num == 31 => self.mem.sp,
-            Reg::P(p) if p.class == Class::Gpr && p.num == 29 => fr.base,
             _ => self.get(fr, r),
         }
     }

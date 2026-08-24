@@ -81,7 +81,10 @@ target-independent middle layer is deferred until a second target exists.
 
 ```
 src/hir/mod.rs        HIR types: Func, Block, Inst, Term, Value, Ty, Effect
-src/hir/build.rs      AST → HIR lowering; Braun SSA construction (also used by mem2reg)
+src/hir/build.rs      AST → HIR lowering. NOTE (R0.9 audit): Braun's SSA construction is NOT
+                      here yet and this line used to claim it was. R0/R1 keep every local in
+                      memory (§14), so no φ/block-parameter insertion runs at all; Braun arrives
+                      with `pass/sroa.rs` at R2.2, which is also where mem2reg uses it.
 src/hir/verify.rs     SSA dominance property, arity, typing
 src/hir/interp.rs     ⟦hir⟧ — the executable reference semantics (SEMANTICS.md)
 src/hir/dom.rs        preds/succs, dominator tree (Cooper-Harvey-Kennedy), loop forest + depth
@@ -406,6 +409,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R0.6 `isel/lower.rs` naive 1:1 (no munch yet) + `isel/abi.rs` for scalar args/returns + `imm.rs` | ✅ `src/isel/tests.rs` 9 groups, ⟦hir⟧=⟦mir_v⟧ |
 | R0.7 **regalloc, complete**: `live` → `spill` → `color` → `destruct` → `verify` (+ `mir/pass/frame.rs`, since a prologue is what makes callee-saved preservation provable) | ✅ `src/regalloc/tests.rs` 7 groups, ⟦mir_v⟧=⟦mir_p⟧. **Residual**: the spiller is the sound base case (spill-at-def, reload-per-use), NOT Braun-Hack — see R2.2 |
 | R0.8 `mir/pass/frame.rs` + `layout.rs` + `emit.rs`; hello world links and runs in the box | ✅ box: `int main(){int s=0,i;for(i=0;i<10;i++)s+=i;return s;}` → exit 45 |
+| R0.9 audit remediation (user audit, 2026-08-24): frame sentinel + frameless leaf · next-use distance without the `*1000` block-size assumption · every remaining convenience constant justified or removed · §2's Braun claim corrected · emit determinism seal in `tests/` (Article E's byte-identical gate, which the repo lacked) · frame/layout given their own `⟦mir_p⟧=⟦mir_final⟧` square instead of riding on regalloc's · `THEORY.md`/`SEMANTICS.md` re-targeted to HIR/MIR (Law 1: those docs ⊕ the specs ARE the source) | ⬜ |
 | R0 gate | `cargo test` batteries green (36/36: hir 10, mir 10, isel 9, regalloc 7); `tests/cases` **61/81** — the 14 remaining failures are exactly the R1 feature set, each stopped by an explicit `todo!` rather than miscompiled: struct by value/return (`abi_callptr_struct abi_composite_ir addr_of_exotic_ir c89_structval stmt_expr_nested_struct`), >8 arguments on the stack (`c89_decl`), varargs (`c99_ternary_decay_vararg e_stdarg kr7_minprintf m5_printf_args`), VLA (`c99_digraph_vla vla_loop_reset_sp`), long double (`c99_long_double`), bitfields (`m6_bitfield`). **81/81 is R1.4's gate, not R0's** — R0.3 only ever claimed the scalar subset; the original wording of this row was inconsistent with it and is corrected here in place | ✅ |
 
 ### R1 — correctness parity with `rc3` (no HIR optimization passes yet)

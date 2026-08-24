@@ -923,10 +923,18 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
         sig,
         blocks: Vec::new(),
         values: Vec::new(),
-        slots: vec![Slot {
-            size: af.frame.max(16),
-            align: 16,
-        }],
+        // Slot 0 is the parser's frame block. A function whose parser frame is
+        // empty gets NO stack object at all — and therefore no `sub sp` — which
+        // is the common case for a leaf.
+        slots: if af.frame == 0 {
+            Vec::new()
+        } else {
+            vec![Slot {
+                size: af.frame,
+                // AAPCS64 §6.2.2: the frame block is 16-byte aligned.
+                align: 16,
+            }]
+        },
         entry: 0,
         is_static: af.is_static,
         is_weak: af.is_weak || af.is_inline,

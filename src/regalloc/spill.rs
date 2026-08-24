@@ -27,6 +27,13 @@ use std::collections::BTreeSet;
 /// Bring every program point to pressure ≤ k. Returns the number of values spilled.
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
     let mut spilled = 0;
+    // Termination bound, derived rather than picked: a victim is never a value
+    // the current instruction reads or writes, and a spilled value is read only
+    // by the `Spill` that immediately follows its definition — so it can never
+    // be chosen again, and each round retires one of the ORIGINAL virtual
+    // registers. Exceeding that count means the argument above is false, which
+    // is a Law-2 defect and not a budget to raise.
+    let bound = f.vregs.len();
     loop {
         let cfg = crate::mir::verify::cfg(f);
         let lv = live::compute(f, &cfg);
@@ -44,8 +51,11 @@ pub fn spill(f: &mut MFunc) -> Result<usize, String> {
         }
         spill_value(f, victim);
         spilled += 1;
-        if spilled > 10_000 {
-            return Err(format!("{}: spilling did not converge", f.name));
+        if spilled > bound {
+            return Err(format!(
+                "{}: spilling retired more values ({}) than the function has virtual registers ({})",
+                f.name, spilled, bound
+            ));
         }
     }
 }
@@ -58,11 +68,11 @@ fn worst_point(
     lv: &live::Liveness,
     cfg: &crate::cfg::Cfg,
 ) -> Result<Option<(VReg, Class)>, String> {
-    // linearize in reverse postorder so "next use" has a meaning
-    let mut pos = vec![usize::MAX; f.blocks.len()];
-    for (i, &b) in cfg.rpo.iter().enumerate() {
-        pos[b as usize] = i;
-    }
+    // Linearize in reverse postorder so "next use" has a meaning. `base[b]` is
+    // the absolute position of block b's first instruction, so a position is a
+    // real instruction index — not a block index scaled by an assumed maximum
+    // block length, which would mis-rank the moment a block grew past it.
+    let base = linear_positions(f, cfg);
     for &b in &cfg.rpo {
         let bi = b as usize;
         let blk = &f.blocks[bi];
@@ -94,7 +104,7 @@ fn worst_point(
                 let cand = members
                     .iter()
                     .filter(|x| **x < lv.sp.nv && !here.contains(x))
-                    .max_by_key(|&&x| next_use(f, cfg, &pos, lv.sp.reg(x), bi, i));
+                    .max_by_key(|&&x| next_use(f, cfg, &base, lv.sp.reg(x), bi, i));
                 match cand {
                     Some(&x) => return Ok(Some((x as VReg, class))),
                     // Every live value at this point is pinned by the very
@@ -123,24 +133,42 @@ fn worst_point(
     Ok(None)
 }
 
-/// Distance to the next use, in linearized instruction positions; `usize::MAX`
-/// when the value is never used again.
+/// Absolute position of each block's first instruction, in reverse postorder.
+/// `usize::MAX` marks an unreachable block. A block occupies
+/// `base[b] ..= base[b] + insts.len()`, the last slot being its terminator.
+fn linear_positions(f: &MFunc, cfg: &crate::cfg::Cfg) -> Vec<usize> {
+    let mut base = vec![usize::MAX; f.blocks.len()];
+    let mut at = 0usize;
+    for &b in &cfg.rpo {
+        base[b as usize] = at;
+        at += f.blocks[b as usize].insts.len() + 1;
+    }
+    base
+}
+
+/// The next position at which `r` is read, on or after the given point;
+/// `usize::MAX` when the value is never used again. Belady's rule evicts the
+/// value whose next use is furthest away, so this number IS the policy — an
+/// approximation here is a quality loss, not a correctness one, but it must at
+/// least be a monotone function of real distance.
 fn next_use(
     f: &MFunc,
     cfg: &crate::cfg::Cfg,
-    pos: &[usize],
+    base: &[usize],
     r: Reg,
     from_block: usize,
     from_inst: usize,
 ) -> usize {
+    let from = base[from_block] + from_inst;
     let mut best = usize::MAX;
     for &b in &cfg.rpo {
         let bi = b as usize;
-        if pos[bi] < pos[from_block] {
+        if base[bi] == usize::MAX {
             continue;
         }
         for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
-            if bi == from_block && i <= from_inst {
+            let at = base[bi] + i;
+            if at <= from {
                 continue;
             }
             let mut hit = false;
@@ -150,17 +178,21 @@ fn next_use(
                 }
             });
             if hit {
-                return (pos[bi] - pos[from_block]) * 1000 + i;
+                best = best.min(at);
+                break;
             }
         }
-        let mut hit = false;
-        f.blocks[bi].term.visit(&mut |q, _| {
-            if q == r {
-                hit = true;
+        let at = base[bi] + f.blocks[bi].insts.len();
+        if at > from {
+            let mut hit = false;
+            f.blocks[bi].term.visit(&mut |q, _| {
+                if q == r {
+                    hit = true;
+                }
+            });
+            if hit {
+                best = best.min(at);
             }
-        });
-        if hit {
-            best = best.min((pos[bi] - pos[from_block]) * 1000 + 999);
         }
     }
     best

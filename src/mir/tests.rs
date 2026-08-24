@@ -127,6 +127,7 @@ fn mfunc(name: &str) -> MFunc {
         is_static: false,
         is_weak: false,
         order: Vec::new(),
+    laid_out: false,
     frame_size: 0,
         saved: RegSet::default(),
         physical: false,

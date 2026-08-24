@@ -759,6 +759,7 @@ fn lower_func(h: &hir::Func) -> MFunc {
         is_static: h.is_static,
         is_weak: h.is_weak,
         order: Vec::new(),
+    laid_out: false,
     frame_size: 0,
         saved: RegSet::default(),
         physical: false,

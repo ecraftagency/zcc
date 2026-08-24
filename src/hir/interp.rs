@@ -16,6 +16,15 @@ use std::collections::HashMap;
 
 pub type Bits = u64;
 
+/// The interpreter's step budget. A non-terminating run is ⊥ for proof
+/// purposes, and every commuting square compares only runs where neither side
+/// traps — so the exact number is not a semantic constant, only a bound on how
+/// long a battery may spend before declaring ⊥. 5·10^7 steps is roughly a
+/// second of interpretation, which is far past anything a battery program does
+/// (the heaviest today, fib(15), is ~10^5).
+pub const STEP_BUDGET: u64 = 50_000_000;
+
+
 pub use crate::mem::Trap;
 use crate::mem::{FUNC_TAG, LABEL_TAG, Layout, Mem};
 
@@ -100,7 +109,7 @@ impl<'a> Machine<'a> {
             let blk = &f.blocks[b as usize];
             for inst in &blk.insts {
                 self.steps += 1;
-                if self.steps > 50_000_000 {
+                if self.steps > STEP_BUDGET {
                     return Err(Trap::OutOfSteps);
                 }
                 self.step(fi, inst, &mut vals, slot_addr)?;

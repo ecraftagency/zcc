@@ -955,6 +955,11 @@ pub struct MFunc {
     /// Emission order, set by `pass/layout.rs`; unreachable blocks are absent.
     /// Empty until layout has run.
     pub order: Vec<MBlockId>,
+    /// Set by `pass/frame.rs` once slot offsets exist. It is NOT inferable from
+    /// `frame_size`: a function that needs no stack at all has a laid-out frame
+    /// of size zero, and conflating the two costs every leaf function a `sub sp`
+    /// / `add sp` pair it does not need.
+    pub laid_out: bool,
     /// filled by `frame`: total frame size and the callee-saved registers used
     pub frame_size: u32,
     pub saved: RegSet,

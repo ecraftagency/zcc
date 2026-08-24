@@ -16,6 +16,7 @@ use crate::mir::*;
 use std::fmt::Write;
 
 pub fn emit(ast: &Ast, m: &MModule) -> String {
+    // an allocation hint only: nothing about the output depends on it
     let mut s = String::with_capacity(64 * 1024);
     // EXT(gcc): a top-level __asm__ is emitted verbatim, before anything else
     for a in &ast.raw_asm {
@@ -708,6 +709,9 @@ fn bytes(s: &mut String, b: &[u8]) {
         }
         let _ = write!(line, "{}", x);
         first = false;
+        // Wrap purely for readability of the .s; the assembled bytes are
+        // identical at any width, and the width is fixed so emission stays
+        // deterministic (tests/determinism.sh).
         if line.len() > 100 {
             let _ = writeln!(s, "{}", line);
             line = String::from("\t.byte ");

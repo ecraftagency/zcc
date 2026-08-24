@@ -42,12 +42,9 @@ pub fn run(f: &mut MFunc) {
         s.off = at as i32;
         at += s.size.max(1);
     }
+    // AAPCS64 §6.2.2: sp is 16-byte aligned at every public interface.
     f.frame_size = (at + 15) & !15;
-    // A frame must exist even when empty: the interpreter and the emitter both
-    // treat frame_size == 0 as "not yet laid out".
-    if f.frame_size == 0 {
-        f.frame_size = 16;
-    }
+    f.laid_out = true;
 
     let entry = f.entry as usize;
     let mut prologue: Vec<MInst> = Vec::with_capacity(save.len());

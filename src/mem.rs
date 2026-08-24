@@ -19,11 +19,21 @@ pub enum Trap {
     OutOfSteps,
 }
 
+// The interpreter's address space. These are choices of the SEMANTICS, not of
+// the target: nothing here reaches emitted code, and no compiled program can
+// observe them. What they must satisfy is only that the regions are disjoint,
+// that address 0 is unmapped (so a null dereference is ⊥ rather than a silent
+// read), and that the tag bits lie above any real address.
+/// first data address; everything below is unmapped, so null traps
 pub const GLOBAL_BASE: u64 = 0x10_000;
+/// Stack available to an interpreted call chain. A battery that exhausts it
+/// gets `Trap::BadAddress`, i.e. ⊥ — which is sound but useless as a proof, so
+/// a battery needing deeper recursion raises this rather than working around it.
 pub const STACK_SIZE: u64 = 1 << 20;
 pub const STACK_TOP: u64 = 0x8000_0000;
 pub const STACK_BASE: u64 = STACK_TOP - STACK_SIZE;
-/// tag bits distinguishing a function address and a block address from data
+/// Tag bits marking a function address and a block address. Above STACK_TOP, so
+/// they can never collide with a data or stack address.
 pub const FUNC_TAG: u64 = 1 << 40;
 pub const LABEL_TAG: u64 = 1 << 41;
 
