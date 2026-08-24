@@ -49,7 +49,7 @@ zcc solved the hard version of the problem. This document adopts the right versi
    override pointing here; the `[optimizer = main]` paragraph after it describes the DEAD architecture
    and does not apply on this branch.)
 2. Resume at the first `⬜` in the §12 ladder. **State at 2026-08-25: R0, R0.9,
-   R1.1–R1.6 and the R1 measurement are ✅ banked (HEAD `7279b36`); the first
+   R1.1–R1.6 and the R1 measurement are ✅ banked (HEAD `4c0bd14`); the first
    `⬜` is R2.1.** The R1 GROUND METRIC is §13a — the origin every R2/R3 pass is
    measured against; the one fact to carry into R2 is that `add` is **28.2%** of
    sqlite's instructions because every local is addressed through the frame
