@@ -398,10 +398,10 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 ### R0 — skeleton, hello world (the "tcc in 5 hours" moment on the new architecture)
 | task | status |
 |---|---|
-| R0.1 `git rm -r src/ir.rs src/opt src/codegen`; `main.rs` compiles against a stub `hir::build` + `emit` | ⬜ |
-| R0.2 `hir/mod.rs` types + `verify.rs` + `dom.rs` (cfg, dom tree, loop forest, critical-edge split) | ⬜ |
-| R0.3 `hir/build.rs`: AST → HIR with Braun SSA; scalar C subset (int/ptr arithmetic, if/while/for, calls, globals, strings) | ⬜ |
-| R0.4 `hir/interp.rs` + first battery (`equiv` harness) proving `build` on the science-gate programs | ⬜ |
+| R0.1 `git rm -r src/ir.rs src/opt src/codegen`; `main.rs` compiles against a stub `hir::build` + `emit` | ✅ |
+| R0.2 `hir/mod.rs` types + `verify.rs` + `dom.rs` (cfg, dom tree, loop forest, critical-edge split) | ✅ |
+| R0.3 `hir/build.rs`: AST → HIR with Braun SSA; scalar C subset (int/ptr arithmetic, if/while/for, calls, globals, strings) | ✅ |
+| R0.4 `hir/interp.rs` + first battery (`equiv` harness) proving `build` on the science-gate programs | ✅ `src/hir/tests.rs` 10/10 |
 | R0.5 `mir/mod.rs` + `isa.rs` (full AAPCS64 register table, immediates) + `verify.rs` + `interp.rs` | ⬜ |
 | R0.6 `isel/lower.rs` naive 1:1 (no munch yet) + `isel/abi.rs` for scalar args/returns + `imm.rs` | ⬜ |
 | R0.7 **regalloc, complete**: `live` → `spill` (Braun-Hack + remat + SSA reconstruction) → `color` → `destruct` → `verify` | ⬜ |
@@ -416,7 +416,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R1.3 EXT surface: `__sync_*`, `__builtin_*_overflow`, computed goto, statement-expr, inline asm (opaque), `__va_area__` | ⬜ |
 | R1.4 science gates green: `abi.sh alg.sh cpp.sh shape.sh decay.sh`; `tests/ext` 21/21 | ⬜ |
 | R1.5 torture ≥ 1471 pass (the `rc3` count; the 4 pre-existing runtime FAIL `20021127-1 bitfld-3 pr32244-1 pr34971` are a bonus if they pass), csmith300 0 DIVERGE, yarpgen300 0 DIVERGE | ⬜ |
-| R1 measurement | **the pure-allocator number**: sqlite static insns + `corpus25.sh` excess histogram + `exectime.sh` paired geo40, all with HIR passes OFF. Record here. KPI: frame-slot mem-ops ≪ 27,403 and reg-reg `mov` ≪ 40,573 (rc3). No ratio promise — this is the first real data point of the thesis | ⬜ |
+| R1 measurement | sqlite static insns + `corpus25.sh` excess histogram + `exectime.sh` paired geo40, all with HIR passes OFF. Record here as the correctness-parity data point. **The allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573 at rc3) is NOT readable here**: per §14, R0/R1 keep every local in memory, so the allocator sees only expression temporaries. That KPI is measured at R2.2, immediately after SROA+mem2reg | ⬜ |
 
 ### R2 — tree-SSA parity (port the A7 ladder onto HIR, §4 order)
 | task | status |
@@ -482,6 +482,7 @@ Law-2 attempt quarantines the task (⚠️ + reason), never the milestone. `main
 | middle target-independent IR | deferred | one target |
 | migration | big-bang on `mir-rearch`; `rc3` is the fallback | user directive; incremental rejected |
 | scratch registers | x16, x17 (GPR), v31 (FPR) reserved | AAPCS64 IP0/IP1; parallel-copy cycle breaking |
+| R0/R1 local storage | every C local stays in ONE frame slot (memory); promotion is R2.2 SROA+mem2reg | the parser reports `Var(off)`, not variable identity — two locals in disjoint scopes may share an offset, so promotion at build time would rest on an unproven disambiguation. Consequence: R0/R1 exercise the allocator on expression temporaries only, and the R1 allocator KPI is re-measured at R2.2 (noted in §12 R1) |
 
 ---
 

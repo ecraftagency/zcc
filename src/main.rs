@@ -6,11 +6,11 @@
 //   (`<stem>.s`). ld: entry via crt1.o (_start → __libc_start_main → main),
 //   ctor/dtor via crti/crtn.
 mod ast;
-mod codegen;
+mod compile;
+mod emit;
 mod ext;
-mod ir;
+mod hir;
 mod lexer;
-mod opt;
 mod parser;
 mod preprocess;
 use std::{env, fs, process::Command, process::ExitCode};
@@ -160,7 +160,7 @@ fn drive() -> ExitCode {
             },
         ) {
             Ok((ast, files)) => {
-                let asm = codegen::emit_ir(&ast);
+                let asm = compile::compile(&ast);
                 Some((asm, files))
             }
             Err(e) => {

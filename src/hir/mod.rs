@@ -1,0 +1,600 @@
+// HIR — the target-independent SSA layer (REARCH.md §3).
+//
+// Three design decisions carry the whole layer, and every file below depends on
+// them (REARCH §3.1 / §14):
+//   1. SSA from birth. `build.rs` lowers the AST straight into SSA (Braun et al.
+//      2013, on-the-fly, no dominance frontiers). There is NO out-of-SSA in HIR.
+//   2. Block parameters instead of φ instructions. `jmp bb(a, b)` makes the edge
+//      transfer explicit; SSA destruction (in MIR) is then one parallel copy per
+//      edge, and the interpreter needs no φ-select rule.
+//   3. A closed scalar `Ty`. Signedness and width live in the OPCODE (`sdiv` vs
+//      `udiv`, `icmp.slt` vs `icmp.ult`, `sext` vs `zext`), never in a lookup
+//      into the frontend's TyTab. After lowering, HIR is independent of TyTab —
+//      which is what makes `⟦·⟧` (SEMANTICS.md §3) a closed definition.
+pub mod build;
+pub mod dom;
+pub mod interp;
+#[cfg(test)]
+mod tests;
+pub mod verify;
+
+pub type BlockId = u32;
+pub type ValueId = u32;
+
+// ── types ──────────────────────────────────────────────────────────────────
+// Closed scalar domain. Pointers are I64 (LP64, Article B). Aggregates never
+// appear as a value: they live in memory and travel by address (`memcpy`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ty {
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+}
+
+impl Ty {
+    pub fn bytes(self) -> u32 {
+        match self {
+            Ty::I8 => 1,
+            Ty::I16 => 2,
+            Ty::I32 | Ty::F32 => 4,
+            Ty::I64 | Ty::F64 => 8,
+        }
+    }
+    pub fn bits(self) -> u32 {
+        self.bytes() * 8
+    }
+    pub fn is_float(self) -> bool {
+        matches!(self, Ty::F32 | Ty::F64)
+    }
+}
+
+// ── operands ───────────────────────────────────────────────────────────────
+// A constant is an operand, not an instruction: it has no definition point, so
+// it never interferes, never needs a value number, and isel can fold it into an
+// immediate field without first proving single-use. The operand's TYPE is the
+// enclosing instruction's `ty` field — an operand is never self-describing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Operand {
+    Val(ValueId),
+    /// Integer constant, already truncated to the instruction's type.
+    Imm(i64),
+    /// Floating constant, as the IEEE-754 BIT PATTERN of the instruction's type.
+    Fimm(u64),
+}
+
+impl Operand {
+    pub fn val(self) -> Option<ValueId> {
+        match self {
+            Operand::Val(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+/// A linker-visible address. `Global`/`Str` index into the `Ast`; `Func`/`Label`
+/// carry the emitted symbol name (a call may name a function never declared as a
+/// global).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Sym {
+    Global(u32),
+    Str(u32),
+    Func(String),
+    /// EXT(gcc) `&&label` — the address of a block, for computed goto.
+    Label(BlockId),
+}
+
+// ── opcodes ────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    SDiv,
+    UDiv,
+    SRem,
+    URem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    LShr,
+    AShr,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UnOp {
+    Neg,  // integer two's-complement negation
+    Not,  // bitwise complement
+    FNeg, // IEEE sign flip (NOT 0-x: it is defined on NaN and -0.0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Slt,
+    Sle,
+    Sgt,
+    Sge,
+    Ult,
+    Ule,
+    Ugt,
+    Uge,
+    // ordered float compares (false if either operand is NaN)
+    FOeq,
+    FOne,
+    FOlt,
+    FOle,
+    FOgt,
+    FOge,
+    /// unordered: true iff either operand is NaN
+    FUno,
+}
+
+impl CmpOp {
+    pub fn is_float(self) -> bool {
+        matches!(
+            self,
+            CmpOp::FOeq
+                | CmpOp::FOne
+                | CmpOp::FOlt
+                | CmpOp::FOle
+                | CmpOp::FOgt
+                | CmpOp::FOge
+                | CmpOp::FUno
+        )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CvtOp {
+    Sext,
+    Zext,
+    Trunc,
+    FpToSi,
+    FpToUi,
+    SiToFp,
+    UiToFp,
+    FpExt,
+    FpTrunc,
+    /// reinterpret the bits (I64↔F64, I32↔F32) — the union/`memcpy` idiom
+    Bitcast,
+}
+
+/// C99 6.5p7 effective-type alias class. 0 = "may alias anything" (the only class
+/// R0/R1 produce). The field is carried from day one because retrofitting an
+/// alias tag through every load/store later is expensive; TBAA (REARCH §16 ★1)
+/// is the pass that will finally read it.
+pub type AClass = u32;
+pub const ACLASS_ANY: AClass = 0;
+
+// ── instructions ───────────────────────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub enum Inst {
+    Bin {
+        dst: ValueId,
+        op: BinOp,
+        ty: Ty,
+        a: Operand,
+        b: Operand,
+    },
+    Un {
+        dst: ValueId,
+        op: UnOp,
+        ty: Ty,
+        a: Operand,
+    },
+    /// `dst : I32` ∈ {0, 1}; `ty` is the type of the COMPARED operands.
+    Cmp {
+        dst: ValueId,
+        op: CmpOp,
+        ty: Ty,
+        a: Operand,
+        b: Operand,
+    },
+    Cvt {
+        dst: ValueId,
+        op: CvtOp,
+        from: Ty,
+        to: Ty,
+        a: Operand,
+    },
+    Load {
+        dst: ValueId,
+        ty: Ty,
+        addr: Operand,
+        aclass: AClass,
+        /// C99 6.7.3: a volatile access may not be removed, duplicated or reordered.
+        vol: bool,
+    },
+    Store {
+        ty: Ty,
+        addr: Operand,
+        val: Operand,
+        aclass: AClass,
+        vol: bool,
+    },
+    /// Address of a static stack object (`Func.slots`), plus a constant offset.
+    SlotAddr {
+        dst: ValueId,
+        slot: u32,
+        off: i64,
+    },
+    /// Address of a linker symbol.
+    SymAddr {
+        dst: ValueId,
+        sym: Sym,
+    },
+    /// C99 6.5.15 conditional, once both arms are known side-effect-free.
+    Select {
+        dst: ValueId,
+        ty: Ty,
+        c: Operand,
+        a: Operand,
+        b: Operand,
+    },
+    Call {
+        dst: Option<ValueId>,
+        sig: Sig,
+        callee: Callee,
+        args: Vec<Operand>,
+    },
+    /// Dynamic stack allocation (C99 VLA / EXT alloca). `dst : I64` is the base.
+    Alloca {
+        dst: ValueId,
+        size: Operand,
+        align: u32,
+    },
+    MemCpy {
+        dst: Operand,
+        src: Operand,
+        len: u64,
+    },
+    MemSet {
+        dst: Operand,
+        byte: Operand,
+        len: u64,
+    },
+    /// The EXT/builtin surface: opaque to every pass (`Effect::Call`), expanded by
+    /// isel. Kept as ONE instruction so no pass needs a builtin list.
+    Intrinsic {
+        dst: Option<ValueId>,
+        kind: IntrinKind,
+        args: Vec<Operand>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum Callee {
+    Direct(String),
+    Indirect(Operand),
+}
+
+#[derive(Clone, Debug)]
+pub enum IntrinKind {
+    VaStart,
+    VaArg(Ty),
+    VaArea,
+    /// EXT(gcc) `__sync_*`; `u32` = access width in bytes.
+    Sync(crate::ast::SyncOp, u32),
+    /// EXT(gcc) `__builtin_{add,sub,mul}_overflow`: op 0=+ 1=- 2=*.
+    Overflow {
+        op: u8,
+        ty: Ty,
+        signed: bool,
+    },
+    /// EXT(gcc) inline asm; operand descriptors ride along from the AST.
+    Asm {
+        tmpl: String,
+        ops: Vec<crate::ast::AsmOp>,
+    },
+}
+
+/// Effect class — the single table DCE / CSE / GVN / LICM / sinking consult
+/// (REARCH §3.1). No pass carries a hand-written opcode list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Effect {
+    Pure,
+    Read,
+    Write,
+    Call,
+}
+
+impl Inst {
+    pub fn effect(&self) -> Effect {
+        match self {
+            Inst::Bin { .. }
+            | Inst::Un { .. }
+            | Inst::Cmp { .. }
+            | Inst::Cvt { .. }
+            | Inst::SlotAddr { .. }
+            | Inst::SymAddr { .. }
+            | Inst::Select { .. } => Effect::Pure,
+            Inst::Load { vol, .. } => {
+                if *vol {
+                    Effect::Call // a volatile read is as opaque as a call
+                } else {
+                    Effect::Read
+                }
+            }
+            Inst::Store { vol, .. } => {
+                if *vol {
+                    Effect::Call
+                } else {
+                    Effect::Write
+                }
+            }
+            Inst::MemCpy { .. } | Inst::MemSet { .. } => Effect::Write,
+            // An alloca moves the stack pointer: never duplicated, never sunk.
+            Inst::Alloca { .. } | Inst::Call { .. } | Inst::Intrinsic { .. } => Effect::Call,
+        }
+    }
+
+    pub fn dst(&self) -> Option<ValueId> {
+        match *self {
+            Inst::Bin { dst, .. }
+            | Inst::Un { dst, .. }
+            | Inst::Cmp { dst, .. }
+            | Inst::Cvt { dst, .. }
+            | Inst::Load { dst, .. }
+            | Inst::SlotAddr { dst, .. }
+            | Inst::SymAddr { dst, .. }
+            | Inst::Select { dst, .. }
+            | Inst::Alloca { dst, .. } => Some(dst),
+            Inst::Call { dst, .. } | Inst::Intrinsic { dst, .. } => dst,
+            Inst::Store { .. } | Inst::MemCpy { .. } | Inst::MemSet { .. } => None,
+        }
+    }
+
+    /// Every operand read by this instruction, in evaluation order. The single
+    /// visitor liveness, DCE, verification and rewriting go through.
+    pub fn uses(&self, mut f: impl FnMut(Operand)) {
+        match self {
+            Inst::Bin { a, b, .. } | Inst::Cmp { a, b, .. } => {
+                f(*a);
+                f(*b);
+            }
+            Inst::Un { a, .. } | Inst::Cvt { a, .. } => f(*a),
+            Inst::Load { addr, .. } => f(*addr),
+            Inst::Store { addr, val, .. } => {
+                f(*addr);
+                f(*val);
+            }
+            Inst::SlotAddr { .. } | Inst::SymAddr { .. } => {}
+            Inst::Select { c, a, b, .. } => {
+                f(*c);
+                f(*a);
+                f(*b);
+            }
+            Inst::Call { callee, args, .. } => {
+                if let Callee::Indirect(o) = callee {
+                    f(*o);
+                }
+                args.iter().for_each(|a| f(*a));
+            }
+            Inst::Alloca { size, .. } => f(*size),
+            Inst::MemCpy { dst, src, .. } => {
+                f(*dst);
+                f(*src);
+            }
+            Inst::MemSet { dst, byte, .. } => {
+                f(*dst);
+                f(*byte);
+            }
+            Inst::Intrinsic { args, .. } => args.iter().for_each(|a| f(*a)),
+        }
+    }
+
+    pub fn uses_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
+        match self {
+            Inst::Bin { a, b, .. } | Inst::Cmp { a, b, .. } => {
+                f(a);
+                f(b);
+            }
+            Inst::Un { a, .. } | Inst::Cvt { a, .. } => f(a),
+            Inst::Load { addr, .. } => f(addr),
+            Inst::Store { addr, val, .. } => {
+                f(addr);
+                f(val);
+            }
+            Inst::SlotAddr { .. } | Inst::SymAddr { .. } => {}
+            Inst::Select { c, a, b, .. } => {
+                f(c);
+                f(a);
+                f(b);
+            }
+            Inst::Call { callee, args, .. } => {
+                if let Callee::Indirect(o) = callee {
+                    f(o);
+                }
+                args.iter_mut().for_each(f);
+            }
+            Inst::Alloca { size, .. } => f(size),
+            Inst::MemCpy { dst, src, .. } => {
+                f(dst);
+                f(src);
+            }
+            Inst::MemSet { dst, byte, .. } => {
+                f(dst);
+                f(byte);
+            }
+            Inst::Intrinsic { args, .. } => args.iter_mut().for_each(f),
+        }
+    }
+}
+
+// ── terminators ────────────────────────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub block: BlockId,
+    pub args: Vec<Operand>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Term {
+    Jmp(Target),
+    /// `br %c, then, else` — `%c` is I32, tested ≠ 0.
+    Br(Operand, Target, Target),
+    Switch(Operand, Ty, Vec<(i64, Target)>, Target),
+    Ret(Option<Operand>),
+    /// C99 6.9.1p12 falling off `main`, or an unreachable tail after `noreturn`.
+    Unreachable,
+    /// EXT(gcc) `goto *e`; the list is every block whose address is taken (the
+    /// CFG edge set — without it the successors are unknown and dominance is
+    /// meaningless).
+    GotoPtr(Operand, Vec<BlockId>),
+}
+
+impl Term {
+    pub fn targets(&self) -> Vec<&Target> {
+        match self {
+            Term::Jmp(t) => vec![t],
+            Term::Br(_, a, b) => vec![a, b],
+            Term::Switch(_, _, cases, d) => {
+                let mut v: Vec<&Target> = cases.iter().map(|(_, t)| t).collect();
+                v.push(d);
+                v
+            }
+            Term::Ret(_) | Term::Unreachable | Term::GotoPtr(..) => vec![],
+        }
+    }
+    pub fn targets_mut(&mut self) -> Vec<&mut Target> {
+        match self {
+            Term::Jmp(t) => vec![t],
+            Term::Br(_, a, b) => vec![a, b],
+            Term::Switch(_, _, cases, d) => {
+                let mut v: Vec<&mut Target> = cases.iter_mut().map(|(_, t)| t).collect();
+                v.push(d);
+                v
+            }
+            Term::Ret(_) | Term::Unreachable | Term::GotoPtr(..) => vec![],
+        }
+    }
+    /// Successor blocks, including `GotoPtr`'s address-taken set.
+    pub fn succs(&self) -> Vec<BlockId> {
+        match self {
+            Term::GotoPtr(_, bs) => bs.clone(),
+            _ => self.targets().iter().map(|t| t.block).collect(),
+        }
+    }
+    pub fn uses(&self, mut f: impl FnMut(Operand)) {
+        match self {
+            Term::Br(c, ..) | Term::Switch(c, ..) | Term::GotoPtr(c, _) => f(*c),
+            Term::Ret(Some(v)) => f(*v),
+            _ => {}
+        }
+        for t in self.targets() {
+            t.args.iter().for_each(|a| f(*a));
+        }
+    }
+}
+
+// ── signatures (the C-level view a call must carry for AAPCS64) ────────────
+/// A parameter/return as the ABI classifier sees it. HIR never breaks an
+/// aggregate apart: isel (`isel/abi.rs`) owns AAPCS64 C.1–C.15.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PTy {
+    S(Ty),
+    /// binary128 `long double` (AAPCS64: a 16-byte FP value in a V register).
+    LDouble,
+    Agg {
+        size: u32,
+        align: u32,
+        /// AAPCS64 §5.9.5 HFA/HVA: (element is double, element count).
+        hfa: Option<(bool, u32)>,
+    },
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Sig {
+    pub params: Vec<PTy>,
+    pub ret: Option<PTy>,
+    /// Number of NAMED parameters; `variadic` args start here (AAPCS64 §6.4.2).
+    pub nfix: u32,
+    pub variadic: bool,
+}
+
+// ── containers ─────────────────────────────────────────────────────────────
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub params: Vec<ValueId>,
+    pub insts: Vec<Inst>,
+    pub term: Term,
+    /// Static execution-frequency estimate (Ball & Larus 1993). Advisory only:
+    /// it drives block layout and spill next-use weighting and carries NO
+    /// semantic obligation, so no pass needs a commuting square for it.
+    pub weight: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ValueInfo {
+    pub ty: Ty,
+    pub def: Def,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Def {
+    /// defined by `blocks[b].insts[i]`
+    Inst(BlockId, u32),
+    /// `blocks[b].params[k]`
+    Param(BlockId, u32),
+    /// the k-th incoming function parameter (entry block only)
+    FuncParam(u32),
+}
+
+/// A static stack object: a C local whose address is observable, an aggregate, or
+/// (R0/R1) the whole parser-assigned frame.
+#[derive(Clone, Copy, Debug)]
+pub struct Slot {
+    pub size: u32,
+    pub align: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Func {
+    pub name: String,
+    pub sig: Sig,
+    pub blocks: Vec<Block>,
+    pub values: Vec<ValueInfo>,
+    pub slots: Vec<Slot>,
+    pub entry: BlockId,
+    pub is_static: bool,
+    pub is_weak: bool,
+}
+
+impl Func {
+    pub fn new_value(&mut self, ty: Ty, def: Def) -> ValueId {
+        self.values.push(ValueInfo { ty, def });
+        (self.values.len() - 1) as ValueId
+    }
+    pub fn ty_of(&self, v: ValueId) -> Ty {
+        self.values[v as usize].ty
+    }
+    pub fn block(&self, b: BlockId) -> &Block {
+        &self.blocks[b as usize]
+    }
+    pub fn block_mut(&mut self, b: BlockId) -> &mut Block {
+        &mut self.blocks[b as usize]
+    }
+    pub fn new_block(&mut self) -> BlockId {
+        self.blocks.push(Block {
+            params: Vec::new(),
+            insts: Vec::new(),
+            term: Term::Unreachable,
+            weight: 1,
+        });
+        (self.blocks.len() - 1) as BlockId
+    }
+}
+
+#[derive(Debug)]
+pub struct Module {
+    pub funcs: Vec<Func>,
+}

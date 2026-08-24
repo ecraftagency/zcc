@@ -361,7 +361,7 @@ pub enum Node {
 // "Q"/"m" (pass an ADDRESS, %k prints "[xN]"), "0".. (share a register with
 // operand k), a pin from `register long v __asm__("x8")`. In ast.rs because it is
 // the parser↔codegen boundary.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AsmOp {
     pub e: NodeId,
     pub out: bool,        // belongs to the output section
