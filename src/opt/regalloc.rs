@@ -189,9 +189,13 @@ pub fn color_abi(
     bias: &[Vec<Tmp>],
     is_param: &[bool],
     target: &[Option<u32>],
+    cost: &[u32],
 ) -> Vec<Option<u32>> {
     let nt = adj.len();
     let k = b.k as usize;
+    // Spill-metric toggle (Article-E: a heuristic switch, not a spec constant). Default =
+    // cost/degree (Briggs); ZCC_SPILL=degree restores the prior cost-blind max-degree for A/B.
+    let spill_by_degree = std::env::var("ZCC_SPILL").ok().as_deref() == Some("degree");
     // class-local degree: count only in-class, not-yet-removed neighbors
     let mut degree: Vec<usize> = (0..nt)
         .map(|v| {
@@ -222,10 +226,29 @@ pub fn color_abi(
             }
             v as usize
         } else {
-            // no degree<k node remains → OPTIMISTIC SPILL: pick the max class-degree node
-            // (the same fallback as before; rare on the sparse graphs that stress compile
-            // time, so its O(remaining) scan does not reintroduce the quadratic there).
-            match (0..nt).filter(|&v| in_class[v] && !removed[v]).max_by_key(|&v| degree[v]) {
+            // no degree<k node remains → OPTIMISTIC SPILL. Chaitin-Briggs spill METRIC:
+            // spill the node minimising cost/degree — cheapest reload traffic per unit of
+            // simplify-unblocking. `cost[v]` = the static use+def count of the temps merged
+            // into rep v (the number of reloads/spill-stores a real spill of v would emit);
+            // dividing by class-degree favours a high-degree node (it unblocks the most
+            // neighbours). This changes ONLY which temp lands in memory — `verify_abi`'s
+            // interference invariant is agnostic to the choice, so no new proof obligation
+            // (same theorem as Stage-5b). The prior heuristic (max class-degree, cost-blind)
+            // is preserved under `ZCC_SPILL=degree` for A/B. Compare cost_v/deg_v < cost_u/deg_u
+            // as cost_v*deg_u < cost_u*deg_v (integer, no float); ties → lowest index (in-order
+            // fold), keeping the coloring deterministic.
+            let cand = (0..nt).filter(|&v| in_class[v] && !removed[v]);
+            let pick = if spill_by_degree {
+                cand.max_by_key(|&v| degree[v])
+            } else {
+                cand.reduce(|a, v| {
+                    // spill the lower cost/degree ratio; degree≥1 here (all remaining ≥k)
+                    let (ca, da) = (cost[a] as u64, degree[a].max(1) as u64);
+                    let (cv, dv) = (cost[v] as u64, degree[v].max(1) as u64);
+                    if cv * da < ca * dv { v } else { a }
+                })
+            };
+            match pick {
                 Some(v) => v,
                 None => break,
             }
@@ -579,10 +602,34 @@ pub fn abi_alloc(tt: &TyTab, f: &IrFunc, gp: &ClassBudget, fp: &ClassBudget, coa
             }
         }
     }
+    // SPILL COST per coloring rep = static use+def count of every temp in its group. This is
+    // the reload/spill-store traffic a real spill of the rep would emit; color_abi minimises
+    // cost/degree at the optimistic-spill step so the cheapest temps go to memory. Loop-depth
+    // weighting (dynamic hotness) is a separate SPEED sub-lever; this unweighted count is the
+    // exact static-`.s` reload proxy (SIZE arm). A def counts once, each use once.
+    let mut cost = vec![0u32; nt];
+    let mut cb = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = inst_def(i) {
+                cost[find(&mut rep, d) as usize] += 1;
+            }
+            cb.clear();
+            inst_uses(i, &mut cb);
+            for &u in &cb {
+                cost[find(&mut rep, u) as usize] += 1;
+            }
+        }
+        cb.clear();
+        term_uses(&b.term, &mut cb);
+        for &u in &cb {
+            cost[find(&mut rep, u) as usize] += 1;
+        }
+    }
     let gp_in: Vec<bool> = (0..nt).map(|t| !is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
     let fp_in: Vec<bool> = (0..nt).map(|t| is_fp[t] && find(&mut rep, t as Tmp) == t as Tmp).collect();
-    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj, &is_param, &target);
-    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj, &is_param, &target);
+    let gc = color_abi(&qadj, &gp_in, gp, &crossing, &move_adj, &is_param, &target, &cost);
+    let fc = color_abi(&qadj, &fp_in, fp, &crossing, &move_adj, &is_param, &target, &cost);
     for t in 0..nt {
         let r = find(&mut rep, t as Tmp) as usize;
         home[t] = if is_fp[t] { fc[r] } else { gc[r] }.map(|c| (is_fp[t], c));

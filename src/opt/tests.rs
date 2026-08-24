@@ -864,6 +864,31 @@ fn abi_alloc_asm_all_spill() {
     );
 }
 
+// #25 spill-cost metric (Chaitin-Briggs): at optimistic spill, color_abi picks the node
+// minimising cost/degree, so the CHEAP temp lands in memory and the HOT one keeps a
+// register. Deterministic teeth: a 3-clique needs 3 colors; with k=2 exactly ONE temp
+// spills. Node 0 has cost 100 (hot), nodes 1,2 cost 1 (cold) — the spilled temp MUST be a
+// cold one, node 0 MUST keep a register. This is the cost-square's structural witness; the
+// correctness square is unchanged (any coloring verify_abi-passes — the choice only moves
+// WHICH temp is in memory). The measured .s confirmation is the sqlite A/B (−6,968 insns).
+#[test]
+fn spill_cost_spills_cheapest() {
+    use std::collections::HashSet;
+    let tri = |a: Tmp, b: Tmp| -> HashSet<Tmp> { [a, b].into_iter().collect() };
+    let adj = vec![tri(1, 2), tri(0, 2), tri(0, 1)];
+    let in_class = vec![true; 3];
+    let b = ClassBudget { k: 2, ncaller: 0, narg: 0 };
+    let no = vec![false; 3];
+    let empty_bias = vec![Vec::new(); 3];
+    let no_target = vec![None; 3];
+    let cost = vec![100u32, 1, 1]; // node 0 hot, 1 & 2 cold
+    let colr = color_abi(&adj, &in_class, &b, &no, &empty_bias, &no, &no_target, &cost);
+    assert!(colr[0].is_some(), "the HOT temp (cost 100) must keep a register");
+    let spilled: Vec<usize> = (0..3).filter(|&t| colr[t].is_none()).collect();
+    assert_eq!(spilled.len(), 1, "a 3-clique under k=2 spills exactly one temp");
+    assert_ne!(spilled[0], 0, "the spilled temp must be a COLD one, never the hot node 0");
+}
+
 // PERF backstop (abi_alloc's 60000-temp ceiling): a function above the cap must return
 // the all-spill baseline — no super-linear allocator path runs — and that baseline is
 // trivially verify_abi-valid (no colored temp ⟹ the interference invariant cannot be
