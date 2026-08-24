@@ -4380,7 +4380,7 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         Exit(u32),          // ret / br : (reads-mask); no in-body successor
         Opaque,             // bl / blr / unmodelable ⟹ block opaque
         Mov(u32, u32),      // mov xD,xS : (d, s)  — drop candidate
-        Sxtw(u32),          // in-place sxtw xD,wD : (d)  — drop candidate
+        Sxtw(u32, u32),     // sxtw xD,wS : (d, reads-mask) — drop candidate (D==S or D≠S)
         Op(u32, u32),       // everything else : (reads, writes)
     }
     let first_reg = |t: &str, mn: &str| -> u32 {
@@ -4428,8 +4428,8 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
                             return K::Mov(d, s);
                         }
                     }
-                    if t.starts_with("sxtw ") && w.count_ones() == 1 && r == w {
-                        return K::Sxtw(w.trailing_zeros());
+                    if t.starts_with("sxtw ") && w.count_ones() == 1 {
+                        return K::Sxtw(w.trailing_zeros(), r); // pure widen — dead iff xD dead
                     }
                     K::Op(r, w)
                 }
@@ -4505,7 +4505,7 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         match kinds[i] {
             K::Cond(r, _) | K::Exit(r) => cur | r,
             K::Mov(d, s) => (cur & !(1 << d)) | (1 << s),
-            K::Sxtw(d) => cur | (1 << d), // reads==writes==d ⟹ keeps d live
+            K::Sxtw(d, reads) => (cur & !(1 << d)) | reads, // widen: writes d, reads s (=d if in-place)
             K::Op(r, w) => (cur & !w) | r,
             _ => cur, // Skip / Label / Jump / Opaque : no GP effect (opaque block handled apart)
         }
@@ -4552,7 +4552,7 @@ fn drop_dead_moves(body: &str, ret_gp: u32) -> String {
         for &i in blocks[b].iter().rev() {
             match kinds[i] {
                 K::Mov(d, _) if (cur & (1 << d)) == 0 => drop[i] = true,
-                K::Sxtw(d) if (cur & (1 << d)) == 0 => drop[i] = true,
+                K::Sxtw(d, _) if (cur & (1 << d)) == 0 => drop[i] = true,
                 _ => cur = step(i, cur),
             }
         }
@@ -4699,6 +4699,113 @@ fn parse_frame_ldst(t: &str) -> Option<(bool, u32, &str)> {
     let n = reg.trim().strip_prefix('x')?.parse::<u32>().ok()?; // x-form (64-bit) only
     let mem = mem.trim();
     mem.starts_with("[sp,").then_some((is_load, n, mem))
+}
+
+/// FP VALUE RESIDENCY [Phase 4.2] — redundant `fmov` elimination via 64-bit value-equivalence
+/// over BOTH the GP (x) and FP (d) register files. Lacking an FP register class, the emitter
+/// round-trips every double d→GP→d and reloads it each use; a `fmov Dst,Src` (or `mov x,x`) whose
+/// Dst already holds Src's exact 64-bit pattern (same value-id) is a proven no-op and dropped.
+/// Only 64-bit copies form equivalences — `fmov d,x` / `fmov x,d` / `fmov d,d` / `mov x,x` — so
+/// value-ids never mix widths. ANY other write to a register (including a w-form or s/q/v-reg
+/// write, matched broadly for invalidation) mints a fresh id, breaking a stale equivalence; an
+/// unrecognized / branch / label line flushes the model (basic-block scope). Same rewrite-
+/// soundness as drop_redundant_moves (a value-id equality means identical bits), extended to d.
+fn fmov_residency(body: &str) -> String {
+    use std::collections::HashMap;
+    // 64-bit copy operand: x n → n (0..30), d n → 32+n. NOT w/s/q (width mismatch) → None.
+    fn rid_copy(tok: &str) -> Option<u32> {
+        let t = tok.trim();
+        if let Some(n) = t.strip_prefix('x') {
+            return n.parse::<u32>().ok().filter(|&r| r <= 30);
+        }
+        t.strip_prefix('d').and_then(|n| n.parse::<u32>().ok()).filter(|&r| r <= 31).map(|r| 32 + r)
+    }
+    // ANY-width destination register (for invalidation): x/w → GP slot; d/s/h/b/q/v → the shared
+    // v-reg id 32+n. Brackets/immediates/labels → None.
+    fn rid_def(tok: &str) -> Option<u32> {
+        let t = tok.trim().trim_start_matches('[').trim_end_matches(']');
+        if let Some(n) = t.strip_prefix('x').or_else(|| t.strip_prefix('w')) {
+            return n.parse::<u32>().ok().filter(|&r| r <= 30);
+        }
+        t.strip_prefix(['d', 's', 'h', 'b', 'q', 'v'])
+            .and_then(|n| n.parse::<u32>().ok())
+            .filter(|&r| r <= 31)
+            .map(|r| 32 + r)
+    }
+    const NO_DEF: &[&str] = &["str", "strb", "strh", "stp", "cmp", "cmn", "tst", "fcmp", "ccmp"];
+    const DEF_FIRST: &[&str] = &[
+        "mov", "movk", "movz", "movn", "add", "sub", "mul", "msub", "madd", "neg", "mvn", "and",
+        "orr", "eor", "bic", "lsl", "lsr", "asr", "sdiv", "udiv", "sxtw", "sxth", "sxtb", "uxtw",
+        "uxth", "uxtb", "cset", "csel", "csinc", "cinc", "adrp", "ldr", "ldrb", "ldrh", "ldrsw",
+        "ldrsb", "ldrsh", "fmov", "scvtf", "ucvtf", "fcvt", "fadd", "fsub", "fmul", "fdiv", "fneg",
+        "fcvtzs", "fcvtzu", "sxtl", "ubfx", "ubfiz", "sbfx", "sbfiz", "fabs", "fsqrt", "fmadd",
+        "fmsub", "fnmul", "fcsel", "frinta", "frintm", "frintp", "frintz", "dup",
+    ];
+    let mut eq: HashMap<u32, u64> = HashMap::new();
+    let mut next = 0u64;
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if t.ends_with(':') {
+            eq.clear(); // basic-block boundary
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if t.starts_with('.') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mn = t.split_whitespace().next().unwrap_or("");
+        let ops = t[mn.len()..].trim_start();
+        // A tracked 64-bit copy: `fmov`/`mov` with two register operands, both x-or-d (rid_copy).
+        if mn == "fmov" || mn == "mov" {
+            let mut it = ops.split(',');
+            if let (Some(dt), Some(st), None) = (it.next(), it.next(), it.next()) {
+                if let (Some(d), Some(s)) = (rid_copy(dt), rid_copy(st)) {
+                    match (eq.get(&d), eq.get(&s)) {
+                        (Some(a), Some(b)) if a == b => continue, // Dst already ≡ Src ⟹ DROP
+                        _ => {
+                            let sid = *eq.entry(s).or_insert_with(|| {
+                                next += 1;
+                                next
+                            });
+                            eq.insert(d, sid);
+                            out.push_str(line);
+                            out.push('\n');
+                            continue;
+                        }
+                    }
+                }
+            }
+            // else (immediate / s-reg / w-form) ⟹ fall through to def-invalidation below
+        }
+        if mn == "ldp" {
+            for tok in ops.split(',').take(2) {
+                if let Some(r) = rid_def(tok) {
+                    next += 1;
+                    eq.insert(r, next);
+                }
+            }
+        } else if NO_DEF.contains(&mn) {
+            // no destination — model unchanged
+        } else if DEF_FIRST.contains(&mn) {
+            if let Some(r) = ops.split(',').next().and_then(rid_def) {
+                next += 1;
+                eq.insert(r, next); // fresh value ⟹ breaks stale ≡
+            }
+        } else {
+            eq.clear(); // unrecognized (branch/call/ret/…) ⟹ flush = safe
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// SHIFTED-REGISTER ARITHMETIC FUSION [Phase 3.1]. ARMv8 add/sub take a shifted second source in
@@ -5189,6 +5296,9 @@ pub fn emit_ir(ast: &Ast) -> String {
             // …then absorb a preceding signed-index widening `sxtw xT,wS; add xD,xB,xT[,lsl #k]`
             // (k≤4) into the add's extend field: `add xD,xB,wS,sxtw #k` (drops the sxtw + shift).
             body = fuse_sxtw_extend(&body);
+            // …and drop redundant fmov round-trips (d→GP→d spill/reload) via 64-bit x+d
+            // value-equivalence (Phase 4.2 FP residency; pure register identity, volatile-safe).
+            body = fmov_residency(&body);
         }
         let c_move = costsq.then(|| count_insn_lines(&body));
         if g.regalloc && passes.ldst_pair && !f.has_volatile {
@@ -5454,6 +5564,44 @@ mod tests {
         assert_eq!(count(&out, "ldr x0, [sp, #24]"), 0, "a directive does not break adjacency");
     }
 
+    use super::fmov_residency;
+
+    // Phase 4.2: a `fmov x,d` then `fmov d,x` round-trip where the reload target already holds the
+    // value (via the store) is redundant and dropped — the FP residency win.
+    #[test]
+    fn fmov_residency_drops_reload_after_store() {
+        // d17 ← x10 (store), then x10 ← d17 (reload): x10 already ≡ d17 ⟹ the reload is dropped.
+        let body = "\tfmov x10, d0\n\tfmov d17, x10\n\tfmov x10, d17\n";
+        let out = fmov_residency(body);
+        assert_eq!(count(&out, "fmov x10, d17"), 0, "reload of a value x10 already holds ⟹ drop");
+        assert_eq!(count(&out, "fmov d17, x10"), 1, "the store stays");
+    }
+
+    // A restore `fmov d0, x10` where d0 already equals x10 (nothing wrote d0 since) is dropped.
+    #[test]
+    fn fmov_residency_drops_redundant_restore() {
+        let body = "\tfmov x10, d0\n\tfmov d17, x10\n\tfmov d0, x10\n";
+        let out = fmov_residency(body);
+        assert_eq!(count(&out, "fmov d0, x10"), 0, "d0 still ≡ x10 ⟹ redundant restore dropped");
+    }
+
+    // TEETH: once the FP value is REDEFINED (fmul writes d0), a later `fmov d0,x10` is NOT
+    // redundant — d0 no longer equals x10. Mis-dropping it would lose the recomputed value.
+    #[test]
+    fn fmov_residency_keeps_after_redef() {
+        let body = "\tfmov x10, d0\n\tfmul d0, d0, d1\n\tfmov d0, x10\n";
+        let out = fmov_residency(body);
+        assert_eq!(count(&out, "fmov d0, x10"), 1, "d0 redefined by fmul ⟹ restore is live ⟹ keep");
+    }
+
+    // TEETH: a block boundary (branch) flushes the equivalence model — no cross-block drop.
+    #[test]
+    fn fmov_residency_flushes_at_branch() {
+        let body = "\tfmov x10, d0\n\tfmov d17, x10\n\tb .L1\n\tfmov x10, d17\n";
+        let out = fmov_residency(body);
+        assert_eq!(count(&out, "fmov x10, d17"), 1, "branch flushes ⟹ conservative keep");
+    }
+
     use super::fuse_sxtw_extend;
 
     // Phase 3.1 (sxtw arm): `sxtw xT,wS; add xD,xB,xT,lsl #k` (xD==xT) folds to one extended-add
@@ -5681,6 +5829,24 @@ mod tests {
         let body = "\tsxtw x24, w24\n\tmov x24, x1\n\tmov x2, x24\n";
         let out = drop_dead_moves(body, 1);
         assert_eq!(count(&out, "sxtw x24, w24"), 0, "the re-canon whose result is overwritten is dead");
+    }
+
+    // EXHAUSTION: a dead NON-in-place widen `sxtw xD,wS` (D≠S, xD never read — e.g. the memory
+    // op re-extends wS itself) is equally pure dead code. Global liveness proves xD dead here.
+    #[test]
+    fn dce_drops_dead_widen_dest_ne_src() {
+        let body = "\tsxtw x20, w1\n\tldrsw x2, [x21, w1, sxtw #2]\n\tadd x0, x0, x2\n\tret\n";
+        let out = drop_dead_moves(body, 1);
+        assert_eq!(count(&out, "sxtw x20, w1"), 0, "x20 never read (op re-extends w1) ⟹ dead");
+        assert_eq!(count(&out, "ldrsw x2, [x21, w1, sxtw #2]"), 1, "the real access stays");
+    }
+
+    // TEETH: the widen is KEPT when its dest IS read (here x20 feeds the add) — not dead.
+    #[test]
+    fn dce_keeps_live_widen() {
+        let body = "\tsxtw x20, w1\n\tadd x0, x0, x20\n\tret\n";
+        let out = drop_dead_moves(body, 1);
+        assert_eq!(count(&out, "sxtw x20, w1"), 1, "x20 is read by the add ⟹ live ⟹ keep");
     }
 
     use super::drop_wform_sxtw;
