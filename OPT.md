@@ -142,7 +142,7 @@
 |---|---|---|---|
 | 17 | **loop rotation** (cond branch = back-edge, drop uncond `b`) | SPEED | ⚠️ pass shipped PROVEN but default-OFF + ✅ banked spin-off. See note ⓱ |
 | 18 | **pointer pre/post-index in loops** (`add p,#k`→`[p],#k`) | SPEED | ⛔ same-block core already ✅ (lever 5, 147 folds); cross-block extension ABANDONED — measured exec-NEUTRAL + unsafe-dominant. See note ⓲ |
-| 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | ⬜ B2 — j5/h1/j2/d2 |
+| 19 | **hot-loop body**: IV-simplification (2.3) + in-loop strength-reduce + residency | SPEED | 🟡 IN-PROGRESS — sxtw-canonical residency lever ✅ BANKED; IV-simpl (2.3) already fires (ptr-to-end); remaining residency (invariant adrp/add hoist + scaled-index-on-global) = memory-bound floor = #23/#25. See note ⓳ |
 | 20 | **struct-by-value + HFA** (5.3) | BOTH | ⬜ B3 — AAPCS64 §5.4/5.5 |
 | 21 | **many-arg marshalling** (5.4) | BOTH | ⬜ B3 — AAPCS64 §5.5 |
 | 22 | **bounded FP register allocation / FP loop residency** (4.3) | BOTH (FP) | ⬜ B3 — f2/f3 |
@@ -152,7 +152,18 @@
 
 **Dimension totals so far (banked):** the size era (1–16) drove sqlite 303,933→288,877 (1.925×→1.830×)
 and geo40 exec to 1.75×. The speed era (17–24) targets geo40 → ~1.5× (see estimate below); #25 is the
-only path to size *and* speed ≈ 1.0×. **RESUME = #19 (hot-loop body: IV-simplification + in-loop strength-reduce + residency).**
+only path to size *and* speed ≈ 1.0×. **RESUME = #19 (remaining residency — see note ⓳; the sxtw-canonical
+sub-lever is banked, the address-hoist/scaled-index sub-levers are the #23/#25 memory-bound floor).**
+
+> **📏 SCOREBOARD BASELINE (record for cross-session regression detection — user point 2026-08-24: an
+> ABSOLUTE geo40 number is NOT comparable across sessions because machine load drifts; the trustworthy
+> check is a SAME-SESSION A/B against a rebuilt pre-change baseline, OR the gcc-normalized ratio which
+> partly cancels machine speed). As of the #19 sxtw-canonical bank (this session, box zccbox):**
+> - **perfn (insn-count proxy, gcc-normalized): 1.759×** (was 1.767× pre-#19; −13 suite insns).
+> - **geo40 exec (arbiter, gcc-normalized, best-of-5 over 19 timeable programs): 1.6469×**, measured
+>   SAME-SESSION vs the rebuilt pre-#19 baseline **1.6484×** ⟹ Δ −0.09% (neutral, NO regression).
+>   NB the #17 note's "~1.67×" was a different session/machine — do NOT diff absolute numbers across
+>   sessions; rebuild `zcc_old` and A/B, as done here.
 
 > **⓱ #17 LOOP ROTATION — outcome (session 2026-08-24).** Implemented `opt::loop_rotate` (post-`out_of_ssa`
 > CFG reshape: top-test → bottom-test + entry guard) with its commuting-square proof (`loop_rotate_preserves`
@@ -192,6 +203,33 @@ only path to size *and* speed ≈ 1.0×. **RESUME = #19 (hot-loop body: IV-simpl
 > neutral → quarantine-mark-advance. No `src/` change; tree unchanged at `d4461a1` (still fully green). The
 > per-iteration residency floor these loop-shape levers keep hitting only falls to **#25 (nuclear regalloc,
 > home-primary → register-primary)** — the backend value-model rewrite, not a loop-shape peephole. **RESUME = #19.**
+
+> **⓳ #19 HOT-LOOP BODY — outcome so far (session 2026-08-24).** Diagnosed the hot loops of the batch-2
+> targets (j5/h1/j2/d2) against gcc-O1 at the middle (Law 3). Findings:
+> - **IV-simplification (2.3) ALREADY FIRES** — the counted loops (histogram clear/accumulate, ptr-walks)
+>   already reduce to a single pointer IV tested against an end-pointer (`cmp x,xEnd; b.hs` + post-index
+>   `ldrsw [p],#4`). No new work; that sub-lever is done from levers 5/6/13.
+> - **✅ BANKED — sxtw value-residency (Law-4 exhaustion of LEVER 2).** The hot loops carried a redundant
+>   in-place `sxtw xD,wD` right after a `and Rd,Rn,#imm` (imm ≤ 0x7fffffff): the mask forces a
+>   non-negative int32 (bits 31..63 = 0) ⟹ the value is ALREADY sign-canonical ⟹ the sxtw is a proven
+>   no-op. Extended `drop_redundant_sxtw`'s canonical-producer set with the PROVABLY-safe subset of the
+>   deliberately-excluded w-form class: `and #imm≤0x7fffffff`, `uxtb`/`uxth`, `ubfx …,#width≤31`. Same
+>   translation-validation tier (a value with a proven-clear bit 31); 5 teeth tests (drop on and/uxt/ubfx,
+>   KEEP on high-bit mask / register-form and / width-32 ubfx / reg-redefined). Fires 13 suite sites + 33
+>   sqlite. **MEASURED:** perfn 1.767×→**1.759×**; geo40 exec (same-session A/B vs rebuilt baseline)
+>   1.6484×→**1.6469×** (−0.09%, neutral-positive, NO regression); per-loop the affected kernels moved
+>   (histogram −7%, d2 −10% on short runs, within their own noise). Full gate green. Small but proven +
+>   zero-risk → banked (a size-monotone, exec-non-regressing residency capture; Law-4 says capture the
+>   safe residual, don't stop at the first green).
+> - **REMAINING residency (NOT banked, = the #17/#18 memory-bound floor).** The histogram accumulate loop
+>   still recomputes the invariant `adrp x1,hist; add x1,:lo12:hist` every iteration (2 insns/iter) and
+>   materializes the `hist[v]` address instead of gcc's scaled-index `[x3, x0, lsl 2]`. Hoisting the
+>   address is LICM (row #23, pressure-guarded pass EXISTS but default-OFF, historically size-negative);
+>   the scaled-index-on-a-hoisted-global needs the hoist first. Both are the uniform per-iteration
+>   residency floor that #17/#18 already proved exec-neutral on this home-primary memory-bound backend —
+>   it only falls to #25 (nuclear regalloc, home→register-primary). NO-PIVOT: do NOT chase it here; the
+>   clean sub-lever is banked, the floor is #23/#25's problem. **RESUME = re-eval #23 LICM under the speed
+>   metric, or advance to #20 (struct-by-value).**
 
 #### Execution grouping of rows 17–24 (SUBORDINATE to the spine — a work-batching label, NOT a plan)
 

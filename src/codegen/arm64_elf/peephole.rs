@@ -216,6 +216,17 @@ pub(super) fn fuse_bitfield(body: &str) -> String {
 /// validation tier as the move peephole. [sqlite: 343 ldrsw→sxtw + 36 double-sxtw + tail.]
 /// W-form producers are deliberately excluded (a `w`-dst leaves bits 32..63 zero, not sign-filled),
 /// as are mov/bitwise propagation (their canonicality is width-subtle — safety over the extra ~17).
+/// The last comma-separated operand parsed as an unsigned immediate `#imm` (decimal or 0x-hex);
+/// None if it is not an immediate (a register/shifted-register operand) or does not parse. Used to
+/// gate the non-negative-int32 canonical producers (`and #imm`, `ubfx …,#width`).
+fn last_imm(operands: &str) -> Option<u64> {
+    let h = operands.rsplit(',').next()?.trim().strip_prefix('#')?;
+    match h.strip_prefix("0x") {
+        Some(x) => u64::from_str_radix(x, 16).ok(),
+        None => h.parse::<u64>().ok(),
+    }
+}
+
 pub(super) fn drop_redundant_sxtw(body: &str) -> String {
     use std::collections::HashSet;
     let mut canon: HashSet<u32> = HashSet::new();
@@ -264,9 +275,21 @@ pub(super) fn drop_redundant_sxtw(body: &str) -> String {
         let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
         let operands = t[mn.len()..].trim_start();
         // 64-bit sign-extending producer (X dst) ⟹ result canonical; cset ⟹ 0/1, canonical.
+        // NON-NEGATIVE-INT32 producers (Law-4 exhaustion of LEVER 2, the deliberately-excluded
+        // w-form class, refined to its PROVABLY-safe subset). A value whose bits 32..63 are 0 is
+        // sign-canonical *iff* bit 31 is also 0 (a positive int32); the generic w-form producer
+        // fails that side test (bit 31 may be set), but three shapes force bit 31 = 0 for ANY
+        // input, so they ARE canonical (and the following in-place `sxtw` a proven no-op):
+        //   • `and Rd, Rn, #imm` with imm ≤ 0x7fffffff — bits 31..63 of the result are all 0
+        //     (register/large-mask `and` correctly rejected: no `#`, or imm's bit 31 set).
+        //   • `uxtb`/`uxth` — result ∈ [0,255] / [0,65535], bits 8|16..63 = 0 ⟹ bit 31 = 0.
+        //   • `ubfx Rd, Rn, #lsb, #width` with width ≤ 31 — result ∈ [0, 2^width), bit 31 = 0.
         let prod = (matches!(mn, "sxth" | "sxtb" | "ldrsw" | "ldrsb" | "ldrsh")
             && operands.starts_with('x'))
-            || mn == "cset";
+            || mn == "cset"
+            || matches!(mn, "uxtb" | "uxth")
+            || (mn == "and" && last_imm(operands).is_some_and(|v| v <= 0x7fff_ffff))
+            || (mn == "ubfx" && last_imm(operands).is_some_and(|w| w <= 31));
         for &w in &writes {
             if prod {
                 canon.insert(w);

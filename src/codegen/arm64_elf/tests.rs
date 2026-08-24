@@ -719,6 +719,48 @@ fn uxt_kept_when_reg_rewritten_between() {
     assert_eq!(count(&out, "uxtb w3, w3"), 1, "reg redefined ⟹ floor lost ⟹ keep");
 }
 
+use super::drop_redundant_sxtw;
+
+// LEVER 2 exhaustion (#19 residency): `and Rd,Rn,#imm` with imm ≤ 0x7fffffff produces a
+// non-negative int32 (bits 31..63 all 0) ⟹ it is already sign-canonical ⟹ an in-place `sxtw`
+// right after is a proven no-op and is DROPPED. This is the histogram/popcount hot-loop case.
+#[test]
+fn sxtw_dropped_after_and_small_mask() {
+    let out = drop_redundant_sxtw("\tand x1, x1, #255\n\tsxtw x1, w1\n\tlsl x2, x1, #2\n");
+    assert_eq!(count(&out, "sxtw x1, w1"), 0, "and #255 ⟹ x1 ∈ [0,255] ⟹ sxtw is a no-op");
+    assert!(out.contains("and x1, x1, #255") && out.contains("lsl x2, x1, #2"), "rest untouched");
+    // w-form and, same slot: dst write zero-extends AND bit 31 = 0 ⟹ canonical.
+    let out2 = drop_redundant_sxtw("\tand w0, w0, #8191\n\tsxtw x0, w0\n");
+    assert_eq!(count(&out2, "sxtw x0, w0"), 0, "and #8191 (13-bit mask) ⟹ canonical");
+}
+
+// TEETH: a mask with bit 31 set (≥ 0x80000000) can leave a negative int32 ⟹ NOT sign-canonical
+// (bits 32..63 are 0 but bit 31 may be 1, so sxtw would sign-fill differently). Must be KEPT.
+#[test]
+fn sxtw_kept_after_and_high_bit_mask() {
+    let out = drop_redundant_sxtw("\tand x1, x1, #0xffffffff\n\tsxtw x1, w1\n");
+    assert_eq!(count(&out, "sxtw x1, w1"), 1, "0xffffffff mask ⟹ bit 31 may be set ⟹ keep");
+    // register-form `and` (no immediate) has an unknown result ⟹ not canonical.
+    let out2 = drop_redundant_sxtw("\tand x1, x1, x9\n\tsxtw x1, w1\n");
+    assert_eq!(count(&out2, "sxtw x1, w1"), 1, "and Rd,Rn,Rm has unknown high bits ⟹ keep");
+}
+
+// TEETH: `uxtb`/`uxth` and `ubfx …,#width≤31` are non-negative-int32 producers too.
+#[test]
+fn sxtw_dropped_after_uxt_and_ubfx() {
+    assert_eq!(count(&drop_redundant_sxtw("\tuxtb w3, w3\n\tsxtw x3, w3\n"), "sxtw x3, w3"), 0);
+    assert_eq!(count(&drop_redundant_sxtw("\tubfx x4, x5, #3, #10\n\tsxtw x4, w4\n"), "sxtw x4, w4"), 0);
+    // width 32 ⟹ result may have bit 31 set ⟹ keep.
+    assert_eq!(count(&drop_redundant_sxtw("\tubfx x4, x5, #0, #32\n\tsxtw x4, w4\n"), "sxtw x4, w4"), 1);
+}
+
+// TEETH: an intervening redefinition of the register clears its canonical status ⟹ sxtw KEPT.
+#[test]
+fn sxtw_kept_when_reg_rewritten_after_and() {
+    let out = drop_redundant_sxtw("\tand x1, x1, #255\n\tadd x1, x4, x5\n\tsxtw x1, w1\n");
+    assert_eq!(count(&out, "sxtw x1, w1"), 1, "reg redefined by add ⟹ canonical lost ⟹ keep");
+}
+
 use super::{cbz_fuse, post_index};
 
 // LEVER 5 CORE: `ldr x5,[x6]` + `add x6,x6,#8` (base incremented, no intervening use) folds
