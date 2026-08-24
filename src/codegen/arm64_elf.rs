@@ -3485,6 +3485,93 @@ fn drop_redundant_sxtw(body: &str) -> String {
     out
 }
 
+/// LEVER 8 (direct) — REDUNDANT ZERO-EXTEND elimination (the zero-extend sibling of LEVER 2). A
+/// byte/half load already zero-extends its destination: `ldrb wD` clears bits 8..63, `ldrh wD`
+/// clears bits 16..63. A subsequent in-place `uxtb wD,wD` / `uxth wD,wD` that only re-clears
+/// already-zero high bits is a pure no-op (it comes from the C integer promotion of an `unsigned
+/// char`/`unsigned short`, emitted without noticing the load did the extension). Track a per-block
+/// map reg → the bit index at/above which the register is KNOWN zero (8 for a byte producer, 16 for
+/// a half producer). Drop `uxtb xD` iff D's known-zero floor ≤ 8; drop `uxth xD` iff ≤ 16 (a
+/// byte-extended value is also half-extended, so `uxth` after `ldrb` is a no-op too; but `uxtb`
+/// after `ldrh` is REAL — the half load leaves bits 8..15). Producers = `ldrb`/`ldrh` (X or W dst)
+/// and the uxt themselves; sign-extending loads (`ldrsb`/`ldrsh`) and word loads (`ldr wD`) are
+/// deliberately NOT producers (they do not clear bits 8..31). Cleared at every block boundary and on
+/// any other write of D. Same translation-validation tier as LEVER 2 (pure ISA zero-extend identity
+/// on a register with a proven-zero high field). [sqlite: 2,501 uxtb-after-ldrb + 1,047 uxth-after-ldrh.]
+fn drop_redundant_uxt(body: &str) -> String {
+    use std::collections::HashMap;
+    let mut zfloor: HashMap<u32, u32> = HashMap::new(); // reg → bits at/above this index are zero
+    let mut out = String::with_capacity(body.len());
+    // "uxtb|uxth wD, wD" (in-place) → (width_bits, D); width 8 for uxtb, 16 for uxth.
+    let parse_uxt = |t: &str| -> Option<(u32, u32)> {
+        let (w, rest) = if let Some(r) = t.strip_prefix("uxtb ") {
+            (8u32, r)
+        } else if let Some(r) = t.strip_prefix("uxth ") {
+            (16u32, r)
+        } else {
+            return None;
+        };
+        let mut it = rest.split(',');
+        let d = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        let s = it.next()?.trim().strip_prefix('w')?.parse::<u32>().ok()?;
+        (it.next().is_none() && d == s).then_some((w, d))
+    };
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            out.push('\n');
+            continue;
+        }
+        if t.ends_with(':') {
+            zfloor.clear(); // basic-block boundary
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if t.starts_with('.') {
+            out.push_str(line); // directive — touches no register
+            out.push('\n');
+            continue;
+        }
+        if let Some((w, d)) = parse_uxt(t) {
+            if zfloor.get(&d).is_some_and(|&f| f <= w) {
+                continue; // bits ≥ w already zero ⟹ the uxt is a no-op ⟹ DROP
+            }
+            zfloor.insert(d, w); // the uxt itself establishes the floor (kept or not)
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let (_, writes, boundary) = reg_uses(t);
+        if boundary {
+            zfloor.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let mn = t.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+        // byte/half loads zero-extend their dst; every other def clobbers the known-zero floor.
+        let load_w = match mn {
+            "ldrb" => Some(8u32),
+            "ldrh" => Some(16u32),
+            _ => None,
+        };
+        for &wr in &writes {
+            match load_w {
+                Some(w) => {
+                    zfloor.insert(wr, w);
+                }
+                None => {
+                    zfloor.remove(&wr);
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// LEVER 7 — W-FORM SIGN-EXTEND elimination (the DEMAND-side dual of `drop_redundant_sxtw`).
 /// Value contract (db9cb93): an int32 lives in the LOW 32 bits of its 64-bit home; bits 32..63 are
 /// DON'T-CARE. An in-place re-canonicalization `sxtw xD, wD` is therefore DEAD unless a later
@@ -3566,8 +3653,8 @@ fn drop_wform_sxtw(body: &str) -> String {
 /// THEN bitfield fusion (LEVER 1) + redundant sign-extend elim (LEVER 2) + the demand-side w-form
 /// sign-extend elim (LEVER 7) on the settled stream.
 fn peephole_moves(body: &str) -> String {
-    drop_wform_sxtw(&drop_dead_moves(&drop_redundant_sxtw(&fuse_bitfield(&drop_redundant_moves(
-        &propagate_copies(body),
+    drop_wform_sxtw(&drop_dead_moves(&drop_redundant_uxt(&drop_redundant_sxtw(&fuse_bitfield(
+        &drop_redundant_moves(&propagate_copies(body)),
     )))))
 }
 
@@ -5123,6 +5210,43 @@ mod tests {
     fn wform_sxtw_ignores_genuine_widening() {
         let out = drop_wform_sxtw("\tsxtw x5, w2\n\tmov w5, w9\n");
         assert_eq!(count(&out, "sxtw x5, w2"), 1, "a widening move is not the in-place form");
+    }
+
+    use super::drop_redundant_uxt;
+
+    // LEVER 8 CORE: `ldrb wD` zero-extends bits 8..63, so an in-place `uxtb wD,wD` right after is a
+    // no-op and is DROPPED. The `uxth` after `ldrb` is likewise redundant (bits ≥16 already zero).
+    #[test]
+    fn uxt_dropped_after_byte_load() {
+        let out = drop_redundant_uxt("\tldrb w3, [x0]\n\tuxtb w3, w3\n\tadd x2, x2, x3\n");
+        assert_eq!(count(&out, "uxtb w3, w3"), 0, "ldrb already zero-extends ⟹ uxtb dead");
+        assert!(out.contains("ldrb w3, [x0]"), "the load is untouched");
+        let out2 = drop_redundant_uxt("\tldrb w3, [x0]\n\tuxth w3, w3\n");
+        assert_eq!(count(&out2, "uxth w3, w3"), 0, "byte-extended ⟹ uxth also a no-op");
+    }
+
+    // TEETH: `uxtb` after `ldrh` is REAL work — the half load leaves bits 8..15, which uxtb clears.
+    // Must be KEPT (dropping it would change the value).
+    #[test]
+    fn uxtb_kept_after_half_load() {
+        let out = drop_redundant_uxt("\tldrh w3, [x0]\n\tuxtb w3, w3\n");
+        assert_eq!(count(&out, "uxtb w3, w3"), 1, "ldrh leaves bits 8..15 ⟹ uxtb is real");
+    }
+
+    // TEETH: a sign-extending load (`ldrsb`) does NOT zero the high bits, so a following `uxtb`
+    // is real (it clears the sign fill). Must be KEPT.
+    #[test]
+    fn uxt_kept_after_signed_load() {
+        let out = drop_redundant_uxt("\tldrsb w3, [x0]\n\tuxtb w3, w3\n");
+        assert_eq!(count(&out, "uxtb w3, w3"), 1, "ldrsb sign-extends ⟹ uxtb is not a no-op");
+    }
+
+    // TEETH: an intervening write of the register between the load and the uxt clears the known-zero
+    // floor ⟹ the uxt is no longer provably redundant. Must be KEPT.
+    #[test]
+    fn uxt_kept_when_reg_rewritten_between() {
+        let out = drop_redundant_uxt("\tldrb w3, [x0]\n\tadd w3, w4, w5\n\tuxtb w3, w3\n");
+        assert_eq!(count(&out, "uxtb w3, w3"), 1, "reg redefined ⟹ floor lost ⟹ keep");
     }
 
     use super::{cbz_fuse, post_index};
