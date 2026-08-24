@@ -1,7 +1,7 @@
 # `arm64_elf.md` — the backend theory (render + allocate)
 
-> **Scope.** This is the constitution for `src/codegen/arm64_elf.rs` (+ the allocator it
-> imports from `src/opt.rs`). It fixes, once, *which* academic algorithm each backend stage
+> **Scope.** This is the constitution for the `src/codegen/arm64_elf/` module (+ the allocator
+> it imports from `src/opt/`). It fixes, once, *which* academic algorithm each backend stage
 > realizes, *which* AAPCS64/ARMv8 fact it is instantiated over, and *where the current code
 > falls short of its own theorem*. It obeys the project charter verbatim: every line of the
 > backend lies on **Side I** (a theorem → an algorithm) or **Side II** (a spec line → a

@@ -6,8 +6,8 @@
 > the direction of the project author. The author designed, reviewed, and steered
 > the work; the AI wrote all of it. This disclaimer applies to every file here.
 
-A C compiler for strict C99, written in Rust — targeting AArch64 (ELF/Linux and
-Mach-O/macOS). Single crate, zero external dependencies.
+A C compiler for strict C99, written in Rust — targeting AArch64 ELF (Linux).
+Single crate, zero external dependencies.
 
 ## Why another compiler
 
@@ -51,7 +51,7 @@ measured and reproducible; a ⏳ is a gate that must close before release.
 | | Capability |
 |---|---|
 | ✅ | **Language:** C99 (C89 is a subset); preprocessor, parser, full type system, code generator |
-| ✅ | **Targets:** AArch64 — ELF (Linux) and Mach-O (macOS) |
+| ✅ | **Targets:** AArch64 — ELF (Linux). macOS/clang is the reference oracle only |
 | ✅ | **Dependencies:** none — a single Rust crate, zero external crates |
 | ✅ | **Drop-in driver:** `CC=zcc` slots into real build systems (configure/make/cmake) unmodified; drives `as`/`ld` directly |
 | ✅ | **Real software:** compiles and differentially validates real C projects (redis, sqlite, git, nginx, …) |
@@ -72,7 +72,7 @@ per-pass machine-checked proofs) is on the roadmap — see `SEMANTICS.md` §6.
 - `THEORY.md` — the theoretical catalog: every feature mapped to a theorem.
 - `SEMANTICS.md` — the formal reference semantics ⟦·⟧ of the IR.
 - `MILESTONES.md` — development history and roadmap.
-- `OPT.md` `[ssa-qbe fork]` — the single optimization working-doc (IR contract · scoreboard · pipeline plan); transient, folds into the above at opt-end.
+- `OPT.md` — the transient execution plan + work-booking (the SUPREME PLAN spine · scoreboard · done-ledger); durable theorems cook into `THEORY.md`/`SEMANTICS.md` at opt-end.
 
 ## Build
 

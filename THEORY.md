@@ -99,10 +99,10 @@ target file (Side II); everything else is Side I.
 ### A5. Codegen & ABI `[IN USE]`
 | concept/theorem | description | zcc |
 |---|---|---|
-| Instruction selection = per-node simulation | simulate AST node → asm (maximal munch over the tree) | `codegen/arm64_elf.rs` |
+| Instruction selection = per-Inst simulation | simulate each IR `Inst` → asm (x0/x1 accumulator; the AST-walk was removed) | `codegen/arm64_elf/emit.rs` |
 | ABI = finite automaton | argument classification (NGRN/NSRN/NSAA) | `gate abi` |
 | Cross-link cancellation | same-compiler ABI errors cancel → 4-way gate | `gate abi` |
-| Activation record / frame layout | fp-relative, spill, variadic save | `codegen/arm64_elf.rs` |
+| Activation record / frame layout | fp-relative, spill, variadic save | `codegen/arm64_elf/lower.rs` |
 
 ### A6. IR — the intermediate form `[PLANNED, scaffolding built]`
 | concept/theorem | description | zcc |
@@ -113,7 +113,7 @@ target file (Side II); everything else is Side I.
 | Virtual registers / temps (SSA-free) | a temporary carries a type from Γ | `ir.rs` (`temps`) |
 | CORE vs. EXOTIC-typed two-tier | CORE (Bin/Un/Copy/Load/Lea/Cast) is reachable by passes; EXOTIC-typed (Call/Store/Overflow/Va*/Sync/Asm…) is impure, no DCE/CSE (Inst::Opaque has been REMOVED) | `ir.rs` (`Inst`) |
 | Well-formedness verifier | reference integrity + def coverage + entry | `ir.rs` (`verify`) |
-| SSA + φ-node `[ssa-qbe fork: repr+interp DONE (Stage 1)]` | single-assignment temps; a φ at a join carries the value of the predecessor edge actually taken | `ir.rs` (`Inst::Phi`, interp φ-select via `prev`, verifier φ-arm V1); proven by `phi_diamond`/`phi_loop` |
+| SSA + φ-node `[main: SSA default-on]` | single-assignment temps; a φ at a join carries the value of the predecessor edge actually taken | `ir.rs` (`Inst::Phi`, interp φ-select via `prev`, verifier φ-arm V1); proven by `phi_diamond`/`phi_loop` |
 
 ### A7. Optimization — proving each pass `[IN USE: IR→IR proven]` (each pass provable, in place of a LOC ceiling)
 
@@ -142,7 +142,7 @@ target file (Side II); everything else is Side I.
 | Dominance / dom-tree (Lengauer–Tarjan) | A dom B; basis of copy-prop, SSA |
 | Graph coloring / interference (Chaitin–Briggs) | regalloc = coloring |
 
-**SSA pipeline `[ssa-qbe fork]` — theorem ladder (each stage a commuting square; QBE is a *projection*, CbC is supreme):**
+**SSA pipeline `[main]` — theorem ladder (each stage a commuting square; QBE is a *projection*, CbC is supreme):**
 
 | stage | theorem (proof obligation) | status |
 |---|---|---|
@@ -170,7 +170,7 @@ target file (Side II); everything else is Side I.
 const-fold = rewrite-soundness · DCE = liveness · copy-prop = dominance + Leibniz ·
 CSE = value-numbering · regalloc = rename-bisimulation.
 
-**The SSA pipeline `opt::optimize_ssa` (the QBE-level projection under CbC) `[ssa-qbe fork]`:**
+**The SSA pipeline `opt::optimize_ssa` (the QBE-level projection under CbC) `[main]`:**
 `[inline (whole-program, pre-SSA)] ▸ per-function{ to_ssa ▸ (sccp ∘ const_fold ∘ copy_prop ∘ gvn ∘ cse ∘ load_elim ∘ dce ∘ cfg_simplify [∘ licm ∘ strength_reduce])* ▸ if_convert ▸ out_of_ssa ▸ optimize }`
 (`load_elim` = B2 alias-gated store→load forwarding; `if_convert` = B4 diamond→csel, runs ONCE after the fixpoint, consuming SSA before `out_of_ssa`)
 (register coalescing runs later, inside `abi_alloc`, as a coloring bias; `licm` is
@@ -294,10 +294,10 @@ Where they live: **`ast.rs` TyTab** (`size/align/data_align`). Changing the mode
 | callee-saved | x19–x28, x29(fp), x30(lr) | §6.1.1 |
 | composite overflow locks NGRN=8 (C.11); HFA overflow does NOT lock | — | §6.8 rule C.11 |
 | prologue | `stp x29,x30,[sp,#-16]!` | §6.2.2 |
-| **variadic anon args go in registers** x0–x7/v0–v7 (standard AAPCS64, NOT darwinpcs stack-only), saved to a 192B reg-save area (128B VR + 64B GP) below the frame | — | §6.4 / `arm64_elf.rs` |
+| **variadic anon args go in registers** x0–x7/v0–v7 (standard AAPCS64, NOT darwinpcs stack-only), saved to a 192B reg-save area (128B VR + 64B GP) below the frame | — | §6.4 / `arm64_elf/emit.rs` |
 | **plain `char` is UNSIGNED** (explicit `signed char` = signed) | inverse of Darwin | AArch64 Linux / `parser.rs` |
 
-Where it lives: **`codegen/arm64_elf.rs`**. The argument-offset algorithm lives in
+Where it lives: **`codegen/arm64_elf/emit.rs`**. The argument-offset algorithm lives in
 **three places that must agree byte-for-byte** (codegen call / codegen spill / parser
 va_off) — changing one means changing all three, plus running `gate abi`.
 
@@ -310,7 +310,7 @@ va_off) — changing one means changing all three, plus running `gate abi`.
 | extern/GOT | `:got:`+`:got_lo12:` | ELF |
 | TLS | `:tprel_*` / TLS model | ELF TLS |
 
-Where it lives: **`codegen/arm64_elf.rs`**. (The former Darwin idiosyncrasies —
+Where it lives: **`codegen/arm64_elf/`** (module tail in `lower.rs`, relocations in `emit.rs`, `sym` in `encoding.rs`). (The former Darwin idiosyncrasies —
 `_`, `@PAGE`, `@TLVPPAGE`, variadic-args-on-stack — were removed when Mach-O was
 dropped; they are recorded in CLAUDE.md to avoid confusion.)
 
@@ -318,7 +318,9 @@ dropped; they are recorded in CLAUDE.md to avoid confusion.)
 Register file (x0–x30, sp, v0–v31), immediate ranges (add/sub 12-bit, logical bitmask,
 branch offset ±128MB), condition codes (eq/ne/lt…), addressing modes (`[base,#off]`,
 `[base,index,lsl]`). Source: **ARM ARM (DDI 0487)**. Where it lives:
-`codegen/arm64_elf.rs` (asm text).
+`codegen/arm64_elf/encoding.rs` (the Side-II encoders) + `emit.rs`/`lower.rs` (asm text).
+The register-operand token grammar (`x`/`w`\<N\> over one physical reg N) has a single
+audited decoder — `xreg`/`wreg`/`gpreg` in `codegen/arm64_elf/peephole.rs`.
 
 ### II-6. GCC/vendor spec — the nonconforming surface (`EXT(...)`)
 | feature | status | marker |
