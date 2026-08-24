@@ -402,7 +402,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R0.2 `hir/mod.rs` types + `verify.rs` + `dom.rs` (cfg, dom tree, loop forest, critical-edge split) | ✅ |
 | R0.3 `hir/build.rs`: AST → HIR with Braun SSA; scalar C subset (int/ptr arithmetic, if/while/for, calls, globals, strings) | ✅ |
 | R0.4 `hir/interp.rs` + first battery (`equiv` harness) proving `build` on the science-gate programs | ✅ `src/hir/tests.rs` 10/10 |
-| R0.5 `mir/mod.rs` + `isa.rs` (full AAPCS64 register table, immediates) + `verify.rs` + `interp.rs` | ⬜ |
+| R0.5 `mir/mod.rs` + `isa.rs` (full AAPCS64 register table, immediates) + `verify.rs` + `interp.rs` | ✅ `src/mir/tests.rs` 10/10 |
 | R0.6 `isel/lower.rs` naive 1:1 (no munch yet) + `isel/abi.rs` for scalar args/returns + `imm.rs` | ⬜ |
 | R0.7 **regalloc, complete**: `live` → `spill` (Braun-Hack + remat + SSA reconstruction) → `color` → `destruct` → `verify` | ⬜ |
 | R0.8 `mir/pass/frame.rs` + `layout.rs` + `emit.rs`; hello world links and runs in the box | ⬜ |

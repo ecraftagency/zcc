@@ -6,11 +6,14 @@
 //   (`<stem>.s`). ld: entry via crt1.o (_start → __libc_start_main → main),
 //   ctor/dtor via crti/crtn.
 mod ast;
+mod cfg;
 mod compile;
 mod emit;
 mod ext;
 mod hir;
 mod lexer;
+mod mem;
+mod mir;
 mod parser;
 mod preprocess;
 use std::{env, fs, process::Command, process::ExitCode};

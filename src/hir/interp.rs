@@ -11,111 +11,26 @@
 // is ⊥, and a transform may REFINE ⊥ into anything — so a commuting square
 // compares only runs where neither side traps.
 use super::*;
-use crate::ast::{self, Ast, GInit};
+use crate::ast::Ast;
 use std::collections::HashMap;
 
 pub type Bits = u64;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Trap {
-    DivZero,
-    BadAddress(u64),
-    NoSuchFunction(String),
-    Unreachable,
-    /// the step budget — a non-terminating program is ⊥ for our purposes
-    OutOfSteps,
-}
-
-/// Where the module's objects live. Address 0 is unmapped so a null dereference
-/// traps rather than silently reading a global.
-const GLOBAL_BASE: u64 = 0x10_000;
-const STACK_SIZE: u64 = 1 << 20;
-const STACK_TOP: u64 = 0x8000_0000;
-const STACK_BASE: u64 = STACK_TOP - STACK_SIZE;
-
-pub struct Mem {
-    /// [GLOBAL_BASE, GLOBAL_BASE + data.len()) — globals and string literals
-    data: Vec<u8>,
-    /// [STACK_BASE, STACK_TOP), grown downward from `sp`
-    stack: Vec<u8>,
-    sp: u64,
-}
-
-impl Mem {
-    fn slice(&mut self, a: u64, n: u64) -> Result<&mut [u8], Trap> {
-        let end = a.checked_add(n).ok_or(Trap::BadAddress(a))?;
-        if a >= GLOBAL_BASE && end <= GLOBAL_BASE + self.data.len() as u64 {
-            let o = (a - GLOBAL_BASE) as usize;
-            return Ok(&mut self.data[o..o + n as usize]);
-        }
-        if a >= self.sp && end <= STACK_TOP {
-            let o = (a - STACK_BASE) as usize;
-            return Ok(&mut self.stack[o..o + n as usize]);
-        }
-        Err(Trap::BadAddress(a))
-    }
-    fn load(&mut self, a: u64, n: u32) -> Result<u64, Trap> {
-        let s = self.slice(a, n as u64)?;
-        let mut v = 0u64;
-        for (i, &b) in s.iter().enumerate() {
-            v |= (b as u64) << (8 * i);
-        }
-        Ok(v)
-    }
-    fn store(&mut self, a: u64, n: u32, v: u64) -> Result<(), Trap> {
-        let s = self.slice(a, n as u64)?;
-        for (i, b) in s.iter_mut().enumerate() {
-            *b = (v >> (8 * i)) as u8;
-        }
-        Ok(())
-    }
-    fn push_frame(&mut self, bytes: u64) -> Result<u64, Trap> {
-        let n = (bytes + 15) & !15;
-        if self.sp - n < STACK_BASE {
-            return Err(Trap::BadAddress(self.sp));
-        }
-        self.sp -= n;
-        let o = (self.sp - STACK_BASE) as usize;
-        for b in &mut self.stack[o..o + n as usize] {
-            *b = 0;
-        }
-        Ok(self.sp)
-    }
-    fn pop_frame(&mut self, bytes: u64) {
-        self.sp += (bytes + 15) & !15;
-    }
-}
+pub use crate::mem::Trap;
+use crate::mem::{FUNC_TAG, LABEL_TAG, Layout, Mem};
 
 pub struct Machine<'a> {
     m: &'a Module,
     /// function name → index in `m.funcs`
     by_name: HashMap<&'a str, usize>,
-    /// symbol addresses: globals then string literals
-    globals: Vec<u64>,
-    strs: Vec<u64>,
+    lay: Layout,
     mem: Mem,
     steps: u64,
 }
 
-/// Lay the AST's globals and string literals out in a flat region, honoring
-/// LP64 size/alignment, and materialize their initializers.
 pub fn new_machine<'a>(m: &'a Module, ast: &Ast) -> Machine<'a> {
-    let mut data: Vec<u8> = Vec::new();
-    let mut globals = Vec::with_capacity(ast.globals.len());
-    let align_to = |d: &mut Vec<u8>, a: usize| while d.len() % a != 0 { d.push(0) };
-    for g in &ast.globals {
-        let (size, align) = (ast.tt.size(g.ty) as usize, ast.tt.data_align(g.ty) as usize);
-        align_to(&mut data, align.max(1));
-        globals.push(GLOBAL_BASE + data.len() as u64);
-        data.resize(data.len() + size.max(1), 0);
-    }
-    let mut strs = Vec::with_capacity(ast.strs.len());
-    for s in &ast.strs {
-        align_to(&mut data, 8);
-        strs.push(GLOBAL_BASE + data.len() as u64);
-        data.extend_from_slice(s);
-    }
-    let mut mach = Machine {
+    let (mem, lay) = crate::mem::build(ast);
+    Machine {
         m,
         by_name: m
             .funcs
@@ -123,66 +38,24 @@ pub fn new_machine<'a>(m: &'a Module, ast: &Ast) -> Machine<'a> {
             .enumerate()
             .map(|(i, f)| (f.name.as_str(), i))
             .collect(),
-        globals,
-        strs,
-        mem: Mem {
-            data,
-            stack: vec![0; STACK_SIZE as usize],
-            sp: STACK_TOP,
-        },
+        lay,
+        mem,
         steps: 0,
-    };
-    for (i, g) in ast.globals.iter().enumerate() {
-        let (base, size) = (mach.globals[i], ast.tt.size(g.ty));
-        mach.init_global(base, size, &g.init);
     }
-    mach
 }
 
 impl<'a> Machine<'a> {
-    /// `size` is the width of THIS item: a `List` carries one per element, so a
-    /// scalar member never borrows the aggregate's size.
-    fn init_global(&mut self, at: u64, size: u32, init: &GInit) {
-        match init {
-            GInit::None => {}
-            GInit::Num(k) => {
-                let _ = self.mem.store(at, size.clamp(1, 8), *k as u64);
-            }
-            GInit::Str(i) => {
-                let a = self.strs[*i as usize];
-                let _ = self.mem.store(at, 8, a);
-            }
-            GInit::StrOff(i, off) => {
-                let a = (self.strs[*i as usize] as i64 + off) as u64;
-                let _ = self.mem.store(at, 8, a);
-            }
-            GInit::Bytes(b) => {
-                if let Ok(s) = self.mem.slice(at, b.len() as u64) {
-                    s.copy_from_slice(b);
-                }
-            }
-            GInit::List(items) => {
-                for (off, isize_, it) in items {
-                    self.init_global(at + *off as u64, *isize_, it);
-                }
-            }
-            // A relocation against another symbol: resolved by name at link time;
-            // the interpreter only needs it when the corpus actually reads it.
-            GInit::Addr(..) | GInit::Diff(..) => {}
-        }
-    }
-
     pub fn sym_addr(&self, s: &Sym) -> u64 {
         match s {
-            Sym::Global(i) => self.globals[*i as usize],
-            Sym::Str(i) => self.strs[*i as usize],
+            Sym::Global(i) => self.lay.globals[*i as usize],
+            Sym::Str(i) => self.lay.strs[*i as usize],
             // A function address is its index + a tag; only comparison and
             // indirect call use it, both of which go back through this map.
             Sym::Func(name) => match self.by_name.get(name.as_str()) {
-                Some(i) => 1 << 40 | *i as u64,
+                Some(i) => FUNC_TAG | *i as u64,
                 None => 0,
             },
-            Sym::Label(b) => 1 << 41 | *b as u64,
+            Sym::Label(b) => LABEL_TAG | *b as u64,
         }
     }
 
@@ -370,7 +243,7 @@ impl<'a> Machine<'a> {
                     Callee::Indirect(o) => {
                         let a = get(o, vals);
                         let i = (a & 0xffff_ffff) as usize;
-                        if a >> 40 != 1 || i >= self.m.funcs.len() {
+                        if a & FUNC_TAG == 0 || i >= self.m.funcs.len() {
                             return Err(Trap::BadAddress(a));
                         }
                         self.call_index(i, &xs)?

@@ -6,12 +6,11 @@
 // (3) block-argument arity and type against EVERY incoming edge, (4) operand
 // types against the opcode, (5) exactly one terminator with in-range targets,
 // (6) the entry block takes no block parameters.
-use super::dom::{Cfg, DomTree};
 use super::*;
 
 pub fn verify(f: &Func) -> Result<(), String> {
-    let cfg = Cfg::new(f);
-    let dt = DomTree::new(f, &cfg);
+    let cfg = dom::cfg(f);
+    let dt = dom::domtree(f, &cfg);
     let nv = f.values.len();
     let err = |m: String| Err(format!("hir::verify {}: {}", f.name, m));
 
