@@ -3,7 +3,7 @@
 **Status.** This document is a *mechanized reference semantics*: a formal
 denotational semantics for the CORE intermediate representation, realized by the
 interpreter `src/ir.rs::tests::interp` and validated by structural exhaustion in
-`src/opt.rs::commuting_square_structural_exhaustion`. It is **not** a
+`src/opt/tests.rs::commuting_square_structural_exhaustion`. It is **not** a
 machine-checked proof. By Rice's theorem, semantic equivalence of programs is
 undecidable in general, so every theorem stated below is quantified over a
 *finite class of program shapes* (a decidable fragment) and is *checked
@@ -98,7 +98,7 @@ exotic and evaluates to ⊥.)
 
 The three functions below live in the **non-test** part of `ir.rs` and are
 called by *both* the interpreter (semantics side) and the constant folder
-(`opt.rs`, release side). A single definition guarantees that the folder and the
+(`opt/`, release side). A single definition guarantees that the folder and the
 interpreter cannot diverge: `⟦fold(e)⟧ = ⟦e⟧` holds *by construction*
 (term-rewriting soundness).
 
@@ -183,9 +183,9 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > **not** identity. Eliding both — as naive mem2reg does — would drop that rounding and
 > leave illegal f64 precision in the promoted temp. So a promoted `Load` of a float(size 4)
 > cell becomes a self-`Cast(d,τ,τ,·)` (which `fnarrow`s, §3.3), not a `Copy`. This is
-> what preserves `⟦f⟧ = ⟦to_ssa(f)⟧` on float locals (`opt.rs` `Act::Load`).
+> what preserves `⟦f⟧ = ⟦to_ssa(f)⟧` on float locals (`opt/ssa.rs` `Act::Load`).
 >
-> **Two soundness preconditions on the CFG and on definedness** (`opt.rs::cfg_complete`,
+> **Two soundness preconditions on the CFG and on definedness** (`opt::cfg_complete`,
 > `read_var`). (a) *CFG-completeness.* Braun's construction — and every dominance /
 > reachability pass (`gvn`, `sccp`) — trusts the block-terminator CFG. A computed goto
 > (`GotoPtr`, EXT gcc) jumps to a data-dependent address-taken label, an edge NO terminator
@@ -304,9 +304,12 @@ This mirrors the `match inst` in `interp`. Write `⟨v⟩ρ` for the fetch
 > is not redundant with the unit proof. Same memory-bound backend ⟹ ships OFF (`ZCC_OPT_ON=sr`).
 
 > **Pass pipeline as an industrial toggle (`opt::Passes`).** `optimize_ssa` no longer
-> hard-codes its pass set; it reads a `Passes { sccp, const_fold, copy_prop, gvn, cse,
-> dce, cfg_simplify, licm, coalesce }` record. `Passes::default()` = every ⟦·⟧-preserving
-> MEASURED-win pass ON, `licm` OFF. `Passes::from_env()` applies comma lists
+> hard-codes its pass set; it reads a `Passes` record (19 fields — sccp, const_fold,
+> copy_prop, gvn, cse, load_elim, dce, cfg_simplify, licm, strength_reduce, pointer_iv,
+> coalesce, peephole, ldst_pair, if_convert, inline, remat, sroa, hoist_const).
+> `Passes::default()` = every ⟦·⟧-preserving MEASURED-win pass ON, with `licm` /
+> `strength_reduce` / `remat` OFF (proven but measured-negative on the naive-slot
+> backend). `Passes::from_env()` applies comma lists
 > `ZCC_OPT_OFF=`/`ZCC_OPT_ON=` (the gcc `-fno-<pass>` / LLVM `PassBuilder` idiom) so any
 > element is switched without a rebuild. Every toggle is `⟦·⟧`-neutral by construction —
 > each pass already carries its own commuting-square proof, so any subset composes to the
@@ -411,7 +414,7 @@ Equivalently, the following square commutes for every `e ∈ 𝔼_struct`:
      P(lower(e)) ────⟦·⟧──────▶  v
 ```
 
-**Mechanical check:** `opt.rs::tests::commuting_square_structural_exhaustion`.
+**Mechanical check:** `opt::tests::commuting_square_structural_exhaustion`.
 `𝔼_struct` is the union of **five shape families**, each exhausting the operator
 set over a distinct structure, so together they cover every kind of `Inst`
 (Bin/Un/Copy/Load/Store/Lea/Cast) and both terminators (Jmp/Br):
