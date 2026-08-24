@@ -952,6 +952,9 @@ pub struct MFunc {
     pub entry: MBlockId,
     pub is_static: bool,
     pub is_weak: bool,
+    /// Emission order, set by `pass/layout.rs`; unreachable blocks are absent.
+    /// Empty until layout has run.
+    pub order: Vec<MBlockId>,
     /// filled by `frame`: total frame size and the callee-saved registers used
     pub frame_size: u32,
     pub saved: RegSet,

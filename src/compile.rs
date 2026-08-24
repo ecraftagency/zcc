@@ -24,6 +24,7 @@ pub fn backend(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
     crate::regalloc::allocate_module(&mut m)?;
     for f in m.funcs.iter_mut() {
         crate::mir::pass::frame::run(f);
+        crate::mir::pass::layout::run(f);
     }
     Ok(m)
 }

@@ -76,6 +76,14 @@ pub struct Liveness {
     /// caller-saved colour (AAPCS64 §6.1.1). This is the whole of the
     /// "value crosses a call" rule — there is no other.
     pub crosses_call: Vec<bool>,
+    /// For each virtual register, the PHYSICAL registers whose live ranges
+    /// overlap it. A physical register is live for real — an argument register
+    /// from the parallel copy that sets it up until the call that reads it, an
+    /// incoming argument until the entry copy consumes it — and a virtual
+    /// register that overlaps it must not be given that colour. Without this a
+    /// function pointer held in x1 is destroyed by the copy that puts the second
+    /// argument into x1.
+    pub phys_conflict: Vec<RegSet>,
 }
 
 pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
@@ -174,11 +182,70 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
         }
     }
 
+    // Physical/virtual overlap. The conflict is recorded at each program point
+    // AFTER the point's definitions are added and its dying operands removed:
+    // an entry copy's source (x0) dies exactly where its destination is born, so
+    // recording before the kill would spuriously forbid the one colour that
+    // makes the copy disappear.
+    let mut phys_conflict = vec![RegSet::default(); sp.nv];
+    let pre = Liveness {
+        sp,
+        live_in: live_in.clone(),
+        live_out: live_out.clone(),
+        crosses_call: crosses_call.clone(),
+        phys_conflict: Vec::new(),
+    };
+    for bi in 0..f.blocks.len() {
+        if !cfg.reachable(bi as MBlockId) {
+            continue;
+        }
+        let last = last_use(f, sp, &pre, bi);
+        let mut live: BTreeSet<usize> = live_in[bi].clone();
+        for &p in &f.blocks[bi].params {
+            live.insert(sp.idx(p));
+        }
+        let mut record = |live: &BTreeSet<usize>, pc: &mut Vec<RegSet>| {
+            let phys: Vec<PReg> = live
+                .iter()
+                .filter(|&&x| x >= sp.nv)
+                .filter_map(|&x| sp.reg(x).preg())
+                .collect();
+            if phys.is_empty() {
+                return;
+            }
+            for &x in live.iter().filter(|&&x| x < sp.nv) {
+                for p in &phys {
+                    pc[x].add(*p);
+                }
+            }
+        };
+        record(&live, &mut phys_conflict);
+        for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
+            let mut ops = Vec::new();
+            inst.visit(&mut |r, c| ops.push((r, c)));
+            for (r, c) in &ops {
+                if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
+                    live.insert(sp.idx(*r));
+                }
+            }
+            let dead: Vec<usize> = live
+                .iter()
+                .copied()
+                .filter(|&x| last[x] == Some(i))
+                .collect();
+            for x in dead {
+                live.remove(&x);
+            }
+            record(&live, &mut phys_conflict);
+        }
+    }
+
     Liveness {
         sp,
         live_in,
         live_out,
         crosses_call,
+        phys_conflict,
     }
 }
 

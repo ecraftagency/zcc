@@ -157,8 +157,11 @@ fn assign(
         return Ok(());
     }
     let avoid_caller_saved = lv.crosses_call[v as usize];
+    let conflict = lv.phys_conflict[v as usize];
     let free = |p: PReg, occupied: &Vec<PReg>| -> bool {
-        !occupied.contains(&p) && !(avoid_caller_saved && !isa::is_callee_saved(p))
+        !occupied.contains(&p)
+            && !conflict.has(p)
+            && !(avoid_caller_saved && !isa::is_callee_saved(p))
     };
     let pick = hint
         .filter(|h| h.class == class && free(*h, occupied))

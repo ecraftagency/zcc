@@ -130,6 +130,25 @@ impl<'a> L<'a> {
         }
     }
 
+    /// The register holding an operand, forbidding the zero register.
+    ///
+    /// DDI 0487 C6.2.4: in the ADD/SUB (immediate) form — and therefore in
+    /// `cmp`/`cmn` too — register 31 encodes SP, not ZR. `add w0, wzr, #5` is
+    /// not an instruction. Every other form that takes an immediate (the
+    /// logical-immediate and shift aliases) does read 31 as ZR, so this applies
+    /// exactly where the encoding says it does.
+    fn reg_nonzr(&mut self, o: Operand, t: hir::Ty) -> Reg {
+        match o {
+            Operand::Imm(0) => {
+                let w = wid(t);
+                let d = self.tmp(w);
+                self.push(imm::materialize(d, 0, w));
+                d
+            }
+            _ => self.reg(o, t),
+        }
+    }
+
     /// An operand that may ride in an immediate field of `op`.
     fn rhs(&mut self, o: Operand, t: hir::Ty, op: AluOp) -> Rhs {
         if let Operand::Imm(k) = o {
@@ -310,8 +329,12 @@ impl<'a> L<'a> {
             });
         } else {
             let _ = op;
-            let x = self.reg(a, ty);
+            // `cmp` is `subs`: the same register-31-is-SP rule applies
             let y = self.rhs(b, ty, AluOp::Sub);
+            let x = match &y {
+                Rhs::Imm(_) => self.reg_nonzr(a, ty),
+                _ => self.reg(a, ty),
+            };
             self.push(MInst::Cmp {
                 kind: CmpKind::Cmp,
                 w: wid(ty),
@@ -326,7 +349,7 @@ impl<'a> L<'a> {
     /// `cmp c, #0` for a value used as a truth value.
     fn test(&mut self, c: Operand) -> Reg {
         let fl = self.f.new_flags();
-        let x = self.reg(c, hir::Ty::I32);
+        let x = self.reg_nonzr(c, hir::Ty::I32);
         self.push(MInst::Cmp {
             kind: CmpKind::Cmp,
             w: Width::W32,
@@ -398,8 +421,11 @@ impl<'a> L<'a> {
             BinOp::AShr => AluOp::Asr,
             _ => unreachable!(),
         };
-        let x = self.reg(a, ty);
         let y = self.rhs(b, ty, aop);
+        let x = match (aop, &y) {
+            (AluOp::Add | AluOp::Sub, Rhs::Imm(_)) => self.reg_nonzr(a, ty),
+            _ => self.reg(a, ty),
+        };
         self.push(MInst::Alu {
             op: aop,
             w,
@@ -676,7 +702,9 @@ impl<'a> L<'a> {
             // R0 lowers a switch to a compare chain; R3.3 adds the jump table
             // (the density threshold is a dated policy constant there).
             Term::Switch(c, ty, arms, d) => {
-                let x = self.reg(*c, *ty);
+                // every arm compares against an immediate, so the switch value
+                // may not be the zero register (see `reg_nonzr`)
+                let x = self.reg_nonzr(*c, *ty);
                 let dflt = self.target(d);
                 let mut next = dflt;
                 let arms: Vec<(i64, MTarget)> = arms
@@ -730,7 +758,8 @@ fn lower_func(h: &hir::Func) -> MFunc {
         entry: h.entry,
         is_static: h.is_static,
         is_weak: h.is_weak,
-        frame_size: 0,
+        order: Vec::new(),
+    frame_size: 0,
         saved: RegSet::default(),
         physical: false,
     };

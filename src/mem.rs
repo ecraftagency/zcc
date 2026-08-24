@@ -101,6 +101,9 @@ pub fn build(ast: &Ast) -> (Mem, Layout) {
         align_to(&mut data, 8);
         strs.push(GLOBAL_BASE + data.len() as u64);
         data.extend_from_slice(s);
+        // C99 6.4.5p6: the terminating null is part of the literal's array but
+        // is not stored in `strs`.
+        data.push(0);
     }
     let mut mem = Mem {
         data,
