@@ -189,6 +189,92 @@ pub(crate) fn ensure_preheader(f: &mut IrFunc, header: BlockId, body: &BTreeSet<
 }
 
 
+/// LOOP-INVARIANT IMMEDIATE HOISTING (the const-bound lever). A large integer constant used
+/// inside a loop — the archetype is a loop bound `j <= 20000000` — is materialized by codegen
+/// with a multi-instruction `mov;movk` sequence on EVERY iteration, because it lives as a
+/// `Val::Imm` operand, not as an instruction LICM could lift (the comparison reads the changing
+/// induction variable, so the whole `Bin(Le, j, Imm(N))` is variant). This pass lifts the
+/// invariant immediate itself into ONE preheader temp `Copy(t, Imm(N))` and rewrites the in-loop
+/// comparison operands to read `t` — turning per-iteration `mov;movk;cmp` into a preheader
+/// `mov;movk` plus a per-iteration register `cmp`. On the sieve's two O(n) linear scans (the
+/// measured hot spots) this is the dominant win. ⟦f⟧ is preserved: reading a temp defined once as
+/// `Copy(t, Imm(N))` in a dominating preheader is value-identical to reading `Imm(N)` in place (a
+/// pure value-numbering identity). PRESSURE-SAFE without a guard — the dual of remat's argument:
+/// if `t` spills, its reload is ONE `ldr` ≤ the two-instruction `mov;movk` rematerialization it
+/// replaces, so C_M never increases even under register pressure. SCOPE: operands of COMPARISON
+/// Bins only, and only "expensive" immediates (|N| beyond the cmp imm12 field). Restricting to
+/// comparisons keeps the pass away from the address/arith immediate FOLDS that later codegen
+/// passes (`try_fuse_*`, ext-fold) depend on seeing as literal `Imm`s. Runs LAST (after the SSA
+/// fixpoint, out_of_ssa, optimize, remat) so no copy-prop/const-fold/remat afterward folds the
+/// hoisted constant back into the loop.
+pub fn hoist_loop_consts(f: &mut IrFunc) -> u32 {
+    use std::collections::BTreeMap;
+    if !cfg_complete(f) {
+        return 0; // computed goto ⟹ incomplete CFG ⟹ back-edges/dominance unsound
+    }
+    let is_cmp = |op: Op| matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge);
+    // "Expensive" ⟺ outside the ±imm12 window a cmp/cmn can encode inline (0..=4095, and its
+    // <<12 form). A value codegen would emit in a single `cmp #imm` is left alone (hoisting it
+    // would trade a free inline immediate for a preheader mov + a register — a size loss).
+    let expensive = |n: i64| {
+        let a = n.unsigned_abs();
+        !(a <= 4095 || (a & 0xFFF == 0 && (a >> 12) <= 4095))
+    };
+    let dom = dominators(f);
+    let backs = back_edges(f, &dom);
+    let mut hoisted = 0u32;
+    for (tail, header) in backs {
+        let body = natural_loop(f, tail, header);
+        // Distinct (value, type) of expensive imms appearing as a comparison operand in the body.
+        let mut wanted: BTreeMap<(i64, TypeId), ()> = BTreeMap::new();
+        for &bid in &body {
+            for inst in &f.blocks[bid as usize].insts {
+                if let Inst::Bin(_, op, ty, a, b) = inst
+                    && is_cmp(*op)
+                {
+                    for v in [a, b] {
+                        if let Val::Imm(n) = v
+                            && expensive(*n)
+                        {
+                            wanted.insert((*n, *ty), ());
+                        }
+                    }
+                }
+            }
+        }
+        if wanted.is_empty() {
+            continue;
+        }
+        let ph = match ensure_preheader(f, header, &body) {
+            Some(p) => p,
+            None => continue,
+        };
+        for (n, ty) in wanted.keys().copied().collect::<Vec<_>>() {
+            let t = f.temps.len() as Tmp;
+            f.temps.push(ty);
+            f.blocks[ph as usize].insts.push(Inst::Copy(t, ty, Val::Imm(n)));
+            for &bid in &body {
+                for inst in &mut f.blocks[bid as usize].insts {
+                    if let Inst::Bin(_, op, bty, a, b) = inst
+                        && is_cmp(*op)
+                        && *bty == ty
+                    {
+                        if matches!(a, Val::Imm(m) if *m == n) {
+                            *a = Val::Tmp(t);
+                        }
+                        if matches!(b, Val::Imm(m) if *m == n) {
+                            *b = Val::Tmp(t);
+                        }
+                    }
+                }
+            }
+            hoisted += 1;
+        }
+    }
+    hoisted
+}
+
+
 /// Hoistable ⟺ pure AND trap-free AND fault-free (see SAFETY FENCES). φ, Load, Store,
 /// Div/Rem, and every impure exotic are excluded.
 pub(crate) fn is_hoistable(i: &Inst) -> bool {
@@ -1175,6 +1261,64 @@ pub(crate) fn speculatable(tt: &TyTab, al: &AliasInfo, i: &Inst) -> bool {
 pub fn if_convert(tt: &TyTab, f: &mut IrFunc) -> u32 {
     let al = alias_info(f);
     let preds = predecessors(f);
+    // Blocks that lie inside SOME natural loop — the only place triangle if-conversion fires.
+    // A triangle (`if(c) stmt;`) trades a predicted-branch skip for unconditional arm execution
+    // plus a csel: profitable in HOT code (a per-iteration branch removed) but a size/speed loss
+    // on the many one-off conditional assignments outside loops (measured: +472 on sqlite when
+    // unrestricted). "In a loop" is the static profitability proxy gcc gets from branch weights.
+    let in_loop: Vec<bool> = if cfg_complete(f) {
+        let dom = dominators(f);
+        let mut m = vec![false; f.blocks.len()];
+        for (tail, header) in back_edges(f, &dom) {
+            for b in natural_loop(f, tail, header) {
+                m[b as usize] = true;
+            }
+        }
+        m
+    } else {
+        vec![false; f.blocks.len()]
+    };
+    // Defining instruction of each temp (single-def in SSA) — used to classify a branch
+    // condition as DATA-DEPENDENT (derives from a memory Load, hence unpredictable) vs derived
+    // only from loop-structural values (predictable). Triangle if-conversion pays exactly when
+    // the branch is unpredictable — the sieve's `if(is[i])` (a load) — and loses on the many
+    // predictable in-loop conditionals in sqlite. This is the static proxy for gcc's branch
+    // probability. Shallow trace (≤2 levels through cmp/Un/Cast) is enough for the load ⟶ cmp ⟶ br
+    // idiom without a full backward slice.
+    // Per-block flag: the block ends in `Br(cond,..)` whose condition is DATA-DEPENDENT — it
+    // derives from a memory Load, hence is unpredictable (the sieve's `if(is[i])`), as opposed
+    // to a condition over loop-structural values (predictable). Triangle if-conversion pays
+    // exactly on the unpredictable branch and loses on the predictable in-loop conditionals that
+    // fill sqlite; this is the static proxy for gcc's branch probability. Computed BEFORE the
+    // mutation loop (all borrows immutable here), then just indexed. Shallow trace (≤2 def-hops
+    // through a cmp/Un/Cast) covers the load ⟶ cmp ⟶ br idiom without a full backward slice.
+    let cond_dd: Vec<bool> = {
+        let mut def_of: Vec<Option<usize>> = vec![None; f.temps.len()];
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, inst) in b.insts.iter().enumerate() {
+                if let Some(d) = inst_def(inst) {
+                    def_of[d as usize] = Some(bi << 16 | ii);
+                }
+            }
+        }
+        let inst_at = |code: usize| -> &Inst { &f.blocks[code >> 16].insts[code & 0xFFFF] };
+        let is_load = |v: &Val| matches!(v, Val::Tmp(t) if def_of[*t as usize].is_some_and(|c| matches!(inst_at(c), Inst::Load(..))));
+        let load_derived = |v0: &Val| -> bool {
+            let mut cur = *v0;
+            for _ in 0..2 {
+                let Val::Tmp(c) = cur else { return false };
+                let Some(code) = def_of[c as usize] else { return false };
+                match inst_at(code) {
+                    Inst::Load(..) => return true,
+                    Inst::Bin(_, _, _, a, b) => cur = if is_load(a) { *a } else { *b },
+                    Inst::Un(_, _, _, a) | Inst::Cast(_, _, _, a) => cur = *a,
+                    _ => return false,
+                }
+            }
+            false
+        };
+        f.blocks.iter().map(|b| matches!(&b.term, Term::Br(c, ..) if load_derived(c))).collect()
+    };
     let mut n = 0u32;
     // One linear scan over heads; each rewrite is local (h, T, E, M) and never creates a
     // new diamond, so a single pass suffices (nested ternaries fold bottom-up across the
@@ -1184,6 +1328,72 @@ pub fn if_convert(tt: &TyTab, f: &mut IrFunc) -> u32 {
         let (t, e) = (t_id as usize, e_id as usize);
         if t == h || e == h || t == e {
             continue;
+        }
+        // TRIANGLE if-conversion (`if(c) stmt;` — one arm IS the merge, no else). Shape:
+        // `Br(cond, t, e)` where exactly one arm A (single-pred = h, pure body) jumps straight
+        // to the OTHER target, which is then the merge M; M's preds are {h, A}. The h→M edge is
+        // the "empty else" path. Convert: hoist A's pure body into h, turn each φ of M — whose
+        // arms are exactly {h, A} — into `Select(cond, then_val, else_val)`, rewire h→M. `arm_true`
+        // = whether the arm lies on the cond-TRUE path (A == t): it decides the Select operand
+        // order. ⟦f⟧ preserved — the φ already encodes value-per-edge; Select is the same choice
+        // made data-flow. Checked BEFORE the diamond path; a matched-but-unconvertible triangle is
+        // never a diamond, so it falls through to the shared `continue` below.
+        let tri = if matches!(f.blocks[t].term, Term::Jmp(j) if j == e_id) {
+            Some((t_id, t, e_id, e, true)) // arm = t (cond-true), merge = e
+        } else if matches!(f.blocks[e].term, Term::Jmp(j) if j == t_id) {
+            Some((e_id, e, t_id, t, false)) // arm = e (cond-false), merge = t
+        } else {
+            None
+        };
+        if let Some((arm_id, arm, mrg_id, mrg, arm_true)) = tri {
+            // arm private to this branch; merge reached ONLY from {h, arm}.
+            let mut mp = preds[mrg].clone();
+            mp.sort_unstable();
+            let mut want = [h as BlockId, arm_id];
+            want.sort_unstable();
+            // PROFITABILITY (size-safety): only convert a SHORT arm. A triangle replaces a
+            // predicted-branch skip with UNCONDITIONAL execution of the arm plus a csel; that is
+            // a win only when the arm is tiny (the count++/flag/min-max sweet spot csel exists
+            // for). Speculating a large arm bloats and de-optimizes. Cap = ≤2 compute insts —
+            // enough for `x = x ± k` / a single reconciled value, the pattern that regressed
+            // sqlite size when unbounded. (The diamond path below is already balanced by both
+            // arms hoisting; a triangle hoists one arm against an EMPTY else, so it needs the cap.)
+            let arm_len = f.blocks[arm].insts.len();
+            let arm_pure = in_loop[h]
+                && arm_len <= 2
+                && cond_dd[h]
+                && f.blocks[arm].insts.iter().all(|i| speculatable(tt, &al, i));
+            // Every leading φ of M is a plain 2-arm (h, arm) φ, non-float (backend csel); and there
+            // is at least one (the merged value the Select will carry — else nothing to convert).
+            let phi_iter = || f.blocks[mrg].insts.iter().take_while(|i| matches!(i, Inst::Phi(..)));
+            let has_phi = phi_iter().next().is_some();
+            let phis_ok = has_phi && phi_iter().all(|i| {
+                let Inst::Phi(_, ty, arms) = i else { return false };
+                !tt.is_float(*ty)
+                    && arms.len() == 2
+                    && arms.iter().any(|(b, _)| *b == h as BlockId)
+                    && arms.iter().any(|(b, _)| *b == arm_id)
+            });
+            if arm != h && mrg != h && arm != mrg && preds[arm] == [h as BlockId] && mp == want && arm_pure && phis_ok {
+                // Hoist the arm's (pure, arm-private) computation into h; it now runs
+                // unconditionally, its defs dominate M.
+                let body = std::mem::take(&mut f.blocks[arm].insts);
+                f.blocks[h].insts.extend(body);
+                // Each φ of M → Select. `then`/`else` = the φ arm on the cond-true / cond-false
+                // edge. The arm edge carries cond=arm_true; the direct h edge carries cond=!arm_true.
+                for i in f.blocks[mrg].insts.iter_mut() {
+                    let Inst::Phi(d, ty, arms) = i else { break };
+                    let v_arm = arms.iter().find(|(b, _)| *b == arm_id).unwrap().1;
+                    let v_h = arms.iter().find(|(b, _)| *b == h as BlockId).unwrap().1;
+                    let (vt, ve) = if arm_true { (v_arm, v_h) } else { (v_h, v_arm) };
+                    *i = Inst::Select(*d, *ty, cond, vt, ve);
+                    n += 1;
+                }
+                f.blocks[h].term = Term::Jmp(mrg_id);
+                // arm is now unreachable+empty; cfg_simplify reclaims it.
+                continue;
+            }
+            continue; // triangle-shaped but not convertible ⟹ not a diamond either
         }
         // Arms must be private to this diamond: single predecessor = h.
         if preds[t] != [h as BlockId] || preds[e] != [h as BlockId] {

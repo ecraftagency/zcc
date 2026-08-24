@@ -100,6 +100,7 @@ pub struct Passes {
     pub inline: bool,   // Tier-1 #5: whole-program depth-1 inlining (runs before to_ssa)
     pub remat: bool,    // Tier-5 #26: rematerialize pure operand-free defs under pressure (last)
     pub sroa: bool,     // SROA: split non-escaping aggregate locals into per-field slots (before to_ssa)
+    pub hoist_const: bool, // lever 9: hoist loop-invariant expensive immediates (bounds) to preheader (last)
 }
 
 
@@ -125,6 +126,7 @@ impl Default for Passes {
             inline: true, // Tier-1 #5: β-reduction; proven (equiv) — measured on the bench before ship
             remat: false, // Tier-5 #26: proven (equiv) but speed-gated on the box A/B (like licm/sr)
             sroa: true,   // SROA: field-split non-escaping aggregates; proven (equiv) — feeds to_ssa
+            hoist_const: true, // lever 9: pressure-safe (spill-reload ≤ mov;movk), exec-positive on loop bounds
         }
     }
 }
@@ -163,6 +165,7 @@ impl Passes {
             "inline" => self.inline = v,
             "remat" => self.remat = v,
             "sroa" => self.sroa = v,
+            "hoist_const" | "hoistconst" | "hc" => self.hoist_const = v,
             _ => {} // an unknown name is ignored (forward-compatible)
         }
     }
@@ -269,6 +272,12 @@ pub fn optimize_ssa(tt: &TyTab, f: &mut IrFunc, p: &Passes, gp_k: u32) {
         // LAST IR touch (nothing runs after ⟹ no CSE re-merges the clones): shorten the live
         // ranges of pure operand-free values the allocator would otherwise spill. #26.
         remat(tt, f, gp_k);
+    }
+    if p.hoist_const {
+        // ABSOLUTE-last IR touch: lift loop-invariant expensive immediates (bounds) into a
+        // preheader temp. Runs after remat so nothing rematerializes/const-folds it back into
+        // the loop; the constant now lives in a register the codegen compares against directly.
+        hoist_loop_consts(f);
     }
 }
 
@@ -827,6 +836,54 @@ mod tests {
             equiv(&ast.tt, &ir, &opt, entry).unwrap_or_else(|e| panic!("{nm}: {e}"));
         }
         assert!(fired > 0, "if_convert must fire on the pure-select battery");
+    }
+
+    // Lever 9 — TRIANGLE if-conversion (`if(c) stmt;`, no else). Gated: in a loop, condition
+    // data-dependent (a Load), arm ≤2 pure insts. `sieve-count` is the canonical target: a
+    // loop-carried increment guarded by a load-derived branch (`if(a[i]) s++`). Asserts it FIRES
+    // (a Select appears) and preserves ⟦·⟧ (the commuting square, over local-array memory inputs).
+    #[test]
+    fn if_convert_triangle_in_loop() {
+        // a[] is address-taken ⟹ a real Load, exactly the data-dependent branch the gate wants.
+        let src = "int f(int k){int a[4]; a[0]=0; a[1]=k; a[2]=0; a[3]=1; int s=0,i; \
+                   for(i=0;i<4;i++){ if(a[i]) s++; } return s;}";
+        let (ast, ir) = compile("tri", src);
+        let mut opt = ir.clone();
+        let mut fired = 0;
+        for f in opt.iter_mut() {
+            to_ssa(&ast.tt, f);
+            fired += if_convert(&ast.tt, f);
+            dce(&ast.tt, f);
+            cfg_simplify(f);
+            out_of_ssa(f);
+        }
+        for f in &opt {
+            verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
+        }
+        assert!(fired > 0, "triangle if-conversion must fire on `if(a[i]) s++` in a loop");
+        assert!(
+            opt.iter().any(|f| f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Select(..))))),
+            "the converted triangle must leave a Select"
+        );
+        equiv(&ast.tt, &ir, &opt, "f").expect("triangle if-conversion must preserve ⟦·⟧");
+    }
+
+    // Lever 9 — LOOP-INVARIANT IMMEDIATE HOISTING. An expensive loop bound (|N|>imm12) used in a
+    // comparison is lifted to a preheader Copy; asserts it FIRES and preserves ⟦·⟧.
+    #[test]
+    fn hoist_loop_consts_preserves() {
+        let src = "int f(int m){int s=0,i; for(i=0;i<5000;i++){ if(i==m) s+=i; } return s;}";
+        let (ast, ir) = compile("hc", src);
+        let mut opt = ir.clone();
+        let mut fired = 0;
+        for f in opt.iter_mut() {
+            fired += hoist_loop_consts(f);
+        }
+        for f in &opt {
+            verify(f).unwrap_or_else(|e| panic!("verify {}: {e}", f.name));
+        }
+        assert!(fired > 0, "hoist_loop_consts must lift the expensive bound 5000");
+        equiv(&ast.tt, &ir, &opt, "f").expect("const hoisting must preserve ⟦·⟧");
     }
 
     // ── B4 SAFETY (the speculation side-condition): a diamond whose arm has a SIDE
