@@ -22,6 +22,25 @@
 > not. Every session opens by re-reading §0. Every lever starts from §0's ledger. We drifted
 > before because the plan lived in conversation and vanished — this section is the fix.
 
+### ⚡ PRIMARY TARGET = EXEC SPEED (user directive 2026-08-24, standing) — SIZE FOLLOWS, IS NOT THE TARGET
+
+> **From now on the finish-line metric is EXEC SPEED vs gcc-O1, measured as the geomean over the
+> ~35-program taxonomy suite (`tests/bench/suite/*.c`) = "geo40" — NEVER the 4-kernel `bench.sh`
+> number ("geo4"=matmul/fib/loops/sieve), which is a best-case mirage (~1.02×) that does not
+> generalize.** Current honest geo40 exec ≈ **1.75×** (best-of-N wall-clock; matches insn-count
+> proxy perfn 1.77×). Rationale (user): **optimizing speed drags size down too** — every real
+> speed win removes instructions from hot paths, so size falls out as a byproduct (small/tiny per
+> lever but monotone downward). Size is therefore a *secondary read-out*, not a goal to chase on
+> its own. **Lever selection is now ranked by exec-speed impact** (hot-loop insns, not static
+> sqlite count). When speed and size ever disagree, **speed wins.**
+>
+> Concretely this REWEIGHTS the gap map (see §5 S4 correction): the biggest *speed* prizes are the
+> **loop-level value-analysis** gaps (final-value/SCEV + loop-DCE — the `gcc=0ms` cases where gcc-O1
+> zeros a whole loop and zcc runs it full) and any spike-lever sitting **inside a hot loop**. A
+> static-size lever that touches only cold/prologue code is now LOW priority even if it cuts sqlite
+> insns. Measure geo40 exec (box harness) as the scoreboard each lever; perfn insn-count stays a
+> cheap proxy but exec-time is the arbiter. See [[zcc-speed-metric-geo40]].
+
 ---
 
 ### ⏱ OVERNIGHT AUTONOMOUS RUNBOOK (started 2026-08-24, user asleep → target: RC1 push)
