@@ -126,6 +126,7 @@ pub fn finish(m: &mut crate::mir::MModule) {
         for f in m.funcs.iter_mut() {
             crate::mir::pass::frame::run(f);
             crate::mir::pass::shrink_wrap::run(f);
+            crate::mir::pass::frame::merge_epilogues(f);
             crate::mir::pass::legalize::run(f);
             crate::mir::pass::ldstp::run(f);
             crate::mir::pass::layout::run(f);

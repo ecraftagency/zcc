@@ -296,3 +296,68 @@ fn a_no_op_extension_leaves_the_alu_operand_plain() {
     same("long f(int n,int*a){long s=0;int k;for(k=0;k<n;k++)s+=a[k];return s;}\
           int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i-9;return (int)f(4,a);}");
 }
+
+#[test]
+fn one_epilogue_serves_every_return_of_a_shape() {
+    // R4.4. Every `Ret` block used to carry its own copy of the callee-saved
+    // reloads, and `emit` adds `add sp` and `ret` to each: sqlite paid 3,815
+    // `ret` against gcc's 317. The tails are identical — physical registers,
+    // fixed slots — and the return value is already in its ABI register, so a
+    // shared epilogue observes nothing about which path reached it.
+    use crate::mir::MTerm;
+    // The call comes FIRST, so every return path is inside the region
+    // shrink-wrapping would pick and all four tails are the same shape. (When
+    // shrink-wrapping does fire, the fast path's returns have no reloads at all
+    // — a different shape, deliberately kept apart.)
+    let src = "int g(int);\
+               int f(int n){int s=g(n)+g(n+1);\
+                            if(s<0)return -1;if(s==0)return 0;\
+                            if(s>100)return s;return s*2;}\
+               int g(int x){int i,s=0;for(i=0;i<x;i++)s+=i*3;return s;}\
+               int main(void){return f(2)+f(-1)+f(0);}";
+    same(src);
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    // Checked right after frame + shrink_wrap + the merge, BEFORE `ldstp` fuses
+    // the reloads into a `Pair` the matcher below would miss — the same reason
+    // `shrink_wrap_moves_saves_off_the_fast_path` stops there.
+    for f in m.funcs.iter_mut() {
+        crate::mir::pass::frame::run(f);
+        crate::mir::pass::shrink_wrap::run(f);
+        crate::mir::pass::frame::merge_epilogues(f);
+    }
+    let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+    let rets = f.blocks.iter().filter(|b| matches!(b.term, MTerm::Ret)).count();
+    let paths = f
+        .blocks
+        .iter()
+        .filter(|b| matches!(b.term, MTerm::Ret | MTerm::B(_)))
+        .count();
+    assert!(rets < 4 && rets < paths, "{} return paths still end in {} `ret`s", paths, rets);
+    // The callee-saved tail exists ONCE, not once per path. (More than one
+    // `ret` may survive: shrink-wrapping leaves the fast path's returns with no
+    // reloads at all, and a bare `ret` is shorter than the branch that would
+    // replace it — different shapes, deliberately not merged together.)
+    let cs: std::collections::HashSet<u32> = f.cs_saves.iter().map(|(s, _, _)| *s).collect();
+    let reloads = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, crate::mir::MInst::Reload { slot, .. } if cs.contains(slot)))
+        .count();
+    assert_eq!(reloads, cs.len(), "the callee-saved tail is duplicated");
+    // …and a frame slot nothing names occupies nothing, so a leaf whose locals
+    // were all promoted carries no frame at all.
+    let src = "int leaf(int a,int b){int x=a+b;int y=a-b;return x*y;}\
+               int main(void){return leaf(5,3);}";
+    same(src);
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    finish(&mut m);
+    let l = m.funcs.iter().find(|f| f.name == "leaf").unwrap();
+    assert_eq!(l.frame_size, 0, "every local was promoted, so there is no frame");
+}

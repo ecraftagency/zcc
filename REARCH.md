@@ -506,6 +506,12 @@ side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), 
 from size-weighted to measured-programs-owned.
 **R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
 **1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green).
+**R4.3 ✅ + R4.4 ✅ (2026-08-25)** — a parallel-copy destination takes its own
+dying source, and one epilogue per shape instead of one per return path (plus
+dropping frame slots nothing names): sqlite **189,279 = 1.2050×**, EXEC geomean
+**1.0357** (median 1.000, only 3 programs above 1.1×), INSN **1.0690**. Both
+rows were filed "size only, the suite cannot see it" and both moved it: e2
+1.500 → **1.000**, f2 1.200 → **1.000**. **Next ⬜ is R4.6.**
 **R4.11 ✅ + R4.14 ⚠️ (2026-08-25)** — rotation over EVERY loop exit (its
 residual print refuted §13n's guess and named the real reason), and one of
 R4.14's three orphans: **EXEC geomean 1.0777, median 1.001, only 5 programs
@@ -1403,7 +1409,7 @@ order is:
 
 ```
 R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️ → R4.5 ✅ → R4.9 ✅ → R4.11 ✅ → R4.14 ⚠️(1 of 3)
-        → R4.3 → R4.4 → R4.6 → R4.10 → R4.8 → R4.12
+        → R4.3 ✅ → R4.4 ✅ → R4.6 → R4.10 → R4.8 → R4.12
 ```
 
 **AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
@@ -2122,6 +2128,79 @@ row the suite was said to be blind to: **d1 1.500** (R4.14 (2), open), **d2
 1.500** (R4.13's add-IV), **e2 1.500** (R4.3's entry copies), **h2 1.222**
 (R4.4's dead frame), **f2 1.200** (R4.6's rebuilt constants). The exec and size
 sides have converged onto the same rows.
+
+### R4.3 + R4.4 — BANKED. sqlite **201,727 → 189,279** (1.2842× → **1.2050×**); EXEC geomean **1.0777 → 1.0357**, INSN **1.1499 → 1.0690**, only **3** programs above 1.1×
+
+**R4.3 — a parallel-copy destination may take its OWN dying source's register.**
+`color.rs`'s "free colours only AFTER the definitions are placed" rule is right
+about a `ParallelCopy` and for the right reason: the assignments are
+SIMULTANEOUS, so a destination taking ANOTHER pair's dying source would destroy
+a value that pair still has to read. It says nothing about a destination taking
+the source of ITS OWN pair — that assignment makes the pair a self-move, which
+writes nothing, so every other pair reads exactly what it read before. The
+colour is freed for that one destination and re-occupied the instant the bias
+declines it, so nothing else can slip into it, and `check` still asserts that no
+two live values share a colour. sqlite **−2,046**.
+
+Its ceiling was §13n's one UNMEASURED band — "(b) 8k…20k (measure first)" — and
+the realized number is a quarter of the low end. That is the third row this
+session whose stated ceiling and delivered number disagreed by more than 2×, and
+it is why a ceiling is written as an upper bound and never as a forecast.
+
+**R4.4, in two halves, and the second is the one that mattered.**
+
+*(i) An object nothing names occupies nothing.* `sroa`/mem2reg promote a local
+into registers and leave its SLOT behind, so a leaf function whose every local
+was promoted still carried a frame and paid `sub sp` + `add sp` for it — §13n
+counted 289 such functions, and f1's four promoted locals still bought
+`sub sp, #32`. A slot no instruction names (no `AddrMode::Slot`, no
+`Spill`/`Reload`, no `SlotAddr`) is never read and never written, so giving it
+zero bytes changes no access and no other object's address beyond moving it
+down. `sub sp` 1,879 → 1,588; sqlite **−1,623**.
+
+*(ii) One epilogue per SHAPE, not one per return path.* `frame::run` gave every
+`Ret` block its own copy of the callee-saved reloads and `emit` added `add sp`
+and `ret` to each: sqlite paid **3,815 `ret` against gcc's 317**. Those tails are
+identical — physical registers, fixed slots — so all but one copy of each
+distinct tail is duplication. The return VALUE is already in its ABI register
+when a `Ret` block is reached, so the shared block needs no parameter and cannot
+observe which path arrived. sqlite **−8,779**, `ret` 3,815 → 2,160.
+
+**AND IT HAD TO BE A SEPARATE PASS, WHICH THE BATTERY PROVED.** Written inside
+`frame::run`, it silenced `shrink_wrap` outright: that pass requires the region
+below its save point to be a SINK — no successor outside it — and a shared
+epilogue is exactly such a successor. `shrink_wrap_moves_saves_off_the_fast_path`
+went red on the first build. Moved to its own pass running AFTER shrink-wrapping,
+the two compose: shrink-wrapping leaves some returns holding the reloads and
+some not, and grouping by the EXACT tail keeps those apart. Two optimizations
+that each look local, one ordering constraint, and only the battery could see it.
+
+**The two axes have collapsed together.** Every row of this batch was filed under
+"size only — the suite cannot see it", and the suite moved more than it has for
+any row this session:
+
+| program | before | after |
+|---|---|---|
+| **e2_many_args** | 1.500 | **1.000** — R4.3's own program, the entry copies |
+| **f2_double_poly** | 1.200 | **1.000** |
+| e4_leaf_calls | 1.000 | 1.103 (short program, at the noise floor) |
+| h2_revbits | 1.222 | 1.189 |
+| INSN geomean | 1.1499 | **1.0690** (median 1.140 → 1.060, 20 → 12 above 1.1×) |
+| EXEC geomean | 1.0777 | **1.0357** (3 programs above 1.1×) |
+
+**What is left above 1.1×, all three already owned:** d1 1.500 (R4.14 (2), open —
+the case count is not the variable), d2 1.500 (R4.13's add-IV, category (b)),
+h2 1.189.
+
+**The mnemonic histogram, after the whole R4 run so far** (zcc vs gcc-O1):
+`csel` **599 vs 542** — collapsed from 4,450 by R4.5's threading; `cbz` **4,631
+vs 4,631**, exact parity; `cmn` 118 vs 134; `tbz`/`tbnz` 650/855 vs 749/972.
+The named remainders: `mul` 730 vs 108 (the shift-and-add half of §17's
+mul-by-constant row), `ccmp` 0 vs 612 (R4.5's residual), `sbfiz`/`ubfiz` 0 vs
+571, `cbnz` 4,441 vs 2,435, `sxtw` 1,210 vs 641, `uxtb`/`uxth` 577 vs 0.
+
+**GATE (all green):** cargo 157/0 · fullsuite 10 PASS / 0 RED · opt-parity
+1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE · determinism 87×8.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

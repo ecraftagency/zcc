@@ -164,6 +164,48 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
                     live_here.insert(sp.idx(*wb));
                 }
             }
+            // R4.3 — A PARALLEL-COPY DESTINATION MAY TAKE ITS OWN DYING
+            // SOURCE'S REGISTER. The simultaneity argument below forbids a
+            // destination from taking ANOTHER pair's dying source: that pair
+            // still has to read it. It says nothing about a destination taking
+            // the source of ITS OWN pair — that assignment makes the pair a
+            // self-move, which writes nothing, so every other pair reads exactly
+            // what it read before. §13n measured the cost of not distinguishing
+            // them: 2.22 register movs per call against gcc's 1.00, and roughly
+            // three copies at the entry of every function moving arguments out
+            // of x0–x7.
+            //
+            // The colour is freed for THIS destination only and re-occupied the
+            // moment the bias declines it, so no other value can slip into it.
+            // `check` still asserts that no two live values share a colour.
+            if let MInst::ParallelCopy(pairs) = inst {
+                for (d, s, _) in pairs.clone() {
+                    let Reg::V(_) = d else { continue };
+                    let (di, si) = (sp.idx(d), sp.idx(s));
+                    if color[di].is_some() || last[si] != Some(i) || !live_here.contains(&si) {
+                        continue;
+                    }
+                    let Some(sc) = color_of(&color, sp, si) else { continue };
+                    occ.sub(sc);
+                    let r = assign(
+                        f, lv, &mut color, &mut used, &mut occ, d, &partners, has_calls,
+                    );
+                    let got = color_of(&color, sp, di);
+                    if got == Some(sc) {
+                        // the source handed its register over; it is no longer
+                        // live and must not be freed a second time below
+                        live_here.remove(&si);
+                    } else {
+                        occ.add(sc);
+                    }
+                    r.map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
+                    if live_here.insert(di) {
+                        if let Some(p) = got {
+                            occ.add(p);
+                        }
+                    }
+                }
+            }
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
                     assign(f, lv, &mut color, &mut used, &mut occ, *r, &partners, has_calls)
