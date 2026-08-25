@@ -1,4 +1,5 @@
 // if_convert (REARCH §4 row 10) — a side-effect-free diamond becomes `select`.
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // The shape is the one mem2reg produces from every `x = c ? a : b` and every
 // small `if`: a block branching on `c` into two arms that join, where the join's
@@ -18,6 +19,7 @@
 // skipped the arm it was not.
 use super::*;
 
+/// MEASURED M8 — the if-conversion arm bound
 /// How many instructions an arm may hold and still be speculated. Both arms are
 /// executed unconditionally afterwards, so the bound is the branch's own cost:
 /// a compare, a taken branch and the pipeline bubble a misprediction costs. Two
@@ -25,6 +27,7 @@ use super::*;
 /// a join parameter and nothing else — needs none at all.
 const ARM_LIMIT: usize = 2;
 
+/// THEORY A7b  SQUARE ifconv_turns_a_diamond_into_a_select — a side-effect-free diamond
 pub fn run(f: &mut Func) -> bool {
     let mut changed = false;
     loop {

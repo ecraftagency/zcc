@@ -1,4 +1,5 @@
 // sroa + mem2reg (REARCH §4 row 2) — the pass the R1 ground metric points at.
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // §13a measured `add` at 28.2% of sqlite's instructions and `ldr` at 19.2%, and
 // named one cause: R0/R1 keep EVERY C local in the frame, so each access is a
@@ -48,6 +49,7 @@ struct Piece {
     ty: Ty,
 }
 
+/// THEORY A7b  SQUARE sroa_splits_a_struct_field_by_field — a private cell is a value
 pub fn run(f: &mut Func) -> bool {
     let mut changed = canon_slot_addr(f);
     let pieces = analyze(f);

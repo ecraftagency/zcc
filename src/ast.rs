@@ -1,4 +1,5 @@
 // AST + type arena — the frontend/backend boundary of zcc.
+// THEORY A4 — the type system; THEORY II-2 — LP64 size and alignment
 // The frontend (lexer → parser) BUILDS these structures; the backend
 // (codegen/<target>) only READS them. The two layers do not import each other;
 // all exchange passes through this file.
@@ -45,6 +46,7 @@ pub enum Ty {
     Bitfield(TypeId, u32, u32), // (container type, bit offset within the unit, bit width)
     Bool,        // _Bool: store/cast normalizes to 0/1
 }
+/// THEORY A4 — the C99 builtin types; THEORY II-2 — their LP64 sizes
 pub const VOID: TypeId = 0;
 pub const CHAR: TypeId = 1;
 pub const UCHAR: TypeId = 2;

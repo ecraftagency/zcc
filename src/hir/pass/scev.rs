@@ -1,4 +1,5 @@
 // scev — scalar evolution for affine induction variables (REARCH §13f).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // An ANALYSIS, like `purity.rs`: it rewrites nothing and so carries no commuting
 // square. What it owes instead is that every AddRec it returns is TRUE of the

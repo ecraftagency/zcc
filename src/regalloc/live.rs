@@ -1,4 +1,5 @@
 // Liveness on MIR-SSA with block parameters (REARCH.md §7.1).
+// THEORY A7 — liveness on SSA (Boissinot et al. 2008)
 //
 // The only subtlety block parameters introduce: a target's ARGUMENTS are uses on
 // the EDGE, not inside the successor, and a block's PARAMETERS are definitions
@@ -25,6 +26,7 @@ pub struct Space {
     pub nv: usize,
 }
 
+/// THEORY II-3 — the physical register file, as AAPCS64 gives it
 pub const PHYS: usize = 96; // 32 GPR + 32 FPR + 32 (flags, only #0 used)
 
 impl Space {

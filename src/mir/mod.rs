@@ -1,4 +1,5 @@
 // MIR — the load-bearing machine layer (REARCH.md §5).
+// THEORY A6b — MIR, the machine layer
 //
 // One type, two lifecycle states (exactly LLVM's "MIR"):
 //   * VIRTUAL phase — SSA over virtual registers, block parameters on edges.
@@ -59,6 +60,7 @@ impl PReg {
             num: n,
         }
     }
+    /// THEORY II-5 — NZCV is one architectural register
     pub const NZCV: PReg = PReg {
         class: Class::Flags,
         num: 0,

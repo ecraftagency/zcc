@@ -1,4 +1,5 @@
 // cfg_simplify (REARCH §4 row 1) — the four control-flow identities.
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // Each is a commuting square proven by inspection of ⟦hir⟧'s terminator rule,
 // and none of them touches a value:
@@ -44,6 +45,7 @@
 // would invalidate both. An emptied block is never entered, so ⟦·⟧ is unchanged.
 use super::*;
 
+/// THEORY A7b  SQUARE cfg_simplify_merges_and_threads — the four control-flow identities
 pub fn run(f: &mut Func) -> bool {
     let mut any = false;
     // A sweep can expose work for the next one (a merge makes the merged block's

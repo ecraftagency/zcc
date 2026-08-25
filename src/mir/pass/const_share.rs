@@ -1,4 +1,5 @@
 // const_share (REARCH.md §13n row (c), R4.6) — the constant that was already
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // materialized.
 //
 // HIR carries a constant as an `Operand::Imm`, not as a value: it has no
@@ -50,6 +51,7 @@ enum Key {
     Sym(Sym, bool),
 }
 
+/// THEORY A6b  SQUARE a_constant_already_materialized_is_not_materialized_again — a dominating constant
 pub fn run(f: &mut MFunc) {
     // A/B while the trade is being measured: sharing buys a materialization and
     // pays in live range, and only the paired number says which wins.

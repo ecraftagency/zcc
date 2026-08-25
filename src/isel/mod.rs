@@ -1,4 +1,5 @@
 // Instruction selection: HIR → MIR (REARCH.md §6).
+// THEORY A5 — instruction selection
 //
 // The layer is split along the Law-1 seam. `abi.rs` is Side II — the AAPCS64
 // automaton over a call's C signature, pure transcribed spec. `imm.rs` is the

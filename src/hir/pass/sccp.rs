@@ -1,4 +1,5 @@
 // sccp — Sparse Conditional Constant Propagation (REARCH §4 row 3).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // Wegman & Zadeck 1991, "Constant Propagation with Conditional Branches". The
 // theorem is the reason this pass is not just "fold, then delete dead arms":
@@ -38,6 +39,7 @@ impl Lat {
     }
 }
 
+/// THEORY A7b  SQUARE sccp_kills_the_arm_a_constant_makes_unreachable — the lattice meet
 pub fn run(f: &mut Func) -> bool {
     let n = f.blocks.len();
     let c = dom::cfg(f);

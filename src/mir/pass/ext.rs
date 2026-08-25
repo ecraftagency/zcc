@@ -1,4 +1,5 @@
 // ext_lattice (REARCH.md §8) — the extension that has already happened.
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // A64 narrows and widens in the LOAD: `ldrb` zero-extends its byte into the
 // whole register, `ldrsh` sign-extends its halfword, and every 32-bit form
@@ -60,6 +61,7 @@ impl Known {
     }
 }
 
+/// THEORY A6b  SQUARE a_no_op_extension_leaves_the_alu_operand_plain — the bit lattice
 pub fn run(f: &mut MFunc) {
     let mut known: HashMap<VReg, Known> = HashMap::new();
     let cfg = crate::mir::verify::cfg(f);

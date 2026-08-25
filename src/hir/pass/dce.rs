@@ -1,4 +1,5 @@
 // dce — dead-code elimination by the effect table (REARCH §4 row 6).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // The whole pass is one rule, and the rule is a TABLE LOOKUP, not a hand-written
 // opcode list: `Inst::effect()` classifies every instruction, and an instruction
@@ -22,6 +23,7 @@
 // loop disappear.
 use super::*;
 
+/// THEORY A7b  SQUARE dce_removes_an_unused_computation_but_not_a_call — the effect table
 pub fn run(f: &mut Func) -> bool {
     let nv = f.values.len();
     let n = f.blocks.len();

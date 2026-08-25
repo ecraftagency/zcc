@@ -1,4 +1,5 @@
 // Lexer: C source -> Vec<PTok>. PTok = Tok + metadata for the preprocessor: bol
+// THEORY A1 — lexing; THEORY II-1 — the ISO C99 token and limit tables
 // (first token of a logical line, eligible to introduce a '#' directive), ws
 // (whitespace or comment immediately precedes it, needed for stringization),
 // line (physical line, for __LINE__ and diagnostics).
@@ -42,6 +43,7 @@ pub struct PTok {
     pub raw: String,       // original spelling (Num/Str/Char) for # stringization; empty = spell from value
 }
 
+/// THEORY II-1 — ISO C99 §6.4.6 digraphs
 // C99 6.4.6: digraphs — longest match first ("%:%:" before "%:").
 const DIGRAPHS: [(&str, &str); 6] = [
     ("%:%:", "##"),
@@ -52,6 +54,7 @@ const DIGRAPHS: [(&str, &str); 6] = [
     ("%>", "}"),
 ];
 
+/// THEORY II-1 — ISO C99 §6.4.6 punctuators
 // Longer punctuators listed first so they match first ("<<=" before "<<" before "<").
 const PUNCTS: [&str; 48] = [
     "...", "<<=", ">>=", "->", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "==",

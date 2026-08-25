@@ -1,4 +1,5 @@
 // HIR — the target-independent SSA layer (REARCH.md §3).
+// THEORY A6 — HIR, the target-independent SSA layer
 //
 // Three design decisions carry the whole layer, and every file below depends on
 // them (REARCH §3.1 / §14):
@@ -186,6 +187,7 @@ pub enum CvtOp {
 /// alias tag through every load/store later is expensive; TBAA (REARCH §16 ★1)
 /// is the pass that will finally read it.
 pub type AClass = u32;
+/// THEORY A6 — HIR's alias-class sentinel
 pub const ACLASS_ANY: AClass = 0;
 
 // ── instructions ───────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 // Frame lowering (REARCH.md §8, post-allocation).
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // Assign a byte offset to every stack object and materialize the prologue and
 // epilogue. The prologue is NOT a special printed string: it is ordinary MIR —
@@ -13,6 +14,7 @@
 // frame pointer here, every slot is addressed from sp).
 use crate::mir::*;
 
+/// THEORY A6b  SQUARE callee_saved_preservation_is_realized_by_the_prologue — the ABI promise, in instructions
 pub fn run(f: &mut MFunc) {
     // x30 (LR) is destroyed by `bl`, so a function that calls anything must
     // preserve it. A leaf function must not: that is one store and one load per

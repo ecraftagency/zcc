@@ -1,4 +1,5 @@
 // C89 preprocessor (M7): token-based, running between the lexer and the parser.
+// THEORY A2 — preprocessing; THEORY II-1 — ISO C99 §6.10
 // In: a file path; out: a Vec<Tok> cleared of directives, ready for the parser.
 // Supported constructs: #include "..." (relative to the directory of the file
 // being processed), #define object/function (# stringization, ## paste,
@@ -21,6 +22,7 @@ enum Macro {
 }
 type Macros = HashMap<String, Macro>;
 
+/// THEORY II-1 — the ISO C99 standard headers
 // System headers EMBEDDED into the binary (zero dependency; the target is
 // locked to arm64 ELF, so the contents are fixed). #include <...> consults this
 // table, it does not read the filesystem. Only 7 COMPILER-OWNED freestanding
@@ -1130,6 +1132,7 @@ fn ternary(ts: &[Tok], p: &mut usize) -> Result<PV, String> {
     Ok((if c.0 != 0 { a.0 } else { b.0 }, a.1 | b.1))
 }
 
+/// THEORY II-1 — ISO C99 §5.2.4.1 nesting limits
 // C binary-operator precedence levels, lowest → highest.
 const LEVELS: [&[&str]; 10] = [
     &["||"],

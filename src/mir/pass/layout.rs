@@ -1,4 +1,5 @@
 // Block layout (REARCH.md §8, post-allocation).
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // Choose the order the blocks are printed in, so that as many branches as
 // possible become fall-through. Reverse postorder already keeps a loop body
@@ -22,6 +23,7 @@
 use crate::cfg::{Cfg, LoopForest, DomTree};
 use crate::mir::*;
 
+/// THEORY A6b  SQUARE layout_preserves_every_edge — order changes, edges do not
 pub fn run(f: &mut MFunc) {
     thread_empty_blocks(f);
     let cfg = crate::mir::verify::cfg(f);
@@ -101,8 +103,10 @@ fn relax_branches(f: &mut MFunc) {
             _ => 3,
         }
     };
+    /// THEORY II-5 — the conditional-branch imm19 reach (DDI 0487 C6.2.25)
     // half the true reach, so the instructions relaxation ADDS cannot undo it
     const NEAR: usize = 4096;
+    /// THEORY II-5 — the unconditional-branch imm26 reach
     const FAR: usize = 1 << 17;
     for _ in 0..8 {
         let mut at: Vec<usize> = vec![0; f.blocks.len()];

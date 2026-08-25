@@ -1,4 +1,5 @@
 // The HIR pass ladder (REARCH.md §4) — the tree-SSA half of gcc -O1, re-realized
+// THEORY A7b — optimization, and what proving each pass requires
 // on this architecture.
 //
 // Every pass in here is an HIR→HIR function shipping the commuting square
@@ -30,6 +31,7 @@ pub mod sroa;
 
 use super::*;
 
+/// THEORY A7b — the ladder's fixpoint bound
 /// Rounds of the ladder. Three is gcc's own practical bound for -O1-class
 /// pipelines: the interesting cascades (fold → branch removal → merge →
 /// re-number) are two levels deep, and the third is the confirmation round that
@@ -80,6 +82,8 @@ fn readonly(m: &Module) -> std::collections::HashSet<String> {
     }
 }
 
+/// THEORY A7b  SQUARE ladder_is_idempotent_at_the_fixpoint — the ladder reaches
+/// a fixpoint, and running it again changes nothing
 pub fn run(f: &mut Func) {
     run_with(f, &std::collections::HashSet::new())
 }

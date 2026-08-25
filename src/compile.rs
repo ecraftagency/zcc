@@ -1,4 +1,5 @@
 // The single door from the frontend to the layered backend (REARCH.md §2).
+// THEORY A5 — the isel/ABI seam; THEORY A6 — HIR; THEORY A6b — MIR
 // main.rs knows only this function; every layer below is private to the pipeline.
 //
 //   AST + TyTab

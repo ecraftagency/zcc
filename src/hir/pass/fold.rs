@@ -1,4 +1,5 @@
 // Constant folding and the algebraic rewrite table (REARCH §4 row 4).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // TWO rules govern this file, and together they are why it needs no separate
 // proof of its own beyond the corpus square:

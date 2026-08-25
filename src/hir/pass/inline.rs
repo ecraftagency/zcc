@@ -1,4 +1,5 @@
 // inline (REARCH §4 row 7) — β-reduction on the call graph.
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // POLICY, dated and cited rather than tuned. gcc -O1 enables
 // `-finline-functions-called-once` and nothing else: a function with exactly one
@@ -35,6 +36,7 @@ fn call_cost(sig: &Sig) -> usize {
     sig.params.len() + 2
 }
 
+/// THEORY A7b — a fixpoint bound: termination insurance, not a policy
 /// Rounds of inlining. A callee's own calls become the caller's after the first
 /// round; two rounds cover the ordinary "wrapper around a wrapper" and stop the
 /// growth from compounding.

@@ -1,4 +1,5 @@
 // ⟦mir⟧ — the executable semantics of the machine layer (REARCH.md §5.4).
+// THEORY A6b — MIR; SEMANTICS 5 — the machine layer's denotation
 //
 // ONE interpreter for both lifecycle states. That is the point: `⟦hir⟧ =
 // ⟦mir_v⟧` validates instruction selection, `⟦mir_v⟧ = ⟦mir_p⟧` validates
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 
 pub type Bits = u64;
 
+/// THEORY A8 — a non-termination guard for the reference interpreter
 /// The interpreter's step budget. A non-terminating run is ⊥ for proof
 /// purposes, and every commuting square compares only runs where neither side
 /// traps — so the exact number is not a semantic constant, only a bound on how
@@ -25,10 +27,14 @@ pub type Bits = u64;
 pub const STEP_BUDGET: u64 = 50_000_000;
 
 
+/// THEORY II-5 — the NZCV bit positions (DDI 0487 C5.2.9)
 /// NZCV, packed as in the PSTATE encoding: N=8, Z=4, C=2, V=1.
 const N: u64 = 8;
+/// THEORY II-5 — the NZCV bit positions
 const Z: u64 = 4;
+/// THEORY II-5 — the NZCV bit positions
 const C: u64 = 2;
+/// THEORY II-5 — the NZCV bit positions
 const V: u64 = 1;
 
 pub struct Machine<'a> {

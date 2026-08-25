@@ -1,4 +1,5 @@
 // load_elim / dse (REARCH §4 row 5) — the memory that SROA could not promote.
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // mem2reg removes a local's memory entirely when the local is a private cell.
 // What is left is genuinely memory: globals, anything reached through a pointer,
@@ -89,6 +90,7 @@ fn same(a: &(Loc, u32), b: &(Loc, u32)) -> bool {
 /// it invisible can delete it.
 type Avail = Vec<((Loc, u32), Ty, Operand, Option<usize>)>;
 
+/// THEORY A7b  SQUARE a_second_read_of_the_same_place_is_the_first — the alias oracle
 pub fn run(f: &mut Func) -> bool {
     // where each value's address comes from
     let mut addr: Vec<Option<Loc>> = vec![None; f.values.len()];

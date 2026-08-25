@@ -1,4 +1,5 @@
 // AST → HIR lowering (REARCH.md §12 R0.3).
+// THEORY A6 — HIR construction; THEORY A4 — the conversions C99 requires
 //
 // The frontend hands the backend an arena of `Node`s whose every convergence
 // point already carries an explicit `Cast` (parser.rs header): types in the AST

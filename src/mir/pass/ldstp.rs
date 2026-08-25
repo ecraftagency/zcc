@@ -1,4 +1,5 @@
 // ldst_pair (REARCH.md §8) — two accesses to consecutive addresses become one.
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // A64 has `ldp`/`stp` (DDI 0487 C6.2.130), and the code that uses them most is
 // not user code: the prologue saves the callee-saved set, the epilogue restores
@@ -18,6 +19,7 @@
 // load must not overwrite the base register it is still addressing through.
 use crate::mir::*;
 
+/// MEASURED M5 — the pairing window saturates within ten instructions
 /// How far ahead a partner is looked for. §13o measured the distribution on
 /// sqlite: of the frame accesses that could pair, 433 sit ADJACENT and 1,374
 /// more sit two to ten instructions away — the second access is simply not next
@@ -25,6 +27,7 @@ use crate::mir::*;
 /// measured tail; beyond it the count is flat.
 const WINDOW: usize = 10;
 
+/// THEORY A6b  SQUARE a_pair_replaces_two_adjacent_accesses — nothing observes the intermediate state
 pub fn run(f: &mut MFunc) {
     let offs: Vec<i32> = f.slots.iter().map(|s| s.off).collect();
     for b in f.blocks.iter_mut() {

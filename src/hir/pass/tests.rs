@@ -529,11 +529,19 @@ fn ladder_is_idempotent_at_the_fixpoint() {
     ] {
         let ast = frontend(src);
         let mut m = build::build(&ast);
+        // ⟦f⟧ = ⟦ladder f⟧ FIRST. Idempotence alone is a statement about the
+        // ROUNDS bound, not about meaning: a ladder that miscompiled
+        // identically on both runs would satisfy it. `provenance.sh` caught
+        // that this square had the effect half and not the equivalence half.
+        let before = run(&m, &ast);
         super::run_module(&mut m);
         let once: Vec<usize> = m.funcs.iter().map(ninsts).collect();
+        let after = run(&m, &ast);
+        assert_eq!(before, after, "⟦f⟧ ≠ ⟦ladder f⟧\n{}", src);
         super::run_module(&mut m);
         let twice: Vec<usize> = m.funcs.iter().map(ninsts).collect();
         assert_eq!(once, twice, "the ladder had not reached its fixpoint\n{}", src);
+        assert_eq!(after, run(&m, &ast), "⟦ladder f⟧ ≠ ⟦ladder² f⟧\n{}", src);
     }
 }
 

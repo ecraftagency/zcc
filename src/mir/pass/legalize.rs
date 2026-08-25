@@ -1,4 +1,5 @@
 // Frame-offset legalization (REARCH.md §8, post-frame).
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // `pass/frame.rs` is the first place a stack object has a NUMBER, and A64's
 // addressing modes bound that number: the unsigned form of a load/store reaches
@@ -18,6 +19,7 @@
 // is reserved, so no live value is destroyed.
 use crate::mir::*;
 
+/// THEORY A6b  SQUARE legalization_of_out_of_range_frame_offsets — same address, encodable
 pub fn run(f: &mut MFunc) {
     let offs: Vec<i32> = f.slots.iter().map(|s| s.off).collect();
     let scratch = Reg::P(isa::SCRATCH_GPR2);

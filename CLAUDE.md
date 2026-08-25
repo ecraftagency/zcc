@@ -6,6 +6,26 @@ zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external cra
 
 > **`[optimizer = `main`]` override (SUPERSEDED on `mir-rearch` by the block above; still governs `main`/`edu`) — the optimizer (formerly the `ssa-qbe` fork) was PROMOTED to `main` on 2026-08-24; the zcc-slim SEAL edu compiler is preserved verbatim on the `edu` branch. This override governs `main`; `edu` keeps the pre-optimizer body.** The two-fact model is literal: `[THEORY.md, SEMANTICS.md]` (Side I) ⊕ `[iso/os/arch/gnu specs]` (Side II) **is** the source of zcc; `src/*.rs` is its *compiled object*. `main` **is** the optimizer. **THE ULTIMATUM (FINAL GOAL): match `gcc -O1` on BOTH binary size AND exec speed (geo40) — 1× on BOTH axes is the STOPPING POINT (điểm dừng): not O2, not O3, and not stopping at one axis — with correctness-by-construction INTACT (every pass ships its commuting-square / translation-validation proof, Law 3; formal verification is never traded for a number).** No toy compiler has reached O1 parity on both; that is the finish line, after which the optimizer is DONE. The fork suspends two clauses of Article B — nothing else: "-O0 / no optimization pass" → SUSPENDED (the fork's purpose is `opt.rs` + `OPT.md`; every pass ships under the CbC gate of Law 3); **"LOC ceiling" → REMOVED entirely for this fork** — the hard LOC number is dropped (it caused doc/context churn with zero correctness value); minimal-LOC survives only as design taste, **never a tracked budget or number to re-count**. Laws 1–3, architecture, driver, extension, and the test gate remain in full force. **TARGET METRIC (2026-08-24 pivot): the finish-line is EXEC SPEED vs gcc-O1 = geomean over the 35-program taxonomy suite ("geo40"), NOT the 4-kernel number ("geo4", a best-case mirage); SIZE follows as a byproduct, it is not the goal.** The ONE plan + scoreboard: **`OPT.md §0` = THE SUPREME PLAN** (parallel to these Laws — a single numbered spine `[1…25]`, nuclear #25 LAST, each row tagged SIZE/SPEED/BOTH, status = the resume memory). **EXECUTION DISCIPLINE (mechanism, not a law — the anti-drift lock): the optimization plan is THE SUPREME PLAN in `OPT.md §0`. BOOT — the user prompt "execute the plan" (or continue/resume/grind) means: read §0, resume at the spine's first `⬜`, run the ONE iteration process (predict Δ on the cost-model → implement + ship its commuting-square/translation-validation inline test → FULL GATE cargo+torture+opt-parity+csmith300+yarpgen300 → re-measure geo40 → bank/quarantine → advance). AUTONOMOUS GRIND MODE (standing user directive): grind rows #17→#24 to completion across context resets WITHOUT checking in, push after each bank; HARD STOP only at #25 (nuclear — wait for the user to type "go nuclear"; never start it autonomously) or when no `⬜` remains. ANTI-FRAGMENTATION LAW: never author a new numbering in a new section (that drift — old `[0-9]`→Phases→batches — is why we lost the thread); to change the plan you EDIT THE SPINE TABLE IN PLACE. The NO-PIVOT contract binds: a low yield, a miscompile, or a BLOCKER NEVER authorizes a new direction. A blocker (wall on lever N — can't-green / won't-fire / needs-missing-infra) is QUARANTINED to lever N: one bounded Law-2 attempt, else revert-that-lever-to-green, mark `BLOCKED: <reason>`, bank any positive, ADVANCE to N+1. Coming back to ask the user "should we try another branch?" IS the collapse and is forbidden — a blocker produces only quarantine-mark-advance, never a request for a new direction. Proposing a new lever/re-sequence is forbidden without the user typing "re-plan". Bank every positive ≥0.5%; if real yield <20% of ceiling, exactly ONE review-push round, then advance. "Done" = the full gate green + number recorded + committed, never the AI's feel. Tripwire: user pastes `OPT.md lever N — stick or amend?` to force the AI back to the ledger.**
 
+## Law 0 — PURITY IS THE PRECONDITION (standing order, 2026-08-26)
+
+THE ULTIMATUM names 1× against gcc-O1 on both axes as the STOPPING POINT.
+This says what may not be spent to reach it:
+
+```
+purity  ≫  exec  >  size  >  compile speed
+```
+
+**No number is banked at the cost of a citation.** A row that would reach parity
+by removing a proof does not ship, however large the number. Laws 1 and 3 are
+claims ABOUT THE SOURCE — every line in theory ∪ fact, every pass carrying its
+commuting square — and `tests/provenance.sh` checks both in the sci gate.
+`PURITY.md` is the plan of record for that work; `MEASURED.md` holds the facts
+that have no spec to cite, so `THEORY.md` II-* stays cited-spec and nothing else.
+
+zcc is an EDUCATIONAL compiler and a community project. A citation is therefore
+a READING PATH — a student who lands on any line should be able to read upward
+to the theorem it realizes — not a lint marker. Write it for a person.
+
 ## Law 1 — the decomposition theorem (Law Zero; if only one is kept, keep this. Full text: `THEORY.md`)
 
 ```
@@ -88,6 +108,12 @@ Every operation is subordinate to Laws 1–3 + THE ULTIMATUM and must leave CbC 
 - **`SEMANTICS.md`** — the reference operational semantics (the executable meaning behind `⟦·⟧`).
 - **`MILESTONES.md`** — milestone ladder, LOC budget, C99-remaining, debt ledger.
 - **`tests/README.md`** — test-asset register, full test-mechanism text, baseline + traps.
+- **`PURITY.md`** — the ONE goal: every LOC provably in theory ∪ fact, every pass
+  squared and non-vacuous. What `tests/provenance.sh` checks, what the audit
+  found, and what is open. Purity outranks every number (Law 0).
+- **`MEASURED.md`** — target facts with no spec to cite (no vendor optimization
+  guide exists for this core): value, method, date, machine, and what reads it.
+  Cited from code as `MEASURED M<n>`, exactly as spec is cited as `THEORY II-<n>`.
 - **`REARCH.md`** `[mir-rearch]` — **the plan of record on this branch**: §0 boot, §2 layer map, §3–§9 the layers, §10 proof map + cost model, §12 the R0–R5 milestone ladder (status lives THERE, edited in place), §13 rc3 baselines, §14 decision log, §16 the O2 headroom shelf, §17 the arm64 isel exhaustion checklist.
 - **`OPT.md`** `[main]` — the transient execution plan + work-booking: the SUPREME PLAN spine (§0) · scoreboard · done-ledger · next-gate · runner/harness/loop-engineering. Deleted at opt-end; durable theorems cook into `THEORY.md`/`SEMANTICS.md`.
 - **`src/ext.rs` + `grep 'EXT(' src/`** — the entire current deviation surface.

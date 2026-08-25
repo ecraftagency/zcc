@@ -1,4 +1,5 @@
 // shrink_wrap (REARCH.md §8, gcc `-fshrink-wrap`) — save the callee-saved
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // registers only on the path that uses them.
 //
 // frame.rs saves every used callee-saved register (and LR) at the entry and
@@ -32,6 +33,7 @@ use crate::cfg::DomTree;
 use crate::mir::*;
 use std::collections::HashSet;
 
+/// THEORY A6b  SQUARE shrink_wrap_moves_saves_off_the_fast_path — the sink region
 pub fn run(f: &mut MFunc) {
     if f.dyn_stack || f.cs_saves.is_empty() {
         return;

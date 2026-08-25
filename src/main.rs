@@ -1,4 +1,5 @@
 // zcc — C89+ compiler, target: AArch64 ELF (Linux).
+// THEORY II-6 — the driver's flag surface; THEORY II-4 — ELF output
 // A cc-compatible CLI for drop-in use in a Makefile (CC=zcc):
 //   zcc [-c | -S] [-o out] [other cc flags: swallowed silently] <in.c>
 //   default: temp .s → `as` → temp .o → `ld` (directly, not via the cc driver)

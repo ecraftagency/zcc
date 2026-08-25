@@ -1,4 +1,5 @@
 // The HIR well-formedness checker (REARCH.md §3.4). This is Law 3 applied at the
+// THEORY A6 — HIR's well-formedness; THEORY A8 — proof at the earliest layer
 // cheapest possible layer: every property below is decidable on the IR alone, so
 // a violation is caught here rather than as a mysterious wrong answer in csmith.
 //

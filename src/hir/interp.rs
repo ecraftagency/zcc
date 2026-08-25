@@ -1,4 +1,5 @@
 // ⟦hir⟧ — the executable reference semantics of HIR (SEMANTICS.md, REARCH §3.4).
+// THEORY A6 — HIR; SEMANTICS 4 — ⟦Inst⟧, the reference semantics ⟦·⟧ denotes
 //
 // This is the *prover* half of Law 3: every HIR→HIR pass P ships the commuting
 // square ⟦f⟧ = ⟦P f⟧, and this file is what evaluates both sides. It is not a
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 
 pub type Bits = u64;
 
+/// THEORY A8 — a non-termination guard for the reference interpreter, not a language fact
 /// The interpreter's step budget. A non-terminating run is ⊥ for proof
 /// purposes, and every commuting square compares only runs where neither side
 /// traps — so the exact number is not a semantic constant, only a bound on how

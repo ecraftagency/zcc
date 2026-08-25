@@ -8,7 +8,7 @@
 #   TARGET (default all) — SEEK reaches an individual LAYER, no full re-run needed:
 #     all                              — sci + corpus + fuzz + app (THE gate)
 #     sci | corpus | fuzz | app | base  — group (base = run.sh cases+ext, fast loop)
-#     determ | optpar | csmith | yarpgen — one stage
+#     provenance | determ | optpar | csmith | yarpgen — one stage
 #   FUZZ_N (default 300) sizes BOTH random generators; 1000 for a seal.
 #     shape|cpp|decay|alg|abi          — 1 sci-gate (theorem verification)
 #     cases|ext                        — 1 base differential
@@ -42,6 +42,7 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
     base_c() { stage cases sh "$W/tests/run.sh" cases "$SEEK" ; }
     base_e() { stage ext   sh "$W/tests/run.sh" ext   "$SEEK" ; }
     run_sci()    { echo "-- SCI-GATE (theorem verification, structural exhaustion) --"
+                   stage provenance sh "$W/tests/provenance.sh"
                    for g in shape cpp decay alg abi; do gate "$g"; done
                    stage determ sh "$W/tests/determinism.sh" ; }
     run_base()   { echo "-- BASE (hand-written differential, fast loop) --"; base_c; base_e ; }
@@ -67,6 +68,7 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
         base)                    run_base ;;
         shape|cpp|decay|alg|abi) gate "$TARGET" ;;
         determ)                  stage determ sh "$W/tests/determinism.sh" ;;
+        provenance)              stage provenance sh "$W/tests/provenance.sh" ;;
         optpar)                  stage optpar sh "$W/tests/opt-parity.sh" ;;
         cases)                   base_c ;;
         ext)                     base_e ;;

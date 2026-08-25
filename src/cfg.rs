@@ -1,4 +1,5 @@
 // Control-flow analyses, written once over an abstract successor relation and
+// THEORY B — graph theory: dominance (Cooper/Harvey/Kennedy), loop nesting
 // instantiated for both HIR and MIR. These are analyses, not transforms: they
 // add no instruction and so carry no commuting-square obligation.
 //

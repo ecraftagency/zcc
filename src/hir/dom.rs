@@ -1,4 +1,5 @@
 // HIR's instantiation of the shared control-flow analyses (`src/cfg.rs`) plus
+// THEORY B — dominance and loop nesting, instantiated for HIR
 // the one CFG transform HIR owns.
 use super::{BlockId, Func, Term};
 pub use crate::cfg::{Cfg, DomTree, Loop, LoopForest};

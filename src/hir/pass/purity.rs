@@ -1,4 +1,5 @@
 // purity — the interprocedural READ-ONLY predicate (REARCH §13c row 1).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // This is an ANALYSIS, not a transform: it adds no instruction and so carries no
 // commuting square of its own. What it owes instead is SOUNDNESS of the

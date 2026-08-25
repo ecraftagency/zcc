@@ -1,4 +1,5 @@
 // sink (REARCH §16 ★, pulled forward because §13b ranked it) — move a pure
+// THEORY A7b — optimization: this pass ships its commuting square
 // instruction down to the block that uses it.
 //
 // NOT an instruction-count optimization: it removes nothing. It is a REGISTER
@@ -20,6 +21,7 @@
 // (4) is the reverse of licm's condition and for the same reason.
 use super::*;
 
+/// THEORY A7b  SQUARE sink_moves_a_computation_to_the_block_that_needs_it — domination of every use
 pub fn run(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);

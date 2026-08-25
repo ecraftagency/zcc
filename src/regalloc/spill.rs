@@ -1,4 +1,5 @@
 // Spilling: reduce register pressure to ≤ k so that chordal colouring cannot
+// THEORY A7 — Belady-based spilling (Braun & Hack 2009)
 // fail (REARCH.md §7.2) — Braun & Hack 2009, "Register Spilling and Live-Range
 // Splitting for SSA-Form Programs".
 //

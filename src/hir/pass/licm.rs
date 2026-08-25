@@ -1,4 +1,5 @@
 // licm — loop-invariant code motion (REARCH §4 row 8).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // UNCONDITIONAL, per §4: no register-pressure guard. The allocator owns pressure
 // and now actually can — R2.2's Belady spiller splits a live range instead of
@@ -24,6 +25,7 @@
 use super::*;
 use std::collections::HashSet;
 
+/// THEORY A7b  SQUARE licm_hoists_an_invariant_expression_out_of_the_loop — invariance + the four fences
 pub fn run(f: &mut Func) -> bool {
     run_with(f, &HashSet::new())
 }

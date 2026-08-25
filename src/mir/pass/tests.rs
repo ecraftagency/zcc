@@ -50,6 +50,32 @@ fn same_all(cases: &[&str]) {
 
 #[test]
 fn callee_saved_preservation_is_realized_by_the_prologue() {
+    // THE EFFECT half. `same_all` below proves the meaning survives; on its own
+    // it would stay green for a frame pass that emitted NOTHING, since a
+    // function whose values were never spilled means the same either way. So
+    // first: the prologue of a function that keeps a value across a call must
+    // actually contain the save.
+    // The callee carries a loop so the size heuristic does not inline it — with
+    // it inlined, `main` has no call, nothing is live across one, and the
+    // assertion below would be testing a function with no frame at all.
+    let src = "int f(int x){int i,s=0;for(i=0;i<x;i++)s+=i;return s;}\
+               int main(void){int a=3;return f(a)+a;}";
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    for f in m.funcs.iter_mut() {
+        crate::mir::pass::frame::run(f);
+    }
+    let mn = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    assert!(!mn.cs_saves.is_empty(), "a value lives across a call but nothing is saved");
+    let saves = mn.blocks[mn.entry as usize]
+        .insts
+        .iter()
+        .filter(|i| matches!(i, crate::mir::MInst::Spill { .. }))
+        .count();
+    assert_eq!(saves, mn.cs_saves.len(), "the prologue does not save what cs_saves records");
+
     // Each of these keeps a value live across a call, so the allocator puts it
     // in a callee-saved register and the prologue must be what saves it.
     same_all(&[
@@ -77,6 +103,38 @@ fn a_frameless_leaf_gets_no_frame_at_all() {
 
 #[test]
 fn layout_preserves_every_edge() {
+    // THE EFFECT half: layout must actually LAY OUT — produce an order and turn
+    // branches into fall-throughs — or `same_all` proves only that doing
+    // nothing changes nothing.
+    //
+    // NOTE ON THIS TEST'S NAME, which the effect half exposed as an overstatement:
+    // layout does NOT preserve every edge. It THREADS an empty block, so a
+    // predecessor's successor changes from the empty block to that block's own
+    // target (measured: bb2's successors go [11,12] → [2,12] when bb11 is an
+    // empty forwarder). What it preserves is the RUN, which is what `same_all`
+    // checks. The edge set is not the invariant; reachable behaviour is.
+    let src = "int main(void){int s=0,i;for(i=0;i<10;i++)s+=i;return s;}";
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    finish(&mut m);
+    let f = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    assert!(f.laid_out, "layout did not run");
+    assert!(!f.order.is_empty(), "layout produced no block order");
+    // at least one conditional branch falls through to the next block in the
+    // order — the whole point of choosing an order at all
+    let mut fallthrough = 0;
+    for (k, b) in f.order.iter().enumerate() {
+        let next = f.order.get(k + 1).copied();
+        if let crate::mir::MTerm::Bcc(_, _, _, e) = &f.blocks[*b as usize].term {
+            if Some(e.block) == next {
+                fallthrough += 1;
+            }
+        }
+    }
+    assert!(fallthrough > 0, "no conditional branch was laid out to fall through");
+
     same_all(&[
         "int main(void){int s=0,i;for(i=0;i<10;i++)s+=i;return s;}",
         "int main(void){int s=0,i,j;for(i=0;i<5;i++)for(j=0;j<5;j++)s+=i*j;return s;}",
@@ -133,6 +191,40 @@ fn slots_do_not_overlap_and_respect_alignment() {
 /// frames below are chosen to straddle the imm12 and scaled-offset limits.
 #[test]
 fn legalization_of_out_of_range_frame_offsets() {
+    // THE EFFECT half: after the pass EVERY frame offset is encodable, and on a
+    // frame this size at least one was not before. Without this, `same` alone
+    // stays green for a legalizer that never fires.
+    {
+        let src = "int main(void){char pad[20000];int i,s=0;pad[0]=1;pad[19999]=2;\n\
+                   for(i=0;i<8;i++)s+=pad[i*3]+i;return s+pad[0]+pad[19999];}";
+        let ast = frontend(src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let mut m = allocated(&h).unwrap();
+        for f in m.funcs.iter_mut() {
+            crate::mir::pass::frame::run(f);
+        }
+        let off_ok = |f: &crate::mir::MFunc| {
+            f.blocks.iter().flat_map(|b| b.insts.iter()).all(|i| match i {
+                crate::mir::MInst::Load { op, mem: crate::mir::AddrMode::Slot { slot, off }, .. }
+                | crate::mir::MInst::Store { op, mem: crate::mir::AddrMode::Slot { slot, off }, .. } => {
+                    crate::mir::isa::mem_off_ok(f.slots[*slot as usize].off + off, op.bytes())
+                }
+                _ => true,
+            })
+        };
+        let before = m.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(!off_ok(before), "this frame was supposed to have an unencodable offset");
+        // MModule is not Clone, so the "after" side is built the same way and
+        // then legalized — the two differ by exactly this pass.
+        let mut m2 = allocated(&h).unwrap();
+        for f in m2.funcs.iter_mut() {
+            crate::mir::pass::frame::run(f);
+            crate::mir::pass::legalize::run(f);
+        }
+        let after = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+        assert!(off_ok(after), "legalize left an unencodable frame offset");
+    }
     for n in [64usize, 600, 1200, 5000, 20000] {
         same(&format!(
             "int main(void){{char pad[{n}];int i,s=0;pad[0]=1;pad[{last}]=2;\n\
@@ -407,4 +499,127 @@ fn a_constant_already_materialized_is_not_materialized_again() {
         .filter(|i| matches!(i, MInst::MovImm { imm: 1000003, .. }))
         .count();
     assert_eq!(movs, 2, "a constant was shared across a call");
+}
+
+#[test]
+fn a_pair_replaces_two_adjacent_accesses() {
+    // `ldp`/`stp` (DDI 0487 C6.2.130). The square this replaces asserted only
+    // `equiv(...)` on three programs — which a pairing pass that never fired
+    // would also pass, and that is exactly the vacuous square §17 was full of.
+    // So: the pair must APPEAR where the shape allows it, and must NOT appear
+    // where the ISA has no paired form.
+    use crate::mir::MInst;
+    let pairs = |src: &str, f: &str| -> usize {
+        let ast = frontend(src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let mut m = allocated(&h).unwrap();
+        finish(&mut m);
+        m.funcs
+            .iter()
+            .find(|x| x.name == f)
+            .map(|x| {
+                x.blocks
+                    .iter()
+                    .flat_map(|b| b.insts.iter())
+                    .filter(|i| matches!(i, MInst::Pair { .. }))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    // Two values already in DISTINCT registers, stored to adjacent slots. The
+    // literal version of this (`p[0]=1;p[1]=2`) does NOT pair, and correctly so:
+    // both stores use the same transfer register, reloaded between them, and
+    // moving the second back would read the wrong value. gcc schedules the two
+    // materializations first; zcc does not. Recorded as a residual, not asserted
+    // here as a failure of this pass.
+    let two_longs = "void g(long*p,long x,long y){p[0]=x;p[1]=y;}\
+                     int main(void){long a[2];g(a,1,2);return (int)(a[0]*10+a[1]);}";
+    assert!(pairs(two_longs, "g") >= 1, "two adjacent 8-byte stores did not pair");
+    same(two_longs);
+
+    // A BYTE access has no paired form: `stp` exists at 32 and 64 bits and for
+    // S/D/Q, and nowhere else. Nothing may be invented here.
+    let two_bytes = "void g(char*p){p[0]=1;p[1]=2;}\
+                     int main(void){char a[2];g(a);return a[0]*10+a[1];}";
+    assert_eq!(pairs(two_bytes, "g"), 0, "a byte access has no paired form");
+    same(two_bytes);
+
+    // RESIDUAL, measured here and recorded rather than fixed: `p->a + p->b`
+    // emits two adjacent loads off one base and does NOT pair, because `fuse`
+    // refuses when a destination equals the base register. DDI 0487 C6.2.130
+    // constrains that only for the WRITEBACK forms — plain `ldp x1, x0, [x0]`
+    // reads the base once to form the address and is well defined, so this is a
+    // missed pair, not an illegal one. The square still holds; only the count
+    // is short.
+    same("struct P{long a,b;};long f(struct P*p){return p->a+p->b;}\
+          int main(void){struct P p;p.a=40;p.b=2;return (int)f(&p);}");
+}
+
+#[test]
+fn an_arithmetic_result_needs_no_second_compare() {
+    // cmp_elim's square, which did not exist — the pass shipped with no proof
+    // at all, found by `tests/provenance.sh`.
+    //
+    // A64's `subs`/`adds`/`ands` set NZCV from their own result, so `sub w0,..`
+    // followed by `cmp w0, #0` computes the flags twice. THE CONDITION CODE IS
+    // THE WHOLE PROBLEM: `cmp d,#0` leaves C=1 and V=0 by definition, while
+    // `subs` sets both from the arithmetic, so only the codes reading N and Z
+    // survive — `lt` becoming `mi` and `ge` becoming `pl`, which is the rewrite
+    // this test's second half exercises.
+    use crate::mir::MInst;
+    let build_one = |src: &str, f: &str| -> crate::mir::MFunc {
+        let ast = frontend(src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let mut m = crate::isel::lower(&h);
+        for g in m.funcs.iter_mut() {
+            crate::mir::pass::cmpelim::run(g);
+        }
+        m.funcs.into_iter().find(|x| x.name == f).unwrap()
+    };
+    // The flags must be CONSUMED by something cmp_elim can reach — a select.
+    // `if (d == 0)` does not exercise this pass at all: isel already turns that
+    // into `cbz` with no `cmp` instruction to eliminate, which is why the first
+    // attempt at this test asserted against an empty set.
+    let src = "int f(int a,int b){int d=a-b;return d<0?11:22;}\
+               int main(void){return f(1,2)*100+f(2,1);}";
+    let g = build_one(src, "f");
+    let flagged = g
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::Alu { flags: Some(_), .. }))
+        .count();
+    let cmps = g
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::Cmp { .. }))
+        .count();
+    assert_eq!(flagged, 1, "the subtraction did not take over the compare");
+    assert_eq!(cmps, 0, "a redundant `cmp #0` survived");
+    // …and the condition was REWRITTEN, not inherited: `subs` sets V from the
+    // arithmetic where `cmp d,#0` left it 0, so `lt` is only `mi`.
+    let mi = g
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::CSel { cc: crate::mir::CC::Mi, .. }))
+        .count();
+    assert_eq!(mi, 1, "`lt` was not rewritten to `mi` when V stopped being 0");
+    same(src);
+
+    // `ands` reaches it too, and there the condition reads N and Z alone, so it
+    // survives unchanged.
+    let src2 = "int f(int a,int b,int c){int d=a&b;return d==0?c:d;}\
+                int main(void){return f(3,4,9)*100+f(3,1,9);}";
+    let g2 = build_one(src2, "f");
+    assert_eq!(
+        g2.blocks.iter().flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i, MInst::Cmp { .. })).count(),
+        0,
+        "a redundant `cmp #0` survived after `and`"
+    );
+    same(src2);
 }

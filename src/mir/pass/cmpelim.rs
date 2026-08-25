@@ -1,4 +1,5 @@
 // cmp_elim (REARCH.md §8, gcc's `-fcompare-elim`) — the compare an arithmetic
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // instruction has already performed.
 //
 // A64's `adds`, `subs` and `ands` set NZCV from their own result, so
@@ -14,6 +15,8 @@
 // and `ge` is exactly `pl`. Everything else refuses the fusion.
 use crate::mir::*;
 
+/// THEORY A6b  SQUARE an_arithmetic_result_needs_no_second_compare — the flags
+/// an arithmetic instruction has already set
 pub fn run(f: &mut MFunc) {
     for b in 0..f.blocks.len() {
         let mut i = 0;

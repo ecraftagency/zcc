@@ -1,4 +1,5 @@
 // auto_inc (REARCH.md §8, gcc's `-fauto-inc-dec`) — fold a pointer
+// THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // post-increment into the load that reads through it.
 //
 // A loop walking an array compiles to `ldr r, [p]` followed by `add p2, p, #k`,
@@ -27,6 +28,7 @@
 // (SSA — it did not exist yet).
 use crate::mir::*;
 
+/// THEORY A6b  SQUARE auto_inc_fires_and_preserves_meaning — the post-index writeback
 pub fn run(f: &mut MFunc) {
     // Cheap gate first: no `[base,#0]` load means nothing to fold, so the
     // liveness recompute below is skipped entirely — the pass costs ~0 on a

@@ -1,4 +1,5 @@
 // Side-II: the A64 / AAPCS64 ultimate fact, transcribed (THEORY II-3, II-5;
+// THEORY II-3 — AAPCS64; THEORY II-5 — A64 instruction and encoding constants
 // AAPCS64 IHI 0055 §6.1.1; ARM DDI 0487 C4/C6). Nothing in this file is a
 // choice — every table and predicate is a spec line, and every deviation from
 // one would be a Law-2 Side-II defect.
@@ -9,24 +10,32 @@
 // truncated budget (the `GP_BUDGET.k=10` mistake of rc3).
 use super::{Class, PReg, RegSet, Width};
 
+/// THEORY II-3 — AAPCS64 §6.1.1, the register roles
 // ── the register files ─────────────────────────────────────────────────────
 // AAPCS64 §6.1.1: x0–x7 arguments/results, x8 indirect result, x9–x15 temporary,
 // x16/x17 IP0/IP1 (intra-procedure-call scratch, clobberable by a linker veneer
 // at ANY call — so zcc reserves them for its own parallel-copy cycle breaking),
 // x18 platform register (reserved), x19–x28 callee-saved, x29 FP, x30 LR.
 pub const FP: PReg = PReg::gpr(29);
+/// THEORY II-3 — AAPCS64 §6.1.1
 pub const LR: PReg = PReg::gpr(30);
+/// THEORY II-3 — AAPCS64 §6.1.1; register 31 is SP in these encodings
 /// the stack pointer: encoded as register 31 in the base+offset forms
 pub const SP: PReg = PReg::gpr(31);
+/// THEORY II-5 — register 31 reads as zero in the data-processing forms
 /// zero register: the same encoding as SP, distinguished by the instruction form
 pub const ZR: PReg = PReg::gpr(31);
+/// THEORY II-3 — AAPCS64 §6.1.1 names x16/x17 as intra-procedure temporaries
 /// GPR scratch reserved for cycle-breaking in a parallel copy (IP0)
 pub const SCRATCH_GPR: PReg = PReg::gpr(16);
+/// THEORY II-3 — AAPCS64 §6.1.1, the second IP temporary
 /// second scratch, used when a spill address needs its own register (IP1)
 pub const SCRATCH_GPR2: PReg = PReg::gpr(17);
+/// THEORY II-3 — AAPCS64 §6.1.2, a caller-saved v register
 /// FPR scratch, same role as IP0 for the v-file
 pub const SCRATCH_FPR: PReg = PReg::fpr(31);
 
+/// THEORY II-3 — AAPCS64 §6.1.1, the full allocatable table
 /// Allocation order for the GPR class: caller-saved first, so a value that does
 /// not live across a call never forces a prologue save; callee-saved last, so a
 /// value that does live across one lands there without any "crossing" rule.
@@ -37,6 +46,7 @@ pub const GPR_ORDER: [u8; 26] = [
     19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 ];
 
+/// THEORY II-3 — AAPCS64 §6.1.2, the full allocatable table
 /// v0–v7 (arguments), v16–v30 (temporary), then the callee-saved v8–v15.
 /// AAPCS64 §6.1.2: only the low 64 bits of v8–v15 are preserved, which is exactly
 /// what zcc stores (no NEON values yet, REARCH §16 row 13).

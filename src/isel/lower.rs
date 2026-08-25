@@ -1,4 +1,5 @@
 // HIR → MIR instruction selection (REARCH.md §6, §12 R0.6).
+// THEORY A5 — instruction selection; THEORY II-5 — the A64 encodings it targets
 //
 // R0 shipped the BASE COVER: one HIR instruction becomes one canonical machine
 // sequence, with no munching of operand trees. That was not a shortcut to be
@@ -19,6 +20,7 @@ use super::imm;
 use crate::hir::{self, BinOp, CmpOp, CvtOp, Inst, Operand, Term, UnOp, ValueId};
 use crate::mir::*;
 
+/// MEASURED M4 — the jump-table/compare-tree crossover, UNSETTLED
 /// The jump-table density threshold (REARCH §13n R4.14 (2)) — the case count at
 /// which a table beats a compare tree on THIS machine, taken on the clock.
 const MIN_CASES: usize = 4;
@@ -1596,7 +1598,9 @@ impl<'a> L<'a> {
     /// input and output in ONE register and the SSA constraint model has no way
     /// to say that. The pool is the whole surface real code (musl, xxhash) uses.
     fn asm(&mut self, tmpl: &str, ops: &[hir::AsmOperand], args: &[Operand]) {
+        /// THEORY II-3 — AAPCS64 temporaries usable by inline asm
         const GP_POOL: [u8; 7] = [9, 10, 11, 12, 13, 14, 15];
+        /// THEORY II-3 — AAPCS64 temporaries usable by inline asm
         const FP_POOL: [u8; 7] = [16, 17, 18, 19, 20, 21, 22];
         let (mut ngp, mut nfp) = (0usize, 0usize);
         let mut slots: Vec<AsmSlot> = Vec::with_capacity(ops.len());

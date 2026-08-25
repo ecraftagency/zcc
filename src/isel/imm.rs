@@ -1,4 +1,5 @@
 // Immediate legalization: given a constant and the instruction that wants it,
+// THEORY II-5 — A64 immediate encodings (add/sub imm12, bitmask, movz/movk)
 // either an encodable operand field or the instruction sequence that
 // materializes it. Every predicate consulted here lives in `mir::isa` (Side-II);
 // this file only chooses between them.

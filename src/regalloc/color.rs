@@ -1,4 +1,5 @@
 // Chordal coloring of the SSA interference graph (REARCH.md §7.3).
+// THEORY A7 — chordal colouring in dominance order (Hack 2007)
 //
 // THE theorem this whole re-architecture rests on (Hack 2007): the interference
 // graph of a program in SSA form is CHORDAL, and a preorder of the dominator

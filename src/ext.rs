@@ -1,4 +1,5 @@
 // EXT — the home for substantial extension logic under the decoupling rule
+// THEORY II-6 — the GCC/vendor nonconforming surface
 // (CLAUDE.md): the core (parser/codegen) may only call INTO here; removing this
 // file plus the touchpoints marked EXT(...) in the core leaves a pure C89
 // compiler. Small touchpoints (1-3 lines) stay in place with a marker; only logic
@@ -23,6 +24,7 @@ pub fn has_operator_zero(name: &str) -> bool {
     )
 }
 
+/// THEORY II-6 — the GCC/vendor macro surface
 // EXT(gcc): the C11-style __atomic_* family (required by hdr_histogram + redis
 // atomicvar at M14) — the memorder argument is IGNORED because zcc always emits
 // seq_cst; mapped as macros down to __sync_* (statement-expr + __typeof__ are
@@ -74,6 +76,7 @@ pub const ATOMIC_MACROS: &[(&str, &[&str], &str)] = &[
             __zcc_cur == __zcc_old ? 1 : (*(e) = __zcc_cur, 0); })",
     ),
 ];
+/// THEORY II-6 — the GCC/vendor macro surface
 // EXT(gcc): bit-manipulation builtins required by redis (util.h clz, endianconv
 // bswap64, keymeta popcount, hyperloglog ctzll) — pure statement-expr, no
 // dedicated codegen needed; with -O0 semantics, speed is not a goal. The
@@ -139,6 +142,7 @@ pub const BIT_MACROS: &[(&str, &[&str], &str)] = &[
     ),
 ];
 
+/// THEORY II-6 — GCC's __ATOMIC_* memory orders
 // EXT(gcc): __ATOMIC_RELAXED..__ATOMIC_SEQ_CST = 0..5 (values as in GCC); the
 // EXISTENCE of __ATOMIC_SEQ_CST is what hdr_atomic.h probes to select the
 // __atomic path

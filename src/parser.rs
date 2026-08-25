@@ -1,4 +1,5 @@
 // Parser: &[Tok] → AST arena (Vec<Node> + NodeId u32) + type arena (TyTab).
+// THEORY A3 — parsing; THEORY A4 — type system and static semantics
 // C89 grammar (missing: initializer {..}, bitfield, struct by value — later passes):
 //   decl       = decl_specs (declarator ("=" init)? ("," declarator ...)*)? ";"
 //              | decl_specs declarator [old-style decls] block   (funcdef)
@@ -155,6 +156,7 @@ fn splice_ginit(off: u32, sz: u32, init: GInit, list: &mut Vec<(u32, u32, GInit)
     }
 }
 
+/// THEORY II-1 — ISO C99 §6.5.16 compound assignment
 const ASSIGN_OPS: [(&str, &str); 11] = [
     ("=", ""),
     ("+=", "+"),
@@ -169,6 +171,7 @@ const ASSIGN_OPS: [(&str, &str); 11] = [
     ("^=", "^"),
 ];
 
+/// THEORY II-1 — ISO C99 §6.7.2 type specifiers
 const TYPE_WORDS: [&str; 25] = [
     "void",
     "char",

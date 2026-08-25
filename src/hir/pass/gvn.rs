@@ -1,4 +1,5 @@
 // gvn — dominator-scoped global value numbering (REARCH §4 row 4).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // This one pass absorbs four classical ones, which is why the ladder has no
 // separate CSE, copy-propagation, constant-folding or reassociation row: an
@@ -94,6 +95,7 @@ fn key_of(inst: &Inst, r: &dyn Fn(Operand) -> Operand) -> Option<Key> {
     })
 }
 
+/// THEORY A7b  SQUARE gvn_numbers_a_repeated_expression_once — redundancy under dominance
 pub fn run(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);

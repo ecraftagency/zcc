@@ -1,4 +1,5 @@
 // iv — pointer induction variables (REARCH §13f item 5; gcc's strength
+// THEORY A7b — optimization: this pass ships its commuting square
 // reduction over addresses, `-fivopts`' core case).
 //
 // THE MEASUREMENT THAT ASKED FOR THIS (§13d cause #2, sharpened by §13f).
@@ -41,6 +42,7 @@
 use super::*;
 use std::collections::HashMap;
 
+/// MEASURED M2 — the pointer-IV rewrite is negative on this target
 /// SHIPPED DEFAULT-OFF, on the measurement rather than on a doubt about the
 /// theorem (§13i). Over the eight programs above the harness's noise floor this
 /// row is **1 win / 1 loss / 6 flat**: g1_memcpy 74 → 48 ms, j2_histogram
@@ -73,6 +75,7 @@ fn enabled() -> bool {
     *W.get_or_init(|| ENABLED || std::env::var("ZCC_IV").is_ok())
 }
 
+/// THEORY A7b  SQUARE a_strided_load_walks_a_pointer — the AddRec IS the address it replaces
 pub fn run(f: &mut Func) -> bool {
     if !enabled() {
         return false;

@@ -1,4 +1,5 @@
 // MIR(final) → AArch64-ELF assembly text (REARCH.md §9; THEORY II-4 for the
+// THEORY II-4 — ELF sections and relocations; THEORY II-5 — A64 syntax
 // ELF/relocation side).
 //
 // This file makes NO decisions. Every instruction was already chosen, every

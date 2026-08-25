@@ -1,4 +1,5 @@
 // rotate — loop rotation / header copying (REARCH §13c row 2).
+// THEORY A7b — optimization: this pass ships its commuting square
 //
 // gcc calls this `-ftree-ch`, "copy loop headers", and enables it at -O1. It
 // turns a TOP-tested loop into a BOTTOM-tested one:
@@ -41,6 +42,7 @@
 //   * a header that stores, calls, or allocas — it would be written twice.
 use super::*;
 
+/// MEASURED M7 — gcc's --param, honestly labelled as not a spec
 /// The largest header worth copying, in instructions. This is gcc's own -O1
 /// number for the same transform (`--param max-loop-header-insns`, default 20,
 /// read by `-ftree-ch`) rather than one picked here: the transform trades a
@@ -49,6 +51,7 @@ use super::*;
 /// thing is to take the reference compiler's rate and say where it came from.
 const MAX_HEADER_INSTS: usize = 20;
 
+/// THEORY A7b — the pass ships on, see the note above
 /// Rotation was measured WORTHLESS when it first landed, and turning it on took
 /// removing two things that were cancelling it — both of them elsewhere, which
 /// is why the sequence is worth recording (§13e → §13f).
@@ -72,6 +75,7 @@ fn enabled() -> bool {
     *W.get_or_init(|| ENABLED || std::env::var("ZCC_ROTATE").is_ok())
 }
 
+/// THEORY A7b  SQUARE rotation_moves_the_test_to_the_bottom — execution-count equality
 pub fn run(f: &mut Func) -> bool {
     if !enabled() {
         return false;
