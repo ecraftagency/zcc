@@ -28,12 +28,10 @@
 // entered zero times still runs the header exactly once, now spelled `guard`.
 //
 // WHAT IS REFUSED, each because it is a property of the IR and not a heuristic:
-//   * a loop with no work outside its header — it is bottom-tested already, and
-//     there is no body for the test to move past. This is what makes the pass
-//     terminate, and it is deliberately phrased about the BODY rather than about
-//     the latch: `split_critical_edges` puts an empty block on the back edge, so
-//     "the latch exits" stops being true of a rotated loop the moment the ladder
-//     is re-entered (§13f).
+//   * a header holding anything but its own exit test — copying that is PEELING,
+//     not rotation. This is also what makes the pass terminate, and it is phrased
+//     about data flow because the two placement-based phrasings that came before
+//     it were each defeated by a later pass (§13f, §13h).
 //   * a header whose definitions are used OUTSIDE the loop. After rotation the
 //     header no longer dominates the exit (the guard reaches it too), so such a
 //     use would leave SSA. Passing a value as an edge ARGUMENT is fine — that is
@@ -165,25 +163,22 @@ fn try_rotate(
     if lf.loops[li].latches.contains(&h) {
         return false;
     }
-    // Rotation moves the exit test PAST the body, so there must BE a body to
-    // move it past. If every block of the loop but the header is empty, the
-    // header already is the body — which is what an ALREADY-ROTATED loop looks
-    // like after cfg_simplify has merged it into one block and critical-edge
-    // splitting has handed it an empty forwarding latch.
+    // THE HEADER MUST BE THE TEST AND NOTHING ELSE — gcc's pass is called "copy
+    // loop HEADERS" for this reason. Copying a header that also holds body work
+    // is not rotation, it is PEELING: the work appears at two program points and
+    // the loop runs one fewer time.
     //
-    // That last sentence is the whole reason this test exists, and it cost a
-    // failing idempotence battery to find: asking whether the LATCH exits is not
-    // enough, because `split_critical_edges` runs at the top of every ladder
-    // entry and inserts an empty block on the back edge. The empty block becomes
-    // the latch, the latch no longer exits, and a rotated loop presents itself as
-    // top-tested again — peeling its whole seven-instruction body into a second
-    // guard. A termination argument that a later pass can quietly invalidate is
-    // not a termination argument.
-    if !lf.loops[li]
-        .body
-        .iter()
-        .any(|&b| b != h && !f.blocks[b as usize].insts.is_empty())
-    {
+    // This is also the termination argument, and it is the THIRD one written
+    // here — the first two were both defeated by a later pass, which is the
+    // lesson worth keeping. "The latch exits" died to `split_critical_edges`,
+    // which puts an empty block on the back edge so the latch stops exiting.
+    // "Some block outside the header has work" died to `sink`, which moves an
+    // instruction down into that empty block and makes it non-empty. Both were
+    // statements about WHERE INSTRUCTIONS SIT, and any pass may move an
+    // instruction. This one is a statement about DATA FLOW: after rotation the
+    // header holds the body, the body does not feed the exit condition, and no
+    // amount of code motion changes that.
+    if !header_is_only_the_test(f, h) {
         return false;
     }
     // The header must BE the exit test: a two-way branch with one arm inside.
@@ -418,4 +413,45 @@ fn reparam(
             }
         }
     }
+}
+
+/// Is every instruction in the header part of computing its exit condition?
+///
+/// The backward slice of the branch condition, taken inside the header, must
+/// cover the whole block. A `while (*p)` header — a load and a compare — passes;
+/// a header that also holds a loop body does not, and that is precisely an
+/// already-rotated loop.
+fn header_is_only_the_test(f: &Func, h: BlockId) -> bool {
+    let cond = match &f.blocks[h as usize].term {
+        Term::Br(c, ..) => *c,
+        _ => return false,
+    };
+    let blk = &f.blocks[h as usize];
+    let mut keep = vec![false; blk.insts.len()];
+    // Where each value this block defines sits, so the slice can walk operands
+    // back to their defining instruction without consulting `values`, whose def
+    // records a mid-pass caller may not have refreshed.
+    let mut at: std::collections::HashMap<ValueId, usize> = std::collections::HashMap::new();
+    for (i, inst) in blk.insts.iter().enumerate() {
+        if let Some(d) = inst.dst() {
+            at.insert(d, i);
+        }
+    }
+    let mut work: Vec<ValueId> = cond.val().into_iter().collect();
+    while let Some(v) = work.pop() {
+        let i = match at.get(&v) {
+            Some(&i) => i,
+            None => continue, // a parameter, or defined elsewhere
+        };
+        if keep[i] {
+            continue;
+        }
+        keep[i] = true;
+        blk.insts[i].uses(|o| {
+            if let Operand::Val(x) = o {
+                work.push(x);
+            }
+        });
+    }
+    keep.iter().all(|&x| x)
 }

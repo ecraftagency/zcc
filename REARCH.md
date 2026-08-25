@@ -951,6 +951,71 @@ that has to be right BEFORE any of them is written. It is dead weight if the nex
 
 ---
 
+## §13h ROW 5 — pointer induction variables, and the miscompile the bench suite caught
+
+`pass/iv.rs`, on `pass/scev.rs`. For a load whose address has an affine evolution, a header
+parameter walks the address itself: entry edges pass `base + off`, latch edges `q + step`, the load
+reads `q`, and `auto_inc` (R3.2) then folds the bump into the access. `mycopy`'s inner loop becomes
+`ldrb w1, [x4], #1` — the exact instruction §13d recorded gcc emitting and this branch not.
+
+| metric | row 3 (`5118da0`) | row 5 |
+|---|---|---|
+| **EXEC geomean, ≥30 ms** | 1.4610 | **1.4125** |
+| EXEC geomean, common 18 | 1.3996 | 1.3788 |
+| INSN geomean (35) | 1.2437 | 1.2460 |
+| sqlite insns | 236,886 | 238,730 (+0.8%) |
+| **g1_memcpy_loop** | 74 ms, 1.542 | **48 ms, 1.000** — parity, INSN **0.950** |
+| j3_prefix_sum | 99 ms, 1.980 | 96 ms, 1.920 |
+| d2_nested_loops | 2.000 | 1.900 |
+| **j2_histogram** | 60 ms, 1.017 | **68 ms, 1.153** — a real regression, below |
+
+Gate: cargo 139/0, opt-parity 1552/0, torture 1378 pass / 0 FAIL, csmith300 254/0, yarpgen300
+300/0, determinism 85 × 8.
+
+### THE MISCOMPILE, and why it is the most valuable thing in this section
+`j5_insertion_sort` DIVERGED — 24,356,600 against gcc's 24,577,970. Bisected mechanically
+(`ZCC_NOPASS`) to iv × rotate, then minimized, then read at the instruction level: the pointer
+walk started at `p` where it should have started at `p + 4`.
+
+The defect was in `scev.rs`, not in the transform. The widening rule computed the recurrence of
+`sext(x)` and returned `{base: None, off: x.off, step: x.step}` — **silently DISCARDING a symbolic
+base**. For `for (i = k; …) p[i]` that reports `{p + 0, +, 4}` instead of `{p + k*4, +, 4}`, and
+insertion sort duly sorted the wrong window. Every other rule in the file refuses a base it cannot
+carry (`scale` does, `Sub` does); the conversion rule dropped it. **A rule that returns a WRONG
+answer where its neighbours return `None` is the shape to hunt for in an analysis** — it is
+invisible to every battery that only asks whether the analysis fires.
+
+Fixing it exposed the second half: `licm::preheaders` builds a preheader that FORWARDS the header's
+parameters, which turns the literal start `0` into a symbolic one — so the now-correct refusal
+killed every ordinary `for (i = 0; …)`. `const_through` resolves a parameter to the constant every
+predecessor passes, which is an equality rather than an approximation.
+
+### LOADS ONLY, and it is a COST argument, not a safety one
+A64 addresses `p[i]` with a scaled index — `ldr w, [base, w, sxtw #2]`, one instruction, the
+arithmetic free. Strength-reducing that trades a free addressing mode for an explicit `add`, so it
+only pays when the add then disappears into a post-index — and A64 offers post-index safely for
+LOADS alone (`STR Xt, [Xn], #imm` with t == n is CONSTRAINED UNPREDICTABLE, which is why `auto_inc`
+is loads-only). Measured with stores included: `j2_histogram`'s zeroing loop went from four
+instructions per iteration to five and the program lost 60 → 69 ms. The step must also fit the
+post-index imm9, or the fold cannot happen and the pointer is pure cost.
+
+### RESIDUAL, measured with 9 samples rather than reasoned about
+| program | without iv | with iv |
+|---|---|---|
+| g1_memcpy_loop | 73 ms | **47 ms** |
+| j3_prefix_sum | 96 ms | 95 ms |
+| **j2_histogram** | 59 ms | **67 ms** |
+
+j2 regresses at IDENTICAL instruction count (INSN 1.047 both ways): the same eight instructions,
+with `ldr w4,[x2],#4` in place of `ldr w4,[x2,w1,sxtw #2]`. So the cost is microarchitectural, not
+static — the writeback form plausibly issuing as a second µop where the scaled-index form does not.
+That is a HYPOTHESIS and it is written here as one: it has not been proven, and proving it needs a
+cycle-level measurement this harness does not take. Until then the honest statement is that
+post-index is not free, and that the profitability rule above ("does the add disappear") is
+necessary but not sufficient. Closing it is a cost-model question, category (b).
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -1009,13 +1074,12 @@ its value are downstream of the same R4 item. The revised order:
    the gate on rotation, and §13d named it independently as cause #3 of the hot-loop regressions
    (`mov x0,x1 ; mov x1,x7` in j3's body). It is the one item two other rows are waiting on
 4. ✅ IV/SCEV analysis (`pass/scev.rs`, §13g) — shipped unwired, seven batteries
-5. ⬜ **pointer-IV** — §13d cause #2, and now the sharpest target on the board: g1_memcpy is at
-   INSN **1.000**, instruction-count parity with gcc-O1, and still costs 1.542 on the clock. What
-   is left is the DEPENDENCE CHAIN `sxtw x1,w0 ; add x1,x4,x1 ; ldrb w1,[x1]` — three dependent
-   operations before every load, where gcc issues `ldrb w1,[x20],#1` at once. NOTE the prerequisite
-   §13g exposes: the widening is only affine under a known trip count, so pointer-IV either takes
-   loops with literal bounds first, or brings the value-range analysis (§16 ★2) with it
-6. ⬜ final-value, then LFTR — cheap once the analysis is wired
+5. ✅ **pointer-IV** (`pass/iv.rs`, §13h) — g1_memcpy 1.542 → **1.000**, EXEC ≥30 ms 1.4610 →
+   **1.4125**. The trip-count prerequisite §13g predicted was dissolved rather than paid: the
+   loop's own exit test bounds the counter by its TYPE, which needs no bound value at all
+6. ⬜ final-value, then LFTR — cheap now that the analysis is wired. LFTR is also what would let
+   `mycopy` drop its separate counter and test the pointer instead, which is the last instruction
+   between that loop and gcc's
 
 ---
 

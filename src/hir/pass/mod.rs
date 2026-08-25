@@ -16,6 +16,7 @@ pub mod fold;
 pub mod gvn;
 pub mod ifconv;
 pub mod inline;
+pub mod iv;
 pub mod licm;
 pub mod mem;
 pub mod purity;
@@ -116,6 +117,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         }
         if on("licm") {
             changed |= licm::run_with(f, ro);
+        }
+        // AFTER licm and rotation: the loop must already be in its final shape,
+        // because the recurrence this reads is a property of that shape. Before
+        // dce, which is what removes the address chain it replaces.
+        if on("iv") {
+            changed |= iv::run(f);
         }
         if on("sink") {
             changed |= sink::run(f);

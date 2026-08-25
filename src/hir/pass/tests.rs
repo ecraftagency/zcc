@@ -1162,23 +1162,42 @@ fn scev_reads_an_address_as_base_plus_stride() {
 }
 
 #[test]
-fn scev_refuses_the_widening_it_cannot_bound() {
-    // The same program with the bound as a PARAMETER. `p[i]` is still
-    // `p + sext(i)*4`, but there is no trip count, so there is no proof that the
-    // 32-bit counter does not wrap — and SEMANTICS §7 makes wrapping DEFINED
-    // here, so the usual "signed overflow is undefined" shortcut is unavailable.
-    // The address therefore has no evolution. This is the analysis's largest
-    // Law-4 residual and it is category (b): a range analysis on `i` would close
-    // it without a trip count at all.
+fn scev_bounds_the_widening_by_the_exit_test() {
+    // The same program with the bound as a PARAMETER, so there is no trip count
+    // — and the recurrence is found anyway. Inside the body the test has passed,
+    // so `i < n`; `n` IS an `int`, so `n <= INT_MAX`; so the counter cannot leave
+    // its type. Nothing about the VALUE of `n` is used, only its TYPE, which is
+    // why this works where a trip count cannot. This is the case every hot loop
+    // in the suite is, and without it pointer-IV would fire only on literal
+    // bounds.
     let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
                int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
     with_scev(&src, "f", |f, s, _c| {
-        assert_eq!(s.trips, None, "an unknown bound has no trip count");
+        assert_eq!(s.trips, None, "an unknown bound still has no trip count");
+        let strided = f.blocks.iter().flat_map(|b| b.insts.iter()).any(|inst| {
+            matches!(inst, Inst::Load { addr, .. }
+                if s.eval(f, *addr).map_or(false, |a| a.step == 4 && a.base.is_some()))
+        });
+        assert!(strided, "the exit test bounds the counter, so the address is affine");
+    });
+}
+
+#[test]
+fn scev_refuses_a_widening_the_test_cannot_bound() {
+    // `i += 2` against a symbolic bound. The argument above needs the step to be
+    // exactly one: at `n == INT_MAX` this counter runs ..., INT_MAX-1, and the
+    // next increment OVERFLOWS — which SEMANTICS §7 makes a defined, wrapping
+    // execution, not undefined behaviour to assume away. The test would then see
+    // a negative value, say "stay in", and the loop would walk off with an
+    // address a affine recurrence had promised. So it is refused.
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i+=2)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
+    with_scev(&src, "f", |f, s, _c| {
         let strided = f.blocks.iter().flat_map(|b| b.insts.iter()).any(|inst| {
             matches!(inst, Inst::Load { addr, .. }
                 if s.eval(f, *addr).map_or(false, |a| a.step != 0))
         });
-        assert!(!strided, "without a bound the widening is not affine");
+        assert!(!strided, "a step of two cannot be proven not to overflow");
     });
 }
 

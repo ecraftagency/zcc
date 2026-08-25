@@ -77,6 +77,11 @@ pub struct LoopScev {
     /// conversion is affine depends on the counter staying in range, and that is
     /// a question about the trip count.
     pub trips: Option<u64>,
+    /// Basic induction variables the loop's own exit test proves cannot wrap —
+    /// separately for the signed and the unsigned reading, since a widening asks
+    /// one question or the other and never both.
+    nowrap_signed: std::collections::HashSet<ValueId>,
+    nowrap_unsigned: std::collections::HashSet<ValueId>,
     latches: Vec<BlockId>,
 }
 
@@ -116,11 +121,124 @@ impl LoopScev {
             invariant,
             ivs: HashMap::new(),
             trips: None,
+            nowrap_signed: std::collections::HashSet::new(),
+            nowrap_unsigned: std::collections::HashSet::new(),
             latches: lf.loops[li].latches.clone(),
         };
         s.find_basic_ivs(f, c);
         s.trips = s.compute_trips(f);
+        s.find_nowrap(f);
         Some(s)
+    }
+
+    /// Which basic induction variables the loop's OWN EXIT TEST keeps inside
+    /// their type — the fact that lets `p[i]` be strength-reduced in a loop whose
+    /// bound is a parameter, where no trip count exists.
+    ///
+    /// THE ARGUMENT, and it needs no numbers. Take `for (i = s; i < n; i++)` with
+    /// `i` and `n` both `int`. Inside the body the test has passed, so `i < n`;
+    /// and `n` IS an `int`, so `n ≤ INT_MAX`; so `i < INT_MAX`. The counter
+    /// cannot leave its type while the body runs, whatever `n` happens to be.
+    /// Nothing about the VALUE of the bound is used — only its TYPE — which is
+    /// why this works where `trip_count` cannot.
+    ///
+    /// THE STEP MUST BE ±1, and that restriction is the whole of the soundness.
+    /// With `i += 2` and `n == INT_MAX` the counter runs …, INT_MAX-1, and the
+    /// next increment overflows — the test then sees a NEGATIVE value, says
+    /// "stay in", and the loop walks off with an address this analysis would have
+    /// promised was affine. At ±1 the increment lands exactly on the bound and
+    /// the loop leaves. (SEMANTICS §7 makes that overflow DEFINED, so it is a
+    /// real execution to account for, not undefined behaviour to assume away.)
+    ///
+    /// Signed and unsigned are tracked apart because the reading has to match the
+    /// widening: `sext` needs the SIGNED comparison to have bounded the counter,
+    /// `zext` the unsigned one.
+    fn find_nowrap(&mut self, f: &Func) {
+        let (op, lhs, rhs, ty) = match self.exit_test(f) {
+            Some(x) => x,
+            None => return,
+        };
+        // The bound must be a value of the compared type, not another recurrence.
+        match self.eval(f, rhs) {
+            Some(b) if b.is_invariant() => {}
+            _ => return,
+        }
+        let ivs: Vec<(ValueId, AddRec)> = self.ivs.iter().map(|(k, v)| (*k, *v)).collect();
+        for (p, rec) in ivs {
+            if rec.ty != ty || rec.step.abs() != 1 {
+                continue;
+            }
+            // The tested value must BE this counter, give or take a constant —
+            // otherwise the test bounds some other value and says nothing here.
+            if !self.is_offset_of(f, lhs, p) {
+                continue;
+            }
+            let up = rec.step > 0;
+            match (op, up) {
+                (CmpOp::Slt | CmpOp::Sle, true) | (CmpOp::Sgt | CmpOp::Sge, false) => {
+                    self.nowrap_signed.insert(p);
+                }
+                (CmpOp::Ult | CmpOp::Ule, true) | (CmpOp::Ugt | CmpOp::Uge, false) => {
+                    self.nowrap_unsigned.insert(p);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `o` is `p` itself, or `p` plus a literal.
+    fn is_offset_of(&self, f: &Func, o: Operand, p: ValueId) -> bool {
+        let v = match o.val() {
+            Some(v) => v,
+            None => return false,
+        };
+        if v == p {
+            return true;
+        }
+        matches!(
+            self.def_inst(f, v),
+            Some(Inst::Bin { op: BinOp::Add | BinOp::Sub, a: Operand::Val(x), b: Operand::Imm(_), .. })
+                if *x == p
+        )
+    }
+
+    /// The loop's single exit test, normalized to "stay in the loop while
+    /// LHS <op> RHS", with the type the comparison is made at.
+    fn exit_test(&self, f: &Func) -> Option<(CmpOp, Operand, Operand, Ty)> {
+        let mut exiting = None;
+        for b in 0..f.blocks.len() as BlockId {
+            if !self.inloop[b as usize] {
+                continue;
+            }
+            if f.blocks[b as usize]
+                .term
+                .succs()
+                .iter()
+                .any(|&s| !self.inloop[s as usize])
+            {
+                if exiting.is_some() {
+                    return None;
+                }
+                exiting = Some(b);
+            }
+        }
+        let ex = exiting?;
+        let (cond, taken_in) = match &f.blocks[ex as usize].term {
+            Term::Br(cond, t, e) => {
+                match (self.inloop[t.block as usize], self.inloop[e.block as usize]) {
+                    (true, false) => (*cond, true),
+                    (false, true) => (*cond, false),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let (op, a, b, ty) = match self.def_inst(f, cond.val()?)? {
+            Inst::Cmp { op, a, b, ty, .. } => (*op, *a, *b, *ty),
+            _ => return None,
+        };
+        let op = if taken_in { op } else { invert(op)? };
+        Some((op, a, b, ty))
     }
 
     /// The value `x`, of a `bits`-wide type, stays inside that type for every
@@ -172,6 +290,7 @@ impl LoopScev {
                 };
                 if !self.inloop[q as usize] {
                     // an entry edge: the start value, which must be invariant
+                    let arg = self.const_through(f, c, q, arg, 4).unwrap_or(arg);
                     match self.leaf(f, arg) {
                         Some(a) if a.is_invariant() && start.is_none() => start = Some(a),
                         // two entry edges disagreeing is not one recurrence
@@ -197,6 +316,47 @@ impl LoopScev {
                 );
             }
         }
+    }
+
+    /// The literal `o` denotes on entry to `blk`, seeing through block
+    /// parameters whose incoming arguments all agree.
+    ///
+    /// This exists because `licm::preheaders` builds a preheader that FORWARDS
+    /// the header's parameters, which turns a literal start into a symbolic one
+    /// — and a symbolic start cannot cross a widening (see the `Cvt` rule), so
+    /// without this every `for (i = 0; i < n; i++)` would lose its recurrence
+    /// the moment a preheader appeared. Replacing the parameter by the constant
+    /// every predecessor passes is an equality, not an approximation.
+    fn const_through(
+        &self,
+        f: &Func,
+        c: &dom::Cfg,
+        blk: BlockId,
+        o: Operand,
+        fuel: u32,
+    ) -> Option<Operand> {
+        let v = match o {
+            Operand::Val(v) => v,
+            k => return Some(k),
+        };
+        if fuel == 0 {
+            return None;
+        }
+        let k = f.blocks[blk as usize].params.iter().position(|&p| p == v)?;
+        if c.preds[blk as usize].is_empty() {
+            return None;
+        }
+        let mut got: Option<Operand> = None;
+        for &q in &c.preds[blk as usize] {
+            let a = self.edge_arg(f, q, blk, k)?;
+            let r = self.const_through(f, c, q, a, fuel - 1)?;
+            match got {
+                None => got = Some(r),
+                Some(x) if x == r => {}
+                _ => return None,
+            }
+        }
+        got
     }
 
     /// `arg` as `p + d` for a literal `d`, when it is.
@@ -295,8 +455,28 @@ impl LoopScev {
             // loop whose bound is unknown. That is the honest answer, not a
             // limitation to route around.
             Inst::Cvt { op: op @ (CvtOp::Sext | CvtOp::Zext), from, a, .. } => {
+                let signed = matches!(op, CvtOp::Sext);
                 let x = self.eval_fuel(f, *a, fuel - 1)?;
-                if !self.stays_in_range(&x, from.bits(), matches!(op, CvtOp::Sext)) {
+                // Two independent licences, and either suffices. The exit test
+                // bounds the counter by its TYPE (`find_nowrap`) — which works
+                // with a symbolic bound and is the one that fires in real code —
+                // or the trip count bounds it by ARITHMETIC (`stays_in_range`),
+                // which works when the counter is not the one being tested.
+                let bounded_by_test = a.val().is_some_and(|v| {
+                    let set = if signed { &self.nowrap_signed } else { &self.nowrap_unsigned };
+                    set.contains(&v)
+                });
+                if !bounded_by_test && !self.stays_in_range(&x, from.bits(), signed) {
+                    return None;
+                }
+                // A SYMBOLIC start cannot cross the conversion. `sext(k + n)` is
+                // not `k + n` in the wider type unless `k`'s own extension is
+                // known, and this form has no room to say so. Refusing is the
+                // only correct answer — and dropping the base instead was a real
+                // miscompile: `for (i = k; …) p[i]` came back as `{p + 0, +, 4}`,
+                // so pointer-IV started the walk at `p` rather than at `p + k*4`
+                // and insertion sort returned the wrong array (§13h).
+                if x.base.is_some() {
                     return None;
                 }
                 Some(AddRec { base: None, off: x.off, step: x.step, ty })
