@@ -112,8 +112,8 @@ Then the HIR sites by their 27 % share, cheapest-high-value first (the exponenti
 |---|---|---|---|---|---|
 | **CP2.1** | spiller fixpoint invariants | rebuild CFG + liveness every round | build CFG once above the loop (topology invariant across rounds); liveness stays per-round | bound× → 1× | **✅ banked** |
 | **CP2.2** ⭐ | `live::compute` (keystone) | `while changed` round-robin + `BTreeSet` clone/block/round | **predecessor worklist** (re-queue preds only when `live_in` changes — Kildall), seeded reverse-RPO | fewer visits | **✅ banked** |
-| **CP2.3** | spiller residency sets | `BTreeSet<VReg>` / `physlive` contains+insert | bitset over the dense vreg / phys index | log→O(1) | ⬜ |
-| **CP2.4** | spiller fixpoint region | re-simulate whole function each round | dirty-worklist: re-simulate only blocks touched by newly-spilled values | bound×n → Σtouched | ⬜ |
+| **CP2.3** | spiller `spilled` set | `BTreeSet<VReg>` contains on the per-operand hot path | dense `Vec<bool>` over the (fixed) vreg index; `physlive` left as-is (order-iterated) | log→O(1) | **✅ banked (small)** |
+| **CP2.4** | spiller fixpoint region | re-simulate whole function each round; s0025 spill 16.5 s is ROUND-COUNT bound, not contains | dirty-worklist: re-simulate only blocks touched by newly-spilled values | bound×n → Σtouched | ⬜ **NEXT — risky, needs bounded attempt** |
 | **CP2.5** | `scev::eval_fuel` | unmemoized, up to 2^16 per `eval` on DAGs | per-call memo `(ValueId, fuel)` | **exp→linear** | **✅ banked** |
 | **CP2.6** | `LoopForest::new` | per-header `vec![false;n]` | one `mark` scratch reused, cleared by body | O(loops×n)→O(Σbody) | **✅ banked (scratch)** |
 | **CP2.6b** | `LoopForest::new` parent nesting | O(loops²×body) `body.contains(header)` | per-loop membership bitset → O(1) contains (O(loops²)) | N²×body→N² | ⬜ |
@@ -151,8 +151,18 @@ vs pristine (0 differ)**, in-box sqlite + s0025 (identical output). torture **13
 (Full yarpgen-seed sweep skipped in this session — the pathological seeds are ~40 s each and the pure
 byte-identical proof already covers the loop path; run it at campaign close.)
 
-**Next ⬜:** CP2.3 (spiller residency bitset) → CP2.4 (spiller dirty-worklist) — the rest of the
-spiller's remaining ~4.5 s. Then CP2.6b / CP2.7–2.10 for the HIR tail.
+**Batch 2 (CP2.3) banked:** `spilled` `BTreeSet<VReg>` → dense `Vec<bool>` (contains on the
+per-operand hot path is now O(1); `apply` still mints slots in ascending-vreg order, byte-identical).
+Marginal by design: s0025 spill 16,954 → 16,493 ms (−3 %), sqlite neutral (low pressure). The bitset
+removed the log factor, but the spiller's dominant cost on the high-pressure yarpgen function is the
+NUMBER OF FIXPOINT ROUNDS (each re-simulates the whole function), not the per-lookup constant.
+
+**Next ⬜ = CP2.4 (the big remaining spiller lever, and the risky one).** s0025's 16.5 s spill is
+round-count bound. Making `simulate` incremental (re-plan only blocks affected by newly-spilled
+values, reuse the plan elsewhere) is where the win is — but the per-block plan depends on cross-block
+entry sets that shift when an upstream value spills, so byte-identical is NOT free. Per the campaign
+rule: ONE bounded attempt; if the locality/convergence argument does not close, mark BLOCKED, keep
+CP2.1–2.3, advance. Then CP2.6b / CP2.7–2.10 for the HIR tail.
 
 ## The per-fix loop (constitution's iteration process; unchanged)
 

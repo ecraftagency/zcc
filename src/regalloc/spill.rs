@@ -82,7 +82,20 @@ pub fn spill_with(
 ) -> Result<usize, String> {
     let remat = rematerializable(f);
     let web = webs(f);
-    let mut spilled: BTreeSet<VReg> = forced.clone();
+    // CP2.3 (compile-speed): `spilled` is membership-tested on the per-operand
+    // hot path of `simulate` and never iterated in order, so a dense `Vec<bool>`
+    // over the (fixed) vreg index replaces the `BTreeSet<VReg>` — O(1) contains,
+    // no log factor or pointer chase. `nsp` tracks the count the old `.len()`
+    // gave. No new vregs are created during the fixpoint (reloads are added by
+    // `apply`, after it), so the width is stable. Byte-identical: same membership.
+    let mut spilled = vec![false; f.vregs.len()];
+    let mut nsp = 0usize;
+    for &v in forced {
+        if !spilled[v as usize] {
+            spilled[v as usize] = true;
+            nsp += 1;
+        }
+    }
     // Termination: every round that does not produce a plan makes at least one
     // more value memory-resident, and a value never leaves that set, so there
     // are at most |vregs| rounds. Exceeding it means the argument is false —
@@ -114,9 +127,14 @@ pub fn spill_with(
                     break;
                 }
                 Sim::More(vs) => {
-                    let before = spilled.len();
-                    spilled.extend(vs.iter().copied());
-                    if spilled.len() == before {
+                    let before = nsp;
+                    for &v in &vs {
+                        if !spilled[v as usize] {
+                            spilled[v as usize] = true;
+                            nsp += 1;
+                        }
+                    }
+                    if nsp == before {
                         return Err(format!("{}: spilling made no progress", f.name));
                     }
                     // A spilled PARAMETER has to leave the IR immediately, not at
@@ -144,7 +162,7 @@ pub fn spill_with(
             None => return Err(format!("{}: spilling did not converge", f.name)),
         }
     };
-    let n = spilled.len();
+    let n = nsp;
     ceiling_report(f, &plan, &remat);
     apply(f, plan, &spilled, &remat, &web, web_slot, slot_of);
     drop_redundant_spills(f);
@@ -437,7 +455,7 @@ fn simulate(
     f: &MFunc,
     lv: &live::Liveness,
     cfg: &crate::cfg::Cfg,
-    spilled: &BTreeSet<VReg>,
+    spilled: &[bool],
     cross_cap: usize,
 ) -> Result<Sim, String> {
     let base = linear_positions(f, cfg);
@@ -581,7 +599,7 @@ fn simulate(
                 .filter(|&x| x < lv.sp.nv)
                 .map(|x| x as VReg)
                 .chain(blk.params.iter().filter_map(|p| p.vreg()))
-                .filter(|v| !spilled.contains(v) && class_of(f, Reg::V(*v)) == c)
+                .filter(|v| !spilled[*v as usize] && class_of(f, Reg::V(*v)) == c)
                 .collect();
             names.sort_unstable();
             names.dedup();
@@ -832,7 +850,7 @@ fn simulate(
                             // A reload copy is a clean duplicate of what the slot
                             // already holds, so dropping it costs nothing. An
                             // original value has to become memory-resident.
-                            if r.copy.is_none() && !spilled.contains(&r.v) {
+                            if r.copy.is_none() && !spilled[r.v as usize] {
                                 newsp.push(r.v);
                             }
                         }
@@ -891,7 +909,7 @@ fn simulate(
                     match pick {
                         Some((j, r)) => {
                             w.remove(j);
-                            if r.copy.is_none() && !spilled.contains(&r.v) {
+                            if r.copy.is_none() && !spilled[r.v as usize] {
                                 newsp.push(r.v);
                             }
                         }
@@ -925,7 +943,7 @@ fn simulate(
                         };
                         let cross = calls_before[end] > calls_before[i.min(end)];
                         w.push(Res { v, copy: Some(id), class: cl, cross });
-                        if !spilled.contains(&v) {
+                        if !spilled[v as usize] {
                             newsp.push(v);
                         }
                     }
@@ -1039,14 +1057,17 @@ fn simulate(
 fn apply(
     f: &mut MFunc,
     plan: Plan,
-    spilled: &BTreeSet<VReg>,
+    spilled: &[bool],
     remat: &BTreeMap<VReg, MInst>,
     web: &[VReg],
     mut web_slot: BTreeMap<VReg, (SlotId, Width)>,
     mut slot_of: BTreeMap<VReg, (SlotId, Width)>,
 ) {
-    for &v in spilled {
-        if remat.contains_key(&v) {
+    // CP2.3: iterate the set in ascending vreg order — identical to the old
+    // `BTreeSet<VReg>` iteration, so slots are minted in the same order and the
+    // output is byte-identical.
+    for v in 0..spilled.len() as VReg {
+        if !spilled[v as usize] || remat.contains_key(&v) {
             continue;
         }
         ensure_slot(f, web, &mut web_slot, &mut slot_of, v);
@@ -1139,7 +1160,7 @@ fn apply(
 fn has_spilled_def(
     f: &MFunc,
     b: usize,
-    spilled: &BTreeSet<VReg>,
+    spilled: &[bool],
     remat: &BTreeMap<VReg, MInst>,
 ) -> bool {
     f.blocks[b].insts.iter().any(|inst| {
@@ -1147,7 +1168,7 @@ fn has_spilled_def(
         inst.visit(&mut |r, k| {
             if matches!(k, Constraint::Def | Constraint::DefFixed(_)) {
                 if let Some(v) = r.vreg() {
-                    if spilled.contains(&v) && !remat.contains_key(&v) {
+                    if spilled[v as usize] && !remat.contains_key(&v) {
                         hit = true;
                     }
                 }
