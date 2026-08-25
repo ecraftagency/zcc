@@ -96,6 +96,22 @@ pub fn run(f: &mut MFunc) {
     }
     let n_mir_saves = save.len() - f.dyn_stack as usize;
 
+    // Record the saves as (slot, register, width) so `shrink_wrap` relocates
+    // exactly these instructions and not a regalloc spill that merely holds a
+    // callee-saved colour.
+    f.cs_saves = save
+        .iter()
+        .zip(&cs_slots)
+        .take(n_mir_saves)
+        .map(|(p, slot)| {
+            (
+                *slot,
+                *p,
+                if p.class == Class::Fpr { Width::D } else { Width::W64 },
+            )
+        })
+        .collect();
+
     let entry = f.entry as usize;
     let mut prologue: Vec<MInst> = Vec::with_capacity(save.len());
     for (p, slot) in save.iter().zip(&cs_slots).take(n_mir_saves) {

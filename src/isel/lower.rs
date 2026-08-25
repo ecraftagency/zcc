@@ -2049,6 +2049,7 @@ fn lower_func(h: &hir::Func) -> MFunc {
         has_vla: h.has_vla,
         outgoing: 0,
         fp_slot: 0,
+        cs_saves: Vec::new(),
         physical: false,
     };
     for s in &h.slots {

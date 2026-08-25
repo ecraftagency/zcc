@@ -134,6 +134,7 @@ fn mfunc(name: &str) -> MFunc {
         has_vla: false,
         outgoing: 0,
         fp_slot: 0,
+        cs_saves: Vec::new(),
         physical: false,
     }
 }

@@ -211,3 +211,58 @@ fn auto_inc_fires_and_preserves_meaning() {
         "auto_inc changed the meaning of the function"
     );
 }
+
+// shrink_wrap (REARCH.md §8, R3.3) — the prologue/epilogue move off the fast
+// path. Proven on the firing configuration (the HIR ladder must run first, or g
+// stays a call and the shape is different): `⟦mir_p⟧ = ⟦mir_final⟧` with the
+// pass active, the value is the oracle's, and the saves DID move — the entry
+// carries no callee-saved Spill while a later block does. A pass that fires
+// nowhere is a Law-4 failure, so firing is asserted, not hoped for.
+#[test]
+fn shrink_wrap_moves_saves_off_the_fast_path() {
+    let src = "int g(int x){if(x<=0)return 0;return x+g(x-1);}\
+               int f(int n){if(n<0)return -1;int a=g(7);int b=g(9);return a+b;}\
+               int main(void){return f(4)+f(-1);}";
+    let ast = frontend(src);
+    let build = || {
+        let mut h = hir::build::build(&ast);
+        crate::hir::pass::run_module(&mut h);
+        allocated(&h).unwrap_or_else(|e| panic!("{}\n{}", e, src))
+    };
+    let mp = build();
+    let before = mi::new_machine(&mp, &ast).call("main", &[], &[]).expect("⟦mir_p⟧");
+    let mut mf = build();
+    finish(&mut mf);
+    for f in &mf.funcs {
+        crate::mir::verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    }
+    let after = mi::new_machine(&mf, &ast).call("main", &[], &[]).expect("⟦mir_final⟧");
+    assert_eq!(before as i32, 72, "the oracle: g(7)+g(9)=28+45, then f(-1)=-1");
+    assert_eq!(before as i32, after as i32, "shrink_wrap changed the meaning");
+
+    // Fire check on the state right after frame+shrink_wrap — BEFORE `ldstp`
+    // fuses the two moved `Spill`s into one `Pair`, which the Spill matcher below
+    // would then miss.
+    let mut chk = build();
+    for f in chk.funcs.iter_mut() {
+        crate::mir::pass::frame::run(f);
+        crate::mir::pass::shrink_wrap::run(f);
+    }
+    let f = chk.funcs.iter().find(|f| f.name == "f").expect("f");
+    let is_csr_spill = |i: &crate::mir::MInst| match i {
+        crate::mir::MInst::Spill { slot, .. } => f.cs_saves.iter().any(|(s, _, _)| s == slot),
+        _ => false,
+    };
+    assert!(!f.cs_saves.is_empty(), "f should save callee-saved registers");
+    let entry_has = f.blocks[f.entry as usize].insts.iter().any(is_csr_spill);
+    let other_has = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| *bi != f.entry as usize)
+        .any(|(_, b)| b.insts.iter().any(is_csr_spill));
+    assert!(
+        !entry_has && other_has,
+        "shrink_wrap did not move the saves off the entry"
+    );
+}

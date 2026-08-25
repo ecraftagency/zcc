@@ -1186,6 +1186,11 @@ pub struct MFunc {
     pub outgoing: u32,
     /// where the caller's x29 is preserved in a dynamic frame (see `pass/frame`)
     pub fp_slot: SlotId,
+    /// the callee-saved saves `frame` materialized as MIR — (slot, register,
+    /// width) — recorded so `shrink_wrap` can find and relocate exactly them
+    /// (a regalloc spill of a value that happens to hold a callee-saved colour
+    /// is otherwise indistinguishable from a prologue save). Empty until `frame`.
+    pub cs_saves: Vec<(SlotId, PReg, Width)>,
     /// true once `regalloc` has run — the verifier switches obligations on it
     pub physical: bool,
 }
