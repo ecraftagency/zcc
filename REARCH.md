@@ -1564,6 +1564,109 @@ definition rather than copying it there at the call), which is a `regalloc`/`ise
 coalescing one — `#21` on `main` did the same thing for the >8-argument hazard path and cut sqlite by
 906 instructions.
 
+### THE HOT-LOOP INSPECTION (2026-08-25, after R4.2) — the exec side of §13n, measured for the first time
+
+**Why it was taken.** §13n's SIZE side was measured with instruments (`ZCC_MOVKIND`, `ZCC_COALESCE`,
+`ZCC_SPILLCEIL`), each printing a verdict before a line was written. Its EXEC side was assigned by
+INFERENCE from the same static sqlite histogram — "the suite's losses are (d), (f), (h), (j)" — with
+no per-program measurement. The plan's own iteration process says to take a row's prediction FIRST;
+for R4.5, R4.7, R4.9 and R4.11 nobody ever had. This is that step: every program above 1.2× exec, hot
+loop diffed against gcc-O1, every mechanism named and attributed to a row or marked UNOWNED.
+
+**Result: 16 mechanisms. 10 owned by a §13n row, 6 with no row.** Only d4, i1 and j3 are fully
+explained by the plan as written. The plan's CONTENT held up well; what it lacked was the exec
+prediction, the order, and one whole theorem family.
+
+| program | exec | insn | zcc hot loop | gcc | mechanisms (row) |
+|---|---|---|---|---|---|
+| j5_insertion_sort | 2.850 | 0.970 | **11 insns** | **6** | bool-then-branch (R4.5) · `p[j]` loaded twice (R4.9) · index recompute vs post-index (**NEW**) · count-down IV (**NEW**) · hot body after `ret` (R4.11) · dead frame (R4.4) |
+| d3_early_exit | 1.969 | 1.055 | 7, 3 branches | 6, 2 | not rotated: top test + unconditional back-branch (R4.11) · 32-bit IV forces `sxtw` in the address where gcc widens to `x` (**NEW**) · dead frame (R4.4) |
+| j3_prefix_sum | 1.940 | 1.091 | **6** | **6** | `ldr`+`add …,sxtw` (2 cyc) vs `ldrsw`+`add` (1 cyc) on the loop-carried chain — **the ONLY difference** (R4.7) |
+| d2_nested_loops | 1.900 | 1.308 | 6 | 5 | `i*j+k` not strength-reduced to an add-IV, `madd` every iteration (**NEW**) · edge copies in the loop nest (R4.10) |
+| f2_double_poly | 1.800 | 1.375 | 15 (incl. `fdiv`) | 7 | `x/1024.0` not `x*2^-10` (**NEW**) · FP constant rebuilt per iteration (R4.6) · **integer loop bound** rebuilt per iteration (R4.6) · `fmov d31,d8; fmov d8,d31` (**R4.2 RESIDUAL**) |
+| e2_many_args | 1.500 | 1.283 | 23 in `mix` | 13 | **8** entry `mov`s out of x0–x7 (R4.3) · `ldr`+`sxtw` vs `ldrsw` (R4.7) · gcc inlines the called-once non-`static` callee, zcc requires `is_static` (**NEW**) |
+| d4_goto | 1.400 | 1.292 | 9, 2 branches | 6, 1 | `and`+`cmp #0` not `tst` (R4.7) · `sub wzr`+`csel` not `csneg` (R4.7) · not rotated (R4.11) |
+| i1_global_acc | **1.333** | 1.089 | 8, 2 mem-ops | 6, 0 | `gsum` reloaded+stored every iteration, gcc keeps it in a register (R4.11 store motion) · `ldr`+`add …,sxtw` vs `ldrsw` (R4.7) · `adrp/add` per global vs one `.LANCHOR` (unowned, cold) |
+| d1_switch | **1.326** | 1.058 | 40 | 40 | jump table + indirect branch where gcc uses a compare tree with `csel`/`csinc`/`tbnz` — R3.3's density policy constant is an Article-E "spec's number or convenience's number?" question (**NEW**) · `sub w3,w3,#0` |
+| h2_revbits | 1.250 | 1.219 | 7 | 5 | `lsl`+`orr` not commuted into `orr …, lsl 1` (R4.7) · count-down IV with `subs` setting the flags (**NEW**) · dead frame (R4.4) |
+
+**d1 and i1 were BELOW the harness's own ~30ms trust floor and are re-measured here** at 25× and 30×
+the work: d1 1.500 → **1.326**, i1 1.368 → **1.333**. geo40 EXEC geomean 1.3467 → **1.3356**.
+
+**The six unowned mechanisms, and what they are.**
+
+| mechanism | gcc flag (all **-O1**) | programs |
+|---|---|---|
+| pointer / 64-bit IV instead of a recomputed `sxtw` index | `-fauto-inc-dec`, `-ftree-slsr` | j5, d3 |
+| count-down IV: `subs`+`bne`, the decrement sets the flags | IV canonicalization | j5, h2 |
+| strength-reduce `i*j+k` to an add-IV in a nested loop | `-ftree-slsr` | d2 |
+| `x/2^k` → `x*2^-k` (exact in IEEE, the reciprocal is representable) | -O1 algebraic | f2 |
+| small dense switch → compare tree, not a jump table | -O1 heuristic | d1 |
+| inline a called-once function that is not `static` | `-finline-functions-called-once` | e2 |
+
+The first three are ONE theorem family: **zcc shipped SCEV in R2 and it does not fire on these
+shapes.** §13n could not see them because it was decomposed from a STATIC sqlite histogram, where an
+induction-variable shape costs zero instructions. That is the honest reason the plan missed them.
+
+### R4.2 IS NOT EXHAUSTED — the FPR twin, 1,558 instructions
+
+`fmov d31, d8 ; fmov d8, d31` in f2's loop is the exact windmill pair R4.2 removed on the GPR side.
+On sqlite: **779 pairs = 1,558 instructions**, 0.7% of the module. R4.2's banked Law-4 residual
+("41, of which 35 fundamental") was **GPR-ONLY** — the count script grepped `mov x16`/`mov wN,wN` and
+never looked at `fmov`, and `residual_report` counts only CANDIDATES, which an edge copy is not.
+
+The cause is structural, not a missed grep. `drop_self_moves` runs BEFORE `destruct`, so it sees
+isel's ABI copies and never an edge copy; and `sequentialize`'s `nop` treats `Width::D` as narrow
+(only `W64 | Q` are full), so `fmov d8,d8` is refused and windmilled through v31. For an FPR holding
+a `double`, `d` IS the full useful width — only a `q` reader can observe the difference, which is the
+same argument R4.2 already makes one register class over. §13n row (a) predicted it ("f2 — the FP
+twin") and the row was closed without checking. **Category (b), same theorem, belongs to R4.2 under
+its own number** (the R4.1 precedent: a follow-up belongs in the row that owns the theorem).
+
+### THE MISSING DUAL — why a row can be right about size and blind about time
+
+**j3 is the cleanest evidence in the project.** Six instructions against six, and 1.940× slower:
+
+```
+zcc   ldr   w5, [x3, x2, lsl #2]      gcc   ldrsw x4, [x0, x2, lsl 2]
+      add   x1, x1, w5, sxtw   2 cyc        add   x3, x3, x4          1 cyc
+      str / add / cmp / b.lt                str / add / cmp / bne
+```
+
+The loop-carried recurrence is `acc += ext(load)`. Extended-register ALU is 2 cycles, plain `add` is
+1, so the recurrence bound predicts **2.0** and the measurement is **1.940** — a 3% error, computed
+from a latency table with no build.
+
+Law 3 gives every pass a CORRECTNESS dual (`⟦f⟧=⟦opt f⟧`) and a SIZE dual (`cost ≡ len∘codegen`,
+exact by construction here). **There is no TIME dual**, so `cost = |MIR|` scores those two loops
+identically and always will. The proposed shape, in the same grammar:
+
+* **Side II — the latency/port table** in `mir/isa.rs`. NOTE (Article E, "the spec's number or my
+  convenience's number?"): the box runs implementer `0x61` — **Apple M1 Pro cores, natively** — and
+  **Apple publishes no Software Optimization Guide.** There is no spec to cite. Either cite ARM's
+  published SOG and declare that the deployment target is a documented ARM core while the measuring
+  machine is an M1, or MEASURE the table with a latency micro-benchmark and record it as a measured
+  Side-II constant with its method. The second is honest; the first invents a citation.
+* **Side I — the cost theorem** in a new `mir/cost.rs`, written independently of the lowering:
+  `time(f) = Σ_b weight(b)·max(ResII(b), CritPath(b))`, and for a loop
+  `max(RecII, ResII)` per iteration, `RecII = max over loop-carried cycles C of Σ lat(i)/dist(C)`.
+  `weight` already exists on `MBlock`.
+* **The square** — `time_model(f) ≡ cycles(mir::interp + scoreboard)`. Both sides from the SAME
+  table, one structurally over the dependence graph, one dynamically by operand-ready times. Neither
+  is a physical clock, so the equation is EXACTLY checkable — the property that makes
+  `cost ≡ len∘codegen` a proof and not a benchmark. A disagreement is a Law-2 defect localized to one
+  construct. `mir/interp.rs` already runs every battery.
+* **Physical validation, ONCE** (not per pass, or patch-then-measure is back): correlate
+  `cycles_interp` against wall time over the 35 programs; report the correlation and classify every
+  outlier.
+
+**What the model will NOT see, stated up front:** branch misprediction (d1's indirect branch, j5's
+data-dependent `cbnz` — the model would predict ~1.8× for j5 against a measured 2.85×) and cache
+behaviour. Both are category (a) FOR THE MODEL and stay the suite's job.
+
+**A premise nobody had written down:** every exec number in this document was measured on Apple M1
+Pro cores under Docker, while the notional target is generic AArch64-Linux.
+
 ### Two standing cautions, both earned this session
 1. **Expect exec and insn to come apart.** j2_histogram regressed at IDENTICAL instruction count, and
    IV widening removed an instruction for exactly zero time. Spill traffic is memory ops in the hot
