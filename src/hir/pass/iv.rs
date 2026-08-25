@@ -225,3 +225,356 @@ fn append(f: &mut Func, b: BlockId, mut inst: Inst) -> Operand {
     f.blocks[b as usize].insts.push(inst);
     Operand::Val(v)
 }
+
+// ── induction-variable WIDENING (REARCH §13l) ──────────────────────────────
+//
+// THE MEASUREMENT. After §13j, `mycopy`'s inner loop is six instructions against
+// gcc's five, and the extra one is a `sxtw` — every iteration, widening a 32-bit
+// counter so it can index memory:
+//
+//     zcc   sxtw x1,w0 ; ldrb w2,[x4,x1] ; strb w2,[x3,x1] ; add w0,w0,#1 ; cmp w0,w5 ; b.lt
+//     gcc                ldrb w3,[x1,x2] ; strb w3,[x0,x2] ; add x2,x2,1  ; cmp x4,x2 ; bne
+//
+// gcc runs the counter in 64 bits and sign-extends the BOUND once, outside the
+// loop. That is the whole difference, and it is available here because
+// `scev::find_nowrap` already proves what it needs: the counter cannot leave its
+// type, so `sext(i)` is the identity on it and a 64-bit counter takes the same
+// values.
+//
+// THE TRANSFORM. Give the header a 64-bit parameter `w` starting at `sext(start)`
+// and advancing by the same step; rewrite every `sext(i)` to `w`; rewrite the
+// exit test to compare in 64 bits against the widened bound. The narrow counter
+// then has no uses left and `dce` deletes it, along with its `add`. One
+// instruction per iteration in every loop that subscripts an array — which is
+// most of them.
+//
+// COMMUTING SQUARE. `w = sext(i)` at every program point: it holds at entry by
+// construction, and is preserved by the step because the no-wrap fact says the
+// narrow add does not overflow, so `sext(i + d) = sext(i) + d`. Every rewritten
+// use therefore reads the value it read before. The comparison is the one place
+// this needs care and it is why the bound is widened with the SAME signedness the
+// test uses: `i <s n` and `sext(i) <s sext(n)` agree exactly, for all i and n.
+//
+// WHAT IS REFUSED: a counter with any use that is not the step, the exit test, or
+// a sign-extension — a narrow use would need a `trunc` back, which costs the
+// instruction this pass exists to remove; a loop with more than one entry edge,
+// since the widened start has to be materialized on it; and an unsigned test,
+// whose `zext` twin is a separate fact this does not claim.
+pub fn widen(f: &mut Func) -> bool {
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    let lf = dom::loops(&c, &dt);
+    let mut order: Vec<usize> = (0..lf.loops.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    for li in order {
+        if widen_loop(f, &c, &dt, &lf, li) {
+            return true;
+        }
+    }
+    false
+}
+
+fn widen_loop(
+    f: &mut Func,
+    c: &dom::Cfg,
+    dt: &dom::DomTree,
+    lf: &dom::LoopForest,
+    li: usize,
+) -> bool {
+    let s = match scev::LoopScev::analyze(f, c, dt, lf, li) {
+        Some(s) => s,
+        None => return false,
+    };
+    let header = lf.loops[li].header;
+    let entries: Vec<BlockId> = c.preds[header as usize]
+        .iter()
+        .copied()
+        .filter(|&p| !dt.dominates(header, p))
+        .collect();
+    let latches: Vec<BlockId> = c.preds[header as usize]
+        .iter()
+        .copied()
+        .filter(|&p| dt.dominates(header, p))
+        .collect();
+    if entries.len() != 1 || latches.is_empty() {
+        return false;
+    }
+    let entry = entries[0];
+    let mut ivs: Vec<(ValueId, scev::AddRec)> = s
+        .ivs
+        .iter()
+        .filter(|(p, r)| r.ty == Ty::I32 && s.no_wrap_signed(**p))
+        .map(|(p, r)| (*p, *r))
+        .collect();
+    ivs.sort_by_key(|(p, _)| *p);
+    for (p, rec) in ivs {
+        if let Some(plan) = plan_widen(f, c, &s, lf, li, header, &latches, p, rec) {
+            apply_widen(f, header, entry, &latches, p, rec, plan);
+            refresh_defs(f);
+            return true;
+        }
+    }
+    false
+}
+
+/// What the rewrite needs to know: the `sext(i)` instructions to replace, the
+/// step instruction, and the exit test.
+struct Plan {
+    sexts: Vec<ValueId>,
+    step_val: ValueId,
+    cmp_at: (BlockId, usize),
+    /// does the test read the counter BEFORE or AFTER the step?
+    cmp_after_step: bool,
+    bound: Operand,
+    op: CmpOp,
+    cmp_dst: ValueId,
+}
+
+fn plan_widen(
+    f: &Func,
+    c: &dom::Cfg,
+    s: &scev::LoopScev,
+    lf: &dom::LoopForest,
+    li: usize,
+    header: BlockId,
+    latches: &[BlockId],
+    p: ValueId,
+    rec: scev::AddRec,
+) -> Option<Plan> {
+    let _ = (c, lf, li);
+    // The step instruction: the one value the latch passes back.
+    let mut step_val = None;
+    let mut sexts: Vec<ValueId> = Vec::new();
+    let mut cmp: Option<(BlockId, usize, ValueId, CmpOp, Operand, bool)> = None;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (i, inst) in b.insts.iter().enumerate() {
+            match inst {
+                Inst::Cvt { dst, op: CvtOp::Sext, from: Ty::I32, to: Ty::I64, a }
+                    if *a == Operand::Val(p) =>
+                {
+                    sexts.push(*dst);
+                }
+                Inst::Bin { dst, op: BinOp::Add, ty: Ty::I32, a, b: rhs }
+                    if *a == Operand::Val(p) && *rhs == Operand::Imm(rec.step) =>
+                {
+                    if step_val.is_some() {
+                        return None;
+                    }
+                    step_val = Some(*dst);
+                }
+                Inst::Cmp { dst, op, ty: Ty::I32, a, b: rhs } => {
+                    let after = match (*a, step_val) {
+                        (Operand::Val(v), Some(sv)) if v == sv => true,
+                        (Operand::Val(v), _) if v == p => false,
+                        _ => continue,
+                    };
+                    if cmp.is_some() {
+                        return None;
+                    }
+                    cmp = Some((bi as BlockId, i, *dst, *op, *rhs, after));
+                }
+                _ => {}
+            }
+        }
+    }
+    let step_val = step_val?;
+    let (cb, ci, cmp_dst, op, bound, cmp_after_step) = cmp?;
+    if sexts.is_empty() {
+        return None; // nothing to save
+    }
+    // A test that reads the counter AFTER the step reads the value this LATCH
+    // produced, so the widened step has to exist in that same block. When the
+    // test sits somewhere else there is no such value to name — and the earlier
+    // cut discovered that by silently skipping the rewrite and then deleting the
+    // counter anyway, which is what `use of undefined` meant on 100 csmith
+    // programs. Refused here, before anything is mutated.
+    if cmp_after_step && !latches.contains(&cb) {
+        return None;
+    }
+    // The bound must be loop-invariant, and the test SIGNED — an unsigned test
+    // proves a different fact than the one `find_nowrap` recorded.
+    if !matches!(op, CmpOp::Slt | CmpOp::Sle | CmpOp::Sgt | CmpOp::Sge | CmpOp::Eq | CmpOp::Ne) {
+        return None;
+    }
+    // The bound is SEXT-ed into the entry block, so it must be defined outside
+    // the loop — not merely have a step of zero, which is also true of values
+    // COMPUTED INSIDE it (`is_loop_invariant` vs `AddRec::is_invariant`). Asking
+    // the weaker question put a `sext` of a header-defined value into the entry
+    // block and broke sqlite: `%79 used in bb18 but defined in bb6`.
+    match bound {
+        Operand::Imm(_) => {}
+        Operand::Val(v) if s.is_loop_invariant(v) => {}
+        _ => return None,
+    }
+    // Every use of the counter and of its step must be one of: the step itself,
+    // the widened sexts, the test, or the header's own edge arguments.
+    let ok_use = |v: ValueId, user: &Inst| -> bool {
+        match user {
+            Inst::Cvt { dst, .. } => sexts.contains(dst),
+            Inst::Bin { dst, .. } => *dst == step_val,
+            Inst::Cmp { dst, .. } => *dst == cmp_dst,
+            _ => {
+                let _ = v;
+                false
+            }
+        }
+    };
+    for b in &f.blocks {
+        for inst in &b.insts {
+            let mut bad = false;
+            inst.uses(|o| {
+                if (o == Operand::Val(p) || o == Operand::Val(step_val)) && !ok_use(p, inst) {
+                    bad = true;
+                }
+            });
+            if bad {
+                return None;
+            }
+        }
+        // A terminator may only carry them as arguments to the HEADER.
+        for t in b.term.targets() {
+            if t.block == header {
+                continue;
+            }
+            if t.args.iter().any(|a| *a == Operand::Val(p) || *a == Operand::Val(step_val)) {
+                return None;
+            }
+        }
+        let mut bad = false;
+        match &b.term {
+            Term::Br(x, ..) | Term::Switch(x, ..) | Term::GotoPtr(x, _) | Term::Ret(Some(x)) => {
+                if *x == Operand::Val(p) || *x == Operand::Val(step_val) {
+                    bad = true;
+                }
+            }
+            _ => {}
+        }
+        if bad {
+            return None;
+        }
+    }
+    Some(Plan { sexts, step_val, cmp_at: (cb, ci), cmp_after_step, bound, op, cmp_dst })
+}
+
+fn apply_widen(
+    f: &mut Func,
+    header: BlockId,
+    entry: BlockId,
+    latches: &[BlockId],
+    p: ValueId,
+    rec: scev::AddRec,
+    plan: Plan,
+) {
+    let idx = f.blocks[header as usize].params.len() as u32;
+    let w = f.new_value(Ty::I64, Def::Param(header, idx));
+    f.blocks[header as usize].params.push(w);
+
+    // entry: the widened start
+    let start = match rec.base {
+        None => Operand::Imm(rec.off),
+        Some(v) => append_cvt(f, entry, CvtOp::Sext, Ty::I32, Ty::I64, Operand::Val(v)),
+    };
+    for t in f.blocks[entry as usize].term.targets_mut() {
+        if t.block == header {
+            t.args.push(start);
+        }
+    }
+    // latches: the widened step. In the block that also holds the exit test it
+    // goes immediately BEFORE that test, which is what reads it — appending at
+    // the end would place the definition after its use.
+    let (cb, mut ci) = plan.cmp_at;
+    let mut wstep = Vec::new();
+    for &l in latches {
+        let at = if l == cb { ci } else { f.blocks[l as usize].insts.len() };
+        let v = insert_bin(f, l, at, BinOp::Add, Ty::I64, Operand::Val(w), Operand::Imm(rec.step));
+        if l == cb {
+            ci += 1;
+        }
+        wstep.push((l, v));
+        for t in f.blocks[l as usize].term.targets_mut() {
+            if t.block == header {
+                t.args.push(Operand::Val(v));
+            }
+        }
+    }
+    // every `sext(i)` becomes the wide counter
+    let mut map: Vec<Option<Operand>> = vec![None; f.values.len()];
+    for d in &plan.sexts {
+        map[*d as usize] = Some(Operand::Val(w));
+    }
+    rewrite_values(f, &map);
+
+    // the exit test, in 64 bits against the widened bound
+    let wide_bound = match plan.bound {
+        Operand::Imm(k) => Operand::Imm(k),
+        o => append_cvt(f, entry, CvtOp::Sext, Ty::I32, Ty::I64, o),
+    };
+    // Placing the widened bound in the ENTRY block keeps it loop-invariant; the
+    // step value the test reads is the one this latch just produced.
+    let lhs = if plan.cmp_after_step {
+        // `plan_widen` has already refused the case where this is absent.
+        Operand::Val(
+            wstep
+                .iter()
+                .find(|(l, _)| *l == cb)
+                .expect("the after-step test is in a latch")
+                .1,
+        )
+    } else {
+        Operand::Val(w)
+    };
+    f.blocks[cb as usize].insts[ci] = Inst::Cmp {
+        dst: plan.cmp_dst,
+        op: plan.op,
+        ty: Ty::I64,
+        a: lhs,
+        b: wide_bound,
+    };
+    // The narrow counter is now dead BY CONSTRUCTION — `plan_widen` proved its
+    // only readers were the sign-extensions and the test, and both now read the
+    // wide one. It is deleted here rather than left to `dce` because what is
+    // left is a CYCLE: the parameter feeds its own step, and the step feeds the
+    // parameter back along the edge, so a use-count sweep sees both as live and
+    // the loop keeps a second counter for nothing. (Widening then costs an `add`
+    // exactly where it saved a `sxtw`, which is how this was caught: the loop
+    // stayed six instructions.)
+    let pi = f.blocks[header as usize]
+        .params
+        .iter()
+        .position(|&x| x == p)
+        .expect("the counter is a header parameter");
+    f.blocks[header as usize].params.remove(pi);
+    let mut preds: Vec<BlockId> = latches.to_vec();
+    preds.push(entry);
+    for b in preds {
+        for t in f.blocks[b as usize].term.targets_mut() {
+            if t.block == header && pi < t.args.len() {
+                t.args.remove(pi);
+            }
+        }
+    }
+    for b in f.blocks.iter_mut() {
+        b.insts.retain(|i| i.dst() != Some(plan.step_val));
+    }
+}
+
+fn insert_bin(
+    f: &mut Func,
+    b: BlockId,
+    at: usize,
+    op: BinOp,
+    ty: Ty,
+    a: Operand,
+    rhs: Operand,
+) -> ValueId {
+    let v = f.new_value(ty, Def::Inst(b, at as u32));
+    f.blocks[b as usize].insts.insert(at, Inst::Bin { dst: v, op, ty, a, b: rhs });
+    v
+}
+
+fn append_cvt(f: &mut Func, b: BlockId, op: CvtOp, from: Ty, to: Ty, a: Operand) -> Operand {
+    let i = f.blocks[b as usize].insts.len() as u32;
+    let v = f.new_value(to, Def::Inst(b, i));
+    f.blocks[b as usize].insts.push(Inst::Cvt { dst: v, op, from, to, a });
+    Operand::Val(v)
+}

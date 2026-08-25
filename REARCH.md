@@ -1142,6 +1142,61 @@ distribution, not the geomean; and when one program carries the whole number, go
 
 ---
 
+## §13l IV WIDENING — instruction-for-instruction parity with gcc -O1 on the array-copy loop
+
+After §13j, `mycopy`'s inner loop was six instructions against gcc's five, and the extra one was a
+`sxtw`: every iteration, widening a 32-bit counter so it can index memory. gcc runs the counter in
+64 bits and sign-extends the BOUND once, outside the loop. `pass/iv.rs::widen` does the same, and
+the fact that licences it was already proven — `scev::find_nowrap` shows the loop's own exit test
+keeps the counter inside its type, so `sext(i)` is the identity and a 64-bit counter takes the same
+values.
+
+```
+    zcc   ldrb w2,[x4,x1] ; strb w2,[x3,x1] ; add x1,x1,#1 ; cmp x1,x0 ; b.lt
+    gcc   ldrb w3,[x1,x2] ; strb w3,[x0,x2] ; add x2,x2,1  ; cmp x4,x2 ; bne
+```
+
+Five instructions each, one for one. The narrow counter is deleted BY CONSTRUCTION rather than left
+to `dce`, because what remains of it is a CYCLE — the parameter feeds its own step and the step
+feeds the parameter back along the edge — so a use-count sweep sees both as live and the loop keeps
+a second counter for nothing. (That is how the first cut was caught: the loop stayed at six, the
+`add` landing exactly where the `sxtw` had been.)
+
+### Measured: EXEC-NEUTRAL, INSN flat, and the parity is structural
+Same box, same session, `ZCC_NOPASS=widen` for the other arm, best of nine:
+
+| program | widen ON | widen OFF |
+|---|---|---|
+| g1_memcpy_loop | 48 ms | 47 ms |
+| j3_prefix_sum · h1_popcount · h2_revbits · h3_fnv · j2_histogram · d3_early_exit | identical | identical |
+
+geo40 EXEC **1.3654 → 1.3670**, INSN **1.2419 → 1.2410**, sqlite 237,026 → **237,025**.
+
+So the honest statement is: **this buys instruction parity, not time.** The `sxtw` it removes was
+already free — it hides in the load shadow, which is the same fact OPT.md #18 recorded on `main`
+when a similar rewrite measured exec-neutral. It ships ON because it is correct, gated green, and
+strictly better on the INSN axis THE ULTIMATUM also names; it does not ship as a speed win, and a
+cross-run comparison that appeared to show ±3% was machine drift, caught by re-measuring both arms
+back to back.
+
+### The defect, and the distinction that caused it
+sqlite failed to compile: `%79 used in bb18 but defined in bb6`. The bound is sign-extended into the
+ENTRY block, so it must be defined OUTSIDE the loop — and the check asked `AddRec::is_invariant()`,
+which only says the recurrence has STEP ZERO. That is also true of values computed INSIDE the loop:
+the sum of two invariants has step zero and is defined in the header. `scev` now offers
+`is_loop_invariant` for the question a code-motion caller actually has, with both spelled out at the
+definition so the next caller does not repeat it.
+
+A second hole, found earlier the same way: when the exit test reads the counter AFTER the step, the
+value it reads is the one that LATCH produced — so a test outside a latch has no such value to name.
+The first cut silently skipped the rewrite in that case and deleted the counter anyway, which is
+what `use of undefined` meant on 100 csmith programs. Refused now before anything is mutated.
+
+Both are the same lesson as §13j's pair: **a predicate that is ALMOST the one you want is worse than
+an absent one.** `is_invariant` vs `is_loop_invariant`; "the add folds" vs "the index peels".
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -1205,9 +1260,10 @@ its value are downstream of the same R4 item. The revised order:
    premise false; re-opening needs a cycle-level cost model for post-index
 5b. ✅ **isel addressing-mode fold** (§13j) — EXEC ≥30 ms 1.4610 → **1.3789**, 8 of 8 improve, 0
    regress, sqlite flat. Strictly better than row 5 was on every axis
-6. ⬜ final-value, then LFTR — cheap now that the analysis is wired. LFTR is also what would let
-   `mycopy` drop its separate counter and test the pointer instead, which is the last instruction
-   between that loop and gcc's
+6a. ✅ **IV widening** (`pass/iv.rs::widen`, §13l) — the last instruction between `mycopy`'s loop
+   and gcc's. Five instructions each, one for one. EXEC-neutral, INSN 1.2419 → 1.2410. Subsumes
+   LFTR for this shape: the narrow counter AND its test are gone
+6b. ⬜ final-value — the only row of R2/R3 still open
 
 ---
 

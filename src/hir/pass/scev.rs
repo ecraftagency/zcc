@@ -186,6 +186,23 @@ impl LoopScev {
         }
     }
 
+    /// Is this value defined OUTSIDE the loop?
+    ///
+    /// Distinct from `AddRec::is_invariant`, which only says the recurrence has
+    /// step 0 — true of plenty of values COMPUTED INSIDE the loop, such as the
+    /// sum of two invariants. A caller that wants to move something out of the
+    /// loop needs this one; asking the other put a `sext` of a header-defined
+    /// value into the preheader and broke sqlite (§13l).
+    pub fn is_loop_invariant(&self, v: ValueId) -> bool {
+        self.invariant[v as usize]
+    }
+
+    /// Does the loop's own exit test prove this basic induction variable cannot
+    /// leave its type, read as SIGNED? See `find_nowrap` for the argument.
+    pub fn no_wrap_signed(&self, v: ValueId) -> bool {
+        self.nowrap_signed.contains(&v)
+    }
+
     /// `o` is `p` itself, or `p` plus a literal.
     fn is_offset_of(&self, f: &Func, o: Operand, p: ValueId) -> bool {
         let v = match o.val() {

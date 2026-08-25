@@ -124,6 +124,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         if on("iv") {
             changed |= iv::run(f);
         }
+        // Widening is a SEPARATE row from the pointer walk above and is ON: it
+        // removes the per-iteration `sxtw` that stands between an `a[i]` loop
+        // and gcc's (§13l).
+        if on("widen") {
+            changed |= iv::widen(f);
+        }
         if on("sink") {
             changed |= sink::run(f);
         }
