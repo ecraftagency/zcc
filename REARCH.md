@@ -499,8 +499,12 @@ re-decomposed by ROOT CAUSE on the R4.1 compiler and is now twelve rows R4.1–R
 its evidence, site, the prediction to take first and its KPI. The two largest are the ABI family the
 first plan had no row for: truncation self-moves at ABI boundaries (12,570 insns, 16.7% of the gap,
 every one a no-op under AAPCS64 §6.4.2) and a colourer rule that forbids a parallel-copy destination
-from taking its own dying source (2.22 movs per call vs gcc 1.00). Next ⬜ **R4.3** — the colourer
-rule; R4.2's histogram has been re-taken and the `mov` excess it leaves is 6,629.
+from taking its own dying source (2.22 movs per call vs gcc 1.00).
+**RE-PLANNED AGAIN 2026-08-25 (user, "re-plan") on the hot-loop inspection**, which measured the exec
+side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), R4.6/R4.7 amended,
+**R4.13** (the IV family, R2's residual) and **R4.14** (three orphans) opened, and the ORDER changed
+from size-weighted to measured-programs-owned — **next ⬜ is R4.2's FPR half, then R4.7**, not R4.3.
+Fourteen rows now; §13n holds the table, the evidence and the order.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
 
@@ -1348,28 +1352,60 @@ every row, paired, in one session, as a distribution.
 | # | step | execution | prediction to take FIRST | KPI | status |
 |---|---|---|---|---|---|
 | **R4.1** | reload copies carried across edges | `regalloc/spill.rs` | ceiling band [3,425 , 9,849] | frame `ldr` ≪ 22,421 | ✅ 232,214, frame `ldr` 17,052 |
-| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k | ✅ **218,776**, `mov` 40,237, x16 pairs 0 |
+| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k; **`fmov v31` pairs = 0** | ⬜ **REOPENED, NEXT** — GPR half ✅ 218,776 (`mov` 40,237, x16 pairs 0); **FPR twin 779 pairs = 1,558 insns still open** (the banked residual was GPR-only; see "R4.2 IS NOT EXHAUSTED" below) |
 | **R4.3** | **A parallel-copy destination takes its own dying source** (b). Amend the "free AFTER" rule: at a `ParallelCopy`, a destination may take the register of the source of ITS OWN pair when that source dies here; the simultaneity argument forbids only the other pairs' sources. `color::check` already asserts no two live values share a colour, so the proof obligation is met by the existing checker | `regalloc/color.rs` walk | count pairs `(d ← s)` with `s` dying at the copy and `colour(d) ≠ colour(s)` — that number is the ceiling; report it split entry / call / other | movs before `bl` per call → ≈1.0 (gcc 1.00); entry copies ≈ 0 | ⬜ |
 | **R4.4** | **returns merged, dead slots dropped, frame adjust folded** (e) | HIR `unify_ret`; `mir/pass/frame.rs` | extra `ret` 1,928 → ≤ 400; 289 leaf frames → 0; `sub sp` count → ≈ number of functions with no save pair | sqlite −4k…−6k | ⬜ |
 | **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ⬜ |
-| **R4.6** | **constants shared** (c): dominator-scoped `MovImm`/`Adrp` sharing on MIR, before spilling; the spiller's remat decides pressure | new `mir/pass/const_share.rs` | repeats 16,085 minus what R4.5 removes = the ceiling; realistic target zcc immediates → ≈ gcc's 12.7k | `movz+movn+mov,zr` ≤ 14k; **f2 exec** | ⬜ |
-| **R4.7** | **§17 verified, row by row** (f): extending loads (`ldrsb/ldrsh/ldrsw`, and prefer the extension in the LOAD over the ALU operand when the value feeds a loop-carried chain — the j3 latency fact, recorded as a cost-model caveat since `cost = \|MIR\|` cannot see it), `cmpelim` across non-flag-writing instructions and `and`+`cmp` → `tst`, `fmov #imm8`, `csneg/csinc`, shifted-operand commute, constant-LHS `cmp` commute, `tbz` for sign/bit tests, `sbfiz`. Each row: its count vs gcc BEFORE, its battery, its count AFTER — the ✔ becomes a number | `isel/lower.rs`, `cmpelim.rs`, `ext_lattice` | the per-mnemonic table above | each mnemonic within ±10% of gcc; **j3, f2, h2, d4 exec** | ⬜ |
+| **R4.6** | **constants shared** (c): dominator-scoped `MovImm`/`Adrp` sharing on MIR, before spilling; the spiller's remat decides pressure. **Amended 2026-08-25:** the inspection found the INTEGER loop bound rebuilt every iteration too (`movz w0,#2304; movk w0,#61,lsl 16` inside f2's and e2's loops, where gcc holds it in a callee-saved register), not only f2's FP constant — a loop-invariant immediate must be hoisted to the preheader, and the row's ceiling counts those | new `mir/pass/const_share.rs` | repeats 16,085 minus what R4.5 removes = the ceiling; realistic target zcc immediates → ≈ gcc's 12.7k; **plus** count of `MovImm`/`Adrp` inside a loop whose value is loop-invariant | `movz+movn+mov,zr` ≤ 14k; **f2, e2 exec** | ⬜ |
+| **R4.7** | **§17 verified, row by row** (f): extending loads (`ldrsb/ldrsh/ldrsw`, and prefer the extension in the LOAD over the ALU operand when the value feeds a loop-carried chain — the j3 latency fact, recorded as a cost-model caveat since `cost = \|MIR\|` cannot see it), `cmpelim` across non-flag-writing instructions and `and`+`cmp` → `tst`, `fmov #imm8`, `csneg/csinc`, shifted-operand commute, constant-LHS `cmp` commute, `tbz` for sign/bit tests, `sbfiz`. Each row: its count vs gcc BEFORE, its battery, its count AFTER — the ✔ becomes a number | `isel/lower.rs`, `cmpelim.rs`, `ext_lattice`, **`mir/isa.rs` latency table (Side II — MEASURED, see "THE MISSING DUAL")** | the per-mnemonic table above, **and the first CYCLE prediction the plan has ever carried**: j3's loop-carried chain is `add xN,xN,wM,sxtw` (2 cyc) → `ldrsw`+`add` (1 cyc), bound 2.0 → 1.0; measured today 1.940, so the row predicts **j3 ≈ 1.0×** and, on the same table, **i1 and e2's `sxtw` chains**. **Amended 2026-08-25:** the KPI below WAS a size KPI ("±10% per mnemonic"); the inspection showed this row's value is on the clock and predictable before the build | **j3 exec 1.94 → ≤ 1.1** (the cycle prediction, validated against the clock); each mnemonic within ±10% of gcc; **i1, e2, h2, d4, f2 exec** — 5 of the 10 programs above 1.2× | ⬜ second, after R4.2's FPR half |
 | **R4.8** | **spill, second pass** (g): entry-set fixpoint across back edges (carry into loop headers); spill-store placement at the eviction frontier | `regalloc/spill.rs` | `ZCC_SPILLCEIL` in-loop 7,607 and dom-ceiling 3,485 are the reload ceiling; for stores, count spilled definitions with a path that never reloads | frame `ldr` ≪ 17,052, frame `str` ≪ 12,239 | ⬜ |
 | **R4.9** | **memory-aware GVN** (h) — FRE | `hir/pass/gvn.rs` + alias classes from `effects()` | count loads whose address was loaded in a dominating block with no clobbering store/call between — measured before a line is written, like R4.1 | non-frame `ldr` → ≈ gcc's 14,567; **j5 exec** | ⬜ |
 | **R4.10** | **Boissinot merge** on the FREE residual (i) | `regalloc/color.rs` | 4,782 | edge copies ≪ 9,332 | ⬜ |
 | **R4.11** | **rotation residual + store motion** (j): `rotate.rs` tests `pin`, not `labels`; add the refusal-reason residual print; trace and lift the early-return shape; LICM store motion for a loop-invariant address with no aliasing access | `hir/pass/rotate.rs`, `hir/pass/licm.rs` | residual print first — the count of refused loops per reason IS the prediction | **d3, d4, i1 exec**; sqlite branch count | ⬜ |
 | **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ⬜ |
+| **R4.13** | **the IV family — R2's exhaustion residual** (l, opened 2026-08-25 on the hot-loop inspection). Three shapes SCEV does not fire on, all one theorem over `scev.rs`/`iv.rs`: (1) a **pointer / 64-bit IV** where the source has a 32-bit counter — zcc recomputes `[xB, wI, sxtw #2]` every iteration, gcc walks a pointer with post-index writeback (`str w3, [x2], -4`; j5, d3); (2) a **count-down IV** whose decrement SETS THE FLAGS so the exit test is free (`subs w1,w1,#1; bpl` — j5, h2), where zcc keeps a separate `cmp`/`tbz`; (3) **strength reduction of `i*j+k` in a nested loop** to an add-IV (d2: `madd` every inner iteration vs gcc's `add`). Every one is `-O1` (`-fauto-inc-dec`, `-ftree-slsr`, IV canonicalization). NOT folded into R4.11 — that row owns rotation refusals and store motion, and Article G forbids blurring a theorem seam. §13n missed this family because it was decomposed from a STATIC sqlite histogram, where an IV shape costs zero instructions | `hir/pass/scev.rs`, `hir/pass/iv.rs`; the post-index fold is `isel/lower.rs` | **residual print FIRST**, as R4.11 requires of rotation: for every loop, is there an IV `scev` recognizes but `iv` refuses to widen/rewrite, and WHY — the count per refusal reason IS the prediction. Then per shape: (1) loops with an address `[base, w, sxtw]` on a recognized IV; (2) counted loops whose exit compare is against 0 or a hoistable bound; (3) inner-loop `mul`/`madd` on two IVs | **j5 exec** (11 → ~7 insns/iter), **d3, d2, h2 exec**; each shape's residual classified (a)/(b) | ⬜ |
+| **R4.14** | **three orphans, one row so they stay tracked** (m, opened 2026-08-25): (1) **`x / 2^k` → `x · 2^−k`** — exact under IEEE 754 since the reciprocal of a power of two is representable, so the commuting square is an identity on every input including ±0/∞/NaN (f2: `fdiv` 10+ cyc → `fmul` 3); (2) **small dense `switch` → compare tree, not a jump table** — R3.3's density constant ("≥4 cases, ≥½ span") is exactly Article E's "the spec's number or my convenience's number?": gcc-O1 builds a `cmp`/`tbnz`/`csel`/`csinc` tree for d1's 8 cases and wins 1.33× on it, so the constant is re-judged against a measured crossover, not cited; (3) **inline a called-once function that is not `static`** — `inline.rs` requires `is_static` for the called-once rule; gcc's `-finline-functions-called-once` does not, and keeps the out-of-line body (e2: `mix` marshals 10 arguments per call). Three sites, three proofs, each a few lines; grouped only so none is lost | `hir/pass/fold.rs`; `isel/lower.rs::jump_table` (the policy constant); `hir/pass/inline.rs` | (1) count `fdiv` by a constant power of two on sqlite and the suite; (2) measure the crossover: compare-tree vs table exec at 4, 6, 8, 12, 16 cases, on the clock; (3) count non-`static` functions with exactly one call site in the module | **f2, d1, e2 exec**; each with its own square | ⬜ |
 
-### Order, and why
-Certainty × size ÷ cost. R4.2 is a Side-II fact with a counted ceiling and a `nop` predicate; R4.3
-is a one-rule change in the colourer whose checker already exists; together they are the ABI family,
-the largest class the R4.2 prediction found and the one the first plan had no row for. R4.4 is
-mechanical. R4.5–R4.7 are the suite's losses and are cheap per row. R4.8–R4.10 are the allocator's
-second pass and need the first three banked so the histogram they are aimed at is real. R4.11 is
-where the exec suite's remaining >1.3× programs live; R4.12 is a measurement. **One commit per row,
-the full gate each, the histogram re-taken each, `.s` confirms and never discovers.** A row whose
-measured prediction comes in under 20% of its stated ceiling gets one push, then the quarantine mark
-and the next row — the no-pivot contract binds.
+### Order, and why — RE-PLANNED 2026-08-25 (user), on the hot-loop inspection
+
+The first order was **certainty × size ÷ cost** — a SIZE-weighted criterion, chosen before any
+exec prediction had been taken. After R4.2 the axes stand at INSN **1.179** and EXEC **1.336**:
+size is ahead, time is behind, and R4.3 — the row that order put next — is one §13n itself says
+"the suite cannot see at all". The inspection (below) measured the exec side for the first time and
+found that R4.7 owns 5 of the 10 programs above 1.2×, with a cycle prediction already validated to
+3% on j3; a whole theorem family (now R4.13) owned 4 and had no row; and R4.2 was closed with its
+FPR half unmeasured. So the criterion becomes **measured programs owned × certainty ÷ cost**, and the
+order is:
+
+```
+R4.2 (FPR twin)  →  R4.7  →  R4.13  →  R4.11  →  R4.14  →  R4.5  →  R4.9
+                 →  R4.6  →  R4.3  →  R4.4  →  R4.8  →  R4.10  →  R4.12
+```
+
+**Why each sits where it does.** R4.2's FPR half is not a re-plan item at all — it is an unfinished
+row under Law 4, 1,558 instructions on a theorem already proven, and the R4.1 precedent says a
+follow-up belongs to the row that owns the theorem. R4.7 is first because it is the only row with a
+quantitative exec prediction and it touches five of the ten (j3, i1, e2, h2, d4); its Side-II half —
+the measured latency table — is also the cheap validation of the time-dual premise, so it is done
+here before any infrastructure is bet on it. R4.13 touches four (j5, d3, d2, h2) and is where j5 —
+81% of the suite's absolute wall time — is decided; it follows R4.7 because both rewrite what isel
+sees and the table should be in place first. R4.11 touches three (d3, d4, i1). R4.14 is three small
+proofs that ride cheaply once the rows around them have moved. R4.5 and R4.9 are j5's remaining
+mechanisms and are taken once R4.13 has reshaped that loop, so their predictions are made on the
+loop as it will be, not as it is. R4.6 then R4.3/R4.4 are the size rows the suite cannot see;
+R4.8/R4.10 the allocator's second pass; R4.12 a measurement.
+
+**What does not change.** One commit per row, the full gate each, the histogram re-taken each,
+**both axes reported paired in one session as a distribution**, `.s` confirms and never discovers.
+A row whose measured prediction comes in under 20% of its stated ceiling gets one push, then the
+quarantine mark and the next row — the no-pivot contract binds. **Every exec-bearing row now takes
+its prediction on the inspection table first**, the way the size rows take theirs on an instrument.
+
+**The time dual is NOT a row yet, by decision.** "THE MISSING DUAL" below records the shape
+(`mir/cost.rs` + an interpreter scoreboard + the square `time_model ≡ cycles(interp)`). It is opened
+as a row only if R4.7's latency table — its cheap half — proves the premise on j3, i1, e2. If the
+table alone closes j3 from 1.94× to ≈1.0×, that is the argument for the rest; if it does not, the
+premise was wrong and nothing was built on it.
 
 ### R4.1 — BANKED. sqlite **237,025 → 232,214**, 1.509× → **1.478×**
 
