@@ -18,24 +18,143 @@
 // load must not overwrite the base register it is still addressing through.
 use crate::mir::*;
 
+/// How far ahead a partner is looked for. §13o measured the distribution on
+/// sqlite: of the frame accesses that could pair, 433 sit ADJACENT and 1,374
+/// more sit two to ten instructions away — the second access is simply not next
+/// to the first, because nothing ever scheduled them together. Ten covers the
+/// measured tail; beyond it the count is flat.
+const WINDOW: usize = 10;
+
 pub fn run(f: &mut MFunc) {
     let offs: Vec<i32> = f.slots.iter().map(|s| s.off).collect();
     for b in f.blocks.iter_mut() {
         let insts = std::mem::take(&mut b.insts);
+        let mut taken = vec![false; insts.len()];
         let mut out: Vec<MInst> = Vec::with_capacity(insts.len());
-        let mut i = 0;
-        while i < insts.len() {
-            if i + 1 < insts.len() {
-                if let Some(p) = fuse(&offs, &insts[i], &insts[i + 1]) {
-                    out.push(p);
-                    i += 2;
+        for i in 0..insts.len() {
+            if taken[i] {
+                continue;
+            }
+            let mut made = None;
+            let hi = (i + WINDOW).min(insts.len() - 1);
+            for j in (i + 1)..=hi {
+                if taken[j] {
                     continue;
                 }
+                if let Some(p) = fuse(&offs, &insts[i], &insts[j]) {
+                    if hoistable(&offs, &insts[(i + 1)..j], &insts[j]) {
+                        made = Some((j, p));
+                        break;
+                    }
+                }
             }
-            out.push(insts[i].clone());
-            i += 1;
+            match made {
+                Some((j, p)) => {
+                    taken[j] = true;
+                    out.push(p);
+                }
+                None => out.push(insts[i].clone()),
+            }
         }
         b.insts = out;
+    }
+}
+
+/// May `y` be moved back across everything in `between`?
+///
+/// COMMUTING SQUARE, and every clause is a way the answer is no:
+///   * MEMORY, and this is the clause that decides whether the pass fires at
+///     all. Refusing every memory instruction in between makes the window
+///     useless: in a spill RUN the things between two frame accesses are the
+///     other spills, which is exactly the case worth pairing (measured: +14
+///     pairs on sqlite with the blanket refusal, against +479 from the frame
+///     layout alone). Two accesses may be reordered when they cannot observe
+///     each other, and there are two ways to know that:
+///       – both only READ. Loads do not conflict with loads, ever.
+///       – both name FRAME OBJECTS whose byte ranges are DISJOINT. After
+///         `frame` every slot has a number, so this is decidable rather than an
+///         alias guess: distinct non-overlapping ranges of the frame are
+///         distinct objects (C99 6.2.4).
+///     Anything else — a call, a pointer access, `StackAlloc` moving sp — is a
+///     barrier.
+///   * `y`'s TRANSFER REGISTER may not be WRITTEN in between — the pair writes
+///     it at the earlier point, so a later write in between would win where it
+///     used to lose (a load), or the stored value would be the wrong one (a
+///     store, whose source is now read early).
+///   * for a LOAD, `y`'s destination may not be READ in between either: that
+///     read currently sees the OLD contents of the register and would see the
+///     loaded value instead.
+///   * `y`'s BASE register may not be written in between.
+/// `x` itself does not move, so nothing has to be said about it.
+fn hoistable(offs: &[i32], between: &[MInst], y: &MInst) -> bool {
+    let (load, xfer, base) = match y {
+        MInst::Load { dst, mem, .. } => (true, *dst, mem_base(mem)),
+        MInst::Store { src, mem, .. } => (false, *src, mem_base(mem)),
+        MInst::Reload { dst, .. } => (true, *dst, None),
+        MInst::Spill { src, .. } => (false, *src, None),
+        _ => return false,
+    };
+    let yr = frame_range(offs, y);
+    between.iter().all(|k| {
+        if matches!(k, MInst::StackAlloc { .. }) {
+            return false;
+        }
+        let mem_ok = match k.effect() {
+            MemEffect::None => true,
+            // two reads cannot observe each other
+            MemEffect::Read if load => true,
+            MemEffect::Read | MemEffect::Write => match (frame_range(offs, k), yr) {
+                (Some((a, an)), Some((b, bn))) => a + an <= b || b + bn <= a,
+                _ => false,
+            },
+            MemEffect::Barrier => false,
+        };
+        if !mem_ok {
+            return false;
+        }
+        let mut ok = true;
+        k.visit(&mut |r, c| {
+            let writes = matches!(c, Constraint::Def | Constraint::DefFixed(_));
+            if r == xfer && (writes || load) {
+                ok = false;
+            }
+            if writes && Some(r) == base {
+                ok = false;
+            }
+        });
+        ok
+    })
+}
+
+/// The byte range this instruction touches inside the FRAME, when it provably
+/// touches the frame and nothing else. A slot has a number after `frame`, so two
+/// such ranges either overlap or name different objects — no alias oracle
+/// required. Anything reached through a register base could be anywhere.
+fn frame_range(offs: &[i32], i: &MInst) -> Option<(i32, i32)> {
+    let (mem, size) = match i {
+        MInst::Load { op, mem, vol: false, .. } | MInst::Store { op, mem, vol: false, .. } => {
+            (mem.clone(), op.bytes() as i32)
+        }
+        MInst::Pair { w, mem, .. } => (mem.clone(), 2 * w.bytes() as i32),
+        MInst::Spill { slot, w, .. } | MInst::Reload { slot, w, .. } => {
+            return Some((*offs.get(*slot as usize)?, w.bytes() as i32));
+        }
+        _ => return None,
+    };
+    match mem {
+        AddrMode::Slot { slot, off } => Some((offs.get(slot as usize)? + off, size)),
+        _ => None,
+    }
+}
+
+fn mem_base(m: &AddrMode) -> Option<Reg> {
+    match m {
+        AddrMode::BaseImm { base, .. }
+        | AddrMode::BaseReg { base, .. }
+        | AddrMode::PreIdx { base, .. }
+        | AddrMode::PostIdx { base, .. }
+        | AddrMode::SymLo12 { base, .. } => Some(*base),
+        AddrMode::Slot { .. } | AddrMode::SpArg { .. } => None,
     }
 }
 

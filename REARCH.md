@@ -506,6 +506,14 @@ side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), 
 from size-weighted to measured-programs-owned.
 **R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
 **1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green).
+**§13o + R4.8 ⚠️ (2026-08-26)** — the excess re-decomposed on this compiler, and
+R4.8 REFUTED by it: frame slot-touches are 35,550 against gcc's 34,931 (+1.8%),
+so the spiller is at parity on VOLUME and the whole +5,044 frame excess is
+PAIRING DENSITY (39.6% of touches paired against gcc's 65.6%). The pairing half
+shipped — spills-first frame layout and a window that looks past disjoint frame
+accesses — for sqlite **186,262 = 1.1858×**. **Next ⬜ is R4.15**: the frame
+adjust becomes a real MIR instruction so an ordinary pass can fold it into the
+first save pair, ≈3,300 instructions, the largest named card left.
 **R4.6 ✅ + R4.10 ✅ (2026-08-26)** — constants value-numbered (not copied, and
 not across a call) and the copy-partner graph followed transitively: sqlite
 **186,705 = 1.1886×**, EXEC unchanged at ≈1.05, INSN 1.0677. **Only R4.8 and the
@@ -1413,7 +1421,8 @@ order is:
 
 ```
 R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️ → R4.5 ✅ → R4.9 ✅ → R4.11 ✅ → R4.14 ⚠️(1 of 3)
-        → R4.3 ✅ → R4.4 ✅ → R4.6 ✅ → R4.10 ✅ → R4.8 → R4.12
+        → R4.3 ✅ → R4.4 ✅ → R4.6 ✅ → R4.10 ✅ → R4.8 ⚠️(refuted; pairing half shipped)
+        → R4.15 (the frame adjust as a MIR instruction, ≈3,300) → R4.12
 ```
 
 **AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
@@ -2334,6 +2343,68 @@ after the across-call refusal; `add`/`sub`/`cmp` +4,906 is address arithmetic an
 loop bookkeeping with no row of its own. Those three are where R4.3/R4.6/R4.10
 have already been grinding, and they are at diminishing returns — which is the
 honest reason the next step is the frame, not another peephole.
+
+### R4.8 — REFUTED BY ITS OWN CEILING. The frame excess is PAIRING DENSITY, not spill volume
+
+The row said "spill, second pass: entry-set fixpoint across back edges; spill
+stores at the eviction frontier", ceiling 4k…8k, on §13n's reading that frame
+`ldr` was 17,052 against gcc's 7,765. Taken on THIS compiler, counting what those
+instructions actually move rather than how many there are:
+
+| | zcc | gcc-O1 | excess |
+|---|---|---|---|
+| frame slot-TOUCHES | 35,550 | 34,931 | **+619 (1.8%)** |
+| frame INSTRUCTIONS | 28,519 | 23,475 | **+5,044 (21.5%)** |
+| of which paired | 7,031 | 11,456 | — |
+| share of touches paired | **39.6%** | **65.6%** | — |
+
+**The spiller is at parity with gcc on how much it spills.** §13n compared
+SINGLES against SINGLES and never counted gcc's `ldp`/`stp`, each of which moves
+two values — so a compiler that spills the same amount and pairs it twice as
+often looked like a compiler that spills twice as much. R4.1 and R4.2 had already
+closed the volume; nobody re-measured. Building "spill less" on that number would
+have chased 619 touches out of 35,550.
+
+**The excess is entirely how many instructions the same traffic takes**, and
+gcc's 11,456 frame pairs over 1,883 functions is ≈6 per function — the
+prologue and epilogue, not body spills.
+
+**SHIPPED, the pairing half.** sqlite 186,705 → **186,262**.
+
+* **The frame is laid out spills-first.** `ldp`/`stp` take a SCALED SIGNED 7-BIT
+  displacement (DDI 0487 C6.2.130), so a paired 64-bit access reaches 504 bytes —
+  one eighth of a single access's reach. Slots were laid out in CREATION order,
+  putting C locals first and the callee-saved saves and allocator spills above
+  them, so in any function with a kilobyte of locals the prologue, the epilogue
+  and every spill run sat out of range. Measured before: of 2,598 near-adjacent
+  pairable frame accesses, **1,903 were refused for the offset alone**, 1,170 of
+  them ADJACENT. After: 761 and 417. **+479 pairs.**
+* **The pairing window looks past what is between.** Two accesses may be
+  reordered when they cannot observe each other, and there are two ways to know
+  it: both only READ (loads never conflict with loads), or both name frame
+  objects whose byte ranges are DISJOINT — decidable, not an alias guess, because
+  after `frame` every slot has a number. Refusing every memory instruction in
+  between made the window useless (+14 pairs), since in a spill RUN the things in
+  between are the other spills. **+139 pairs.**
+
+**WHAT IS LEFT, MEASURED, and why the batch stops here.**
+* ~1,700 pairing opportunities remain inside a ten-instruction window: 939
+  encodable (blocked by the transfer register being rewritten in between — real)
+  and 761 still beyond imm7 in the largest frames.
+* **≈3,300 instructions in the frame adjust**: 1,588 `sub sp` and 1,726 `add sp`
+  that `stp x19,x20,[sp,#-N]!` and `ldp x19,x20,[sp],#N` fold away for free
+  (DDI 0487 C6.2.130's pre/post-indexed forms). **This is the largest single
+  named card left in the whole plan** — larger than any remaining §13o class
+  except the pairing it belongs to.
+  It is NOT a peephole and must not be written as one: `emit` currently
+  synthesises the adjust from `f.frame_size`, so folding it there would be
+  `emit` making a decision, which Article B forbids in as many words. The row is
+  **the frame adjust becomes a real MIR instruction**, after which an ordinary
+  MIR pass fuses it with the first save pair and the last restore pair — which
+  also removes the existing "emit invents two instructions" wart.
+
+**GATE (all green):** cargo 159/0 · fullsuite 10 PASS / 0 RED · opt-parity
+1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE / 0 NOT-IMPL · determinism 88×8.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

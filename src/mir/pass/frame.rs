@@ -103,18 +103,40 @@ pub fn run(f: &mut MFunc) {
     // is sp after the prologue's single adjustment (§8: one frame adjust, by
     // construction — `StackAlloc` excepted, and that is the whole reason for the
     // frame pointer above).
+    //
+    // SPILLS FIRST, AND THAT ORDER IS WORTH AN INSTRUCTION EACH (§13o). `ldp`
+    // and `stp` take a SCALED SIGNED 7-BIT displacement (DDI 0487 C6.2.130), so
+    // a paired 64-bit access reaches only 504 bytes from the base — one eighth
+    // of what a single access reaches. Slots were laid out in creation order,
+    // which put the C locals first and the callee-saved saves and allocator
+    // spills ABOVE them, so in any function with a kilobyte of locals the
+    // prologue, the epilogue and every spill run sat out of the paired form's
+    // range. Measured on sqlite: of 2,598 adjacent-or-near frame accesses that
+    // could pair, **1,903 were refused for the offset alone**.
+    //
+    // The objects that are accessed in PAIRED RUNS therefore go where the paired
+    // form can reach: the outgoing-argument area keeps offset 0 (the ABI pins
+    // it), then every `Spill` — callee-saved saves and allocator spills — then
+    // the locals, whose accesses are ordinary singles with a 32× larger reach.
+    // Nothing else changes: an offset is an offset, and `emit` resolves each
+    // slot through the same path either way.
     let mut at: u32 = f.outgoing;
-    for s in f.slots.iter_mut() {
-        if s.kind == SlotKind::InArgs {
-            continue; // fixed below, once the frame's size is known
+    let mut place = |slots: &mut Vec<StackSlot>, at: &mut u32, kind: SlotKind| {
+        for s in slots.iter_mut() {
+            if s.kind != kind {
+                continue;
+            }
+            let a = s.align.max(1);
+            *at = (*at + a - 1) / a * a;
+            s.off = *at as i32;
+            // A zero-size object occupies nothing: nothing can read or write it,
+            // so two of them may share an address (EXT(gcc) empty struct).
+            *at += s.size;
         }
-        let a = s.align.max(1);
-        at = (at + a - 1) / a * a;
-        s.off = at as i32;
-        // A zero-size object occupies nothing: nothing can read or write it, so
-        // two of them may share an address (EXT(gcc) empty struct).
-        at += s.size;
-    }
+    };
+    place(&mut f.slots, &mut at, SlotKind::Spill);
+    place(&mut f.slots, &mut at, SlotKind::Local);
+    place(&mut f.slots, &mut at, SlotKind::OutArgs);
     // AAPCS64 §6.2.2: sp is 16-byte aligned at every public interface.
     f.frame_size = (at + 15) & !15;
     // The caller's argument area begins exactly where this frame ends — that is
