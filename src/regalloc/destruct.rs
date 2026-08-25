@@ -438,9 +438,19 @@ pub fn sequentialize(f: &mut MFunc, edge_pairs: usize) {
             // narrow write into a wider name really does truncate.
             _ => match src {
                 Reg::V(v) => widths[v as usize] == w,
-                // a physical source carries no width record — an ABI register's
-                // upper half is whatever the caller left there
-                Reg::P(_) => false,
+                // R4.2 FPR TWIN — a physical FPR self-move at `s`/`d` is a no-op,
+                // the SAME theorem as the GPR ABI case one register class over.
+                // The pair's OWN width is the value's width: a 128-bit value
+                // carries `Width::Q`, so at `s`/`d` the only bits a `q`-form
+                // reader could observe belong to a DIFFERENT value. `fmov d,d`
+                // architecturally zeroes bits 127:64 of Vn (DDI 0487, FMOV
+                // scalar), but no reader of an `s`/`d` value looks there —
+                // AAPCS64 §6.8.2 leaves them unspecified. So the same-register
+                // pair the windmill would route through v31 (`fmov d31,dN ;
+                // fmov dN,d31`) has no observer and is dropped. A physical GPR
+                // source stays truncating: an ABI register's upper half is
+                // whatever the caller left there.
+                Reg::P(_) => matches!(w, Width::S | Width::D),
             },
         }
     };

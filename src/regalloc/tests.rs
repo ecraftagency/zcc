@@ -520,6 +520,50 @@ fn abi_boundary_truncation_leaves_no_instruction() {
     assert_eq!(selfmove, 0, "a narrow self-move survived at an ABI boundary");
 }
 
+/// R4.2 FPR TWIN — the same no-op, one register class over. A `double` carried
+/// across a loop back edge becomes an `fmov dN, dN` edge copy the moment biased
+/// colouring lands parameter and argument on the same register; the windmill
+/// reads that identity as a one-element cycle and routes it through the reserved
+/// v31 (`fmov d31, dN ; fmov dN, d31`), two instructions where the answer is
+/// none (779 pairs on sqlite). It is a no-op because the pair's OWN width is `d`:
+/// a 128-bit value would carry `Width::Q`, so at `s`/`d` no `q`-form reader can
+/// observe the bits `fmov d,d` would zero (AAPCS64 §6.8.2). A GENUINE swap of two
+/// doubles still needs the scratch, so the test both counts identity self-moves
+/// to zero AND checks the differential where a real cycle survives.
+#[test]
+fn a_double_self_move_across_an_edge_leaves_no_instruction() {
+    // two double accumulators carried around a loop: an edge copy per iteration,
+    // but no genuine cycle, so nothing should reach v31.
+    let src = "double f(int n){\n\
+               double s=0.0, t=1.0;\n\
+               for(int i=0;i<n;i++){ s+=t; t*=1.5; }\n\
+               return s+t;\n}\n\
+               int main(void){ return (int)f(6) & 0xff; }\n";
+    same(src);
+
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let p = crate::compile::backend(&h).unwrap();
+    let f = p.funcs.iter().find(|f| f.name == "f").unwrap();
+    use crate::mir::{isa, MInst, Reg};
+    let scratch = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::FMov { dst, .. } if *dst == Reg::P(isa::SCRATCH_FPR)))
+        .count();
+    assert_eq!(
+        scratch, 0,
+        "v31 was used to break a `double` edge copy that is an identity assignment"
+    );
+
+    // a REAL swap of two doubles is a genuine 2-cycle and MUST keep the scratch —
+    // the differential is the whole assertion: drop it and the two values clobber.
+    same("double f(double a,double b,int n){for(int i=0;i<n;i++){double u=a;a=b;b=u;}return a*10.0+b;}\
+          int main(void){return (int)f(1.0,2.0,5) & 0xff;}");
+}
+
 /// …and the rule is NOT "drop every narrow self-move": one whose destination is
 /// read wider than it was written still truncates, and deleting it would leave
 /// the upper half of whatever the register held. This is the direction the

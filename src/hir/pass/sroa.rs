@@ -324,23 +324,37 @@ fn promote(f: &mut Func, pieces: &[Piece]) -> bool {
     let mut added: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut placed = vec![vec![false; nv]; n];
     let mut promoted: Vec<bool> = vec![true; nv];
+    // `ever`/`seen` are membership bitmaps, not Vecs: on a 7,266-block function
+    // (yarpgen `init`) with 1,643 pieces, an `ever.contains` linear scan per
+    // worklist step made the iterated-frontier walk O(blocks²) PER piece —
+    // minutes of compile. Reused across pieces by clearing only the bits touched.
+    let mut ever = vec![false; n];
+    let mut seen = vec![false; n];
     for k in 0..nv {
         let mut work = stores_in[k].clone();
-        let mut ever: Vec<BlockId> = work.clone();
+        let mut touched: Vec<BlockId> = Vec::new();
+        for &b in &work {
+            ever[b as usize] = true;
+            touched.push(b);
+        }
         let mut sites: Vec<BlockId> = Vec::new();
-        let mut seen = vec![false; n];
         while let Some(b) = work.pop() {
             for &y in &df[b as usize] {
                 if seen[y as usize] {
                     continue;
                 }
                 seen[y as usize] = true;
+                touched.push(y);
                 sites.push(y);
-                if !ever.contains(&y) {
-                    ever.push(y);
+                if !ever[y as usize] {
+                    ever[y as usize] = true;
                     work.push(y);
                 }
             }
+        }
+        for &b in &touched {
+            ever[b as usize] = false;
+            seen[b as usize] = false;
         }
         if sites.iter().any(|&y| argless[y as usize]) {
             promoted[k] = false;

@@ -85,7 +85,10 @@ pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
             };
             let inst = f.blocks[b as usize].insts.remove(i);
             f.blocks[pre as usize].insts.push(inst);
-            refresh_defs(f);
+            // Only `b` (indices after `i` shifted) and `pre` (the appended inst)
+            // changed — scoped refresh, not O(function) per hoist (see mod.rs).
+            super::refresh_block_defs(f, b);
+            super::refresh_block_defs(f, pre);
             changed = true;
         }
         while hoist_call(f, &c, &dt, &lf, li, pre, readonly) {

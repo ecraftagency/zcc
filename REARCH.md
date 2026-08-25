@@ -503,7 +503,9 @@ from taking its own dying source (2.22 movs per call vs gcc 1.00).
 **RE-PLANNED AGAIN 2026-08-25 (user, "re-plan") on the hot-loop inspection**, which measured the exec
 side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), R4.6/R4.7 amended,
 **R4.13** (the IV family, R2's residual) and **R4.14** (three orphans) opened, and the ORDER changed
-from size-weighted to measured-programs-owned — **next ⬜ is R4.2's FPR half, then R4.7**, not R4.3.
+from size-weighted to measured-programs-owned.
+**R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
+**1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green). **Next ⬜ is R4.7.**
 Fourteen rows now; §13n holds the table, the evidence and the order.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
@@ -1283,9 +1285,10 @@ baseline aims at the wrong layer.
 
 ### The excess, today. sqlite zcc **237,025** vs gcc-O1 **157,074** = **1.509×**, excess **79,951**
 > Taken on the pre-R4.1 compiler and kept as the plan's premise. Where a row has since banked, its
-> own section below carries the re-taken numbers: after R4.2 the module is **218,776** (**1.3928×**,
-> excess **61,702**) and `mov` is **40,237** against gcc's 33,608 — so the `mov` row's excess is now
-> **+6,629**, not +19,147, and rows (b)/(i) are aimed at what is left of it.
+> own section below carries the re-taken numbers: after R4.2 (both halves) the module is **217,160**
+> (**1.3826×**, excess **60,086**) — GPR half 218,776, then the FPR twin −1,616. `mov` is **40,237**
+> against gcc's 33,608, so the `mov` row's excess is now **+6,629**, not +19,147, and rows (b)/(i) are
+> aimed at what is left of it.
 | class | zcc | gcc | excess | share |
 |---|---|---|---|---|
 | `mov` | 52,755 | 33,608 | **+19,147** | 24% |
@@ -1352,7 +1355,7 @@ every row, paired, in one session, as a distribution.
 | # | step | execution | prediction to take FIRST | KPI | status |
 |---|---|---|---|---|---|
 | **R4.1** | reload copies carried across edges | `regalloc/spill.rs` | ceiling band [3,425 , 9,849] | frame `ldr` ≪ 22,421 | ✅ 232,214, frame `ldr` 17,052 |
-| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k; **`fmov v31` pairs = 0** | ⬜ **REOPENED, NEXT** — GPR half ✅ 218,776 (`mov` 40,237, x16 pairs 0); **FPR twin 779 pairs = 1,558 insns still open** (the banked residual was GPR-only; see "R4.2 IS NOT EXHAUSTED" below) |
+| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k; **`fmov v31` pairs = 0** | ✅ **BANKED (both halves).** GPR half 218,776; **FPR twin** `fmov d31` windmill **783 → 4 pairs** (−779 = **−1,558 `fmov`**), sqlite **218,776 → 217,160** (−1,616), **1.3928× → 1.3826×**. Residual 4 = genuine `d8↔d9` swaps (real 2-cycles, scratch mandatory) → category (a) fundamental, **exhausted**. See "R4.2 IS NOT EXHAUSTED" below |
 | **R4.3** | **A parallel-copy destination takes its own dying source** (b). Amend the "free AFTER" rule: at a `ParallelCopy`, a destination may take the register of the source of ITS OWN pair when that source dies here; the simultaneity argument forbids only the other pairs' sources. `color::check` already asserts no two live values share a colour, so the proof obligation is met by the existing checker | `regalloc/color.rs` walk | count pairs `(d ← s)` with `s` dying at the copy and `colour(d) ≠ colour(s)` — that number is the ceiling; report it split entry / call / other | movs before `bl` per call → ≈1.0 (gcc 1.00); entry copies ≈ 0 | ⬜ |
 | **R4.4** | **returns merged, dead slots dropped, frame adjust folded** (e) | HIR `unify_ret`; `mir/pass/frame.rs` | extra `ret` 1,928 → ≤ 400; 289 leaf frames → 0; `sub sp` count → ≈ number of functions with no save pair | sqlite −4k…−6k | ⬜ |
 | **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ⬜ |
@@ -1644,20 +1647,86 @@ The first three are ONE theorem family: **zcc shipped SCEV in R2 and it does not
 shapes.** §13n could not see them because it was decomposed from a STATIC sqlite histogram, where an
 induction-variable shape costs zero instructions. That is the honest reason the plan missed them.
 
-### R4.2 IS NOT EXHAUSTED — the FPR twin, 1,558 instructions
+### R4.2 IS NOT EXHAUSTED → NOW EXHAUSTED — the FPR twin, 1,558 instructions ✅ BANKED 2026-08-25
 
 `fmov d31, d8 ; fmov d8, d31` in f2's loop is the exact windmill pair R4.2 removed on the GPR side.
-On sqlite: **779 pairs = 1,558 instructions**, 0.7% of the module. R4.2's banked Law-4 residual
-("41, of which 35 fundamental") was **GPR-ONLY** — the count script grepped `mov x16`/`mov wN,wN` and
-never looked at `fmov`, and `residual_report` counts only CANDIDATES, which an edge copy is not.
+On sqlite: **783 pairs = 1,566 instructions** (measured; §13n's 779/1,558 was the pre-R4.1 estimate),
+0.7% of the module. R4.2's banked Law-4 residual ("41, of which 35 fundamental") was **GPR-ONLY** —
+the count script grepped `mov x16`/`mov wN,wN` and never looked at `fmov`, and `residual_report`
+counts only CANDIDATES, which an edge copy is not.
 
-The cause is structural, not a missed grep. `drop_self_moves` runs BEFORE `destruct`, so it sees
-isel's ABI copies and never an edge copy; and `sequentialize`'s `nop` treats `Width::D` as narrow
-(only `W64 | Q` are full), so `fmov d8,d8` is refused and windmilled through v31. For an FPR holding
-a `double`, `d` IS the full useful width — only a `q` reader can observe the difference, which is the
-same argument R4.2 already makes one register class over. §13n row (a) predicted it ("f2 — the FP
-twin") and the row was closed without checking. **Category (b), same theorem, belongs to R4.2 under
-its own number** (the R4.1 precedent: a follow-up belongs in the row that owns the theorem).
+The cause is structural, not a missed grep. `sequentialize`'s `nop` treated **every** narrow physical
+self-move as truncating (`Reg::P(_) => false`), correct for a GPR ABI register but wrong for an FPR:
+`fmov d8,d8` was refused and windmilled through v31. For an FPR the pair's OWN width is the value's
+width — a 128-bit value carries `Width::Q` — so at `s`/`d` no `q`-form reader can observe the bits
+`fmov d,d` zeroes; `d` IS the full useful width, the same argument R4.2 already makes one register
+class over (AAPCS64 §6.8.2). §13n row (a) predicted it ("f2 — the FP twin"). **Category (b), same
+theorem, banked under R4.2's own number** (R4.1 precedent).
+
+**THE FIX** — one arm in `destruct::sequentialize::nop`: a physical self-move at `Width::S | Width::D`
+is a no-op. drop_self_moves needed no change; the FPR windmills are edge copies, born after `destruct`
+and killed at `nop`. **Measured 783 → 4 pairs**; the 4 survivors are a genuine `fmov d31,d9 ; fmov
+d9,d8 ; fmov d8,d31` **swap of two doubles** (a real 2-cycle, scratch mandatory) — category (a),
+fundamental. Residual is (a) entirely ⟹ **exhausted**. sqlite **218,776 → 217,160** (−1,616 insns,
+**1.3928× → 1.3826×** vs gcc-O1 157,074).
+
+**Proof (Law 3).** Inline test `a_double_self_move_across_an_edge_leaves_no_instruction`
+(`regalloc/tests.rs`): a two-double loop's edge copies leave **zero** `SCRATCH_FPR` writes
+(the count assertion), and a genuine double-swap keeps its scratch and stays correct under the
+`same` differential (the commuting square). **GATE:** cargo 145/0, torture 0 FAIL, opt-parity
+1552/0 DIVERGE, csmith300 254/0 DIVERGE, yarpgen300 294/0 DIVERGE (the 6 CTIMEOUT are a **pre-existing**
+optimizer/backend slow-compile on pathological yarpgen functions, not R4.2: proven with `ZCC_O0=1`
+s0007 12 s vs opt-on 259 s, and this change lives in `destruct`, after the optimizer — now the subject
+of **§CP, the compile-speed campaign**), determinism 86×8.
+
+**Banked WITH R4.2 (byte-identical compile-speed, §CP):** two O(n²)→O(n) fixes that leave codegen
+untouched — `sroa`'s iterated-frontier `ever`/`seen` Vec-scans became bitmaps, and `licm`'s
+per-hoist full-`Func` `refresh_defs` became a scoped `refresh_block_defs` over the two blocks a hoist
+changes. sqlite 217,160 insns UNCHANGED; the rest of the campaign (backend regalloc first) is planned
+in §CP, not started.
+
+### §CP — THE COMPILE-SPEED CAMPAIGN (opened 2026-08-25; a side campaign, orthogonal to R4)
+
+**Why.** Gating R4.2 surfaced **6 yarpgen CTIMEOUT** (compile > 300 s: s0007, s0025, s0035, s0075,
+s0231, s0228) where the fuzz suites are meant to be ~constant. Isolated to the OPTIMIZER + BACKEND,
+not R4.2 (that change is in `destruct`, after the optimizer; `ZCC_O0=1` compiles s0007 in **12 s**
+vs **259 s** opt-on). The trigger is a class of yarpgen function that is pathologically large — `init`
+in s0007 is **7,266 blocks / 27,999 values / 1,643 loops / 1,643 SROA pieces** (sqlite's largest is
+6,231 blocks / 59 loops / 328 pieces) — and several passes plus the register allocator are
+super-linear in one of those dimensions.
+
+**Goal (user, 2026-08-25):** MAINTAIN MAXIMUM OPTIMIZATION — no output change, no de-optimizing size
+cap. Replace every super-linear site with the right algorithm (N² → N log N → N), trading MEMORY for
+speed where it helps (bitsets, hash indices, incremental maps). The per-fix gate is **byte-identical
+`.s`** over a corpus: identical bytes ARE the proof that output speed/size are untouched (the dual of
+the refactor gate). A size cap that skips a pass is NOT allowed here — that is a different tool and it
+loses optimization.
+
+**Measured catalog (worst wall-time first; each fix must be byte-identical):**
+| site | cost class | fix (memory-for-speed) | output |
+|---|---|---|---|
+| **backend regalloc/isel** | s0025 is **~264 s of ~280 s** in the backend (HIR only ~16 s) — THE monster; profile first | TBD, profile Phase 0 | identical |
+| `cfg::run` (cfg-simplify) | ~4–5 s per big function, every round | TBD | identical |
+| `sroa` mem2reg DF construction | O(preds × domdepth × `df.contains`-Vec) | bitset frontier + Cytron IDF | identical |
+| `LoopForest::new` nesting | O(loops² × body) + per-header `vec![false;n]` | near-linear parent (of[]-based), reused scratch | identical |
+| `rotate::force` | O(iters × full CFG/dom/loop rebuild) | batch, or incremental invalidation | identical |
+| `licm` hoist scan | O(hoists × body) restart-scan | worklist, not restart | identical |
+| `scev::eval_fuel` | unmemoized, up to 2^16 per `eval` on DAGs (NOT s0007's dominant — iv/widen disabled and it stayed slow — but still exponential) | memoize `(ValueId, fuel)` | identical |
+| `sroa` `ever.contains` | **✅ SHIPPED 2026-08-25** — Vec→bitset, reused across pieces | — | identical |
+| `licm` `refresh_defs` | **✅ SHIPPED 2026-08-25** — full-`Func` per hoist → scoped to the two touched blocks (`refresh_block_defs`) | — | identical |
+
+**Shipped with R4.2 (byte-identical, "minor compile-speed" per the bank):** the two ✅ rows — `sroa`'s
+IDF `ever`/`seen` bitmaps and `licm`'s scoped `refresh_block_defs`. Verified output-neutral: sqlite
+**217,160 insns unchanged**, opt-parity 1552/0, torture 0 FAIL, determinism 86×8. On the suite they
+cut licm on yarpgen `test` from **10.7 s → 2.4 s** and dropped the CTIMEOUT count under a session's
+worth of guard experiments from **6 → 1** (s0025, backend-bound). NOT shipped: the large-function
+size guards trialed this session — they de-optimize and violate the campaign goal; the algorithm
+fixes above replace them.
+
+**Plan.** Phase 0: a compile-time profiler covering the BACKEND (isel/regalloc/emit), since s0025 is
+backend-bound. Phase 1: rank every super-linear site by measured wall-time, classify N²/N³/exp with
+its n. Phase 2: fix one at a time, each gated byte-identical `.s` + full correctness gate. Phase 3:
+re-measure yarpgen (target 0 CTIMEOUT) and sqlite compile time, with output provably unchanged.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

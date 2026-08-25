@@ -170,14 +170,25 @@ fn on(name: &str) -> bool {
 /// are simply never reached again (the same status a DCE'd value has).
 pub fn refresh_defs(f: &mut Func) {
     for bi in 0..f.blocks.len() {
-        for k in 0..f.blocks[bi].params.len() {
-            let p = f.blocks[bi].params[k];
-            f.values[p as usize].def = Def::Param(bi as BlockId, k as u32);
-        }
-        for i in 0..f.blocks[bi].insts.len() {
-            if let Some(d) = f.blocks[bi].insts[i].dst() {
-                f.values[d as usize].def = Def::Inst(bi as BlockId, i as u32);
-            }
+        refresh_block_defs(f, bi as BlockId);
+    }
+}
+
+/// Re-stamp the `Def` of every value one block defines. Moving an instruction
+/// between two blocks only invalidates those two — the source (every inst after
+/// the removed one shifts index) and the destination (the appended inst) — so a
+/// mover that knows them updates just those, not the whole function. `refresh_defs`
+/// over the entire `Func` after each single hoist was O(insts) PER hoist, minutes
+/// on a large function that hoists many invariants (yarpgen `test`).
+pub fn refresh_block_defs(f: &mut Func, bi: BlockId) {
+    let b = bi as usize;
+    for k in 0..f.blocks[b].params.len() {
+        let p = f.blocks[b].params[k];
+        f.values[p as usize].def = Def::Param(bi, k as u32);
+    }
+    for i in 0..f.blocks[b].insts.len() {
+        if let Some(d) = f.blocks[b].insts[i].dst() {
+            f.values[d as usize].def = Def::Inst(bi, i as u32);
         }
     }
 }
