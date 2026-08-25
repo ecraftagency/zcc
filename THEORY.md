@@ -158,9 +158,12 @@ target file (Side II); everything else is Side I.
 > under `hir::interp`/`mir::interp`, gated by `opt-parity` (passes off vs on, 0 DIVERGE) plus
 > torture/csmith300/yarpgen300. The R0 pipeline was `AST → HIR → isel → regalloc → frame →
 > layout → .s`; the passes below now sit between lowering and isel (HIR ladder) and between isel
-> and regalloc / after frame (MIR ladder). Still `⬜`: the HIR loop tail (iv / strength-reduce /
-> pointer-iv / LFTR, rotate / final-value / invariant-pure-call hoist) and two MIR rows
-> (`auto_inc` R3.2, `shrink_wrap` R3.3). The general theorems in the first table are
+> and regalloc / after frame (MIR ladder). The MIR ladder is COMPLETE (`auto_inc` R3.2 and
+> `shrink_wrap` R3.3 shipped 2026-08-25). Still `⬜`, all in the HIR loop tail: iv /
+> pointer-iv / LFTR, and rotate / final-value. Scalar strength-reduction (`mul`→`add` on an
+> induction variable) is CLOSED as Law-4 category-(a) rather than pending — the rewrite is
+> 1:1 static and an out-of-order core pipelines `mul` at ≈`add` cost, so it is null on every
+> target (REARCH §13c). The general theorems in the first table are
 > architecture-independent and survived the re-architecture unchanged — they are about how a
 > pass is PROVEN, not about what the IR is.
 
@@ -187,8 +190,14 @@ normalization, `pass/gvn.rs`) · `load_elim/dse` (gated by the alias oracle, `pa
 `licm` (unconditional at O1 — the ALLOCATOR owns pressure, not the pass, `pass/licm.rs`) · `if_convert`
 (diamond → select, `pass/ifconv.rs`) · `sink` (licm's dual — a pure trap-free instruction with one
 using block moves down to it; added at R3 because §13b ranked register pressure the largest residual,
-`pass/sink.rs`). ⬜ remaining — `iv/strength-reduction/pointer-iv/LFTR`, `rotate / final-value /
-invariant-pure-call hoist` (`pass/iv.rs`, `pass/loop.rs`).
+`pass/sink.rs`). `purity` (the INTERPROCEDURAL read-only predicate — gcc's `pure`, not `const`; an optimistic
+fixpoint over the call graph, which is what makes a recursive read-only callee read-only, since
+"performs a write" is existential over the body, `pass/purity.rs`) · `invariant pure-call hoist`
+(licm with a CALL as the hoisted term: same preheader, same invariance rule, plus two fences a
+scalar does not need — the loop must be MEMORY-CLEAN, because a read-only callee is a function OF
+the memory state, and the call must be proven to run on the first iteration anyway, because purity
+does not imply termination, `licm::hoist_call`).
+⬜ remaining — `iv/pointer-iv/LFTR`, `rotate / final-value` (`pass/iv.rs`).
 
 **The MIR pass ladder (REARCH §8):** pre-allocation on SSA — ✅ `cmp_elim` (value numbering over flag
 definitions: `subs`/`ands` for a following `cmp #0`, fusing only where the condition code survives —
@@ -196,8 +205,10 @@ definitions: `subs`/`ands` for a following `cmp #0`, fusing only where the condi
 rewritten to `mi`/`pl`; `mir/pass/cmpelim.rs`), ✅ `ext_lattice` (forward known-width dataflow — ONE
 pass replacing rc3's five text `sxtw` levers, `mir/pass/ext.rs`), ✅ `ldst_pair` (`ldp`/`stp`, runs
 LAST after frame/legalize so slots have numbers and displacements are final, `mir/pass/ldstp.rs`);
-⬜ `auto_inc` (pre/post-index). Post-allocation — ✅ block `layout` + branch relaxation, ✅ jump
-tables, ✅ STRUCTURED peephole on MIR (never on text); ⬜ `shrink_wrap`.
+✅ `auto_inc` (pre/post-index writeback, with the register-allocator TIE that makes the base and
+its writeback one value, `mir/pass/autoinc.rs`). Post-allocation — ✅ block `layout` + branch
+relaxation, ✅ jump tables, ✅ STRUCTURED peephole on MIR (never on text), ✅ `shrink_wrap`
+(callee-saved save/restore off the fast path, `mir/pass/shrink_wrap.rs`).
 gcc -O1 has no instruction scheduler and neither does this list.
 
 **5 classic passes → theorem (all DECIDABLE):**

@@ -330,8 +330,27 @@ the separate op-then-`cmp` only for the condition codes reading N/Z alone (§5.1
 which is the square's whole content; `ext_lattice` — an extension whose source
 already satisfies the width fact (§1.2) is the identity, and the fact is
 established only by instructions whose architectural definition establishes it;
-`ldst_pair` — §5.5. Each `⬜` row of §A7b (iv/LFTR, rotate, `auto_inc`,
-`shrink_wrap`) owes the same equality when it lands.
+`ldst_pair` — §5.5; `auto_inc` — a writeback addressing form denotes the access
+AND the base update, tied to one value so the two cannot be separated;
+`shrink_wrap` — the callee-saved contract of §2.2 holds on every path, not only
+on the one that saves.
+
+The **invariant pure-call hoist** is the one square in the ladder whose side
+conditions are not all visible to the interpreter, so it is worth stating
+separately. `⟦f⟧ = ⟦hoist f⟧` rests on three facts: the callee writes no memory
+(so moving the call moves no state change), nothing in the loop writes memory (so
+the callee — a function OF the memory state, not of its arguments alone — is the
+same function on every iteration), and the call is executed on the first
+iteration anyway (so the preheader performs no call the original did not). Only
+the first two are equalities a run can exhibit; the third is a claim about a
+program the transform must NOT create. It matters because §7 makes
+non-termination ⊥, and a square is silent at ⊥: hoisting a diverging call onto a
+path that never took it would be invisible here and fatal in a real program. It
+is therefore discharged STRUCTURALLY — by dominance and by an evaluation of the
+loop's entry test — rather than by execution, and `pass/tests.rs` pins the
+refusals (`a_pure_call_is_not_speculated_into_a_loop_that_may_not_run`,
+`a_break_before_the_call_keeps_it_in`) as well as the fires. Each `⬜` row of
+§A7b (iv/LFTR, rotate, final-value) owes the same equality when it lands.
 
 ### 6.3 `⟦hir⟧ = ⟦mir_v⟧` (instruction selection) and `⟦mir_v⟧ = ⟦mir_p⟧` (allocation)
 `src/isel/tests.rs` and `src/regalloc/tests.rs`. The second is a **renaming

@@ -24,6 +24,14 @@
 #       factor exec geomean but never hidden. Closing them is #24 (SCEV/loop-DCE).
 #   (b) DISTRIBUTION reported, not just the geomean — worst program, median, count>1.1x.
 #       Parity means no systematic loss on ANY class, not just on-average.
+#   (c) SYMMETRY (2026-08-25) — the zcc-ZEROED bucket, the exact mirror of (a). Once zcc
+#       kills a loop gcc keeps (the invariant pure-call hoist), zcc≈0ms against a gcc of
+#       hundreds of ms. That is an ASYMPTOTIC win and belongs in a named bucket for the
+#       same reason an asymptotic loss does: folding a ratio of 0.006 — or of 0, whose
+#       log is -inf and which silently printed the geomean as 0.0000 — into a
+#       CONSTANT-FACTOR geomean does not measure a constant factor. The rule is one rule
+#       applied both ways: a side whose time is below GCC_FAST is unmeasurable at ms
+#       granularity, so the pair leaves the geomean and is reported by name.
 #
 # Clean-input law: every case is correctness-gated (gcc stdout == zcc stdout) before it
 # is timed; a mismatch is reported DIVERGE, never silently skipped.
@@ -36,7 +44,8 @@ GCC_FAST=5    # gcc <this ms ⟹ wall-time unmeasurable (startup-dominated)
 ZCC_SLOW=15   # zcc >=this ms while gcc is fast ⟹ gcc-zeroed (real asymptotic gap)
 
 rows=/tmp/geo40_rows.$$; zeroed=/tmp/geo40_zeroed.$$; allinsn=/tmp/geo40_insn.$$
-: > "$rows"; : > "$zeroed"; : > "$allinsn"
+zzero=/tmp/geo40_zzero.$$
+: > "$rows"; : > "$zeroed"; : > "$allinsn"; : > "$zzero"
 skip=0; diverge=0
 
 insns() { grep -cE '^[[:space:]]+[a-z]' "$1" 2>/dev/null || echo 0; }
@@ -75,6 +84,12 @@ for c in "$SUITE"/*.c; do
     fi
     continue
   fi
+  if [ "$zmin" -lt "$GCC_FAST" ]; then
+    # The mirror of the gcc-ZEROED case: zcc killed work gcc still performs.
+    printf "%-22s %8s %8d %8s %8s\n" "$b" "$ir" "$gmin" "~0" "ZCC-ZEROED"
+    echo "$b $gmin $ir" >> "$zzero"
+    continue
+  fi
   er=$(awk "BEGIN{printf \"%.3f\", $zmin/$gmin}")
   printf "%-22s %8s %8d %8d %8s\n" "$b" "$ir" "$gmin" "$zmin" "$er"
   echo "$b $er" >> "$rows"
@@ -101,6 +116,11 @@ if [ "$zc" -gt 0 ]; then
   echo "gcc-ZEROED (gcc-O1 killed the loop; asymptotic = #24 SCEV/loop-DCE) — insn ratio still deterministic:"
   while read -r nm ms ir; do printf "  %-20s zcc=%sms vs gcc≈0  (insn %s)\n" "$nm" "$ms" "$ir"; done < "$zeroed"
 fi
+zz=$(wc -l < "$zzero" | tr -d ' ')
+if [ "$zz" -gt 0 ]; then
+  echo "zcc-ZEROED (zcc killed the loop gcc-O1 keeps; asymptotic WIN, kept out of the geomean):"
+  while read -r nm ms ir; do printf "  %-20s gcc=%sms vs zcc≈0  (insn %s)\n" "$nm" "$ms" "$ir"; done < "$zzero"
+fi
 echo "(skipped $skip trivial, $diverge DIVERGE)"
 echo "PARITY = exec≈1.0 AND insn≈1.0 AND flat distribution AND gcc-zeroed bucket EMPTY."
-rm -f "$rows" "$zeroed" "$allinsn"
+rm -f "$rows" "$zeroed" "$allinsn" "$zzero"

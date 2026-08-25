@@ -22,8 +22,16 @@
 // which dominates the whole body, so a use inside the loop is still dominated by
 // a definition placed there.
 use super::*;
+use std::collections::HashSet;
 
 pub fn run(f: &mut Func) -> bool {
+    run_with(f, &HashSet::new())
+}
+
+/// `readonly` is the interprocedural purity set (`pass/purity.rs`). When it is
+/// empty this is exactly the pass above; when it is not, a CALL becomes a
+/// hoistable term too — see `hoist_call` for the four fences that licence it.
+pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
     let mut changed = false;
     // Preheaders first: creating one changes the CFG, so the analyses are rebuilt
     // afterwards and the motion itself runs on a stable graph.
@@ -80,8 +88,274 @@ pub fn run(f: &mut Func) -> bool {
             refresh_defs(f);
             changed = true;
         }
+        while hoist_call(f, &c, &dt, &lf, li, pre, readonly) {
+            changed = true;
+        }
     }
     changed
+}
+
+// ── the invariant PURE-CALL hoist (REARCH §13c row 1) ──────────────────────
+//
+// COMMUTING SQUARE. Moving `x = g(a₁…aₙ)` from a loop body to its preheader
+// preserves ⟦f⟧ when four things hold, and none of them is assumed:
+//
+//   (1) PURITY — `g` is read-only (`pass/purity.rs`): the call itself writes
+//       nothing, so executing it earlier changes no state. Its RESULT still
+//       depends on memory, which is what fence (3) is for.
+//   (2) INVARIANCE — every argument's definition dominates the preheader, so the
+//       call is applied to the same arguments on every iteration. Exactly the
+//       rule the scalar hoist above uses, for exactly the same reason.
+//   (3) MEMORY-CLEAN — no instruction anywhere in the loop writes memory (the
+//       only calls left in it are themselves read-only). A read-only function is
+//       a function OF the memory state, so equal arguments give equal results
+//       only while that state is fixed; a single store in the loop would break
+//       the equality and no dominance argument would notice.
+//   (4) GUARANTEED EXECUTION — the call runs on the first iteration anyway, so
+//       running it in the preheader adds no execution that the original did not
+//       perform. This is the fence that stops a fault or a non-terminating
+//       callee from being speculated onto a path that never took it, and it is
+//       three conditions at once: the loop is entered at least once (the header
+//       test, evaluated on the entry edge, selects a body block); the call's
+//       block dominates every latch (the first iteration cannot reach the back
+//       edge without it); and it dominates every other block the loop can be
+//       left from (the first iteration cannot escape without it either). The
+//       header is excused from the last, because leaving THERE is the loop test
+//       the ≥1-trip condition has already decided.
+//
+// Non-termination deserves its own line, because purity does not imply it. If
+// something in the loop could diverge BEFORE the call, hoisting would turn a
+// hang into whatever the callee does. Fence (4) plus the memory-clean fence
+// leave only two ways to diverge ahead of the call — another call, or a nested
+// loop — so both are refused among the blocks that may precede it. A FAULT ahead
+// of the call needs no fence: a first iteration that faults is undefined
+// behaviour (C99 6.5.3.2p4), and undefined behaviour licences any continuation.
+/// `ZCC_RESIDUAL=1` names, per refused loop, WHICH fence refused it. Law 4 asks
+/// for the residual of every shipped theorem — the sites where it could fire and
+/// did not — and answering that by reading the pass is exactly the guesswork Law
+/// 2 forbids. Read once: the fences run per loop, and an environment lookup in
+/// that position would be a measurement that changes what it measures.
+pub fn residual_wanted() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_RESIDUAL").is_ok())
+}
+
+fn hoist_call(
+    f: &mut Func,
+    c: &dom::Cfg,
+    dt: &dom::DomTree,
+    lf: &dom::LoopForest,
+    li: usize,
+    pre: BlockId,
+    readonly: &HashSet<String>,
+) -> bool {
+    if readonly.is_empty() {
+        return false;
+    }
+    let resid = residual_wanted();
+    let mut note = |why: &str| {
+        if resid {
+            let n: usize = lf.loops[li]
+                .body
+                .iter()
+                .map(|&b| {
+                    f.blocks[b as usize]
+                        .insts
+                        .iter()
+                        .filter(|i| matches!(i, Inst::Call { callee: Callee::Direct(x), .. } if readonly.contains(x)))
+                        .count()
+                })
+                .sum();
+            if n > 0 {
+                eprintln!("RESIDUAL refused {} ({} candidate calls)", why, n);
+            }
+        }
+    };
+    let header = lf.loops[li].header;
+    let depth = lf.loops[li].depth;
+    let latches = lf.loops[li].latches.clone();
+    let mut inloop = vec![false; f.blocks.len()];
+    for &b in &lf.loops[li].body {
+        inloop[b as usize] = true;
+    }
+    // (3) memory-clean, over the WHOLE body: a store after the call changes what
+    // the NEXT iteration's call would have read.
+    for &b in &lf.loops[li].body {
+        for inst in &f.blocks[b as usize].insts {
+            match inst.effect() {
+                Effect::Pure | Effect::Read => {}
+                _ => match inst {
+                    Inst::Call { callee: Callee::Direct(n), sret: None, .. }
+                        if readonly.contains(n) => {}
+                    _ => {
+                        note("memory-clean");
+                        return false;
+                    }
+                },
+            }
+        }
+    }
+    // (4b) the loop is entered at least once.
+    if !enters_body(f, c, pre, header, &inloop) {
+        note("trip-count");
+        return false;
+    }
+    // The FIRST call in the body, in reverse postorder. Within one iteration the
+    // body is acyclic (back edges only reach the header), so reverse postorder
+    // is an execution order: nothing that may run before this call is a call.
+    let mut site = None;
+    'scan: for &b in c.rpo.iter().filter(|&&b| inloop[b as usize]) {
+        for i in 0..f.blocks[b as usize].insts.len() {
+            if matches!(f.blocks[b as usize].insts[i], Inst::Call { .. }) {
+                site = Some((b, i));
+                break 'scan;
+            }
+        }
+    }
+    let (b, i) = match site {
+        Some(x) => x,
+        None => return false,
+    };
+    // (4c) the first iteration cannot finish WITHOUT the call: every way onward
+    // from the body passes through it. There are exactly two ways onward — round
+    // the back edge, or out of the loop — so every latch and every EXITING block
+    // must be dominated by the call's block. The header is excused from the
+    // second: its exit is the loop test, and (4b) has just shown that test lets
+    // the first iteration in.
+    //
+    // This is deliberately weaker than "the header is the only exit", which is
+    // what a first cut writes. Measured on sqlite, that stronger form refused
+    // 1,123 of 1,816 candidate loops — every loop carrying a `break` or an early
+    // `return` after the call — and every one of them was a Law-4 category-(b)
+    // truncation rather than a boundary, since a `break` REACHED through the
+    // call proves the call ran.
+    if !latches.iter().all(|&l| dt.dominates(b, l)) {
+        note("conditional-call");
+        return false;
+    }
+    for &x in &lf.loops[li].body {
+        if x == header || dt.dominates(b, x) {
+            continue;
+        }
+        let exits = match &f.blocks[x as usize].term {
+            Term::Ret(_) | Term::Unreachable => true,
+            t => t.succs().iter().any(|&s| !inloop[s as usize]),
+        };
+        if exits {
+            note("early-exit-before-call");
+            return false;
+        }
+    }
+    // No nested loop among the blocks that may precede the call: a block the
+    // call dominates certainly runs after it, and every other body block may run
+    // before it.
+    for &x in &lf.loops[li].body {
+        if !dt.dominates(b, x) && lf.depth[x as usize] != depth + 1 {
+            note("nested-loop-before");
+            return false;
+        }
+    }
+    // (2) invariance
+    let inst = f.blocks[b as usize].insts[i].clone();
+    let mut ok = true;
+    inst.uses(|o| {
+        if let Operand::Val(v) = o {
+            let db = match f.values[v as usize].def {
+                Def::FuncParam(_) => return,
+                Def::Inst(x, _) | Def::Param(x, _) => x,
+            };
+            if !dt.dominates(db, pre) {
+                ok = false;
+            }
+        }
+    });
+    if !ok {
+        note("variant-args");
+        return false;
+    }
+    f.blocks[b as usize].insts.remove(i);
+    f.blocks[pre as usize].insts.push(inst);
+    refresh_defs(f);
+    true
+}
+
+/// Does control reach a block INSIDE the loop the first time the header runs?
+///
+/// The header's parameters are bound to the arguments the preheader's edge
+/// carries, the header's own instructions are constant-folded under that
+/// binding, and the terminator is then read. This is a one-iteration
+/// interpretation, not a range analysis: it answers the question the ≥1-trip
+/// fence asks (`for (k = 0; k < 800; k++)`) and returns false whenever the entry
+/// test is not decidable, which is the safe answer.
+fn enters_body(f: &Func, c: &dom::Cfg, pre: BlockId, header: BlockId, inloop: &[bool]) -> bool {
+    let args = match &f.blocks[pre as usize].term {
+        Term::Jmp(t) if t.block == header => t.args.clone(),
+        _ => return false,
+    };
+    if args.len() != f.blocks[header as usize].params.len() {
+        return false;
+    }
+    let mut known: Vec<Option<Operand>> = vec![None; f.values.len()];
+    for (k, &p) in f.blocks[header as usize].params.iter().enumerate() {
+        known[p as usize] = resolve(f, c, pre, args[k], 4);
+    }
+    fn get(known: &[Option<Operand>], o: Operand) -> Operand {
+        match o {
+            Operand::Val(v) => known[v as usize].unwrap_or(o),
+            k => k,
+        }
+    }
+    for inst in &f.blocks[header as usize].insts {
+        let mut cl = inst.clone();
+        cl.uses_mut(|o| *o = get(&known, *o));
+        if let (Some(d), Some(r)) = (cl.dst(), fold::fold_inst(&cl)) {
+            if !matches!(r, Operand::Val(_)) {
+                known[d as usize] = Some(r);
+            }
+        }
+    }
+    match &f.blocks[header as usize].term {
+        // No test here at all: reaching the header IS reaching the body.
+        Term::Jmp(t) => inloop[t.block as usize],
+        Term::Br(cond, t, e) => match get(&known, *cond) {
+            Operand::Imm(k) => inloop[(if k != 0 { t } else { e }).block as usize],
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The constant `o` denotes on entry to `blk`, seeing through block parameters
+/// whose incoming arguments all agree. `fuel` bounds the walk; a preheader that
+/// forwards the header's parameters (the one `preheaders` builds) needs one
+/// level, and nothing sensible needs four.
+fn resolve(f: &Func, c: &dom::Cfg, blk: BlockId, o: Operand, fuel: u32) -> Option<Operand> {
+    let v = match o {
+        Operand::Val(v) => v,
+        k => return Some(k),
+    };
+    if fuel == 0 {
+        return None;
+    }
+    let k = f.blocks[blk as usize].params.iter().position(|&p| p == v)?;
+    let mut got: Option<Operand> = None;
+    if c.preds[blk as usize].is_empty() {
+        return None;
+    }
+    for &p in &c.preds[blk as usize] {
+        for t in f.blocks[p as usize].term.targets() {
+            if t.block != blk {
+                continue;
+            }
+            let r = resolve(f, c, p, *t.args.get(k)?, fuel - 1)?;
+            match got {
+                None => got = Some(r),
+                Some(x) if x == r => {}
+                _ => return None,
+            }
+        }
+    }
+    got
 }
 
 fn hoistable(

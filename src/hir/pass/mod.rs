@@ -18,6 +18,7 @@ pub mod ifconv;
 pub mod inline;
 pub mod licm;
 pub mod mem;
+pub mod purity;
 #[cfg(test)]
 mod tests;
 pub mod sccp;
@@ -42,8 +43,13 @@ pub fn run_module(m: &mut Module) {
 /// &f;`). HIR has no view of the data segment, so the caller supplies it — and
 /// without it the inliner would delete a function the linker still needs.
 pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String>) {
+    // The purity set is INTERPROCEDURAL, so it is computed on the module and
+    // handed to the per-function ladder rather than rediscovered inside it. It
+    // is recomputed after inlining, which changes both the call graph and the
+    // set of functions.
+    let ro = readonly(m);
     for f in m.funcs.iter_mut() {
-        run(f);
+        run_with(f, &ro);
     }
     // Inlining is the one INTERPROCEDURAL row, so it runs between two
     // intra-procedural sweeps rather than inside one: the callee must already be
@@ -51,13 +57,31 @@ pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String
     // folded), and the caller must be re-optimized afterwards, because a call
     // replaced by a body is exactly the shape the other rows feed on.
     if on("inline") && inline::run_module(m, pinned) {
+        let ro = readonly(m);
         for f in m.funcs.iter_mut() {
-            run(f);
+            run_with(f, &ro);
         }
     }
 }
 
+fn readonly(m: &Module) -> std::collections::HashSet<String> {
+    match on("purecall") {
+        true => {
+            let r = purity::readonly_functions(m);
+            if licm::residual_wanted() {
+                eprintln!("RESIDUAL readonly={} of {}", r.len(), m.funcs.len());
+            }
+            r
+        }
+        false => std::collections::HashSet::new(),
+    }
+}
+
 pub fn run(f: &mut Func) {
+    run_with(f, &std::collections::HashSet::new())
+}
+
+pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     // Critical edges are split once, up front: sccp and gvn both want to place a
     // value on an edge, and a critical edge offers nowhere to put it.
     dom::split_critical_edges(f);
@@ -83,7 +107,7 @@ pub fn run(f: &mut Func) {
             changed |= ifconv::run(f);
         }
         if on("licm") {
-            changed |= licm::run(f);
+            changed |= licm::run_with(f, ro);
         }
         if on("sink") {
             changed |= sink::run(f);

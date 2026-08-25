@@ -775,3 +775,173 @@ fn sink_keeps_a_faulting_computation_where_it_was() {
     );
     square(ok, 42);
 }
+
+// ── the invariant pure-call hoist (REARCH §13c row 1) ──────────────────────
+
+/// Calls left anywhere inside a loop body — the structure the hoist removes.
+fn calls_in_loops(f: &Func) -> usize {
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    lf.loops
+        .iter()
+        .flat_map(|l| l.body.iter())
+        .map(|&b| {
+            f.blocks[b as usize]
+                .insts
+                .iter()
+                .filter(|i| matches!(i, Inst::Call { .. }))
+                .count()
+        })
+        .sum()
+}
+
+/// The summing helper every case below calls: read-only (it stores nothing) and
+/// big enough that the inliner leaves it alone, so what the batteries observe is
+/// the hoist and not β-reduction.
+const SUM: &str = "int g(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}";
+
+#[test]
+fn an_invariant_pure_call_leaves_the_loop() {
+    let src = format!(
+        "{}int main(void){{int a[4];a[0]=1;a[1]=2;a[2]=3;a[3]=4;\
+         int k,s=0;for(k=0;k<10;k++)s+=g(a,4);return s;}}",
+        SUM
+    );
+    let after = module(&src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "main")),
+        0,
+        "g(a,4) reads memory nothing in the loop writes, so it is computed once"
+    );
+    square(&src, 100);
+}
+
+#[test]
+fn a_pure_call_is_not_hoisted_across_a_store() {
+    // The memory-clean fence. `g` is still read-only, and its ARGUMENTS are
+    // still invariant — but the loop writes the array it reads, so the call is a
+    // different function of state on every iteration.
+    let src = format!(
+        "{}int main(void){{int a[2];a[0]=1;a[1]=2;int k,s=0;\
+         for(k=0;k<5;k++){{s+=g(a,2);a[0]=a[0]+1;}}return s;}}",
+        SUM
+    );
+    let after = module(&src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "main")),
+        1,
+        "a store in the loop kills the hoist"
+    );
+    square(&src, 25);
+}
+
+#[test]
+fn an_impure_call_is_not_hoisted() {
+    // The purity fence. Hoisting this would run the counter's increment once
+    // instead of five times — a visible change, not an optimization.
+    let src = "static int c;int g(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];c=c+1;return s;}\
+               int main(void){int a[2];a[0]=1;a[1]=2;int k,s=0;\
+               for(k=0;k<5;k++)s+=g(a,2);return s+c;}";
+    let after = module(src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "main")),
+        1,
+        "g writes a global, so it is not read-only"
+    );
+    square(src, 20);
+}
+
+#[test]
+fn a_pure_call_is_not_speculated_into_a_loop_that_may_not_run() {
+    // The ≥1-trip fence. The bound is a parameter, so the entry test is not
+    // decidable, and running `g` in the preheader would call it on a path the
+    // program never takes — where it may fault or never return.
+    let src = format!(
+        "{}int h(int *a,int m){{int k,s=0;for(k=0;k<m;k++)s+=g(a,2);return s;}}\
+         int main(void){{int a[2];a[0]=1;a[1]=2;return h(a,0)+42;}}",
+        SUM
+    );
+    let after = module(&src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "h")),
+        1,
+        "an unknown trip count refuses the hoist"
+    );
+    square(&src, 42);
+}
+
+#[test]
+fn a_conditional_pure_call_is_not_hoisted() {
+    // The guaranteed-execution fence. The call's block does not dominate the
+    // latch, so the first iteration can close without it.
+    let src = format!(
+        "{}int h(int *a,int m){{int k,s=0;for(k=0;k<10;k++){{if(k>m)s+=g(a,2);}}return s;}}\
+         int main(void){{int a[2];a[0]=1;a[1]=2;return h(a,4);}}",
+        SUM
+    );
+    let after = module(&src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "h")),
+        1,
+        "a call under a condition stays under it"
+    );
+    square(&src, 15);
+}
+
+#[test]
+fn purity_survives_recursion() {
+    // The fixpoint starts optimistic, which is what makes a read-only RECURSIVE
+    // function read-only: "performs a write" is an existential over the body, so
+    // a cycle with no writing instruction in it never writes.
+    let src = "int g(int *p,int n){if(n<=0)return 0;return p[n-1]+g(p,n-1);}\
+               int main(void){int a[3];a[0]=1;a[1]=2;a[2]=3;int k,s=0;\
+               for(k=0;k<7;k++)s+=g(a,3);return s;}";
+    let after = module(src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "main")),
+        0,
+        "a recursive read-only callee is still read-only"
+    );
+    square(src, 42);
+}
+
+#[test]
+fn a_break_after_the_call_still_lets_it_out() {
+    // The exit-dominance fence, on its permissive side. The loop leaves through
+    // a `break` that only the call's own block can reach, so an iteration that
+    // breaks has already made the call — and computing it in the preheader adds
+    // no execution.
+    let src = format!(
+        "{}int h(int *a,int m){{int k,s=0;for(k=0;k<10;k++){{s+=g(a,2);if(s>m)break;}}return s;}}\
+         int main(void){{int a[2];a[0]=1;a[1]=2;return h(a,7);}}",
+        SUM
+    );
+    let after = module(&src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "h")),
+        0,
+        "an exit the call dominates does not block the hoist"
+    );
+    square(&src, 9);
+}
+
+#[test]
+fn a_break_before_the_call_keeps_it_in() {
+    // The same fence, on its refusing side: this loop can leave BEFORE ever
+    // reaching the call, so hoisting would speculate it onto a path the program
+    // never takes. The difference from the case above is the order, and the
+    // dominance test is what sees it.
+    let src = format!(
+        "{}int h(int *a,int m){{int k,s=0;for(k=0;k<10;k++){{if(k>m)break;s+=g(a,2);}}return s;}}\
+         int main(void){{int a[2];a[0]=1;a[1]=2;return h(a,3);}}",
+        SUM
+    );
+    let after = module(&src, true);
+    assert_eq!(
+        calls_in_loops(func(&after, "h")),
+        1,
+        "an exit ahead of the call keeps it inside"
+    );
+    square(&src, 12);
+}
