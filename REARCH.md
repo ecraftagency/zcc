@@ -483,6 +483,12 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 The excess histogram is the worklist: attack the largest class with one proof-carrying lever, re-measure,
 repeat until every class is residual-fundamental. Predict on MIR before building — always.
 
+**Planned in full at §13n** (2026-08-25, on the zero-pending compiler): four steps — R4.1 SSA
+reconstruction after spilling, R4.2 Boissinot coalescing, R4.3 truncation-as-rename, R4.4 re-judge
+`csel` — each with its execution site, the prediction to take BEFORE building, its KPI and its gate.
+Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
+subsystem, the allocator**; the loop rows have reached everything they can.
+
 ### R5 — the O2 headroom stack (§16)
 User principle (2026-08-24): "to reach 1× we must stack enough technique to reach 0.5×, and keep 0.5×
 as headroom" — O1 parity must be reached with margin, not asymptotically. R5 pulls the §16 shelf in
@@ -1247,6 +1253,63 @@ which was the asymptotic gap final-value was meant to finish; and a WEAKER form 
 accumulator while the loop keeps running would save one `add` per loop, not an order of growth.
 
 **R2 and R3 now have zero pending rows.**
+
+---
+
+## §13n R4 PLAN — measured worklist and the four steps, each with its execution / measurement / gate
+
+Re-taken on the zero-pending compiler (`10fc699`), because §13b's histogram predates rotation,
+coalescing, block threading and the isel fold — and this session twice showed that acting on a stale
+baseline aims at the wrong layer.
+
+### The excess, today. sqlite zcc **237,025** vs gcc-O1 **157,074** = **1.509×**, excess **79,951**
+| class | zcc | gcc | excess | share |
+|---|---|---|---|---|
+| `mov` | 52,755 | 33,608 | **+19,147** | 24% |
+| `ldr` | 41,322 | 22,332 | **+18,990** | 24% |
+| `str` | 17,569 | 9,462 | **+8,107** | 10% |
+| `csel` | 4,498 | 542 | +3,956 | 5% — JUDGEMENT, not excess: zcc if-converts more, and the exec number says yes |
+| `cmp` | 10,200 | 6,973 | +3,227 | 4% |
+| `sub` · `sxtw` · `cset` | | | +2,376 | 3% |
+
+`ldr` + `str` = **+27,097, 34% of all excess**. `mov` = 24%. **Together 58%, and both are the
+allocator.** Everything the loop rows could reach is now reached; what is left is one subsystem.
+
+Two decompositions that make the steps concrete:
+- **spill traffic** — frame `[sp]` accesses: `ldr` **22,421** + `str` **12,298** + `ldp`/`stp` 9,899.
+  So over half of all `ldr` is a RELOAD.
+- **copies** — of 52,755 `mov`: `x,x` **27,425** · `w,w` **16,870** · `,zr` 8,302 · other 158. The
+  `w,w` half is where the TRUNCATION movs live (a 64-bit value narrowed then read wide again — the
+  width-typed vreg cannot say "same register, narrower name").
+
+### The four steps
+Each is one commit. **Execution** = what changes. **Prediction** = made on the model BEFORE building
+(Law 3: `.s` confirms, never discovers). **Gate** = cargo + the layer's own square + opt-parity +
+torture + csmith300 + yarpgen300 + determinism. **Measurement** = `corpus25.sh` for the histogram
+and `exectime.sh` PAIRED IN ONE SESSION (`ZCC_NOPASS=…` for the other arm) reported as the
+distribution over the ≥30 ms subset, never as a lone geomean.
+
+| # | step | execution | prediction to make first | KPI |
+|---|---|---|---|---|
+| **R4.1** | **SSA reconstruction after spilling** — the §14 deviation, and the single largest named item. A reload's register is used only inside the block that made it, so a value live in five blocks is reloaded five times: one reload per BLOCK-RESIDENCY instead of one per program REGION (Braun 2013) | `regalloc/spill.rs` | count reloads whose value is ALREADY in a register in a dominating block — that number IS the ceiling, and it is measured before a line is written | frame `ldr` ≪ 22,421; `ldr` excess ≪ +18,990 |
+| **R4.2** | **Aggressive coalescing** (Boissinot) on the residual biased colouring leaves | `regalloc/color.rs` | classify the 44,295 reg-reg movs into edge copies / call-argument setup / truncation; only the first is Boissinot's | `mov` excess ≪ +19,147 |
+| **R4.3** | **Truncation as a rename** — the `w,w` 16,870. Needs the block-parameter WIDTH rule relaxed first, so a narrower read of the same register is expressible | `mir/mod.rs` width rule, then `regalloc/destruct.rs` | how many `w,w` movs have a source that is never read wider — §15c's own trap, and it is a FIXPOINT question, not a local one | `mov w,w` ≪ 16,870 |
+| **R4.4** | **Re-judge `csel`** — +3,956 is deliberate over-if-conversion. It bought the branch; whether it still does after rotation changed the branch cost is an EXEC question that has not been re-asked since | `hir/pass/ifconv.rs` threshold | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number |
+
+### Order, and why
+R4.1 first: largest item, and its fix is already NAMED in §14 rather than needing design. R4.2 second
+— it is independent, and §13f showed coalescing pays twice over because it unblocks block threading.
+R4.3 third: it needs a width-rule change that is easier to review once the allocator is otherwise
+settled. R4.4 last and cheap — a measurement, possibly a one-constant change.
+
+### Two standing cautions, both earned this session
+1. **Expect exec and insn to come apart.** j2_histogram regressed at IDENTICAL instruction count, and
+   IV widening removed an instruction for exactly zero time. Spill traffic is memory ops in the hot
+   path so it SHOULD move both — but that is a prediction to test, not to assume.
+2. **The allocator is where the nastiest defects live** (§15b: the truncating self-move, the zero
+   register as a copy partner). Both were found by a checker at the layer that owns the invariant,
+   not by a suite three layers away. Any R4 step that weakens an allocator invariant adds its
+   verifier check in the same commit.
 
 ---
 
