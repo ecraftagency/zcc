@@ -1687,74 +1687,12 @@ in §CP, not started.
 
 ### §CP — THE COMPILE-SPEED CAMPAIGN (opened 2026-08-25; a side campaign, orthogonal to R4)
 
-**Why.** Gating R4.2 surfaced **6 yarpgen CTIMEOUT** (compile > 300 s: s0007, s0025, s0035, s0075,
-s0231, s0228) where the fuzz suites are meant to be ~constant. Isolated to the OPTIMIZER + BACKEND,
-not R4.2 (that change is in `destruct`, after the optimizer; `ZCC_O0=1` compiles s0007 in **12 s**
-vs **259 s** opt-on). The trigger is a class of yarpgen function that is pathologically large — `init`
-in s0007 is **7,266 blocks / 27,999 values / 1,643 loops / 1,643 SROA pieces** (sqlite's largest is
-6,231 blocks / 59 loops / 328 pieces) — and several passes plus the register allocator are
-super-linear in one of those dimensions.
-
-**Goal (user, 2026-08-25):** MAINTAIN MAXIMUM OPTIMIZATION — no output change, no de-optimizing size
-cap. Replace every super-linear site with the right algorithm (N² → N log N → N), trading MEMORY for
-speed where it helps (bitsets, hash indices, incremental maps). The per-fix gate is **byte-identical
-`.s`** over a corpus: identical bytes ARE the proof that output speed/size are untouched (the dual of
-the refactor gate). A size cap that skips a pass is NOT allowed here — that is a different tool and it
-loses optimization.
-
-**FIRST, THE BUILD FACT (Law-2 measurement exception).** Every alarming compile number this session
-was a **debug** zcc. `tests/box.sh` / `tests/fullsuite.sh` build the musl ELF debug; debug Rust is
-**~9× slower**. Measured in-box (aarch64 musl), sqlite `-O1 -S`, byte-identical output (217,160 insns):
-**debug 112 s → RELEASE 12 s**; old-main (rc3) debug was ALSO 112 s (no branch regression). The 6
-yarpgen "CTIMEOUT" seeds: debug 259–300 s → **release 36–56 s, 0 CTIMEOUT**. gcc-O1 in-box = 7 s, so
-release zcc is **1.7× gcc**. **Rule: TIME with a release zcc.** So §CP is a POLISH (12 s → ~7 s), not
-a fire — but the quadratics below are real and DO scale the 12 s.
-
-**MEASURED phase profile (RELEASE, `ZCC_TIME=1`, phase totals over the whole module):**
-
-| phase | sqlite -O1 (~12 s) | s0025 -O1 (~29 s) | share |
-|---|---|---|---|
-| **`regalloc` (of which `spill`)** | **6.7 s (spill 6.1 s)** | **18.6 s (spill 18.5 s)** | **51 % / 64 %** |
-| `hir::pass` (the HIR optimizer) | 3.2 s | 7.4 s | 27 % / 25 % |
-| `mir::pass` | 0.7 s | 3.3 s | 6 % / 11 % |
-| isel · emit · frame · verify · cfg · domtree | each < 0.2 s | each < 0.03 s | negligible |
-
-**The spiller is HALF the compile.** `regalloc::spill::spill_with` (`src/regalloc/spill.rs`, 1495 lines)
-is #1 by a wide margin on BOTH real code and the fuzzer monster — its `for _ in 0..bound` fixpoint
-re-runs an O(function) decision over `BTreeSet`s (log-factor everywhere), so it is at least
-O(bound × n log n). That is Phase-0's first target, ahead of everything HIR.
-
-**Measured catalog (worst wall-time first; each fix must be byte-identical):**
-| site | cost class | fix (memory-for-speed) | output |
-|---|---|---|---|
-| **`regalloc::spill::spill_with`** | **#1 — 51 % (sqlite) / 64 % (s0025)**; `for _ in 0..bound` fixpoint × O(n) BTreeSet work | bound the fixpoint / dirty-worklist; BTreeSet→bitset/Vec where order is not needed | identical |
-| `hir::pass` (the optimizer, all rounds) | #2 — 27 %; the sroa/rotate/licm/scev O(n²) sites below live here | the rows below | identical |
-| `mir::pass` | #3 — 6–11 % | profile which MIR pass | identical |
-| `sroa` mem2reg DF construction | O(preds × domdepth × `df.contains`-Vec) | bitset frontier + Cytron IDF | identical |
-| `LoopForest::new` nesting | O(loops² × body) + per-header `vec![false;n]` | near-linear parent (of[]-based), reused scratch | identical |
-| `rotate::force` | O(iters × full CFG/dom/loop rebuild) | batch, or incremental invalidation | identical |
-| `licm` hoist scan | O(hoists × body) restart-scan | worklist, not restart | identical |
-| `scev::eval_fuel` | unmemoized, up to 2^16 per `eval` on DAGs | memoize `(ValueId, fuel)` | identical |
-| `sroa` `ever.contains` | **✅ SHIPPED 3894fb5** — Vec→bitset, reused across pieces | — | identical |
-| `licm` `refresh_defs` | **✅ SHIPPED 3894fb5** — full-`Func` per hoist → scoped `refresh_block_defs` | — | identical |
-
-**Baseline table (RELEASE, in-box, sqlite `-O1 -S`):** gcc 7 s · **zcc 12 s (1.7×)** · target **≤ 7–10 s**
-(user's sufficiency bar). The two shipped fixes are IN this 12 s; the spiller is where the next ~5 s is.
-
-**Shipped with R4.2 (byte-identical, "minor compile-speed" per the bank):** the two ✅ rows — `sroa`'s
-IDF `ever`/`seen` bitmaps and `licm`'s scoped `refresh_block_defs`. Verified output-neutral: sqlite
-**217,160 insns unchanged**, opt-parity 1552/0, torture 0 FAIL, determinism 86×8. On the suite they
-cut licm on yarpgen `test` from **10.7 s → 2.4 s** and dropped the CTIMEOUT count under a session's
-worth of guard experiments from **6 → 1** (s0025, backend-bound). NOT shipped: the large-function
-size guards trialed this session — they de-optimize and violate the campaign goal; the algorithm
-fixes above replace them.
-
-**Plan.** Phase 0 (profiler) and Phase 1 (rank by measured wall-time) are **DONE** — the pipeline's
-existing `ZCC_TIME=1` phase timers gave the table above, no new instrument needed; run any release zcc
-with `ZCC_TIME=1` and `awk` the `[time]` lines per phase. **Phase 2 (not started — the user plans it):**
-fix one site at a time, worst-first, so **`regalloc::spill::spill_with`** is the first target; each fix
-gated **byte-identical `.s`** over a corpus (proves output untouched) + full correctness gate; trade
-memory for speed. Phase 3: re-measure release sqlite (target ≤ 7–10 s) and yarpgen, output unchanged.
+**Moved to `CP.md`** (transient working doc, the compile-speed twin of `OPT.md`). The full campaign —
+why, the debug-vs-release build fact, the measured phase profile, the shipped 3894fb5 fixes, and the
+CP2.x algorithm ladder (spiller-first) — lives there and is edited in place there while it runs.
+`CP.md` is DELETED when the campaign closes; its durable results cook back here (final baseline) and
+into `THEORY.md` (any load-bearing algorithm). One-line status: **Phases 0–1 DONE (profiled, ranked);
+Phase 2 = the CP2.x ladder, NOT started, spiller `spill_with` is target #1 at 51–64 % of compile.**
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

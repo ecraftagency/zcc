@@ -193,9 +193,14 @@ impl LoopForest {
             }
         }
         let mut loops: Vec<Loop> = Vec::new();
+        // CP2.6 (compile-speed): one `mark` scratch reused across headers instead
+        // of a fresh `vec![false; n]` per loop — the backward walk touches only a
+        // loop's own body, so clearing exactly `body` afterward restores it to
+        // all-false in O(body), turning the O(loops × n) allocation into O(Σbody).
+        // Same body sets, byte-identical.
+        let mut mark = vec![false; n];
         for (h, latches) in headers {
             let mut body = vec![h];
-            let mut mark = vec![false; n];
             mark[h as usize] = true;
             let mut work = Vec::new();
             for &l in &latches {
@@ -213,6 +218,9 @@ impl LoopForest {
                         work.push(p);
                     }
                 }
+            }
+            for &b in &body {
+                mark[b as usize] = false;
             }
             loops.push(Loop {
                 header: h,

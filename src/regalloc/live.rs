@@ -121,29 +121,42 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
         });
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        // reverse RPO converges fastest for a backward problem
-        for &b in cfg.rpo.iter().rev() {
-            let b = b as usize;
-            let mut out = BTreeSet::new();
-            for t in f.blocks[b].term.targets() {
-                out.extend(live_in[t.block as usize].iter().copied());
-                for a in &t.args {
-                    out.insert(sp.idx(*a));
+    // CP2.2 (compile-speed): a predecessor-worklist instead of a `while changed`
+    // round-robin over every block each sweep. The problem is monotone with a
+    // unique least fixpoint, so visit ORDER does not change the answer — only the
+    // number of visits. A block is recomputed only when a successor's `live_in`
+    // grew (a backward problem: `live_out[b]` reads `live_in[succ]`), so on a
+    // change to `live_in[b]` its predecessors are re-queued. Seeded in reverse
+    // RPO, the order that converged fastest under the old sweep. Byte-identical.
+    let mut inq = vec![true; n];
+    let mut wl: std::collections::VecDeque<usize> =
+        cfg.rpo.iter().rev().map(|&b| b as usize).collect();
+    while let Some(b) = wl.pop_front() {
+        inq[b] = false;
+        let mut out = BTreeSet::new();
+        for t in f.blocks[b].term.targets() {
+            out.extend(live_in[t.block as usize].iter().copied());
+            for a in &t.args {
+                out.insert(sp.idx(*a));
+            }
+        }
+        // a computed goto has successors but carries no arguments
+        for &s in &cfg.succs[b] {
+            out.extend(live_in[s as usize].iter().copied());
+        }
+        let mut inn = uses[b].clone();
+        inn.extend(out.iter().filter(|i| !defs[b].contains(i)).copied());
+        if out != live_out[b] {
+            live_out[b] = out;
+        }
+        if inn != live_in[b] {
+            live_in[b] = inn;
+            for &p in &cfg.preds[b] {
+                let p = p as usize;
+                if !inq[p] {
+                    inq[p] = true;
+                    wl.push_back(p);
                 }
-            }
-            // a computed goto has successors but carries no arguments
-            for &s in &cfg.succs[b] {
-                out.extend(live_in[s as usize].iter().copied());
-            }
-            let mut inn = uses[b].clone();
-            inn.extend(out.iter().filter(|i| !defs[b].contains(i)).copied());
-            if out != live_out[b] || inn != live_in[b] {
-                live_out[b] = out;
-                live_in[b] = inn;
-                changed = true;
             }
         }
     }

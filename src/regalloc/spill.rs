@@ -96,10 +96,17 @@ pub fn spill_with(
         }
     }
     evict_params(f, &slot_of);
+    // CP2.1 (compile-speed): the CFG's TOPOLOGY is invariant across the fixpoint
+    // — a round only adds slots and rewrites block-arg lists / appends spills
+    // (`ensure_slot`, `evict_params`), never a terminator's target block — so the
+    // edge set, RPO and predecessor lists are the same every round. Build it once.
+    // Liveness DOES change each round (a value newly memory-resident stops being
+    // live) so it is recomputed inside the loop; `simulate`'s `linear_positions`
+    // likewise re-reads the (now longer) instruction lists off the same CFG.
+    let cfg = crate::mir::verify::cfg(f);
     let plan = {
         let mut plan = None;
         for _ in 0..bound {
-            let cfg = crate::mir::verify::cfg(f);
             let lv = live::compute(f, &cfg);
             match simulate(f, &lv, &cfg, &spilled, cross_cap)? {
                 Sim::Plan(p) => {

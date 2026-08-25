@@ -402,10 +402,23 @@ impl LoopScev {
     /// bound costs nothing and turns a corrupted IR into a refusal rather than a
     /// hang.
     pub fn eval(&self, f: &Func, o: Operand) -> Option<AddRec> {
-        self.eval_fuel(f, o, 16)
+        // CP2.5 (compile-speed): a per-call memo. `eval_fuel` fans out into BOTH
+        // operands of every Add/Sub, so a value shared between the two subtrees
+        // was re-evaluated on each path — up to 2^fuel evaluations on a diamond
+        // DAG. Caching (value, fuel) within ONE top-level eval collapses that to
+        // linear. Scoped to the call, not a struct field, so a change to `ivs`
+        // during `analyze` can never return a stale hit: byte-identical.
+        let mut memo = HashMap::new();
+        self.eval_fuel(f, o, 16, &mut memo)
     }
 
-    fn eval_fuel(&self, f: &Func, o: Operand, fuel: u32) -> Option<AddRec> {
+    fn eval_fuel(
+        &self,
+        f: &Func,
+        o: Operand,
+        fuel: u32,
+        memo: &mut HashMap<(ValueId, u32), Option<AddRec>>,
+    ) -> Option<AddRec> {
         if let Some(a) = self.leaf(f, o) {
             return Some(a);
         }
@@ -416,10 +429,26 @@ impl LoopScev {
         if let Some(a) = self.ivs.get(&v) {
             return Some(*a);
         }
+        if let Some(cached) = memo.get(&(v, fuel)) {
+            return *cached;
+        }
+        let r = self.eval_step(f, v, fuel, memo);
+        memo.insert((v, fuel), r);
+        r
+    }
+
+    fn eval_step(
+        &self,
+        f: &Func,
+        v: ValueId,
+        fuel: u32,
+        memo: &mut HashMap<(ValueId, u32), Option<AddRec>>,
+    ) -> Option<AddRec> {
         let ty = f.ty_of(v);
         match self.def_inst(f, v)? {
             Inst::Bin { op: BinOp::Add, a, b, .. } => {
-                let (x, y) = (self.eval_fuel(f, *a, fuel - 1)?, self.eval_fuel(f, *b, fuel - 1)?);
+                let (x, y) =
+                    (self.eval_fuel(f, *a, fuel - 1, memo)?, self.eval_fuel(f, *b, fuel - 1, memo)?);
                 // At most one symbolic term: `base1 + base2` is not in the form.
                 let base = match (x.base, y.base) {
                     (None, b) => b,
@@ -434,7 +463,8 @@ impl LoopScev {
                 })
             }
             Inst::Bin { op: BinOp::Sub, a, b, .. } => {
-                let (x, y) = (self.eval_fuel(f, *a, fuel - 1)?, self.eval_fuel(f, *b, fuel - 1)?);
+                let (x, y) =
+                    (self.eval_fuel(f, *a, fuel - 1, memo)?, self.eval_fuel(f, *b, fuel - 1, memo)?);
                 // Subtracting a symbolic term would need it negated, which the
                 // form has no room for.
                 if y.base.is_some() {
@@ -449,8 +479,8 @@ impl LoopScev {
             }
             Inst::Bin { op: BinOp::Mul, a, b, .. } => {
                 let (x, k) = match (*a, *b) {
-                    (p, Operand::Imm(k)) => (self.eval_fuel(f, p, fuel - 1)?, k),
-                    (Operand::Imm(k), p) => (self.eval_fuel(f, p, fuel - 1)?, k),
+                    (p, Operand::Imm(k)) => (self.eval_fuel(f, p, fuel - 1, memo)?, k),
+                    (Operand::Imm(k), p) => (self.eval_fuel(f, p, fuel - 1, memo)?, k),
                     _ => return None,
                 };
                 self.scale(x, k, ty)
@@ -460,7 +490,7 @@ impl LoopScev {
             // rather than folded to zero.
             Inst::Bin { op: BinOp::Shl, a, b, .. } => match *b {
                 Operand::Imm(k) if k >= 0 && (k as u32) < ty.bits() => {
-                    let x = self.eval_fuel(f, *a, fuel - 1)?;
+                    let x = self.eval_fuel(f, *a, fuel - 1, memo)?;
                     self.scale(x, 1i64 << k, ty)
                 }
                 _ => None,
@@ -473,7 +503,7 @@ impl LoopScev {
             // limitation to route around.
             Inst::Cvt { op: op @ (CvtOp::Sext | CvtOp::Zext), from, a, .. } => {
                 let signed = matches!(op, CvtOp::Sext);
-                let x = self.eval_fuel(f, *a, fuel - 1)?;
+                let x = self.eval_fuel(f, *a, fuel - 1, memo)?;
                 // Two independent licences, and either suffices. The exit test
                 // bounds the counter by its TYPE (`find_nowrap`) — which works
                 // with a symbolic bound and is the one that fires in real code —

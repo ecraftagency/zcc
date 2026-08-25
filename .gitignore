@@ -4,3 +4,11 @@ chat.txt
 tests/__pycache__/
 /ref/
 .opt-notes/
+/scratchpad/
+*.o
+/big_gcc
+/big_licm
+/big_zcc
+/sieve_gcc
+/sieve_licm
+/sieve_zcc
