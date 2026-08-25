@@ -138,7 +138,7 @@ pub fn spill_with(
         }
     };
     let n = spilled.len();
-    ceiling_report(f, &plan);
+    ceiling_report(f, &plan, &remat);
     apply(f, plan, &spilled, &remat, &web, web_slot, slot_of);
     drop_redundant_spills(f);
     check_pressure(f)?;
@@ -183,8 +183,8 @@ pub fn spill_with(
 /// apart and never added into the prediction.
 ///
 /// Columns: `name total dom-ceiling same-block-repeat in-loop all-preds
-/// some-preds all-preds-in-loop`.
-fn ceiling_report(f: &MFunc, plan: &Plan) {
+/// some-preds all-preds-in-loop remat`.
+fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("ZCC_SPILLCEIL").is_some()) {
@@ -207,6 +207,10 @@ fn ceiling_report(f: &MFunc, plan: &Plan) {
         .collect();
     let (mut tot, mut ceil, mut rep, mut tot_l) = (0usize, 0usize, 0usize, 0usize);
     let (mut all_p, mut some_p, mut all_p_l) = (0usize, 0usize, 0usize);
+    // how many of the reloads are REMATERIALIZATIONS (a `movz`/`adrp`/frame
+    // address recomputed) rather than frame loads — the spiller's cost model
+    // calls these free, and the histogram says they are 14,393 `movz`
+    let mut rm = 0usize;
     for (bi, rs) in plan.reloads.iter().enumerate() {
         let inloop = lf.depth[bi] > 0;
         let preds = &cfg.preds[bi];
@@ -222,6 +226,7 @@ fn ceiling_report(f: &MFunc, plan: &Plan) {
             let all = first && !preds.is_empty() && np == preds.len();
             let some = first && np > 0 && np < preds.len();
             tot += 1;
+            rm += remat.contains_key(&v) as usize;
             ceil += dom as usize;
             rep += !first as usize;
             tot_l += inloop as usize;
@@ -232,8 +237,8 @@ fn ceiling_report(f: &MFunc, plan: &Plan) {
     }
     if tot > 0 {
         eprintln!(
-            "SPILLCEIL {} {} {} {} {} {} {} {}",
-            f.name, tot, ceil, rep, tot_l, all_p, some_p, all_p_l
+            "SPILLCEIL {} {} {} {} {} {} {} {} {}",
+            f.name, tot, ceil, rep, tot_l, all_p, some_p, all_p_l, rm
         );
     }
 }

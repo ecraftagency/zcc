@@ -491,9 +491,13 @@ repeat until every class is residual-fundamental. Predict on MIR before building
 reconstruction after spilling, R4.2 Boissinot coalescing, R4.3 truncation-as-rename, R4.4 re-judge
 `csel` — each with its execution site, the prediction to take BEFORE building, its KPI and its gate.
 **R4.1 ✅ BANKED** (§13n): reload copies carried across edges, no SSA reconstruction needed after all
-— sqlite 237,025 → 232,214, **1.509× → 1.478×**, full gate green. Its Law-4 residual is measured and
-NOT exhausted: 61.5% of the remaining reloads are in loops, unreachable until the carry gets a
-fixpoint across back edges. Next ⬜ R4.2.
+— sqlite 237,025 → 232,214, **1.509× → 1.478×**, full gate green.
+**RE-PLANNED 2026-08-25 (user)** after the R4.2 prediction inverted the row's premise: the excess was
+re-decomposed by ROOT CAUSE on the R4.1 compiler and is now twelve rows R4.1–R4.12 in §13n, each with
+its evidence, site, the prediction to take first and its KPI. The two largest are the ABI family the
+first plan had no row for: truncation self-moves at ABI boundaries (12,570 insns, 16.7% of the gap,
+every one a no-op under AAPCS64 §6.4.2) and a colourer rule that forbids a parallel-copy destination
+from taking its own dying source (2.22 movs per call vs gcc 1.00). Next ⬜ **R4.2**.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
 
@@ -1264,7 +1268,7 @@ accumulator while the loop keeps running would save one `add` per loop, not an o
 
 ---
 
-## §13n R4 PLAN — measured worklist and the four steps, each with its execution / measurement / gate
+## §13n R4 PLAN — measured worklist and the steps, each with its execution / measurement / gate (re-planned 2026-08-25)
 
 Re-taken on the zero-pending compiler (`10fc699`), because §13b's histogram predates rotation,
 coalescing, block threading and the isel fold — and this session twice showed that acting on a stale
@@ -1290,25 +1294,75 @@ Two decompositions that make the steps concrete:
   `w,w` half is where the TRUNCATION movs live (a 64-bit value narrowed then read wide again — the
   width-typed vreg cannot say "same register, narrower name").
 
-### The four steps
-Each is one commit. **Execution** = what changes. **Prediction** = made on the model BEFORE building
-(Law 3: `.s` confirms, never discovers). **Gate** = cargo + the layer's own square + opt-parity +
-torture + csmith300 + yarpgen300 + determinism. **Measurement** = `corpus25.sh` for the histogram
-and `exectime.sh` PAIRED IN ONE SESSION (`ZCC_NOPASS=…` for the other arm) reported as the
-distribution over the ≥30 ms subset, never as a lone geomean.
+### The steps — RE-PLANNED 2026-08-25 (user: "re-plan R4 carefully, we are still far from 1×")
 
-| # | step | execution | prediction to make first | KPI |
+The first plan had four steps aimed at "the allocator". R4.1 banked and the R4.2 prediction inverted
+its premise (below), so the whole excess was re-decomposed by ROOT CAUSE rather than by mnemonic,
+on the R4.1 compiler (`bb7ae52`), sqlite **232,214** vs gcc-O1 **157,074**, gap **75,140**, and the
+35-program exec suite read program by program. Every number here is from the `.s` or from a
+read-only instrument (`ZCC_SPILLCEIL`, `ZCC_MOVKIND`, `ZCC_COALESCE`), never reasoned.
+
+**What the re-decomposition found, in one table.** The gap is BROAD, not concentrated: the top 10
+functions hold 27.9% of it, the top 80 only 53.9%, and the bulk of gcc's instruction mass sits at
+1.3–1.5×. So it is a per-function tax paid by several independent mechanisms, and no single lever
+reaches 1×. Ranked by measured size × certainty ÷ cost:
+
+| # | root cause | evidence on sqlite | site | exec programs it owns |
 |---|---|---|---|---|
-| **R4.1** | **SSA reconstruction after spilling** — the §14 deviation, and the single largest named item. A reload's register is used only inside the block that made it, so a value live in five blocks is reloaded five times: one reload per BLOCK-RESIDENCY instead of one per program REGION (Braun 2013) | `regalloc/spill.rs` | count reloads whose value is ALREADY in a register in a dominating block — that number IS the ceiling, and it is measured before a line is written | frame `ldr` ≪ 22,421; `ldr` excess ≪ +18,990 |
-| **R4.2** | **Aggressive coalescing** (Boissinot) on the residual biased colouring leaves | `regalloc/color.rs` | classify the 44,295 reg-reg movs into edge copies / call-argument setup / truncation; only the first is Boissinot's | `mov` excess ≪ +19,147 |
-| **R4.3** | **Truncation as a rename** — the `w,w` 16,870. Needs the block-parameter WIDTH rule relaxed first, so a narrower read of the same register is expressible | `mir/mod.rs` width rule, then `regalloc/destruct.rs` | how many `w,w` movs have a source that is never read wider — §15c's own trap, and it is a FIXPOINT question, not a local one | `mov w,w` ≪ 16,870 |
-| **R4.4** | **Re-judge `csel`** — +3,956 is deliberate over-if-conversion. It bought the branch; whether it still does after rotation changed the branch cost is an EXEC question that has not been re-asked since | `hir/pass/ifconv.rs` threshold | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number |
+| a | **ABI-boundary truncation self-moves** — a 64-bit name copied into a fixed argument/return register at 32 bits, or a call result read back narrow. `dst == src` makes the windmill see a cycle and route it through x16/v31 | `mov x16,xN ; mov wN,w16` **4,208 pairs, all before a `bl`** (8,416 insns) + `mov wN,wN` 4,906: 3,462 after a call, 692 before `ret`, 720 other. **12,570 insns = 16.7% of the gap**, every one a no-op: AAPCS64 §6.4.2/§6.8.2 leave the bits above an argument's or result's type width UNSPECIFIED, so the reader reads `wN` and the truncation has no observer | `regalloc/destruct.rs` `nop()` + `isel` call-result width | f2 (`fmov d31,d0; fmov d0,d31`, the FP twin), every `bl` in the suite |
+| b | **Parallel-copy destinations may not take their own dying source's register.** `color.rs` frees dying operands only AFTER an instruction's definitions are placed — correct for an ordinary instruction, and deliberately extended to `ParallelCopy` "at the cost of one register". The real cost is one `mov` per pair: a destination may not take ANOTHER pair's dying source, but taking ITS OWN is exactly the copy disappearing | every function copies its arguments out of x0–x7 at entry (`mov x3,x0; mov w4,w1; mov w5,w2`, ≈3 per function, ≈5.9k); **2.22 register movs per call vs gcc 1.00** (27,501 before 12,378 `bl` vs 11,949 before 11,901); ABI copies 36,911 of the 55,338 surviving | `regalloc/color.rs` walk (the "Free colours only AFTER" rule), `live.rs` is already right | e2 (8 entry movs in `mix`), e3, every call site |
+| c | **Constants materialized per use.** HIR carries constants as `Operand::Imm`, not values, so isel mints a `MovImm` at every use that does not fold; nothing shares them across blocks. NOT the spiller: only 891 of 12,370 reloads are rematerializations (7.2%) | `movz/movn` 14,393 of which **9,035 repeat** an immediate already materialized in the same function; `mov ,zr` 8,282 of which **7,050 repeat**. zcc 22,675 immediates vs gcc ≈12,720: **+9,955** | new MIR pass `const_share` (dominator-scoped GVN of `MovImm`/`Adrp`; the spiller's remat already handles pressure) | f2 (1024.0 re-built every iteration, gcc loads it once), j5 (`movz #1; cmp; movz #1`) |
+| d | **Booleans materialized, then branched.** `&&`/`\|\|` in a condition become a VALUE (`select`), then `br(value)`; and `select c,1,0` is emitted as `movz #1 ; csel` instead of `cset` | pure-boolean `csel w,w,wzr` **3,707** (each with its `movz #1`); `csel/cset → cbnz` 669 vs gcc 9; `cbnz` 10,878 vs 7,066 while `b.cond` 5,463 vs 6,822 and `ccmp` 0 vs 621 — zcc branches on bools, gcc on flags | `hir/pass/cfg.rs` thread `br(select c,k1,k2)` → `br c`; `isel` `cset`/`csinc`/`csneg` rows; `ccmp` chains (§17) | **j5 2.87×** (`cmp; movz; csel; cbnz` per iteration vs `cmp; ble`), f5-shape loops, d4 (`csneg`) |
+| e | **Returns not merged, frames not folded, dead slots kept.** Every return path duplicates the epilogue; every function carries a frame even when every local was promoted; `sub sp` / `add sp` are separate instructions where gcc folds them into `stp x29,x30,[sp,-N]!` / `ldp …,[sp],N` | extra `ret` per function **1,928 vs gcc 317**; `add sp,sp` 3,807; **289 leaf functions with a frame and zero `[sp]` references** (promoted allocas keep their slot: `f1` has 4 locals → `sub sp,#32`); 1,879 of 1,892 functions adjust sp vs 1,616 of 1,883 for gcc | HIR `unify_ret` (single exit block, one parameter); `mir/pass/frame.rs` drop unreferenced slots + pre/post-index fold of the adjust into the first/last save pair | every leaf in the suite (`isort`, `find`, `prefix`, `revbits`: 2 insns each) |
+| f | **§17's ✔ marks are claims, not measurements.** Rows marked "exhausted" are measurably not firing | `ldrsh` **0 vs 492**, `ldrsb` 0 vs 111, `ldrsw` 29 vs 329, standalone `sxth` 687 vs 90, `uxtb/uxth` 516 vs 0 (a `w`-form load already zero-extends); `tst` 0 vs 489 (`cmpelim` fuses only when the `cmp` is the NEXT instruction, and only `and`+`cmp #0`); `fmov #imm8` never emitted (`isa::fp_imm8` is dead code — the build warns); `csneg/csinc` absent; shifted-operand fold not commuted (`lsl w1; orr w1,w1,w3` where gcc `orr w0,w3,w0,lsl 1`); `cmp` with a constant LEFT operand materializes it (`movz w0,#1; cmp w0,w3`); `tbz` 326 vs 1,721; `sbfiz` 0 vs 477 | `isel/lower.rs` munch table, `mir/pass/cmpelim.rs`, `ext_lattice` | **j3 1.92×** (`add x1,x1,w5,sxtw` on the loop-carried chain: 2-cycle latency where `ldrsw` + `add` is 1 — identical instruction COUNT, double the time), **f2 1.8×** (`movz; fmov d,x` GPR→FPR transfer per constant), h2 1.28×, d4 |
+| g | **Spill traffic, what R4.1 left.** Residency restarts at every loop header because the latch is unsimulated when the header is walked; spill stores sit at the definition whether or not any path reloads | frame `ldr` 17,052 vs 7,765 (**+9,287**), frame `str` 12,239 vs 4,956 (**+7,283**) = 22%; 12,370 reloads of which **7,607 (61.5%) inside loops**; dom-ceiling 3,485; `sqlite3VdbeExec` alone 15,484 vs 6,041 (2.56×) | `regalloc/spill.rs` entry-set fixpoint across back edges; spill-store placement at the eviction frontier rather than the definition | the suite cannot see this row at all (no function spills); sqlite only |
+| h | **Redundant loads across blocks.** HIR GVN numbers pure expressions only; a load repeated in a dominated block with no intervening store is loaded again | non-frame `ldr` 18,964 vs 14,567 (**+4,397**); j5 loads `p[j]` in the condition and again in the body | `hir/pass/gvn.rs` memory-aware value numbering (dominator walk, kill on store/call by alias class) — gcc's FRE | **j5** (second load on the hot path) |
+| i | **Edge-copy coalescing** (the old R4.2, now measured) | 16,778 param/arg pairs: 11,848 already one colour, **4,782 FREE**, 148 BOUND | `regalloc/color.rs` Boissinot merge on the FREE residual | — |
+| j | **Loops that refuse rotation, and a store that stays in the loop.** A header carrying ANY C label is refused (`rotate.rs:129` tests `labels`, where only ADDRESS-TAKEN labels pin a block — `pinned()` already knows the difference); the early-`return`-in-body shape is refused for a reason not yet traced (the pass prints no residual — a Law-4 gap in itself); a loop-invariant global read+written every iteration is not promoted to a register | d3/`f1` not rotated (2 branches per iteration), d4/`f4` not rotated; i1 `ldr x5,[x0]; add; str x4,[x0]` per iteration where gcc keeps `gsum` in x2 | `hir/pass/rotate.rs` (labels → `pin`, residual print, then the early-return shape); LICM store motion (`-ftree-loop-im`, an O1 feature) | **d3 1.97×**, d4 1.40×, i1 1.30× |
+| k | `csel` re-judge | 4,498 vs 542 — re-ask AFTER (d), which removes the boolean `csel`s | `hir/pass/ifconv.rs` | — |
+
+**Arithmetic, stated honestly.** Predicted ceilings, lower…upper: (a) 12,570 certain · (b) 8k…20k
+(measure first: pairs whose source dies at the copy and whose colours differ) · (c) 6k…12k · (d)
+5k…7k · (e) 4k…6k · (f) 3k…5k · (g) 4k…8k · (h) 3k…4.4k · (i) 2k…4.8k · (j)/(k) exec rows, size
+small. Lower bounds sum to ≈47k of the 75,140 gap; upper bounds to ≈84k — but the rows OVERLAP (an
+x16 pair is also a "mov before `bl`"; a `movz #1` is both a repeated constant and a boolean), so the
+sum is not a forecast. The forecast is made one row at a time, on the model, before each build, and
+the histogram is re-taken after each bank. What the table does establish: **the gap is explained
+by named mechanisms with named sites, none of them fundamental**, and the suite's every loss above
+1.3× has a row that owns it. The user's R5 principle (reach 1× with 0.5× of headroom) still needs the
+§16 shelf on top of this; R4 alone is not expected to reach 1× on sqlite with margin.
+
+**The two axes come apart here, and the plan says so.** The 35-program suite has no function that
+spills, so rows (g) and (i) are invisible to it, and R4.1 moved its geomean by exactly nothing. The
+suite's losses are (d), (f), (h), (j) — isel, control-flow and memory shapes — and j3 is the proof
+that instruction count and time are different quantities on this machine. Both are reported after
+every row, paired, in one session, as a distribution.
+
+| # | step | execution | prediction to take FIRST | KPI | status |
+|---|---|---|---|---|---|
+| **R4.1** | reload copies carried across edges | `regalloc/spill.rs` | ceiling band [3,425 , 9,849] | frame `ldr` ≪ 22,421 | ✅ 232,214, frame `ldr` 17,052 |
+| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k | ⬜ |
+| **R4.3** | **A parallel-copy destination takes its own dying source** (b). Amend the "free AFTER" rule: at a `ParallelCopy`, a destination may take the register of the source of ITS OWN pair when that source dies here; the simultaneity argument forbids only the other pairs' sources. `color::check` already asserts no two live values share a colour, so the proof obligation is met by the existing checker | `regalloc/color.rs` walk | count pairs `(d ← s)` with `s` dying at the copy and `colour(d) ≠ colour(s)` — that number is the ceiling; report it split entry / call / other | movs before `bl` per call → ≈1.0 (gcc 1.00); entry copies ≈ 0 | ⬜ |
+| **R4.4** | **returns merged, dead slots dropped, frame adjust folded** (e) | HIR `unify_ret`; `mir/pass/frame.rs` | extra `ret` 1,928 → ≤ 400; 289 leaf frames → 0; `sub sp` count → ≈ number of functions with no save pair | sqlite −4k…−6k | ⬜ |
+| **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ⬜ |
+| **R4.6** | **constants shared** (c): dominator-scoped `MovImm`/`Adrp` sharing on MIR, before spilling; the spiller's remat decides pressure | new `mir/pass/const_share.rs` | repeats 16,085 minus what R4.5 removes = the ceiling; realistic target zcc immediates → ≈ gcc's 12.7k | `movz+movn+mov,zr` ≤ 14k; **f2 exec** | ⬜ |
+| **R4.7** | **§17 verified, row by row** (f): extending loads (`ldrsb/ldrsh/ldrsw`, and prefer the extension in the LOAD over the ALU operand when the value feeds a loop-carried chain — the j3 latency fact, recorded as a cost-model caveat since `cost = \|MIR\|` cannot see it), `cmpelim` across non-flag-writing instructions and `and`+`cmp` → `tst`, `fmov #imm8`, `csneg/csinc`, shifted-operand commute, constant-LHS `cmp` commute, `tbz` for sign/bit tests, `sbfiz`. Each row: its count vs gcc BEFORE, its battery, its count AFTER — the ✔ becomes a number | `isel/lower.rs`, `cmpelim.rs`, `ext_lattice` | the per-mnemonic table above | each mnemonic within ±10% of gcc; **j3, f2, h2, d4 exec** | ⬜ |
+| **R4.8** | **spill, second pass** (g): entry-set fixpoint across back edges (carry into loop headers); spill-store placement at the eviction frontier | `regalloc/spill.rs` | `ZCC_SPILLCEIL` in-loop 7,607 and dom-ceiling 3,485 are the reload ceiling; for stores, count spilled definitions with a path that never reloads | frame `ldr` ≪ 17,052, frame `str` ≪ 12,239 | ⬜ |
+| **R4.9** | **memory-aware GVN** (h) — FRE | `hir/pass/gvn.rs` + alias classes from `effects()` | count loads whose address was loaded in a dominating block with no clobbering store/call between — measured before a line is written, like R4.1 | non-frame `ldr` → ≈ gcc's 14,567; **j5 exec** | ⬜ |
+| **R4.10** | **Boissinot merge** on the FREE residual (i) | `regalloc/color.rs` | 4,782 | edge copies ≪ 9,332 | ⬜ |
+| **R4.11** | **rotation residual + store motion** (j): `rotate.rs` tests `pin`, not `labels`; add the refusal-reason residual print; trace and lift the early-return shape; LICM store motion for a loop-invariant address with no aliasing access | `hir/pass/rotate.rs`, `hir/pass/licm.rs` | residual print first — the count of refused loops per reason IS the prediction | **d3, d4, i1 exec**; sqlite branch count | ⬜ |
+| **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ⬜ |
 
 ### Order, and why
-R4.1 first: largest item, and its fix is already NAMED in §14 rather than needing design. R4.2 second
-— it is independent, and §13f showed coalescing pays twice over because it unblocks block threading.
-R4.3 third: it needs a width-rule change that is easier to review once the allocator is otherwise
-settled. R4.4 last and cheap — a measurement, possibly a one-constant change.
+Certainty × size ÷ cost. R4.2 is a Side-II fact with a counted ceiling and a `nop` predicate; R4.3
+is a one-rule change in the colourer whose checker already exists; together they are the ABI family,
+the largest class the R4.2 prediction found and the one the first plan had no row for. R4.4 is
+mechanical. R4.5–R4.7 are the suite's losses and are cheap per row. R4.8–R4.10 are the allocator's
+second pass and need the first three banked so the histogram they are aimed at is real. R4.11 is
+where the exec suite's remaining >1.3× programs live; R4.12 is a measurement. **One commit per row,
+the full gate each, the histogram re-taken each, `.s` confirms and never discovers.** A row whose
+measured prediction comes in under 20% of its stated ceiling gets one push, then the quarantine mark
+and the next row — the no-pivot contract binds.
 
 ### R4.1 — BANKED. sqlite **237,025 → 232,214**, 1.509× → **1.478×**
 
@@ -1371,7 +1425,7 @@ header is, and nothing is carried across a back edge — residency restarts ever
 needs a fixpoint over the loop. **R4.1 is therefore NOT exhausted**, and the follow-up belongs in this
 row rather than in a new one.
 
-### R4.2 PREDICTION — taken before building, and it INVERTS the row's premise
+### The prediction that forced the re-plan (taken as "R4.2" under the first plan; its findings are rows R4.2, R4.3 and R4.10 above)
 
 §13n's R4.2 row says the prediction to take first is "classify the 44,295 reg-reg movs into edge
 copies / call-argument setup / truncation; only the first is Boissinot's". Taken (`ZCC_MOVKIND=1` in
