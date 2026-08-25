@@ -325,12 +325,16 @@ Programs"), Boissinot et al. 2009 (fast liveness / out-of-SSA), Braun et al. 201
 1. **Liveness** (`live.rs`): iterative backward dataflow on SSA with block parameters (a target's
    argument is a use on the edge). Cheap enough; Boissinot's dominance-based variant is an optional
    later optimization.
-2. **Spilling** (`spill.rs`) — Braun-Hack, per register class. **As built (R2.2), with
-   two deviations recorded here rather than left implicit:** SSA RECONSTRUCTION is absent
-   because it is not needed — a reload's fresh register is used only inside the block that
-   created it, so its live range is dominated by its definition; and a spilled BLOCK
-   PARAMETER is removed from the IR rather than stored at its definition, since its
-   definition is the block head. One slot per SSA WEB (parameter ∪ its arguments), merged
+2. **Spilling** (`spill.rs`) — Braun-Hack, per register class. **As built (R2.2, entry sets
+   widened at R4.1), with two deviations recorded here rather than left implicit:** SSA
+   RECONSTRUCTION is absent because it is not needed. Through R3 that held because a reload's
+   register never left the block that created it. Since **R4.1** a reload copy is carried into
+   the successors, but only where EVERY predecessor holds that same copy — and a copy has one
+   definition, so that condition says every path to the use runs through the definition, which
+   IS dominance. The use is dominated by its definition for the same reason as before, with no
+   block parameter and no renaming; `mir::verify` re-derives it after every spill in debug
+   builds. The second deviation is unchanged: a spilled BLOCK PARAMETER is removed from the IR
+   rather than stored at its definition, since its definition is the block head. One slot per SSA WEB (parameter ∪ its arguments), merged
    only where the members do not interfere:
    - Walk blocks in dominance order. For each block compute the entry set `W_entry` (≤ k values) from
      the predecessors' exit sets, preferring values with the nearest next use (loop-aware next-use
@@ -486,6 +490,10 @@ repeat until every class is residual-fundamental. Predict on MIR before building
 **Planned in full at §13n** (2026-08-25, on the zero-pending compiler): four steps — R4.1 SSA
 reconstruction after spilling, R4.2 Boissinot coalescing, R4.3 truncation-as-rename, R4.4 re-judge
 `csel` — each with its execution site, the prediction to take BEFORE building, its KPI and its gate.
+**R4.1 ✅ BANKED** (§13n): reload copies carried across edges, no SSA reconstruction needed after all
+— sqlite 237,025 → 232,214, **1.509× → 1.478×**, full gate green. Its Law-4 residual is measured and
+NOT exhausted: 61.5% of the remaining reloads are in loops, unreachable until the carry gets a
+fixpoint across back edges. Next ⬜ R4.2.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
 
@@ -1302,6 +1310,67 @@ R4.1 first: largest item, and its fix is already NAMED in §14 rather than needi
 R4.3 third: it needs a width-rule change that is easier to review once the allocator is otherwise
 settled. R4.4 last and cheap — a measurement, possibly a one-constant change.
 
+### R4.1 — BANKED. sqlite **237,025 → 232,214**, 1.509× → **1.478×**
+
+**The ceiling was measured first, and it is the reason the step is small.** `ZCC_SPILLCEIL=1`
+(read-only, in `spill.rs`) reported on the pre-change compiler: 18,764 planned reloads in 189
+functions, of which **9,849 (52.5%)** had the same value already reloaded in a STRICTLY DOMINATING
+block — the loose bound, which ignores whether the register file can hold the copy that far — and
+**3,425 (18.3%)** were still resident at the exit of EVERY predecessor, the bound that a
+block-boundary reconciliation can actually reach. The prediction was therefore a band,
+`[3,425 , 9,849]` fewer reloads, not a number. **Measured: −5,288 frame `ldr`, net −4,811
+instructions** — inside the band, above its floor.
+
+**No SSA reconstruction was built, and none is needed.** §13n named Braun 2013 reconstruction as the
+execution, and the measurement made it unnecessary. A reload copy is carried into a block only where
+EVERY predecessor is holding that same copy; a copy has exactly one definition; so the condition says
+every path from the entry to the use runs through that definition — which is dominance. The use is
+dominated by its definition for the same reason it was when the copy could not leave its own block,
+so there is no φ, no block parameter and no renaming. The §14 row is amended rather than discharged.
+
+| | base | R4.1 | gcc-O1 |
+|---|---|---|---|
+| total | 237,025 | **232,214** | 157,074 |
+| frame `ldr` | 22,340 | **17,052** | 7,765 |
+| frame `str` | 12,065 | 12,239 | 4,956 |
+| `mov` | 52,755 | 53,518 | 33,608 |
+
+Excess 79,951 → 75,140: **6.0% of the gap closed**. `str` and `mov` moved the wrong way by 174 and
+763 — longer residencies are more to copy — which is R4.2's subject, not a regression to chase here.
+
+**Gate** — cargo 142/0 · sci-gate shape/cpp/decay/alg/abi PASS · cases/ext/torture/cts PASS ·
+opt-parity **1552 PARITY / 0 DIVERGE** · csmith300 **254/0** · yarpgen300 **300/0** · determinism
+**56 programs × 8 fresh processes**. `musl` is RED and was **RED on `10fc699` too** — pre-existing,
+re-checked on the parent commit before this step was allowed to proceed.
+
+**The verifier check that caution #2 demands.** The invariant "a reload copy is used only in the
+block that made it" is exactly what this step removes, so `spill_with` now runs
+`mir::verify::verify` — one definition per vreg, every use dominated by it — after every spill in
+debug builds. `apply` also had to mint every copy's register BEFORE rewriting any block: block INDEX
+order is not dominance order, so a use could otherwise read a register not yet assigned.
+
+**EXEC: unchanged, and that is the honest reading.** Paired in one session, geo40 INSN geomean
+**1.2410 both sides, identical**; EXEC 1.3634 → 1.3567, inside noise. The 35-program taxonomy suite
+has no function under enough pressure to spill, so R4.1 cannot fire there at all. The win is in large
+real functions — `sqlite3VdbeExec` alone planned 2,330 reloads — and sqlite is the only corpus in the
+harness that contains them. Caution #1 said to expect exec and insn to come apart; here the suite
+simply cannot see the axis.
+
+**Compile time: −11% and kept.** sqlite compile 10.46s → 11.57s, all of it in `spill`
+(4.93s → 6.09s). Measured, it is NOT extra rounds (2,087 → 2,117 simulate calls, +1.4%) and NOT the
+predecessor-intersection scan (replacing it with a sorted binary search moved nothing). It is that
+the working sets now genuinely hold more live values, and every per-instruction scan in `simulate` is
+O(|W|). That is the price of keeping values in registers rather than a defect. Making those scans
+incremental is a pure refactor under Article G and is not this commit.
+
+**LAW-4 RESIDUAL (measured, `ZCC_SPILLCEIL=1` on the shipped compiler).** 18,764 → **12,370** planned
+reloads. Of what remains: dom-ceiling 9,849 → **3,485**, all-preds 3,425 → **1,120**, and **61.5% sit
+inside loops**. The residual is dominated by ONE named category-(b) truncation, not by fundamentals:
+blocks are walked in reverse postorder, so a loop header's latch has not been simulated when the
+header is, and nothing is carried across a back edge — residency restarts every iteration. Lifting it
+needs a fixpoint over the loop. **R4.1 is therefore NOT exhausted**, and the follow-up belongs in this
+row rather than in a new one.
+
 ### Two standing cautions, both earned this session
 1. **Expect exec and insn to come apart.** j2_histogram regressed at IDENTICAL instruction count, and
    IV widening removed an instruction for exactly zero time. Spill traffic is memory ops in the hot
@@ -1407,6 +1476,7 @@ its value are downstream of the same R4 item. The revised order:
 | SSA representation | block parameters (HIR and MIR) | explicit edges, trivial destruction, one model |
 | HIR types | closed `Ty` enum, signedness in opcodes | passes independent of TyTab; closed semantics |
 | allocation | on SSA, Braun-Hack spill first, chordal greedy color | polynomial + optimal for the spill set; splitting free |
+| SSA reconstruction after spilling | never built; R4.1 got the effect without it | carrying a copy only where every predecessor holds it IS dominance, so the copy's def dominates its uses and no φ/parameter is needed. §13n planned reconstruction; the measurement made it unnecessary |
 | coalescing | biased coloring first; Boissinot merge only on measured residual | never breaks the pressure guarantee |
 | call-crossing values | modeled as `Clobber` constraints, no special logic | falls out of constraint-respecting greedy coloring |
 | flags | k=1 register class | compare-elim = GVN; conflicts = liveness |

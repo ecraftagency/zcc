@@ -21,9 +21,10 @@
 //     in the future — provably optimal for a fixed cache size, which is what a
 //     register class is).
 //   * A use of a value not in `W` gets a RELOAD into a fresh virtual register,
-//     which then serves every later use in the block until it is evicted. That
-//     is the whole difference from the base case: one reload per block-residency
-//     rather than one per use.
+//     which then serves every later use until it is evicted — and, since R4.1,
+//     every later use in the blocks that follow as well, not only in the block
+//     that reloaded it. That is the whole difference from the base case: one
+//     reload per REGION of residency rather than one per use.
 //   * Room is made before definitions, and — the rule that subsumes all
 //     "crosses a call" reasoning — a call's clobber set counts as registers
 //     already spoken for at that point, so what survives a call is at most the
@@ -34,13 +35,23 @@
 //     is REMATERIALIZED instead of stored and reloaded — the recomputation is
 //     one instruction and the store disappears entirely.
 //
-// NO SSA RECONSTRUCTION IS NEEDED, and that is a deliberate structural choice
-// rather than an omission. A reload's fresh register is used only inside the
-// block that created it, so its live range is dominated by its definition and
-// SSA holds by construction; a value that stays in `W` across an edge keeps its
-// ORIGINAL name and is never renamed. The price is one reload per block for a
-// memory-resident value instead of one per program region — measured, and the
-// residual is recorded in REARCH §12 rather than left implicit.
+// NO SSA RECONSTRUCTION IS NEEDED — still true after R4.1, and now for a
+// sharper reason than before. It used to hold because a reload's register never
+// left the block that made it. R4.1 lets a copy cross an edge, but only where
+// EVERY predecessor is holding that same copy; a copy has exactly one
+// definition, so that condition says every path from the entry to the use runs
+// through the definition, which IS dominance. The use is therefore dominated by
+// its definition for the same reason as before, and no block parameter, no
+// renaming and no Braun 2013 reconstruction is required to make it so. A value
+// that stays in `W` under its ORIGINAL name is likewise never renamed.
+//
+// What is NOT carried is a copy at a LOOP HEADER: blocks are walked in reverse
+// postorder, so the latch has not been simulated when the header is, and a
+// predecessor that has not run holds nothing as far as the test above can tell.
+// Residency therefore restarts each iteration. That is a truncation of the
+// theorem, not a limit of it — lifting it needs a fixpoint over the loop — and
+// under Law 4 it is measured rather than assumed: `ZCC_SPILLCEIL=1` prints the
+// residual, and REARCH §13n records what it says.
 //
 // POST-CONDITION (what the colourer relies on): at every program point the
 // number of virtual values of a class that are live, plus the allocatable
@@ -127,10 +138,104 @@ pub fn spill_with(
         }
     };
     let n = spilled.len();
+    ceiling_report(f, &plan);
     apply(f, plan, &spilled, &remat, &web, web_slot, slot_of);
     drop_redundant_spills(f);
     check_pressure(f)?;
+    // A reload copy is no longer confined to the block that made it, so "the
+    // copy's definition dominates every use of it" stopped being true BY
+    // INSPECTION and became a property to check. It is checked here, at the
+    // layer that owns it, rather than three layers down as a wrong answer out of
+    // a suite (Law 3, and §13n's standing caution that the allocator is where the
+    // nastiest defects live). `mir::verify` in its virtual mode is exactly the
+    // check: one definition per virtual register, every use dominated by it,
+    // widths agreeing across every edge.
+    #[cfg(debug_assertions)]
+    crate::mir::verify::verify(f)?;
     Ok(n)
+}
+
+/// R4.1 CEILING MEASUREMENT (`ZCC_SPILLCEIL=1`) — read-only, changes nothing.
+///
+/// A reload's fresh register is used only inside the block that made it (the
+/// deliberate deviation recorded at the head of this file and in REARCH §14), so
+/// a value wanted in five blocks is reloaded five times: once per BLOCK-RESIDENCY
+/// instead of once per program REGION. Before writing a line of Braun 2013 SSA
+/// reconstruction, this asks the corpus how many reloads such a reconstruction
+/// could POSSIBLY remove — the number that IS the ceiling on the whole step.
+///
+/// A reload of `v` in block B is counted against the ceiling when some block A
+/// STRICTLY DOMINATING B also reloads `v`: a register copy of `v` provably
+/// exists on every path that reaches this use, so reconstruction has something
+/// to rewire the use to. It is an UPPER bound and is meant to be — it asks
+/// nothing about whether the register file can hold that copy from A to B, which
+/// is exactly the question the implementation would have to answer. The
+/// same-block repeat column is the residue reconstruction cannot touch (the copy
+/// was evicted between the two uses, so the second reload is real work), and the
+/// loop columns say how much of the ceiling is in code that runs more than once.
+///
+/// The dominance count is the LOOSE bound. The IMPLEMENTABLE one is the last two
+/// columns: a reload of `v` in B whose value is still resident at the exit of
+/// EVERY predecessor of B needs no reload at all once the entry set is derived
+/// from the predecessors' exit sets (Braun-Hack's block-boundary reconciliation)
+/// — that column is the honest prediction. Resident at SOME predecessor only is
+/// a reload moved onto the cold edges rather than removed, so it is reported
+/// apart and never added into the prediction.
+///
+/// Columns: `name total dom-ceiling same-block-repeat in-loop all-preds
+/// some-preds all-preds-in-loop`.
+fn ceiling_report(f: &MFunc, plan: &Plan) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ZCC_SPILLCEIL").is_some()) {
+        return;
+    }
+    let cfg = crate::mir::verify::cfg(f);
+    let dt = crate::cfg::DomTree::new(&cfg, f.entry);
+    let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+    let nb = f.blocks.len();
+    let mut at: Vec<BTreeSet<VReg>> = vec![BTreeSet::new(); nb];
+    for (bi, rs) in plan.reloads.iter().enumerate() {
+        for &(_, v, _) in rs {
+            at[bi].insert(v);
+        }
+    }
+    let ex: Vec<BTreeSet<VReg>> = plan
+        .wexit
+        .iter()
+        .map(|w| w.iter().map(|&(v, _)| v).collect())
+        .collect();
+    let (mut tot, mut ceil, mut rep, mut tot_l) = (0usize, 0usize, 0usize, 0usize);
+    let (mut all_p, mut some_p, mut all_p_l) = (0usize, 0usize, 0usize);
+    for (bi, rs) in plan.reloads.iter().enumerate() {
+        let inloop = lf.depth[bi] > 0;
+        let preds = &cfg.preds[bi];
+        let mut seen: BTreeSet<VReg> = BTreeSet::new();
+        for &(_, v, _) in rs {
+            let dom = (0..nb).any(|a| {
+                a != bi
+                    && at[a].contains(&v)
+                    && dt.dominates(a as crate::cfg::Node, bi as crate::cfg::Node)
+            });
+            let first = seen.insert(v);
+            let np = preds.iter().filter(|&&p| ex[p as usize].contains(&v)).count();
+            let all = first && !preds.is_empty() && np == preds.len();
+            let some = first && np > 0 && np < preds.len();
+            tot += 1;
+            ceil += dom as usize;
+            rep += !first as usize;
+            tot_l += inloop as usize;
+            all_p += all as usize;
+            some_p += some as usize;
+            all_p_l += (all && inloop) as usize;
+        }
+    }
+    if tot > 0 {
+        eprintln!(
+            "SPILLCEIL {} {} {} {} {} {} {} {}",
+            f.name, tot, ceil, rep, tot_l, all_p, some_p, all_p_l
+        );
+    }
 }
 
 /// The spiller's POST-CONDITION, checked rather than trusted (REARCH §7.6a):
@@ -292,6 +397,11 @@ struct Plan {
     /// per block: at instruction i, read `value` from `copy` instead
     subs: Vec<Vec<(usize, VReg, CopyId)>>,
     ncopies: u32,
+    /// per block: what is still resident in a register when the block ENDS,
+    /// each under the name it is resident as. Not read by `apply`; it is what the
+    /// successors' entry sets are built from (§ "carrying a reload") and what the
+    /// R4.1 ceiling measurement reports.
+    wexit: Vec<Vec<(VReg, Option<CopyId>)>>,
 }
 
 enum Sim {
@@ -336,8 +446,20 @@ fn simulate(
         reloads: vec![Vec::new(); nb],
         subs: vec![Vec::new(); nb],
         ncopies: 0,
+        wexit: vec![Vec::new(); nb],
     };
     let mut newsp: Vec<VReg> = Vec::new();
+    // what each block is still holding when it ends, and whether it has been
+    // simulated yet — the two things a successor's entry set is built from.
+    let mut exits: Vec<Vec<Res>> = vec![Vec::new(); nb];
+    // the same set as `exits`, keyed and sorted for lookup. The entry test below
+    // asks "does every predecessor hold this exact copy" once per resident value
+    // per predecessor, on every round of the simulation. Measured, this is NOT
+    // where the step's compile time went — replacing the linear scan with the
+    // binary search moved the sqlite compile not at all — so it is kept for the
+    // asymptotics and named here so nobody re-measures it hoping for the 11%.
+    let mut exit_keys: Vec<Vec<(VReg, CopyId)>> = vec![Vec::new(); nb];
+    let mut done: Vec<bool> = vec![false; nb];
     let mut lu = live::LastUse::new(lv.sp);
     let masks = [
         isa::alloc_mask(Class::Gpr),
@@ -393,11 +515,55 @@ fn simulate(
             m
         };
 
-        // (1) the working set at the head: everything live in and not already
-        //     memory-resident, nearest next use first, truncated to the budget
+        // (1) the working set at the head: everything live in and still
+        //     available in a register, nearest next use first, truncated to the
+        //     budget. Two sources, and the second is the whole of R4.1.
+        //
+        //     CARRYING A RELOAD ACROSS AN EDGE. A memory-resident value used in
+        //     five blocks used to be reloaded five times — once per block, since
+        //     a reload copy was dropped at the block boundary (the deviation this
+        //     file's header records). It need not be: a copy is carried into `bi`
+        //     when EVERY predecessor is still holding it, under the SAME name.
+        //
+        //     That one condition is also the SSA proof, which is why no Braun
+        //     2013 reconstruction, no block parameter and no renaming appears
+        //     here. A copy is created at exactly one place, so "every predecessor
+        //     holds it" means every path from the entry to `bi` runs through that
+        //     place — which is the definition of dominance. The copy's definition
+        //     therefore dominates every use we redirect to it, and SSA holds by
+        //     construction exactly as it did when the copy could not leave its
+        //     own block. `mir::verify` checks the property rather than trusting
+        //     this paragraph.
+        //
+        //     A predecessor not yet simulated (a back edge, since blocks are
+        //     walked in reverse postorder) holds nothing as far as this test is
+        //     concerned, so nothing is carried into a loop header — the residency
+        //     starts afresh each iteration. That is a truncation, not a limit:
+        //     lifting it needs a fixpoint over the loop, and Law 4 asks for it
+        //     only once the acyclic case has been measured.
         let mut w: Vec<Res> = Vec::new();
+        let live_here = |v: VReg| lv.live_in[bi].contains(&lv.sp.idx(Reg::V(v)));
+        let carried: Vec<Res> = if cfg.preds[bi].is_empty()
+            || cfg.preds[bi].iter().any(|&p| !done[p as usize])
+        {
+            Vec::new()
+        } else {
+            let (first, rest) = cfg.preds[bi].split_first().unwrap();
+            exits[*first as usize]
+                .iter()
+                .filter(|r| r.copy.is_some())
+                .filter(|r| live_here(r.v))
+                .filter(|r| {
+                    let key = (r.v, r.copy.unwrap());
+                    rest.iter()
+                        .all(|&p| exit_keys[p as usize].binary_search(&key).is_ok())
+                })
+                .copied()
+                .collect()
+        };
+
         for c in [Class::Gpr, Class::Fpr] {
-            let mut cand: Vec<VReg> = lv.live_in[bi]
+            let mut names: Vec<VReg> = lv.live_in[bi]
                 .iter()
                 .copied()
                 .filter(|&x| x < lv.sp.nv)
@@ -405,24 +571,45 @@ fn simulate(
                 .chain(blk.params.iter().filter_map(|p| p.vreg()))
                 .filter(|v| !spilled.contains(v) && class_of(f, Reg::V(*v)) == c)
                 .collect();
-            cand.sort_unstable();
-            cand.dedup();
-            cand.sort_by_key(|v| next_use(&uses, *v as usize, head));
+            names.sort_unstable();
+            names.dedup();
+            let mut cand: Vec<Res> = names
+                .into_iter()
+                .map(|v| Res { v, copy: None, class: c, cross: lv.crosses_call[v as usize] })
+                .collect();
+            for r in carried.iter().filter(|r| r.class == c) {
+                if !cand.iter().any(|q| q.v == r.v) {
+                    cand.push(*r);
+                }
+            }
+            // An ORIGINAL name claims the budget before a carried copy does, even
+            // when the copy is wanted sooner. The two are not symmetric: a copy
+            // that does not fit is simply dropped and the value reloaded, while
+            // an original that does not fit becomes memory-resident for the WHOLE
+            // function and restarts the simulation — so a copy must not be able
+            // to displace one. On sqlite the tie-break changes nothing (the
+            // emitted bytes are identical with and without it, and the budget
+            // turns out not to bind at block heads); it is here because the
+            // asymmetry is real and the day it binds is not the day to discover
+            // that a reload here was traded for a spill everywhere.
+            cand.sort_by_key(|r| (r.copy.is_some(), next_use(&uses, r.v as usize, head)));
             let hm = phys_mask(&physlive, c) & masks[ki(c)];
             let budget = isa::k(c).saturating_sub(hm.count_ones() as usize);
             let mut bcross = cs[ki(c)]
                 .saturating_sub((hm & isa::callee_saved_mask(c)).count_ones() as usize);
             let mut bplain = usize::MAX;
             let mut taken = 0usize;
-            for v in cand.into_iter() {
-                let cross = lv.crosses_call[v as usize];
-                let room = if cross { &mut bcross } else { &mut bplain };
+            for r in cand.into_iter() {
+                let room = if r.cross { &mut bcross } else { &mut bplain };
                 if taken < budget && *room > 0 {
                     *room -= 1;
                     taken += 1;
-                    w.push(Res { v, copy: None, class: c, cross });
-                } else {
-                    newsp.push(v);
+                    w.push(r);
+                } else if r.copy.is_none() {
+                    // an ORIGINAL name that does not fit has to become
+                    // memory-resident; a copy that does not fit is a duplicate of
+                    // what the slot already holds, so dropping it costs nothing.
+                    newsp.push(r.v);
                 }
             }
         }
@@ -816,6 +1003,15 @@ fn simulate(
                 }
             }
         }
+        plan.wexit[bi] = w.iter().map(|r| (r.v, r.copy)).collect();
+        exit_keys[bi] = {
+            let mut k: Vec<(VReg, CopyId)> =
+                w.iter().filter_map(|r| r.copy.map(|c| (r.v, c))).collect();
+            k.sort_unstable();
+            k
+        };
+        exits[bi] = w;
+        done[bi] = true;
     }
     if newsp.is_empty() {
         Ok(Sim::Plan(plan))
@@ -845,7 +1041,18 @@ fn apply(
     }
     evict_params(f, &slot_of);
 
+    // Every copy's register is minted BEFORE any block is rewritten. A copy is
+    // no longer confined to the block that reloads it (§ "carrying a reload"), so
+    // a use of it can sit in a block with a lower index than its definition —
+    // assigning the register as the reload is emitted would then have the use
+    // read a placeholder. Block INDEX order is not dominance order and never was.
     let mut copy_reg: Vec<Reg> = vec![Reg::P(isa::ZR); plan.ncopies as usize];
+    for rs in plan.reloads.iter() {
+        for &(_, v, id) in rs {
+            let w = f.vregs[v as usize].width;
+            copy_reg[id as usize] = f.new_vreg(w);
+        }
+    }
     for b in 0..f.blocks.len() {
         let reloads = &plan.reloads[b];
         let subs = &plan.subs[b];
@@ -860,9 +1067,7 @@ fn apply(
             std::iter::once((n, None)),
         ) {
             for &(at, v, id) in reloads.iter().filter(|(at, ..)| *at == i) {
-                let w = f.vregs[v as usize].width;
-                let d = f.new_vreg(w);
-                copy_reg[id as usize] = d;
+                let d = copy_reg[id as usize];
                 let _ = at;
                 match remat.get(&v) {
                     Some(src) => {

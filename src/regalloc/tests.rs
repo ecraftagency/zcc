@@ -391,3 +391,79 @@ fn a_chain_of_narrowing_copies_keeps_one_truncation() {
     same("long g(long a,long b){int x=(int)a;int y=x;long z=(unsigned)y;return z-b;}\
           int main(void){return g(0xff00000007L,7)==0?0:1;}");
 }
+
+/// R4.1 — a reload copy is CARRIED into the blocks its definition dominates, so
+/// a memory-resident value wanted in a chain of nested blocks is reloaded ONCE
+/// instead of once per block. The semantic battery above cannot see this: eight
+/// reloads and one reload compute the same number. So the COUNT is what is
+/// pinned here, and the count is the whole point of the step.
+///
+/// The condition that makes the carry sound is the same one that makes it fire.
+/// A copy is kept across an edge only where EVERY predecessor is holding it
+/// under the same name; a copy has exactly one definition; so every path from
+/// the entry to the use runs through that definition — which is dominance, and
+/// SSA therefore holds by construction with no reconstruction and no block
+/// parameter. `mir::verify` re-derives that independently after the spiller runs.
+///
+/// The shape matters and the first draft got it wrong twice. The values must be
+/// LOADED, since a constant is rematerializable and never reaches the spiller at
+/// all; and the pressure that forces `x` into memory must be BEHIND the nested
+/// uses rather than around them, or the copy is evicted again immediately and
+/// the test measures nothing.
+#[test]
+fn a_reload_is_carried_into_the_blocks_it_dominates() {
+    let mut src = String::from("int g[64];\nint main(void){\nint s = 0;\nint x = g[0] * 3 + 1;\n");
+    // (1) a region that exhausts the register file while `x` is live across it,
+    //     so `x` is certain to be memory-resident afterwards
+    for i in 0..40 {
+        src.push_str(&format!("int v{} = g[{}] * {} + 1;\n", i, i, i + 2));
+    }
+    src.push_str("s += ");
+    for i in 0..40 {
+        if i > 0 {
+            src.push('+');
+        }
+        src.push_str(&format!("v{}*{}", i, i + 1));
+    }
+    src.push_str(";\n");
+    // (2) NESTED uses of `x`, each block dominated by the one above it and the
+    //     pressure now gone: one reload should serve all eight
+    for i in 0..NEST {
+        src.push_str(&format!("if (g[{}] > 0) {{ s += x;\n", i + 41));
+    }
+    for _ in 0..NEST {
+        src.push('}');
+    }
+    src.push_str("\nreturn s & 0xff;\n}\n");
+
+    same(&src);
+
+    let ast = frontend(&src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let p = crate::compile::backend(&h).unwrap();
+    let f = p.funcs.iter().find(|f| f.name == "main").unwrap();
+    let mut per_slot: std::collections::BTreeMap<crate::mir::SlotId, usize> =
+        std::collections::BTreeMap::new();
+    for inst in f.blocks.iter().flat_map(|b| b.insts.iter()) {
+        if let crate::mir::MInst::Reload { slot, .. } = inst {
+            *per_slot.entry(*slot).or_default() += 1;
+        }
+    }
+    // `x`'s slot is the one wanted in all NEST blocks. Before the carry it was
+    // reloaded once per block; the assertion is on the WORST slot, so it does not
+    // depend on which slot number `x` happens to receive, and it fails in both
+    // directions — a regression that reinstates the per-block reload, and an
+    // over-claim that no slot is reloaded at all.
+    let worst = per_slot.values().copied().max().unwrap_or(0);
+    assert!(
+        worst > 0 && worst < NEST,
+        "worst slot reloaded {} times over {} nested uses — the copy is not being carried",
+        worst,
+        NEST
+    );
+}
+
+/// How deep the nested uses go. Large enough that "once per block" and "once"
+/// cannot be confused with each other or with allocator noise.
+const NEST: usize = 8;
