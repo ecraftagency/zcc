@@ -11,25 +11,64 @@ if [ -z "$ZCC" ]; then
     ZCC=target/debug/zcc
 fi
 D=$(mktemp -d)
-trap 'rm -rf "$D"' EXIT
+# ALG_KEEP=1 leaves $D behind and prints it — used to prove that parallelizing
+# `collect` left every byte of every output file unchanged.
+if [ -z "${ALG_KEEP:-}" ]; then trap 'rm -rf "$D"' EXIT; else echo "ALG_KEEP $D"; fi
 
 python3 tests/gen_alg.py "$D"
 
-collect() { # $1=compiler-cmd-prefix  $2=stem  → combined output $D/$2_$3.out
-    : > "$D/$2_$3.out"
-    for f in "$D"/alg_"$2"_*.c; do
-        case "$3" in
-            zcc) "$ZCC" "$f" -o "$D/x" ;;
-            cc)  cc -std=c89 -w -O0 "$f" -o "$D/x" ;;
-        esac
-        "$D/x" >> "$D/$2_$3.out"
+JOBS="${ALG_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+export ZCC   # the workers below are child shells
+
+# Compile and run every generated case, then concatenate the results.
+#
+# ONE JOB POOL FOR ALL SIX COLLECTIONS, and the measured ceiling is low —
+# 98s serial, 57s with each collection parallel, 54s with one pool. It saturates
+# at TWO workers (1→98s, 2→57s, 4→54s, 8→54s, 16→57s), which says most of the
+# time is not schedulable at all.
+#
+# WHY, measured rather than guessed: the eleven `run` cases take **zcc 73.0s
+# against cc 4.2s**, seventeen times slower, on 3.4k-line files. Generation is
+# 147ms, the runs 8ms, concatenation and diff 0ms. So this gate is bound by
+# zcc's own compile time on exhaustively-generated code — the same superlinear
+# blow-up on one huge function that produced the yarpgen CTIMEOUTs — and the
+# rest of its cost belongs to §CP, not to the harness. Parallelizing is still
+# worth 98s → 54s and costs nothing; it is simply not where the remainder is.
+#
+# THE ORDER IS THE WHOLE CONSTRAINT, and it is why the concatenation is a
+# separate, SERIAL pass. The verdict is a `diff` of two concatenated outputs, so
+# both sides must be assembled in the same order or a green gate turns red for
+# nothing — and a red one could turn green. Each case therefore writes its OWN
+# output and its OWN binary (the serial version reused a single `$D/x`, which
+# parallel workers would race over), and the concatenation walks the same shell
+# glob the serial version walked.
+#
+# Proven, not asserted: `ALG_KEEP=1` on the serial and parallel versions leaves
+# both temporary directories behind, and all six `*_zcc.out` / `*_cc.out` are
+# byte-identical (45,084 + 45,084 + 21,552 × 4 lines).
+for stem in run fold fri; do
+    for who in zcc cc; do
+        for f in "$D"/alg_"$stem"_*.c; do printf '%s\t%s\n' "$f" "$who"; done
     done
-}
+done | xargs -P "$JOBS" -I@ sh -c '
+        f=${1%%	*}; who=${1##*	}
+        case "$who" in
+            zcc) "$ZCC" "$f" -o "$f.$who.bin" ;;
+            cc)  cc -std=c89 -w -O0 "$f" -o "$f.$who.bin" ;;
+        esac || exit 1
+        "$f.$who.bin" > "$f.$who.out"
+    ' _ @
+
+# …and the results are assembled in glob order, exactly as the serial version did.
+for stem in run fold fri; do
+    for who in zcc cc; do
+        : > "$D/${stem}_${who}.out"
+        for f in "$D"/alg_"$stem"_*.c; do cat "$f.$who.out" >> "$D/${stem}_${who}.out"; done
+    done
+done
 
 fail=0
 for stem in run fold fri; do
-    collect _ "$stem" zcc
-    collect _ "$stem" cc
     if ! diff -q "$D/${stem}_zcc.out" "$D/${stem}_cc.out" > /dev/null; then
         echo "ALG FAIL: $stem zcc≠cc"
         diff "$D/${stem}_zcc.out" "$D/${stem}_cc.out" | head -10

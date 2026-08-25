@@ -6,8 +6,10 @@
 #
 # Usage:  sh tests/fullsuite.sh [TARGET] [SEEK]
 #   TARGET (default all) — SEEK reaches an individual LAYER, no full re-run needed:
-#     all                              — sci + corpus + app
-#     sci | corpus | app | base        — group (base = run.sh cases+ext, fast loop)
+#     all                              — sci + corpus + fuzz + app (THE gate)
+#     sci | corpus | fuzz | app | base  — group (base = run.sh cases+ext, fast loop)
+#     determ | optpar | csmith | yarpgen — one stage
+#   FUZZ_N (default 300) sizes BOTH random generators; 1000 for a seal.
 #     shape|cpp|decay|alg|abi          — 1 sci-gate (theorem verification)
 #     cases|ext                        — 1 base differential
 #     torture|cts                      — 1 corpus suite
@@ -36,28 +38,40 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
     gate()   { case $1 in
         shape|cpp|decay|alg|abi) stage "$1" sh "$W/tests/$1.sh" ;;
         *) echo "unknown gate: $1"; exit 2 ;; esac ; }
-    suite()  { stage "$1" sh "$W/tests/suites/$1.sh" ; }
+    suite()  { stage "$1" sh "$W/tests/suites/$1.sh" ${SUITE_N:+"$SUITE_N"} ; }
     base_c() { stage cases sh "$W/tests/run.sh" cases "$SEEK" ; }
     base_e() { stage ext   sh "$W/tests/run.sh" ext   "$SEEK" ; }
     run_sci()    { echo "-- SCI-GATE (theorem verification, structural exhaustion) --"
-                   for g in shape cpp decay alg abi; do gate "$g"; done ; }
+                   for g in shape cpp decay alg abi; do gate "$g"; done
+                   stage determ sh "$W/tests/determinism.sh" ; }
     run_base()   { echo "-- BASE (hand-written differential, fast loop) --"; base_c; base_e ; }
     run_corpus() { echo "-- CORPUS (practical corroboration, FAIL ⊆ known-fail) --"
                    base_c; base_e
-                   for s in torture cts; do suite "$s"; done ; }
+                   for s in torture cts; do suite "$s"; done
+                   stage optpar sh "$W/tests/opt-parity.sh" ; }
+    # The two random differential generators. They are the slowest stages and the
+    # only ones whose sample size is a dial, so they take one: FUZZ_N (default 300)
+    # for iteration, 1000 for a seal. Both are `xargs -P` internally.
+    run_fuzz()   { echo "-- FUZZ (random differential; FUZZ_N=${FUZZ_N:-300} per generator) --"
+                   stage csmith  sh "$W/tests/suites/csmith.sh"  "${FUZZ_N:-300}"
+                   stage yarpgen sh "$W/tests/suites/yarpgen.sh" "${FUZZ_N:-300}" ; }
     run_app()    { echo "-- APP (libc = musl, real software for the minimal-distro) --"
                    stage musl sh "$W/tests/suites/musl-box.sh" ; }
     echo "== fullsuite (ELF box aarch64 — AUTHORITATIVE, target=$TARGET${SEEK:+ seek=$SEEK}) =="
     case "$TARGET" in
-        all)                     run_sci; run_corpus; run_app ;;
+        all)                     run_sci; run_corpus; run_fuzz; run_app ;;
         sci)                     run_sci ;;
         corpus)                  run_corpus ;;
+        fuzz)                    run_fuzz ;;
         app)                     run_app ;;
         base)                    run_base ;;
         shape|cpp|decay|alg|abi) gate "$TARGET" ;;
+        determ)                  stage determ sh "$W/tests/determinism.sh" ;;
+        optpar)                  stage optpar sh "$W/tests/opt-parity.sh" ;;
         cases)                   base_c ;;
         ext)                     base_e ;;
         torture|cts)             suite "$TARGET" ;;
+        csmith|yarpgen)          stage "$TARGET" sh "$W/tests/suites/$TARGET.sh" "${FUZZ_N:-300}" ;;
         musl)                    run_app ;;
         *) echo "unknown target: '$TARGET' (see the file header)"; exit 2 ;;
     esac

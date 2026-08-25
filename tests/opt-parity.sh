@@ -16,30 +16,39 @@ DIR="$C/gcc/gcc/testsuite/gcc.c-torture/execute"
 LIM="${1:-0}"
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
+JOBS="${OPT_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+RES="$D/res"
 
-par=0; div=0; skip=0; n=0
-divlist=""
-for f in "$DIR"/*.c; do
-    [ -f "$f" ] || continue
+# PARALLEL, and the verdict is order-independent by construction. Each case
+# writes ONE tab-separated line — verdict, name, detail — and the aggregation is
+# a separate pass over the SORTED result file, so the counts and the DIVERGE list
+# do not depend on which worker finished first. (`csmith.sh` beside this file has
+# used the same shape since it was written; this loop simply never adopted it.)
+# Each case also gets its OWN two binaries: the serial version reused `$D/a` and
+# `$D/b`, which parallel workers would race over — a race that would not fail
+# loudly, it would compare one case's -O0 binary against another's optimized one.
+work='
+    f=$1
     b=$(basename "$f" .c)
-    n=$((n+1))
-    [ "$LIM" -gt 0 ] && [ "$n" -gt "$LIM" ] && { n=$((n-1)); break; }
+    o="$D/$b"
+    if ! ZCC_O0=1 "$ZCC" "$f" -o "$o.a" >/dev/null 2>&1; then printf "SKIP\t%s\t\n" "$b"; exit 0; fi
+    if ! "$ZCC" "$f" -o "$o.b" >/dev/null 2>&1; then printf "SKIP\t%s\t\n" "$b"; exit 0; fi
+    timeout 5 "$o.a" >/dev/null 2>&1; ra=$?
+    timeout 5 "$o.b" >/dev/null 2>&1; rb=$?
+    rm -f "$o.a" "$o.b"
+    if [ "$ra" = "$rb" ]; then printf "PARITY\t%s\t\n" "$b"
+    else printf "DIVERGE\t%s\t(noopt=%s,opt=%s)\n" "$b" "$ra" "$rb"; fi
+'
+export ZCC D
+ls "$DIR"/*.c 2>/dev/null | { [ "$LIM" -gt 0 ] && head -n "$LIM" || cat; } \
+  | xargs -P "$JOBS" -I@ sh -c "$work" _ @ | sort > "$RES"
 
-    # -O0 naive path (optimizer disabled)
-    if ! ZCC_O0=1 "$ZCC" "$f" -o "$D/a" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
-    # default optimizer (SSA + regalloc, no env)
-    if ! "$ZCC" "$f" -o "$D/b" >/dev/null 2>&1; then skip=$((skip+1)); continue; fi
+n=$(wc -l < "$RES" | tr -d ' ')
+par=$(grep -c "^PARITY" "$RES" || true)
+div=$(grep -c "^DIVERGE" "$RES" || true)
+skip=$(grep -c "^SKIP" "$RES" || true)
+divlist=$(awk -F'\t' '$1=="DIVERGE"{printf " %s%s", $2, $3}' "$RES")
 
-    timeout 5 "$D/a" >/dev/null 2>&1; ra=$?
-    timeout 5 "$D/b" >/dev/null 2>&1; rb=$?
-    if [ "$ra" = "$rb" ]; then
-        par=$((par+1))
-    else
-        div=$((div+1))
-        divlist="$divlist $b(noopt=$ra,opt=$rb)"
-    fi
-done
-
-echo "opt-parity: $par PARITY / $div DIVERGE / $skip SKIP  (scanned $n cases)"
+echo "opt-parity: $par PARITY / $div DIVERGE / $skip SKIP  (scanned $n cases, ${JOBS} jobs)"
 [ -n "$divlist" ] && echo "DIVERGE:$divlist"
 [ "$div" = 0 ]
