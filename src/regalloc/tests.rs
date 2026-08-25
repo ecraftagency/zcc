@@ -467,3 +467,74 @@ fn a_reload_is_carried_into_the_blocks_it_dominates() {
 /// How deep the nested uses go. Large enough that "once per block" and "once"
 /// cannot be confused with each other or with allocator noise.
 const NEST: usize = 8;
+
+/// R4.2 — an ABI-boundary truncation is a no-op, and it is GONE.
+///
+/// AAPCS64 §6.4.2/§6.8.2 leave the bits above an argument's or a result's
+/// declared width unspecified, so a narrow self-move into a fixed argument
+/// register, or out of a fixed result register, truncates something no
+/// conforming program observes. Two shapes are pinned, both by COUNTING on the
+/// physical MIR — the bisimulation above already says the function still
+/// computes the right thing, so what is left to show is that the instructions
+/// really left:
+///
+///   * `mov x16, xN ; mov wN, w16` — the windmill breaking a one-element
+///     "cycle" that was only ever an identity assignment. The scratch register
+///     is reserved for real cycles; a call-argument setup must never touch it.
+///   * `mov wN, wN` — the standalone self-move, at a call boundary.
+///
+/// The program is chosen so the allocator has every reason to colour the
+/// argument temps into x0-x7 directly: several `int` calls in a row whose
+/// arguments are already the values the callee wants.
+#[test]
+fn abi_boundary_truncation_leaves_no_instruction() {
+    let src = "int h(int,int,int);\n\
+               int main(void){\n\
+               int a=3,b=5,c=7,s=0;\n\
+               s+=h(a,b,c); s+=h(b,c,a); s+=h(c,a,b);\n\
+               s+=h(s,a,b); s+=h(a,s,c);\n\
+               return s&0xff;\n}\n";
+    same(src);
+
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let p = crate::compile::backend(&h).unwrap();
+    let f = p.funcs.iter().find(|f| f.name == "main").unwrap();
+    use crate::mir::{isa, MInst, Reg, Width};
+    let (mut scratch, mut selfmove) = (0usize, 0usize);
+    for inst in f.blocks.iter().flat_map(|b| b.insts.iter()) {
+        if let MInst::Copy { w, dst, src } = inst {
+            if *dst == Reg::P(isa::SCRATCH_GPR) {
+                scratch += 1;
+            }
+            if dst == src && *w != Width::W64 {
+                selfmove += 1;
+            }
+        }
+    }
+    assert_eq!(
+        scratch, 0,
+        "x16 was used to break a cycle that is an identity assignment"
+    );
+    assert_eq!(selfmove, 0, "a narrow self-move survived at an ABI boundary");
+}
+
+/// …and the rule is NOT "drop every narrow self-move": one whose destination is
+/// read wider than it was written still truncates, and deleting it would leave
+/// the upper half of whatever the register held. This is the direction the
+/// yarpgen s0188 miscompile came from — the value below is narrowed on an edge
+/// and then read as a full 64-bit quantity in the successor.
+#[test]
+fn a_truncation_with_a_wide_reader_is_kept() {
+    let src = "long g[8];\n\
+               int main(void){\n\
+               long l = g[0];\n\
+               int t = (int)l;\n\
+               long r = g[1] ? (long)t : l;\n\
+               g[2] = r;\n\
+               return (int)(r & 0xff);\n}\n";
+    // the bisimulation IS the assertion here: if the truncation is dropped, the
+    // two sides compute different values
+    same(src);
+}

@@ -49,65 +49,7 @@ pub fn split_critical_edges(f: &mut MFunc) -> bool {
 
 /// Replace every register in the function by its assigned colour.
 pub fn apply_colors(f: &mut MFunc, color: &[Option<PReg>]) -> Result<(), String> {
-    // A copy that biased colouring turned into a self-move is usually nothing —
-    // but `mov w0, w0` TRUNCATES (DDI 0487 B1.2.1 zeroes bits 63:32 on every
-    // 32-bit write), so deleting it is only right when nobody looks at the upper
-    // half. This is the only place both facts are available: the virtual
-    // identity, which says how wide the value is ever READ, and the colour, which
-    // says whether the move is a self-move at all. `(int)someLong` is exactly a
-    // `mov w, w` and nothing more, and sqlite has 20,000 of them.
-    //
-    // The decision is a FIXPOINT, not a single pass, because deleting one copy
-    // changes what the next one is asked about: with `t1 = trunc x; t2 = copy
-    // t1; use64 t2`, `t1` looks 32-bit-only — until `t2`'s copy is deleted and
-    // `t1` inherits its 64-bit reader. Start optimistic and give up one candidate
-    // at a time (yarpgen s0131).
-    let widths: Vec<Width> = f.vregs.iter().map(|v| v.width).collect();
-    let mut cand: Vec<(usize, usize, VReg, VReg, Width)> = Vec::new();
-    for (b, blk) in f.blocks.iter().enumerate() {
-        for (i, inst) in blk.insts.iter().enumerate() {
-            let (w, dst, src) = match inst {
-                MInst::Copy { w, dst, src } => (*w, *dst, *src),
-                MInst::FMov { dw, sw, dst, src } if dw == sw => (*dw, *dst, *src),
-                _ => continue,
-            };
-            if let (Reg::V(d), Reg::V(s)) = (dst, src) {
-                if color[d as usize] == color[s as usize] {
-                    cand.push((b, i, d, s, w));
-                }
-            }
-        }
-    }
-    let mut drop = vec![true; cand.len()];
-    for _ in 0..cand.len() + 1 {
-        let reads = max_read(f, &cand, &drop);
-        let mut changed = false;
-        for (k, &(_, _, d, s, w)) in cand.iter().enumerate() {
-            if !drop[k] {
-                continue;
-            }
-            let ok = matches!(w, Width::W64 | Width::Q)
-                || widths[s as usize] == w
-                || reads[d as usize] <= w.bytes();
-            if !ok {
-                drop[k] = false;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut kill: Vec<(usize, usize)> = cand
-        .iter()
-        .enumerate()
-        .filter(|(k, _)| drop[*k])
-        .map(|(_, &(b, i, ..))| (b, i))
-        .collect();
-    kill.sort_unstable();
-    for &(b, i) in kill.iter().rev() {
-        f.blocks[b].insts.remove(i);
-    }
+    drop_self_moves(f, color);
     let mut bad = None;
     let mut map = |r: &mut Reg| {
         if let Reg::V(v) = *r {
@@ -133,6 +75,257 @@ pub fn apply_colors(f: &mut MFunc, color: &[Option<PReg>]) -> Result<(), String>
         Some(v) => Err(format!("{}: v{} was never coloured", f.name, v)),
         None => Ok(()),
     }
+}
+
+/// One self-move candidate: a copy — standalone, or one pair of a
+/// `ParallelCopy` — whose destination and source have landed on the SAME
+/// physical register.
+#[derive(Clone, Copy)]
+struct Cand {
+    b: usize,
+    i: usize,
+    /// `Some(k)`: pair `k` of the `ParallelCopy` at `(b, i)`; `None`: the whole
+    /// instruction at `(b, i)`.
+    pair: Option<usize>,
+    dst: Reg,
+    src: Reg,
+    w: Width,
+}
+
+/// The physical register a name has landed on: its colour if it is virtual,
+/// itself if it is already physical.
+fn preg_of(r: Reg, color: &[Option<PReg>]) -> Option<PReg> {
+    match r {
+        Reg::V(v) => color.get(v as usize).copied().flatten(),
+        Reg::P(p) => Some(p),
+    }
+}
+
+/// Delete the copies that biased colouring turned into self-moves.
+///
+/// A self-move is usually nothing — but `mov w0, w0` TRUNCATES (DDI 0487
+/// B1.2.1 zeroes bits 63:32 on every 32-bit write), so deleting it is only
+/// right when nobody looks at the upper half. This is the only place both facts
+/// are available: the virtual identity, which says how wide the value is ever
+/// READ, and the colour, which says whether the move is a self-move at all.
+/// `(int)someLong` is exactly a `mov w, w` and nothing more, and sqlite has
+/// 20,000 of them.
+///
+/// The decision is a FIXPOINT, not a single pass, because deleting one copy
+/// changes what the next one is asked about: with `t1 = trunc x; t2 = copy t1;
+/// use64 t2`, `t1` looks 32-bit-only — until `t2`'s copy is deleted and `t1`
+/// inherits its 64-bit reader. Start optimistic and give up one candidate at a
+/// time (yarpgen s0131).
+///
+/// **R4.2** — the candidate set is not only the virtual/virtual copies. A name
+/// that has landed on a physical register is a self-move partner just as much
+/// as a virtual one, and the three shapes this adds are, on sqlite, 13,322
+/// instructions of pure no-op:
+///
+///   * `V ← P` — a call result read back, or an incoming parameter copied out
+///     of its argument register. Answered by the machinery already here: the
+///     copy goes when no reader of the destination looks past `w`.
+///   * `P ← V` and `P ← P` — a value placed in a fixed ARGUMENT or RESULT
+///     register. `max_read` cannot answer this one (a physical destination has
+///     no virtual identity, so it has no readers to catalogue); `abi_reader`
+///     answers it from AAPCS64 instead.
+///
+/// Doing it HERE, before `destruct`, matters twice over. Every `ParallelCopy`
+/// in the function is still isel's ABI marshalling — SSA destruction has not
+/// yet created any edge copy — so a physical destination is an ABI-fixed
+/// operand by construction, which is what makes `abi_reader`'s question
+/// answerable. And a narrow identity pair left in a `ParallelCopy` reads to the
+/// windmill as a one-element CYCLE: it breaks it through the scratch register
+/// and emits `mov x16, xN ; mov wN, w16`, two instructions where the right
+/// answer is none (4,208 of these on sqlite).
+fn drop_self_moves(f: &mut MFunc, color: &[Option<PReg>]) {
+    let widths: Vec<Width> = f.vregs.iter().map(|v| v.width).collect();
+    let mut cand: Vec<Cand> = Vec::new();
+    let mut add = |b: usize, i: usize, pair: Option<usize>, dst: Reg, src: Reg, w: Width| {
+        let (pd, ps) = (preg_of(dst, color), preg_of(src, color));
+        if pd.is_some() && pd == ps {
+            cand.push(Cand { b, i, pair, dst, src, w });
+        }
+    };
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for (i, inst) in blk.insts.iter().enumerate() {
+            match inst {
+                MInst::Copy { w, dst, src } => add(b, i, None, *dst, *src, *w),
+                MInst::FMov { dw, sw, dst, src } if dw == sw => add(b, i, None, *dst, *src, *dw),
+                MInst::ParallelCopy(pairs) => {
+                    for (k, &(dst, src, w)) in pairs.iter().enumerate() {
+                        add(b, i, Some(k), dst, src, w);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut drop = vec![true; cand.len()];
+    for _ in 0..cand.len() + 1 {
+        let reads = max_read(f, &cand, &drop);
+        let mut changed = false;
+        for (k, c) in cand.iter().enumerate() {
+            if !drop[k] {
+                continue;
+            }
+            let ok = match c.dst {
+                // A virtual destination knows how wide it is ever read.
+                Reg::V(d) => {
+                    matches!(c.w, Width::W64 | Width::Q)
+                        || matches!(c.src, Reg::V(s) if widths[s as usize] == c.w)
+                        || reads[d as usize] <= c.w.bytes()
+                }
+                // A physical one does not; AAPCS64 answers instead.
+                Reg::P(p) => abi_reader(f, c.b, c.i, p),
+            };
+            if !ok {
+                drop[k] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    residual_report(f, &cand, &drop, &widths);
+    // Remove back-to-front so earlier indices stay valid: pairs within one
+    // instruction first, then whole instructions.
+    let mut kill: Vec<(usize, usize, Option<usize>)> = cand
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| drop[*k])
+        .map(|(_, c)| (c.b, c.i, c.pair))
+        .collect();
+    kill.sort_unstable();
+    for &(b, i, pair) in kill.iter().rev() {
+        match pair {
+            // Dropping an IDENTITY pair leaves the simultaneous assignment the
+            // `ParallelCopy` denotes unchanged: it assigned a register to
+            // itself, so no other pair's source or destination is affected.
+            Some(k) => {
+                if let MInst::ParallelCopy(pairs) = &mut f.blocks[b].insts[i] {
+                    pairs.remove(k);
+                }
+            }
+            None => {
+                f.blocks[b].insts.remove(i);
+            }
+        }
+    }
+    f.blocks.iter_mut().for_each(|b| {
+        b.insts
+            .retain(|i| !matches!(i, MInst::ParallelCopy(p) if p.is_empty()))
+    });
+}
+
+/// LAW-4 RESIDUAL (`ZCC_R42RES=1`) — read-only, changes nothing.
+///
+/// A self-move that survives is refused for exactly one of three reasons, and
+/// the row is not exhausted until every survivor is classified:
+///
+///   * `wide-read` — a reader genuinely looks past `w`, so the truncation has an
+///     observer. FUNDAMENTAL (category (a)): the instruction is doing work.
+///   * `unknown-form` — `max_read` met an `MInst` form it does not list and
+///     charged the operand a full 8-byte read. A convenience truncation
+///     (category (b)) in the ANALYSIS, not in the program: listing the form
+///     lifts it.
+///   * `no-abi-reader` — a physical destination whose reader is neither the next
+///     `Call`'s argument list nor the block's `Ret`. Category (b) as well: a
+///     wider reader analysis would decide it.
+fn residual_report(f: &MFunc, cand: &[Cand], drop: &[bool], widths: &[Width]) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ZCC_R42RES").is_some()) {
+        return;
+    }
+    // what `max_read` would say with NOTHING dropped, i.e. the pessimistic bound
+    let none = vec![false; cand.len()];
+    let reads = max_read(f, cand, &none);
+    // the vregs an unlisted instruction form charged a full 8-byte read
+    let mut unknown = vec![false; f.vregs.len()];
+    for b in f.blocks.iter() {
+        for i in b.insts.iter() {
+            if matches!(
+                i,
+                MInst::Alu { .. } | MInst::Alu3 { .. } | MInst::Cmp { .. } | MInst::CSel { .. }
+                    | MInst::Copy { .. } | MInst::FMov { .. } | MInst::Bfx { .. }
+                    | MInst::Ext { .. } | MInst::Store { .. } | MInst::Spill { .. }
+                    | MInst::ParallelCopy(_) | MInst::Pair { .. }
+            ) {
+                continue;
+            }
+            i.visit(&mut |r, c| {
+                if let (Reg::V(v), Constraint::Use | Constraint::UseFixed(_)) = (r, c) {
+                    unknown[v as usize] = true;
+                }
+            });
+        }
+    }
+    let (mut wide, mut unk, mut noabi) = (0usize, 0usize, 0usize);
+    for (k, c) in cand.iter().enumerate() {
+        if drop[k] {
+            continue;
+        }
+        match c.dst {
+            Reg::V(d) => {
+                let _ = widths;
+                if unknown[d as usize] && reads[d as usize] > c.w.bytes() {
+                    unk += 1;
+                } else {
+                    wide += 1;
+                }
+            }
+            Reg::P(_) => noabi += 1,
+        }
+    }
+    if wide + unk + noabi > 0 {
+        eprintln!("R42RES {} {} {} {}", f.name, wide, unk, noabi);
+    }
+}
+
+/// Is the only reader of physical register `p`, after the copy at `(b, i)`, an
+/// ABI boundary that reads it at its declared width?
+///
+/// **Side II — AAPCS64 §6.4.2 (arguments) and §6.8.2 (return values).** The
+/// bits of a parameter or result register ABOVE the declared type's width are
+/// UNSPECIFIED. A callee handed an `int` in x0 reads `w0` and may not look
+/// higher; a caller taking an `int` result reads `w0` and may not look higher.
+/// So a narrow write into such a register truncates something no conforming
+/// program observes, and a narrow SELF-move into it is a no-op.
+///
+/// Only two shapes are accepted, and everything else is refused:
+///
+///   * the register is an argument of the very next `Call` — `uses` is exactly
+///     the AAPCS64 assignment isel computed, at the width the pair carries;
+///   * nothing in the rest of the block mentions the register and the block
+///     RETURNS — so the only reader is the caller, at the declared result width.
+///
+/// Everything else is refused because the reader is not known to be an ABI one.
+/// `Asm` in particular must never be accepted: an inline-asm template chooses
+/// its own operand width and may name `%x0` for an `int` operand, so its upper
+/// half is a real reader. It is refused by falling into the general
+/// "mentions `p`" case below.
+fn abi_reader(f: &MFunc, b: usize, i: usize, p: PReg) -> bool {
+    for inst in f.blocks[b].insts[i + 1..].iter() {
+        if let MInst::Call { uses, clobbers, .. } = inst {
+            if uses.iter().any(|&(_, u)| u == p) {
+                return true; // §6.4.2 — an argument, read at its declared width
+            }
+            if clobbers.has(p) {
+                return false; // the value dies here; not our business
+            }
+        }
+        let mut touched = false;
+        inst.visit(&mut |r, _| touched |= r == Reg::P(p));
+        if touched {
+            return false;
+        }
+    }
+    let mut touched = false;
+    f.blocks[b].term.visit(&mut |r, _| touched |= r == Reg::P(p));
+    // §6.8.2 — the result register, read by the caller at the declared width
+    !touched && matches!(f.blocks[b].term, MTerm::Ret)
 }
 
 /// Turn each edge's arguments into a parallel copy in the predecessor, then
@@ -335,16 +528,45 @@ fn mov(dst: Reg, src: Reg, w: Width) -> MInst {
 /// For each virtual register, the WIDEST access any reader makes of it, in
 /// bytes. Anything this does not recognize counts as a full 8-byte read, so an
 /// instruction form added later is conservative until it is listed here.
-fn max_read(f: &MFunc, cand: &[(usize, usize, VReg, VReg, Width)], drop: &[bool]) -> Vec<u32> {
+fn max_read(f: &MFunc, cand: &[Cand], drop: &[bool]) -> Vec<u32> {
     let mut out = vec![0u32; f.vregs.len()];
     // a copy that is going to DISAPPEAR does not narrow anything: its source
     // inherits whatever its destination is read at
-    let dropped: std::collections::HashMap<(usize, usize), (VReg, VReg)> = cand
+    let dropped: std::collections::HashSet<(usize, usize, Option<usize>)> = cand
         .iter()
         .enumerate()
         .filter(|(k, _)| drop[*k])
-        .map(|(_, &(b, i, d, s, _))| ((b, i), (d, s)))
+        .map(|(_, c)| (c.b, c.i, c.pair))
         .collect();
+    // …and only where BOTH ends are virtual is there anything to propagate to.
+    let mut prop: Vec<(VReg, VReg)> = cand
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| drop[*k])
+        .filter_map(|(_, c)| match (c.dst, c.src) {
+            (Reg::V(d), Reg::V(s)) => Some((d, s)),
+            _ => None,
+        })
+        .collect();
+    // Every EDGE is a copy that may disappear the same way. SSA destruction
+    // turns an argument into a copy into its parameter, and when the two share
+    // a colour that copy is deleted — after which the argument IS the
+    // parameter, and inherits every reader the parameter has. Counting the
+    // argument at the parameter's WIDTH alone is therefore not enough: a `w`
+    // parameter read as an `x` (`str x1` of a value the edge copy narrowed) is
+    // exactly the shape that made this rule miscompile yarpgen s0188. The
+    // parameter's width still goes in as the floor above, for the case where
+    // the copy survives; this adds the case where it does not.
+    for b in f.blocks.iter() {
+        for t in b.term.targets() {
+            let params = &f.blocks[t.block as usize].params;
+            for (k, a) in t.args.iter().enumerate() {
+                if let (Some(Reg::V(p)), Reg::V(a)) = (params.get(k).copied(), a) {
+                    prop.push((p, *a));
+                }
+            }
+        }
+    }
     let mut note = |r: Reg, bytes: u32, out: &mut Vec<u32>| {
         if let Reg::V(v) = r {
             out[v as usize] = out[v as usize].max(bytes);
@@ -352,7 +574,7 @@ fn max_read(f: &MFunc, cand: &[(usize, usize, VReg, VReg, Width)], drop: &[bool]
     };
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            if dropped.contains_key(&(bi, ii)) {
+            if dropped.contains(&(bi, ii, None)) {
                 continue; // handled by the propagation below
             }
             let (regs, bytes): (Vec<Reg>, u32) = match i {
@@ -374,6 +596,20 @@ fn max_read(f: &MFunc, cand: &[(usize, usize, VReg, VReg, Width)], drop: &[bool]
                 MInst::CSel { w, a, b, .. } => (vec![*a, *b], w.bytes()),
                 MInst::Copy { w, src, .. } => (vec![*src], w.bytes()),
                 MInst::FMov { sw, src, .. } => (vec![*src], sw.bytes()),
+                // Each pair reads its own source at its OWN width, so the
+                // instruction has no single one — note them here and contribute
+                // nothing to the common path. Without this arm a `ParallelCopy`
+                // falls into the catch-all below and every argument counts as a
+                // full 8-byte read, which is what used to hide every narrow
+                // call-argument copy from this analysis.
+                MInst::ParallelCopy(pairs) => {
+                    for (k, (_, s, w)) in pairs.iter().enumerate() {
+                        if !dropped.contains(&(bi, ii, Some(k))) {
+                            note(*s, w.bytes(), &mut out);
+                        }
+                    }
+                    (Vec::new(), 0)
+                }
                 MInst::Bfx { w, src, .. } => (vec![*src], w.bytes()),
                 // an extension reads only the bits it names
                 MInst::Ext { op, src, .. } => (
@@ -426,14 +662,34 @@ fn max_read(f: &MFunc, cand: &[(usize, usize, VReg, VReg, Width)], drop: &[bool]
                 }
             });
         }
-        // a terminator's own operand, and every edge argument
-        b.term.visit(&mut |r, _| note(r, 8, &mut out));
+        // A terminator's own operand is read at the terminator's own width, and
+        // an edge ARGUMENT at the width of the parameter it will be copied into
+        // — which is exactly the width `destruct` gives the edge copy. Counting
+        // either as a full 8 bytes is the conservatism that used to keep every
+        // narrow call result (`w0` copied out after a `bl` and passed along an
+        // edge) out of reach of this analysis.
+        {
+            match &b.term {
+                MTerm::Cbz { w, reg, .. } | MTerm::Tb { w, reg, .. } => note(*reg, w.bytes(), &mut out),
+                MTerm::Bcc(_, r, ..) | MTerm::Switch { idx: r, .. } | MTerm::BrReg(r, _) => {
+                    note(*r, 8, &mut out)
+                }
+                MTerm::B(_) | MTerm::Ret | MTerm::Unreachable => {}
+            }
+            for t in b.term.targets() {
+                let params = &f.blocks[t.block as usize].params;
+                for (k, a) in t.args.iter().enumerate() {
+                    let w = params.get(k).map_or(8, |p| width_of(f, *p).bytes());
+                    note(*a, w, &mut out);
+                }
+            }
+        }
     }
     // propagate through the copies that are going away, to a fixpoint: a chain
     // of them passes the widest reader all the way back to the real producer
-    for _ in 0..dropped.len() + 1 {
+    for _ in 0..prop.len() + 1 {
         let mut changed = false;
-        for (d, s) in dropped.values() {
+        for (d, s) in prop.iter() {
             let want = out[*d as usize];
             if out[*s as usize] < want {
                 out[*s as usize] = want;
