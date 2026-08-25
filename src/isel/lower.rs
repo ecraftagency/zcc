@@ -95,8 +95,12 @@ enum Folded {
     Slot(u32, i32),
     /// a register base at a constant displacement
     Base(ValueId, i32),
-    /// `[base, idx, ext #shift]` — an array subscript, addressed directly
+    /// `[base, idx, ext #shift]` — an array subscript, addressed directly.
+    /// `src` is the operand of the ADD that became the index, kept because the
+    /// dead-marking below has to know WHICH side that was — guessing it wrote
+    /// `use of undefined` into a yarpgen case (§13j).
     Indexed {
+        src: ValueId,
         base: ValueId,
         idx: ValueId,
         ext: Option<ExtKind>,
@@ -261,12 +265,25 @@ fn munch(h: &hir::Func) -> Munch {
                         (Operand::Val(x), Operand::Val(y)) => {
                             // `base + index*scale`: whichever side is the scaled
                             // one is the index
-                            let pick = |i: ValueId, base: ValueId| {
-                                if uses[i as usize] != 1 {
-                                    return None;
+                            let pick = |i: ValueId, base: ValueId| -> Option<Folded> {
+                                if uses[i as usize] == 1 {
+                                    let (idx, ext, shift) = scaled(i)?;
+                                    return Some(Folded::Indexed { src: i, base, idx, ext, shift });
                                 }
-                                let (idx, ext, shift) = scaled(i)?;
-                                Some(Folded::Indexed { base, idx, ext, shift })
+                                // A MULTIPLY-USED index cannot be PEELED — its
+                                // `sext` or shift has other readers and must
+                                // still be materialized — but the ADD folds
+                                // anyway, as the plain 64-bit register-offset
+                                // form `[base, idx]`. Requiring single use for
+                                // the whole thing conflated the two and cost an
+                                // `add` per access in the commonest loop there
+                                // is: `d[i] = s[i]`, where one index feeds two
+                                // addresses, folded for NEITHER (§13j). Both
+                                // operands are I64 here, so reading the index as
+                                // a 64-bit register is exact; and `[a, b]` is
+                                // symmetric, so it does not matter which side of
+                                // a multi-use pair is called the index.
+                                Some(Folded::Indexed { src: i, base, idx: i, ext: None, shift: 0 })
                             };
                             pick(y, x).or_else(|| pick(x, y))
                         }
@@ -333,21 +350,24 @@ fn munch(h: &hir::Func) -> Munch {
     cand.retain(|v, _| seen.contains(v));
     for (v, p) in &cand {
         m.dead.insert(*v);
-        // the scale computation belongs to the address too
-        if let Folded::Indexed { .. } = p {
-            if let Some((_, _, _, Operand::Val(y))) = bin(*v) {
-                if uses[y as usize] == 1 {
-                    m.dead.insert(y);
-                    if let Some((hir::BinOp::Shl, _, Operand::Val(inner), _)) = bin(y) {
-                        if uses[inner as usize] == 1 && ext_of(inner).is_some() {
-                            m.dead.insert(inner);
-                        }
+        // The scale computation belongs to the address too — but ONLY when it was
+        // peeled into the addressing mode, which is exactly when the operand
+        // that became the index had a single use. A multiply-used index is read
+        // as a register and must still be emitted.
+        //
+        // This used to guess which side of the add was the index by testing each
+        // for `scaled`, and it guessed wrong: an `add` whose BASE happened to be
+        // a single-use sign-extension had the base marked dead, and `dead` means
+        // "not emitted", so its register was never defined. yarpgen `s0096`
+        // printed `use of undefined v2659` (§13j). `src` records the choice
+        // instead of re-deriving it.
+        if let Folded::Indexed { src, .. } = p {
+            if uses[*src as usize] == 1 {
+                m.dead.insert(*src);
+                if let Some((hir::BinOp::Shl, _, Operand::Val(inner), _)) = bin(*src) {
+                    if uses[inner as usize] == 1 && ext_of(inner).is_some() {
+                        m.dead.insert(inner);
                     }
-                }
-            }
-            if let Some((_, _, Operand::Val(x), _)) = bin(*v) {
-                if uses[x as usize] == 1 && (scaled(x).is_some() && ext_of(x).is_some()) {
-                    m.dead.insert(x);
                 }
             }
         }
@@ -369,6 +389,15 @@ fn munch(h: &hir::Func) -> Munch {
                 hir::Inst::Bin { dst, op, ty, a, b } if !ty.is_float() => (*dst, *op, *ty, *a, *b),
                 _ => continue,
             };
+            // An instruction that is already DEAD — folded into an addressing
+            // mode above — is never emitted, so nothing may be absorbed INTO it:
+            // the absorbed value would be marked dead too and then defined
+            // nowhere. yarpgen `s0096` printed `use of undefined v2659` for
+            // exactly this once address folding began reaching the `add` that
+            // an index feeds (§13j).
+            if m2.dead.contains(&dst) {
+                continue;
+            }
             // A BITFIELD read: C spells it as a shift and a mask, or as a pair of
             // shifts, and A64 has one instruction for each (DDI 0487 C6.2.398).
             let bits = ty.bits();
@@ -615,7 +644,7 @@ impl<'a> L<'a> {
                     let base = self.base(Operand::Val(b));
                     return AddrMode::BaseImm { base, off };
                 }
-                Some(Folded::Indexed { base, idx, ext, shift }) => {
+                Some(Folded::Indexed { base, idx, ext, shift, .. }) => {
                     let b = self.base(Operand::Val(base));
                     let t = if ext.is_some() { hir::Ty::I32 } else { hir::Ty::I64 };
                     let i = self.reg(Operand::Val(idx), t);

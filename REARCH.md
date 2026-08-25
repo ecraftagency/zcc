@@ -1057,6 +1057,60 @@ looking sideways.
 
 ---
 
+## §13j THE ISEL DEBT — one condition in the munch table, and it was worth more than the row above it
+
+§13i said pointer-IV's only win was paying an isel debt, and named the debt: `add` + load is not
+folded into an addressing mode when TWO accesses share one index. It is one line.
+
+```rust
+let pick = |i, base| { if uses[i] != 1 { return None; }  … };
+```
+
+The index had to be single-use. But single use is what licences PEELING the `sext`/shift INTO the
+addressing mode; it is not what licences folding the `add`. A multiply-used index is simply read as
+a register — `[base, idx]`, the plain 64-bit register-offset form — and the `add` still disappears.
+Conflating the two cost one `add` PER ACCESS in `d[i] = s[i]`, the commonest loop shape there is.
+
+```
+    before   sxtw x1,w0 ; lsl x1,x1,#2 ; add x2,x3,x1 ; add x1,x4,x1 ; ldr w2,[x1] ; str w2,[x2]
+    after    sxtw x1,w0 ; lsl x1,x1,#2 ;                               ldr w2,[x4,x1] ; str w2,[x3,x1]
+```
+
+### Numbers — and note the DISTRIBUTION, which is the whole point of §13i
+| set | row 3 | isel fix |
+|---|---|---|
+| EXEC ≥30 ms | 1.4610 | **1.3789** |
+| EXEC all timed | 1.3996 | 1.3654 |
+| INSN (35) | 1.2437 | **1.2419** |
+| sqlite | 236,886 | 237,026 (+140, flat) |
+
+**8 of 8 programs improve, 0 regress.** g1_memcpy 74 → 47 ms (−36.5%) — the SAME win pointer-IV
+bought, without the pass, without the parameter, without the register, without the +0.8% size, and
+WITHOUT j2_histogram going backwards (it improves, 60 → 59 ms). Compare §13i's row 5: 1 win, 1 loss,
+6 flat, ≥30 ms 1.4125. The lower layer is strictly better on every axis.
+
+### Two defects found on the way, both of the same family
+`yarpgen s0096` failed to compile — `use of undefined v2659` — the moment the fold began reaching
+these adds. Two orphaned-value bugs, both pre-existing and both made REACHABLE by the wider fold:
+
+1. **The dead-marking guessed which operand was the index**, testing each side for `scaled`. An
+   `add` whose BASE happened to be a single-use sign-extension had the base marked dead — and `dead`
+   means "not emitted", so its register was never defined. `Folded::Indexed` now RECORDS which
+   operand it chose (`src`) instead of re-deriving it.
+2. **The ALU stage absorbed operands into instructions that were already dead** from address
+   folding. The absorbed value is marked dead too, and then nothing emits it. Fixed by skipping a
+   `Bin` whose destination is already dead — absorbing into an instruction that is never emitted
+   was meaningless anyway.
+
+Both are the same shape: a value marked "rides inside its consumer" when the consumer no longer
+exists. Worth naming, because address folding will keep widening.
+
+**ORDERING, now the third instance.** §13e→§13f: rotation worthless until coalescing and block
+threading were fixed below it. §13i→§13j: pointer-IV worthless, and the layer below it was the whole
+story. When a transform's number disappoints, look DOWN before looking sideways.
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -1117,8 +1171,8 @@ its value are downstream of the same R4 item. The revised order:
 4. ✅ IV/SCEV analysis (`pass/scev.rs`, §13g) — shipped unwired, seven batteries
 5. ⏸️ **pointer-IV** (`pass/iv.rs`, §13h) — built and proven; re-judged on the distribution and
    GATED OFF (§13i): 1 win / 1 loss / 6 flat, and the winner is paying an isel debt
-5b. ⬜ **isel addressing-mode fold** — the debt: `add` + load is not folded when two accesses share
-   an index, which is `d[i] = s[i]`. Fix, then re-measure row 5
+5b. ✅ **isel addressing-mode fold** (§13j) — EXEC ≥30 ms 1.4610 → **1.3789**, 8 of 8 improve, 0
+   regress, sqlite flat. Strictly better than row 5 was on every axis
 6. ⬜ final-value, then LFTR — cheap now that the analysis is wired. LFTR is also what would let
    `mycopy` drop its separate counter and test the pointer instead, which is the last instruction
    between that loop and gcc's
