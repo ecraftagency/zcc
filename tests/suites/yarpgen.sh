@@ -29,6 +29,14 @@
 # stay within the supported surface; max-array-dims=3 caps global size so a test runs
 # in well under a second (the default admits 7-D arrays → hundreds of MB per global).
 set -u
+# ── TEMPORARILY DISABLED (user request, 2026-08-25) ──────────────────────────
+# yarpgen is removed from the suite until the user brings it back. To restore,
+# delete this block. Exits 0 (skip, not fail) so any gate that invokes this
+# script treats it as a clean no-op. Set ZCC_YARPGEN=1 to run it anyway.
+if [ -z "${ZCC_YARPGEN:-}" ]; then
+    echo "yarpgen: TEMPORARILY DISABLED (user request 2026-08-25) — set ZCC_YARPGEN=1 to run, or delete the guard in tests/suites/yarpgen.sh to restore"
+    exit 0
+fi
 export ZCC="${ZCC:-/usr/local/bin/zcc}"
 # Compile-timeout ceiling (s): bounds a pathological zcc compile (e.g. s0940, super-
 # linear opt path) so a 10k run cannot stall. An overrun is a PERF fault, named

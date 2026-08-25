@@ -11,9 +11,19 @@
 #   tests/box.sh s 'shell...'         # arbitrary shell; has $ZCC, /suites, /work/zcc
 set -eu
 cd "$(dirname "$0")/.."
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-    cargo build -q --target aarch64-unknown-linux-musl
-ELF="$PWD/target/aarch64-unknown-linux-musl/debug/zcc"
+# ZCC_REL=1 builds a RELEASE zcc — use it when RUNNING A SUITE (torture), where a
+# release zcc compiles the corpus much faster (debug Rust is ~9x slower to
+# compile the input; the gap is largest on big functions). Default stays debug
+# for the fast ~2s rebuild that single-file `c FILE` / `s` iteration wants.
+if [ -n "${ZCC_REL:-}" ]; then
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+        cargo build -q --release --target aarch64-unknown-linux-musl
+    ELF="$PWD/target/aarch64-unknown-linux-musl/release/zcc"
+else
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+        cargo build -q --target aarch64-unknown-linux-musl
+    ELF="$PWD/target/aarch64-unknown-linux-musl/debug/zcc"
+fi
 SUITES="${ZCC_SUITE_CACHE:-$HOME/.cache/zcc-suites}"
 DR="docker run --rm -e ZCC=/usr/local/bin/zcc -e ZCC_SUITE_CACHE=/suites
     -v $ELF:/usr/local/bin/zcc:ro -v $SUITES:/suites -v $PWD:/work/zcc:ro zcc-box"
