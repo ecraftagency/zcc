@@ -96,10 +96,10 @@ target file (Side II); everything else is Side I.
 | Constant folding = partial evaluation | evaluate constants at translation time | `parser.rs` (`fold`), `gate alg` |
 | Commuting square fold↔runtime | fold(e)=run(e) | `gate alg` |
 
-### A5. Instruction selection & ABI `[IN USE — R0.6]`
+### A5. Instruction selection & ABI `[IN USE — R0.6 base cover / R3.1 munch]`
 | concept/theorem | description | zcc |
 |---|---|---|
-| Instruction selection = tree pattern matching (BURS / maximal munch, Aho-Ganapathi-Tjiang 1989) | an HIR expression tree is covered by machine-instruction patterns; a value with ONE use may be folded into its user, a multi-use value is materialized once. Each pattern row is a theorem `⟦hir-tree⟧ = ⟦mir-seq⟧` with its own battery entry | `isel/lower.rs`, pattern table `isel/pattern.rs` (R3.1). **R0 ships the BASE CASE ONLY**: one HIR instruction → one canonical machine sequence, no munching. That is not a shortcut to patch later — it is the identity cover, and every munch row is added on top of a lowering already proven correct |
+| Instruction selection = tree pattern matching (BURS / maximal munch, Aho-Ganapathi-Tjiang 1989) | an HIR expression tree is covered by machine-instruction patterns; a value with ONE use may be folded into its user, a multi-use value is materialized once. Each pattern row is a theorem `⟦hir-tree⟧ = ⟦mir-seq⟧` with its own battery entry | `isel/lower.rs`. **R0 shipped the BASE COVER** (one HIR instruction → one canonical machine sequence, the identity cover, proven correct); **R3.1 added the MUNCH TABLE on top of it** — `isel/lower.rs::munch`, ONE pre-pass over the use-def graph deciding, before any instruction is emitted, which producers each consumer absorbs (it must be a pass, not an emission-time choice, because the producer is emitted first). There is no `isel/pattern.rs` — the rows live in `munch` + `lower`. **Two licences, not interchangeable**: an ADDRESS folds only when EVERY use of it is a memory operand (folding into some while still computing it for others duplicates work); an ALU operand folds on a SINGLE use (the shift/extension happens inside the consumer). A producer that has itself absorbed something may not be absorbed again. Rows: `[base,#off]`, `[slot,#off]`, `[base,idx,ext #k]`, `add/sub …, sxtw`, `op …, lsl #k`, `madd`/`msub`, `cmp`+`b.cc`, `cbz`/`cbnz`, `tbz`/`tbnz` (sign/single-bit tests), `cmp`+`csel`, `ubfx`/`sbfx`. `mul(x,2^k)→shl` is an HIR canonicalization (`fold::canon`), because only the shift form folds into an address |
 | ABI = finite automaton over the C signature | AAPCS64 §6.4–6.8 C.1–C.15: the state is (NGRN, NSRN, NSAA) and each parameter advances it. Composites ≤16B in registers, HFA/HVA, >16B by reference, sret in x8, C.11 lock, variadics | `isel/abi.rs` (R0: the scalar subset; composites/varargs R1.2). Side-II table: II-3 |
 | Constrained instruction = local parallel copy (Hack 2007 §4) | rather than teach the allocator about "argument registers", ONE `ParallelCopy` before a call moves every operand where the ABI wants it, and one after moves the result out. The allocator then sees no fixed constraint anywhere, and an argument permutation (`f(b,a)`) is resolved by the same windmill sequentialization every block edge uses | `isel/lower.rs::call`, entry prologue |
 | Immediate legalization | a constant either fits an instruction's immediate field or must be materialized; which is a pure encoding question | `isel/imm.rs` over the `mir/isa.rs` predicates (II-5) |
@@ -144,22 +144,25 @@ target file (Side II); everything else is Side I.
 |---|---|---|
 | **SSA interference graphs are CHORDAL** (Hack 2007, PhD) | and a preorder of the dominator tree is a PERFECT ELIMINATION ORDER for them. Greedy colouring along that order is therefore OPTIMAL — it uses exactly ω(G) = the maximum register pressure — and it CANNOT get stuck once pressure ≤ k. No graph is built, no node is merged, there is no simplify/spill iteration | `regalloc/color.rs` |
 | Liveness on SSA with block parameters | `live_out(b) = ⋃_{s∈succ} (live_in(s) ∪ args(b→s))`, `live_in(b) = uses(b) ∪ (live_out(b) ∖ defs(b))` with parameters counted as definitions. PHYSICAL registers are tracked in the SAME set — an argument register is genuinely live from the copy that sets it up until the call that reads it, and a virtual register overlapping it must not take that colour | `regalloc/live.rs` |
-| Spilling = Belady MIN on a working set (Braun & Hack 2009) | walk in dominance order carrying a working set of ≤ k values, reload on a use that is absent, evict the value whose NEXT USE is furthest, reconcile the sets on each edge. Reloads create new definitions ⟹ SSA reconstruction (Braun 2013). Post-condition: pressure ≤ k at every point — which is exactly the precondition colouring needs | `regalloc/spill.rs`. **R0 ships the SOUND BASE CASE**: spill at the definition, reload into a FRESH register per use (so SSA holds with no reconstruction, and live ranges do split). The full algorithm is a BLOCKING prerequisite of R2.2, where mem2reg first creates long-lived values |
-| Rematerialization (Briggs 1992) | a value whose producer is pure and operand-free (`iconst`, `adrp+add`, an extend of a live value) is RECOMPUTED instead of reloaded. Flags are the extreme case: never spilled, always rematerialized | R2.2, with the spiller |
+| Spilling = Belady MIN on a working set (Braun & Hack 2009) | per register class, walk each block forward carrying a WORKING SET `W` of ≤ k values; at the head, live-in non-memory values ordered by next-use distance, truncated to the budget (what does not fit becomes memory-resident — Belady's provably-optimal rule for a fixed-size cache, which is what a register class is); a use of a value absent from `W` gets a RELOAD into a fresh vreg serving every later use in the block; a call's clobber set counts as registers already spoken for, so what survives a call is ≤ the class's callee-saved count (this SUBSUMES all "crosses a call" reasoning; two values crossing DIFFERENT calls are bound by whichever call comes first). Post-condition: pressure ≤ k at every point — exactly colouring's precondition | `regalloc/spill.rs`. **R0/R1 shipped the sound base case** (spill-at-def, reload-per-use); **R2.2 shipped Braun-Hack proper**, the blocking prerequisite mem2reg forced (the base case collapsed exactly as predicted: sqlite 12,253 → 275,665 frame mem-ops before it). **Two deviations, theory not implementation notes**: (1) **NO SSA reconstruction** — a reload's fresh register is used only inside the block that created it, so its live range is dominated by its definition and SSA holds by construction; a value staying in `W` across an edge keeps its original name. The price is one reload per block-residency rather than one per program region (the §13b spill-traffic excess). (2) **A spilled BLOCK PARAMETER cannot be stored at its definition** — its definition is the block head — so the parameter is removed from the IR and each predecessor writes the slot; one slot per SSA WEB (parameter ∪ arguments), merged only where members do not interfere |
+| Rematerialization (Briggs 1992) | a value whose producer reads no register (`MovImm`, `Adrp`, `SlotAddr`, an extend of a live value) is RECOMPUTED instead of stored-and-reloaded — the recomputation is one instruction and the store disappears entirely. Flags are the extreme case: never spilled, always rematerialized | `regalloc/spill.rs` (shipped R2.2 with the spiller) |
 | Coalescing = BIASED COLOURING | at a definition that is a copy, prefer the partner's colour when free. It never merges nodes, so it can never break the pressure guarantee — the property Chaitin-Briggs coalescing must be careful about. Upgrade to Boissinot merging only if the MEASURED residual copy count justifies it (Law-4) | `regalloc/color.rs` |
 | Calls need no special rule | the caller-saved set is a property of the value, not of the instruction: a value live across a call may not take a caller-saved colour (AAPCS64 §6.1.1). Everything else falls out of ordinary constraint-respecting greedy colouring | `regalloc/live.rs::crosses_call` |
 | SSA destruction = one parallel copy per edge (Boissinot et al. 2009) | with block parameters this is the whole of it. Sequentialization is the windmill: emit any copy whose destination is nobody's source; when only cycles remain, break one through the reserved scratch register (x16 = AAPCS64 IP0, v31) — which is what those registers are reserved FOR | `regalloc/destruct.rs` |
 | Correctness = renaming bisimulation | allocation renames values and may route some through memory; it must not change what the function computes. Proven as `⟦mir_v⟧ = ⟦mir_p⟧` under one interpreter, plus the structural checks: no vreg survives, every fixed operand satisfied, every reload DOMINATED by a spill of its slot, no parallel copy left | `regalloc/verify.rs`, `regalloc/tests.rs` |
 | Frame lowering realizes the ABI CONTRACT | before frame lowering, AAPCS64's promise that x19–x28 / v8–v15 / x30 survive a call is an ASSUMPTION the allocator already relied on; after, real `Spill`/`Reload` instructions keep it. So `⟦mir_p⟧ = ⟦mir_final⟧` is precisely the statement that frame lowering realizes that assumption in instructions — and the prologue is ordinary MIR, not a printed string, so the interpreter executes it | `mir/pass/frame.rs`, `mir/pass/tests.rs` |
 
-### A7b. Optimization — proving each pass `[PLANNED — R2 (HIR) / R3 (MIR)]`
+### A7b. Optimization — proving each pass `[IN USE — R2 (HIR) / R3 (MIR); two rows ⬜]`
 
-> Status after R0: **no optimization pass exists yet.** The R0 pipeline is
-> `AST → HIR → isel → regalloc → frame → layout → .s`, and every layer boundary already
-> carries its square. The pass ladder below is the catalogue of theorems to re-realize, in
-> gcc -O1 order; each ships with a commuting square before the next is written (Law 3).
-> The general theorems in the first table are architecture-independent and survived the
-> re-architecture unchanged — they are about how a pass is PROVEN, not about what the IR is.
+> Status after R3: **the ladder is shipped**, each pass carrying its commuting square (Law 3)
+> under `hir::interp`/`mir::interp`, gated by `opt-parity` (passes off vs on, 0 DIVERGE) plus
+> torture/csmith300/yarpgen300. The R0 pipeline was `AST → HIR → isel → regalloc → frame →
+> layout → .s`; the passes below now sit between lowering and isel (HIR ladder) and between isel
+> and regalloc / after frame (MIR ladder). Still `⬜`: the HIR loop tail (iv / strength-reduce /
+> pointer-iv / LFTR, rotate / final-value / invariant-pure-call hoist) and two MIR rows
+> (`auto_inc` R3.2, `shrink_wrap` R3.3). The general theorems in the first table are
+> architecture-independent and survived the re-architecture unchanged — they are about how a
+> pass is PROVEN, not about what the IR is.
 
 | concept/theorem | description |
 |---|---|
@@ -176,17 +179,25 @@ target file (Side II); everything else is Side I.
 | Dominance / dominator tree | A dom B; the basis of GVN, LICM, and of the colouring order itself |
 | **Chordal graphs / perfect elimination order** | the SSA colouring theorem (A7); replaces "graph colouring is NP-hard" as the operative fact |
 
-**The HIR pass ladder (REARCH §4, gcc `-ftree-*` order) — every row is PLANNED at R2:**
-`cfg_simplify · sroa+mem2reg (Braun 2013) · sccp (Wegman-Zadeck) · gvn (absorbing CSE, copy-prop,
-constant folding, algebraic normalization) · load_elim/dse (gated by the alias oracle) · dce
-(Effect table) · inline (β-reduction + interprocedural purity) · licm (unconditional at O1 — the
-ALLOCATOR owns pressure, not the pass) · iv/strength-reduction/pointer-iv/LFTR · if_convert
-(diamond → select) · rotate / final-value / invariant-pure-call hoist`
+**The HIR pass ladder (REARCH §4, gcc `-ftree-*` order):** ✅ shipped —
+`cfg_simplify` (`pass/cfg.rs`) · `sroa+mem2reg` (Braun 2013, `pass/sroa.rs`) · `sccp`
+(Wegman-Zadeck, `pass/sccp.rs`) · `gvn` (absorbing CSE, copy-prop, constant folding, algebraic
+normalization, `pass/gvn.rs`) · `load_elim/dse` (gated by the alias oracle, `pass/mem.rs`) · `dce`
+(Effect table, `pass/dce.rs`) · `inline` (β-reduction + interprocedural purity, `pass/inline.rs`) ·
+`licm` (unconditional at O1 — the ALLOCATOR owns pressure, not the pass, `pass/licm.rs`) · `if_convert`
+(diamond → select, `pass/ifconv.rs`) · `sink` (licm's dual — a pure trap-free instruction with one
+using block moves down to it; added at R3 because §13b ranked register pressure the largest residual,
+`pass/sink.rs`). ⬜ remaining — `iv/strength-reduction/pointer-iv/LFTR`, `rotate / final-value /
+invariant-pure-call hoist` (`pass/iv.rs`, `pass/loop.rs`).
 
-**The MIR pass ladder (REARCH §8) — PLANNED at R3:** pre-allocation on SSA `cmp_elim` (value
-numbering over flag definitions), `auto_inc` (pre/post-index), `ext_lattice` (known-width
-dataflow — ONE pass replacing rc3's five text `sxtw` levers), `ldst_pair` (ldp/stp);
-post-allocation `shrink_wrap`, and a STRUCTURED peephole on MIR, never on text.
+**The MIR pass ladder (REARCH §8):** pre-allocation on SSA — ✅ `cmp_elim` (value numbering over flag
+definitions: `subs`/`ands` for a following `cmp #0`, fusing only where the condition code survives —
+`cmp d,#0` sets C=1,V=0 by definition, so only codes reading N/Z alone carry, and `lt`/`ge` are
+rewritten to `mi`/`pl`; `mir/pass/cmpelim.rs`), ✅ `ext_lattice` (forward known-width dataflow — ONE
+pass replacing rc3's five text `sxtw` levers, `mir/pass/ext.rs`), ✅ `ldst_pair` (`ldp`/`stp`, runs
+LAST after frame/legalize so slots have numbers and displacements are final, `mir/pass/ldstp.rs`);
+⬜ `auto_inc` (pre/post-index). Post-allocation — ✅ block `layout` + branch relaxation, ✅ jump
+tables, ✅ STRUCTURED peephole on MIR (never on text); ⬜ `shrink_wrap`.
 gcc -O1 has no instruction scheduler and neither does this list.
 
 **5 classic passes → theorem (all DECIDABLE):**
@@ -342,6 +353,18 @@ a bitmask immediate is a ROTATED RUN OF ONES replicated across the register (0 a
 are NOT encodable), and in the ADD/SUB **immediate** form register 31 is **SP, not ZR** —
 `add w0, wzr, #5` is not an instruction, while the shifted-register and logical-immediate
 forms do read 31 as ZR.
+
+**Side-II arch constants the R2/R3 machine passes rest on** (each transcribed from the manual,
+consumed at the named site; the register-width rule is the load-bearing one — three of the
+R2.4/R3 wrong-code defects, §15c, ARE that one line):
+
+| constant | value | source | consumed at |
+|---|---|---|---|
+| **every 32-bit (`w`-form) write ZEROES bits 63:32** | the upper half is cleared, not preserved — so `sxtb w0, w1` is sign-extended within the low 32 bits and zero above, and `mov w0, w0` is a TRUNCATION, not a no-op | **DDI 0487 B1.2.1** | `mir/pass/ext.rs` (the extension lattice's third field), `regalloc/destruct.rs` (self-move-as-truncation fixpoint), `isel/lower.rs` |
+| `ldp`/`stp` displacement | SIGNED 7-bit field, SCALED by the element width (`imm7 · size`), naming the FIRST of two consecutive registers | DDI 0487 C6.2.130 | `mir/isa.rs::pair_off_ok`, `mir/pass/ldstp.rs` |
+| conditional-branch reaches | `b.cc`/`cbz`/`cbnz` 19-bit signed = ±1 MB; `tbz`/`tbnz` 14-bit = ±32 KB; unconditional `b` 26-bit = ±128 MB. The assembler does NOT relax these — a far target needs a trampoline | DDI 0487 C6.2.26/C6.2.42/C6.2.375 | `mir/pass/layout.rs::relax_branches` |
+| bit-field extract | `ubfx`/`sbfx dst, src, #lsb, #width` — a shifted mask (`and(lshr(a,s),mask)`, `shl+ashr`) in one instruction | DDI 0487 C6.2 | `isel/lower.rs` munch, `MInst::Bfx` |
+| jump-table density rule | a `switch` becomes a table (`adrp`/`ldrsw`/`br` over signed 32-bit offsets) when it has ≥ 4 cases AND occupies ≥ half its span (span ≤ 4096); below that, a balanced compare tree | gcc default policy (dated constant) | `isel/lower.rs::jump_table` |
 
 ### II-6. GCC/vendor spec — the nonconforming surface (`EXT(...)`)
 | feature | status | marker |

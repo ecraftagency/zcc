@@ -287,6 +287,28 @@ sequentialized after allocation (§6.3).
 assigned offsets inside one frame and `frame_size` is its size — which may
 legitimately be **zero** for a leaf that needs no stack.
 
+### 5.5 Bit-field extract and the paired forms
+
+These are the denotations the R3 machine passes (`isel` munch, `ldst_pair`)
+introduce; each is the atom its commuting-square battery compares against.
+
+```
+⟦Bfx u  w, d, s, lsb, wid⟧   f = zext of bits [lsb+wid-1 .. lsb] of s↓;   ν' = ν[d ↦ f]   (ubfx)
+⟦Bfx s  w, d, s, lsb, wid⟧   f = sext of that same field (bit lsb+wid-1 replicated);      (sbfx)
+                             then the `w`-form rule of §1.2: a W32 result ZEROES bits 63:32
+⟦Pair load  w, a, b, m⟧      addr = ⟦m⟧;  ν' = ν[a ↦ μ[addr .. addr+w], b ↦ μ[addr+w .. addr+2w]]
+⟦Pair store w, a, b, m⟧      addr = ⟦m⟧;  μ' = μ[addr .. ↦ a↓][addr+w .. ↦ b↓]
+```
+
+`Bfx` denotes exactly `and(lshr(s, lsb), (1<<wid)−1)` for the unsigned form and
+its sign-extended twin for the signed one — which is *why* the munch table may
+fold `and(lshr(a,s), mask)` and `shl+ashr` into it. `Pair` names the FIRST of
+two registers; the second is at `+w.bytes()` (DDI 0487 C6.2.130), so a pair is
+two independent single accesses with one caveat the fusing pass must honor and
+⟦·⟧ makes visible: a **load** must not name a destination twice and must not
+clobber a base it is still addressing through — otherwise the two-access
+denotation and the one-instruction form diverge.
+
 ---
 
 ## 6. The commuting squares (REARCH §10 made concrete)
@@ -299,9 +321,17 @@ only inputs on which neither side is ⊥ (§7).
 The lowering battery (`src/hir/tests.rs`). The oracle is the STANDARD,
 transcribed by hand — never "what zcc currently prints".
 
-### 6.2 `⟦f⟧ = ⟦P f⟧` for an HIR pass P
-Not yet exercised: R0 ships no pass. The harness is the one above, run on both
-sides.
+### 6.2 `⟦f⟧ = ⟦P f⟧` for an HIR pass P, and `⟦m⟧ = ⟦P m⟧` for a MIR pass
+Shipped and exercised (R2/R3). The harness is the one above, run on both sides of
+each pass. HIR: `cfg_simplify`, `sroa+mem2reg`, `sccp`, `gvn`, `load_elim/dse`,
+`dce`, `inline`, `licm`, `if_convert`, `sink`. MIR-SSA (under `mir::interp`):
+`cmp_elim` — a fused `subs`/`ands` denotes the same result AND the same NZCV as
+the separate op-then-`cmp` only for the condition codes reading N/Z alone (§5.1),
+which is the square's whole content; `ext_lattice` — an extension whose source
+already satisfies the width fact (§1.2) is the identity, and the fact is
+established only by instructions whose architectural definition establishes it;
+`ldst_pair` — §5.5. Each `⬜` row of §A7b (iv/LFTR, rotate, `auto_inc`,
+`shrink_wrap`) owes the same equality when it lands.
 
 ### 6.3 `⟦hir⟧ = ⟦mir_v⟧` (instruction selection) and `⟦mir_v⟧ = ⟦mir_p⟧` (allocation)
 `src/isel/tests.rs` and `src/regalloc/tests.rs`. The second is a **renaming

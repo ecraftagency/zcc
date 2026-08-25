@@ -1,11 +1,14 @@
 // HIR → MIR instruction selection (REARCH.md §6, §12 R0.6).
 //
-// R0 is deliberately NAIVE: one HIR instruction becomes one canonical machine
-// sequence, with no munching of operand trees. That is not a shortcut to be
-// grown out of by patching — it is the base case of the pattern table. R3.1
-// adds munch rows (addressing modes, cmp-branch fusion, madd/msub, bfx, extend
-// folding), each as a row in `pattern.rs` with its own `⟦hir-tree⟧ = ⟦mir-seq⟧`
-// battery entry, on top of a lowering that is already proven correct.
+// R0 shipped the BASE COVER: one HIR instruction becomes one canonical machine
+// sequence, with no munching of operand trees. That was not a shortcut to be
+// grown out of by patching — it is the base case, proven correct, on top of
+// which R3.1 added the MUNCH TABLE (addressing modes, cmp-branch fusion,
+// madd/msub, bfx, extend folding). The rows live in `munch` (below) and their
+// `lower` arms, NOT in a separate `pattern.rs` — each with its own
+// `⟦hir-tree⟧ = ⟦mir-seq⟧` battery entry in `tests.rs`. `munch` is one pre-pass:
+// the producer is emitted before the consumer, so which producers a consumer
+// absorbs must be decided ahead of emission, not at it.
 //
 // The one non-obvious invariant, established in `hir::build`: HIR never performs
 // arithmetic or comparison at I8/I16 (C99 6.3.1.1 promotes first). Narrow types
