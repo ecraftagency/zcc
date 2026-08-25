@@ -945,3 +945,107 @@ fn a_break_before_the_call_keeps_it_in() {
     );
     square(&src, 12);
 }
+
+// ── loop rotation (REARCH §13c row 2, shipped default-OFF — see §13e) ──────
+
+/// Build, promote locals, then rotate by hand. `module(src, true)` cannot reach
+/// this pass because it ships disabled, and a disabled theorem still owes its
+/// square — otherwise enabling it later would enable something unproven.
+fn rotated(src: &str) -> (Module, bool) {
+    let ast = frontend(src);
+    let mut m = build::build(&ast);
+    let mut any = false;
+    for f in m.funcs.iter_mut() {
+        super::super::dom::split_critical_edges(f);
+        for _ in 0..super::ROUNDS {
+            super::cfg::run(f);
+            super::sroa::run(f);
+            super::sccp::run(f);
+            super::gvn::run(f);
+        }
+        any |= super::rotate::force(f);
+        verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    }
+    (m, any)
+}
+
+/// ⟦f⟧ = ⟦rotate f⟧, on the interpreter, both sides equal `want`.
+fn rotate_square(src: &str, want: i64) {
+    let ast = frontend(src);
+    let plain = build::build(&ast);
+    let (rot, _) = rotated(src);
+    match (run(&plain, &ast), run(&rot, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == want => {}
+        (x, y) => panic!("⟦f⟧={:?} ⟦rotate f⟧={:?} want {}\n{}", x, y, want, src),
+    }
+}
+
+/// Does the loop leave from its HEADER? That is what "top-tested" means, and its
+/// disappearance is the structural consequence rotation exists to produce. Asked
+/// of the header rather than of the latch because rotation ends by splitting the
+/// critical edges it created, and the latch is then a split block that merely
+/// forwards — a true statement about layout, but not the one under test.
+fn header_is_the_test(f: &Func) -> bool {
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    lf.loops.iter().any(|l| {
+        f.blocks[l.header as usize]
+            .term
+            .succs()
+            .iter()
+            .any(|s| !l.body.contains(s))
+    })
+}
+
+#[test]
+fn rotation_moves_the_test_to_the_bottom() {
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
+    let (before, _) = (build::build(&frontend(src)), 0);
+    assert!(
+        header_is_the_test(func(&before, "f")),
+        "the frontend builds a top-tested loop — otherwise this proves nothing"
+    );
+    let (after, fired) = rotated(src);
+    assert!(fired, "a counted loop must rotate");
+    assert!(
+        !header_is_the_test(func(&after, "f")),
+        "after rotation the loop no longer leaves from its header"
+    );
+    rotate_square(src, 42);
+}
+
+#[test]
+fn rotation_preserves_a_loop_that_never_runs() {
+    // The whole content of the square: the guard is the header's FIRST
+    // execution, so a loop entered zero times still evaluates the test once and
+    // takes the same exit.
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+               int main(void){int a[1];a[0]=7;return f(a,0)+42;}";
+    rotate_square(src, 42);
+}
+
+#[test]
+fn rotation_refuses_a_header_that_stores() {
+    // The header is COPIED. A read may be copied — each dynamic execution still
+    // happens once — but a store would stand at two program points.
+    let src = "int f(int *p,int n){int i=0;while(p[i]++ < n) i++; return i;}\
+               int main(void){int a[3];a[0]=0;a[1]=1;a[2]=9;return f(a,2)+40;}";
+    let (after, fired) = rotated(src);
+    assert!(!fired, "a header with a store is not copyable");
+    assert!(header_is_the_test(func(&after, "f")), "so the loop stays top-tested");
+}
+
+#[test]
+fn rotation_is_not_applied_twice() {
+    // Termination. A rotated loop tests on its latch, and that is exactly the
+    // shape the pass refuses, so the peel cannot chain.
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
+    let (mut m, fired) = rotated(src);
+    assert!(fired);
+    for f in m.funcs.iter_mut() {
+        assert!(!super::rotate::force(f), "rotation must be idempotent");
+    }
+}

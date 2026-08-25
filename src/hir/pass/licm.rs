@@ -115,8 +115,10 @@ pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
 //       running it in the preheader adds no execution that the original did not
 //       perform. This is the fence that stops a fault or a non-terminating
 //       callee from being speculated onto a path that never took it, and it is
-//       three conditions at once: the loop is entered at least once (the header
-//       test, evaluated on the entry edge, selects a body block); the call's
+//       three conditions at once: the loop is entered at least once — free when
+//       the call sits in the HEADER, since the preheader's only successor is the
+//       header, and otherwise decided by evaluating the header's test under the
+//       preheader's own edge arguments; the call's
 //       block dominates every latch (the first iteration cannot reach the back
 //       edge without it); and it dominates every other block the loop can be
 //       left from (the first iteration cannot escape without it either). The
@@ -195,11 +197,6 @@ fn hoist_call(
             }
         }
     }
-    // (4b) the loop is entered at least once.
-    if !enters_body(f, c, pre, header, &inloop) {
-        note("trip-count");
-        return false;
-    }
     // The FIRST call in the body, in reverse postorder. Within one iteration the
     // body is acyclic (back edges only reach the header), so reverse postorder
     // is an execution order: nothing that may run before this call is a call.
@@ -216,6 +213,17 @@ fn hoist_call(
         Some(x) => x,
         None => return false,
     };
+    // (4b) the call is REACHED on the first iteration. When it sits in the
+    // header there is nothing to prove — the preheader's only successor is the
+    // header, and the call precedes the header's terminator, so entering the
+    // loop at all runs it. That is the ordinary shape AFTER rotation, and it is
+    // why rotation was the row that unblocked this one. Otherwise the loop must
+    // be shown to run at least once, by evaluating the header's test under the
+    // arguments the preheader's own edge carries.
+    if b != header && !enters_body(f, c, pre, header, &inloop) {
+        note("trip-count");
+        return false;
+    }
     // (4c) the first iteration cannot finish WITHOUT the call: every way onward
     // from the body passes through it. There are exactly two ways onward — round
     // the back edge, or out of the loop — so every latch and every EXITING block

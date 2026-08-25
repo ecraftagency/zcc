@@ -19,6 +19,7 @@ pub mod inline;
 pub mod licm;
 pub mod mem;
 pub mod purity;
+pub mod rotate;
 #[cfg(test)]
 mod tests;
 pub mod sccp;
@@ -105,6 +106,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         }
         if on("ifconv") {
             changed |= ifconv::run(f);
+        }
+        // Rotation runs BEFORE licm, not after: a bottom-tested loop is what
+        // makes "the loop runs at least once" structural rather than
+        // arithmetic, and that is the fence licm's call hoist was refusing on.
+        if on("rotate") {
+            changed |= rotate::run(f);
         }
         if on("licm") {
             changed |= licm::run_with(f, ro);
