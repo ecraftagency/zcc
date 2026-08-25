@@ -490,14 +490,17 @@ repeat until every class is residual-fundamental. Predict on MIR before building
 **Planned in full at §13n** (2026-08-25, on the zero-pending compiler): four steps — R4.1 SSA
 reconstruction after spilling, R4.2 Boissinot coalescing, R4.3 truncation-as-rename, R4.4 re-judge
 `csel` — each with its execution site, the prediction to take BEFORE building, its KPI and its gate.
-**R4.1 ✅ BANKED** (§13n): reload copies carried across edges, no SSA reconstruction needed after all
-— sqlite 237,025 → 232,214, **1.509× → 1.478×**, full gate green.
+**R4.1 ✅ BANKED** · **R4.2 ✅ BANKED** (§13n): reload copies carried across edges (no SSA
+reconstruction needed after all), then the ABI-boundary truncation no-op — sqlite
+237,025 → 232,214 → **218,776**, 1.509× → **1.3928×**, full gate green (musl included, for the
+first time).
 **RE-PLANNED 2026-08-25 (user)** after the R4.2 prediction inverted the row's premise: the excess was
 re-decomposed by ROOT CAUSE on the R4.1 compiler and is now twelve rows R4.1–R4.12 in §13n, each with
 its evidence, site, the prediction to take first and its KPI. The two largest are the ABI family the
 first plan had no row for: truncation self-moves at ABI boundaries (12,570 insns, 16.7% of the gap,
 every one a no-op under AAPCS64 §6.4.2) and a colourer rule that forbids a parallel-copy destination
-from taking its own dying source (2.22 movs per call vs gcc 1.00). Next ⬜ **R4.2**.
+from taking its own dying source (2.22 movs per call vs gcc 1.00). Next ⬜ **R4.3** — the colourer
+rule; R4.2's histogram has been re-taken and the `mov` excess it leaves is 6,629.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
 
@@ -1275,6 +1278,10 @@ coalescing, block threading and the isel fold — and this session twice showed 
 baseline aims at the wrong layer.
 
 ### The excess, today. sqlite zcc **237,025** vs gcc-O1 **157,074** = **1.509×**, excess **79,951**
+> Taken on the pre-R4.1 compiler and kept as the plan's premise. Where a row has since banked, its
+> own section below carries the re-taken numbers: after R4.2 the module is **218,776** (**1.3928×**,
+> excess **61,702**) and `mov` is **40,237** against gcc's 33,608 — so the `mov` row's excess is now
+> **+6,629**, not +19,147, and rows (b)/(i) are aimed at what is left of it.
 | class | zcc | gcc | excess | share |
 |---|---|---|---|---|
 | `mov` | 52,755 | 33,608 | **+19,147** | 24% |
@@ -1341,7 +1348,7 @@ every row, paired, in one session, as a distribution.
 | # | step | execution | prediction to take FIRST | KPI | status |
 |---|---|---|---|---|---|
 | **R4.1** | reload copies carried across edges | `regalloc/spill.rs` | ceiling band [3,425 , 9,849] | frame `ldr` ≪ 22,421 | ✅ 232,214, frame `ldr` 17,052 |
-| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k | ⬜ |
+| **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k | ✅ **218,776**, `mov` 40,237, x16 pairs 0 |
 | **R4.3** | **A parallel-copy destination takes its own dying source** (b). Amend the "free AFTER" rule: at a `ParallelCopy`, a destination may take the register of the source of ITS OWN pair when that source dies here; the simultaneity argument forbids only the other pairs' sources. `color::check` already asserts no two live values share a colour, so the proof obligation is met by the existing checker | `regalloc/color.rs` walk | count pairs `(d ← s)` with `s` dying at the copy and `colour(d) ≠ colour(s)` — that number is the ceiling; report it split entry / call / other | movs before `bl` per call → ≈1.0 (gcc 1.00); entry copies ≈ 0 | ⬜ |
 | **R4.4** | **returns merged, dead slots dropped, frame adjust folded** (e) | HIR `unify_ret`; `mir/pass/frame.rs` | extra `ret` 1,928 → ≤ 400; 289 leaf frames → 0; `sub sp` count → ≈ number of functions with no save pair | sqlite −4k…−6k | ⬜ |
 | **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ⬜ |
@@ -1424,6 +1431,89 @@ blocks are walked in reverse postorder, so a loop header's latch has not been si
 header is, and nothing is carried across a back edge — residency restarts every iteration. Lifting it
 needs a fixpoint over the loop. **R4.1 is therefore NOT exhausted**, and the follow-up belongs in this
 row rather than in a new one.
+
+### R4.2 — BANKED. sqlite **232,214 → 218,776**, 1.478× → **1.3928×**
+
+**The prediction was re-taken on this compiler before a line was written** and it
+reproduced §13n's counts exactly: 4,208 `mov x16,xN ; mov wN,w16` pairs (8,416
+instructions) and 4,906 `mov wN,wN`, **13,322 no-ops, 5.7% of the module**.
+
+**Where they came from.** `apply_colors` already deleted the copies biased colouring
+turned into self-moves — but only where BOTH ends were virtual, so every ABI copy, whose
+one end is a physical register by construction, was invisible to it. The x16 pairs are
+the second-order cost of that blindness: a narrow identity pair left inside a
+`ParallelCopy` reads to the windmill as a one-element CYCLE, which it dutifully breaks
+through the scratch register — two instructions where the right answer is none.
+
+The candidate set is now every copy whose two ends land on the same physical register,
+and the drop question splits by who can answer it:
+
+| shape | who answers | rule |
+|---|---|---|
+| `V ← P` (call result read back, incoming parameter) | `max_read`, already here | no reader of the destination looks past `w` |
+| `P ← V`, `P ← P` (argument setup, return value) | `abi_reader`, new | the register is an argument of the very next `Call` (§6.4.2), or nothing else in the block mentions it and the block RETURNS (§6.8.2) |
+
+Everything else is refused — `Asm` in particular, whose template chooses its own operand
+width and may name `%x0` for an `int` operand. Doing it BEFORE `destruct` is what makes
+the second question answerable at all: every `ParallelCopy` in the function is still
+isel's ABI marshalling, since SSA destruction has not yet created an edge copy.
+
+**The one that miscompiled, recorded because the error is the interesting part.** The
+first version also read an edge ARGUMENT at the width of the parameter it is copied
+into. That is true only while the edge copy SURVIVES: when argument and parameter share
+a colour the copy is deleted, and the argument then IS the parameter and inherits every
+reader it has. yarpgen **s0188** is exactly that shape — `mov w1,w1` narrowing a value
+the successor stores with `str x1` — and it was the ONE diverge in an otherwise 300/0
+run, on the `-O0` side, which is why only a full gate could find it. The parameter's
+width stays as the floor; the parameter's READERS now propagate back to the argument
+through the same fixpoint that already handled a deleted copy. Cost of the correction:
+11 instructions.
+
+| | R4.1 | R4.2 | gcc-O1 |
+|---|---|---|---|
+| total | 232,214 | **218,776** | 157,074 |
+| `mov` | 53,518 | **40,237** | 33,608 |
+| every other mnemonic | | identical | |
+
+Excess 75,140 → **61,702**: **17.9% of the gap closed**, above the row's own 12,570
+prediction. `ldr`/`str`/`csel`/`cmp` are unchanged to the instruction, which is what a
+pure copy-removal row must look like.
+
+**EXEC and INSN come apart, exactly as caution #1 said.** Paired in one session:
+INSN geomean **1.2410 → 1.1786** (median 1.217 → 1.173, programs above 1.1× 26 → 20);
+EXEC 1.3691 → 1.3603, median 1.309 on both sides — inside noise. A register-rename
+no-op costs a modern core nothing to retire, so this row moves the deterministic axis
+and not the clock. j5's insn ratio crosses below gcc (1.000 → 0.970).
+
+**LAW-4 RESIDUAL** (`ZCC_R42RES=1`, read-only, on the shipped compiler): **41 of 13,322
+survive, 0.31%** — **35 category (a)** (a reader genuinely looks past `w`, so the
+truncation has an observer and the instruction is doing work), **6 category (b)** (an
+`MInst` form `max_read` does not list, charging its operand a full 8-byte read),
+**0** refused for want of an ABI reader. The row is exhausted but for six instructions
+behind two unlisted instruction forms.
+
+**Gate** — cargo 144/0 over 30 runs · sci-gate shape/cpp/decay/alg/abi PASS ·
+cases/ext/torture/cts PASS · **musl PASS** · opt-parity **1552 PARITY / 0 DIVERGE** ·
+csmith300 **254/0** · yarpgen300 **300/0** · determinism **85 programs × 8 fresh
+processes**.
+
+**THE COMPILER STATE IS NOW WHOLLY GREEN, and that took five defects of its own**
+(commit `f99ca66`, banked underneath this row because the R4.2 gate could not be read
+until they were gone). `musl` had been RED since before R4.1; it is PASS for the first
+time. Side I: `parser::cond_expr` implemented two of C99 6.5.15p6's rows and not the
+rest, so a null pointer constant against a pointer either narrowed the pointer to `int`
+or left the constant an `int` (musl `getpass`, `return l < 0 ? 0 : password;`);
+`mir::interp`'s `Pair` arm passed 16 bytes to a `u64` accessor for a `q`-form
+`ldp`/`stp`; `hir::interp::f64_to_f128` reassociated `exp - 1023 + 16383` into an
+unsigned underflow for every value below 1.0. Side II: `pinned_symbols` did not pin an
+`__attribute__((alias))` TARGET, so the inliner deleted musl's `static void
+dummy(void){}` behind `weak_alias(dummy,_init)`; a weak EXTERN object emitted no
+`.weak`, making the reference to `_DYNAMIC` a strong undefined one. The measurement
+exception, once: `testutil::frontend` named its temp file after the source hash "so
+concurrent threads cannot collide", which guarantees they do when two batteries quote
+the same program — `fs::write` truncates first, so a reader preprocessed half a file.
+That was the whole of the ~20% battery flake; it is write-private-then-rename now, and
+30 consecutive runs are green.
 
 ### The prediction that forced the re-plan (taken as "R4.2" under the first plan; its findings are rows R4.2, R4.3 and R4.10 above)
 
