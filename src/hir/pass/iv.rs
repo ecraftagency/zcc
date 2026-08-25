@@ -55,9 +55,17 @@ use std::collections::HashMap;
 /// pay directly: no new parameter, no register, no size, and no post-index µop
 /// to lose on (j2 regresses at IDENTICAL instruction count).
 ///
-/// The gate is therefore: fix the fold, then re-measure. What is left of this
-/// row afterwards is the post-index form alone, and j2 is the standing evidence
-/// that that is not reliably a win. `ZCC_IV=1` forces it on for the re-measure.
+/// THE GATE WAS DISCHARGED, NEGATIVE (§13k). isel was fixed; re-measured on that
+/// baseline this pass is **0 win / 1 loss / 7 flat** — g1_memcpy 47 → 47 ms (the
+/// win was isel's all along), j2_histogram 59 → 67 ms (the loss is this pass's),
+/// EXEC ≥30 ms 1.3789 → 1.4087, INSN 1.2419 → 1.2454, sqlite +1,276.
+///
+/// The premise is false on this target: A64's scaled-index form makes rebuilding
+/// an address from a counter free, so there is nothing to strength-reduce. What
+/// remains is the post-index form alone, and j2 is the counter-example to that —
+/// identical instruction count, 13% slower. Re-opening needs a cost model that
+/// can say WHEN a writeback pays, which is a cycle-level question the `-S`
+/// harness cannot answer. `ZCC_IV=1` forces it on for that day.
 const ENABLED: bool = false;
 
 fn enabled() -> bool {

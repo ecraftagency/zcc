@@ -1111,6 +1111,37 @@ story. When a transform's number disappoints, look DOWN before looking sideways.
 
 ---
 
+## §13k ROW 5 RE-MEASURED on the fixed baseline — the gate is discharged, NEGATIVE. It stays off.
+
+§13i gated pointer-IV with one condition: fix the addressing-mode fold, then re-measure. §13j fixed
+it. The re-measurement (`ZCC_IV=1` against the same tree) settles the row:
+
+| | iv OFF | iv ON |
+|---|---|---|
+| EXEC ≥30 ms | **1.3789** | 1.4087 |
+| EXEC all timed | **1.3654** | 1.3690 |
+| INSN (35) | **1.2419** | 1.2454 |
+| sqlite | **237,026** | 238,302 (+1,276) |
+| g1_memcpy_loop | 47 ms | 47 ms — **the win is gone; isel already had it** |
+| j2_histogram | 59 ms | 67 ms — **the loss remains** |
+
+**0 win / 1 loss / 7 flat.** Worse on every axis. The row's premise — that rebuilding an address
+from a counter is expensive — is simply FALSE on A64, where the scaled-index form makes it free.
+What was left after §13j is the post-index form alone, and j2 is the standing counter-example:
+identical instruction count, 13% slower, because the writeback is not free either.
+
+So `ENABLED = false` stands, and the gate is now marked DISCHARGED rather than open. Re-opening it
+needs something this branch does not have: a cost model that can say WHEN a post-index pays, which
+is a cycle-level question the `-S` harness cannot answer. Until then the pass is a proven theorem
+with no profitable instance, kept for its batteries — which encode two real ISA facts (loads-only
+post-index, and the free scaled index) — and for `scev`, whose next consumer is item 6.
+
+The three-line summary of rows 5 / 5b, because it is the most transferable thing in this file:
+**a transform that looks like a win can be a lower layer's bug wearing a costume.** Measure the
+distribution, not the geomean; and when one program carries the whole number, go find out why.
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -1169,8 +1200,9 @@ its value are downstream of the same R4 item. The revised order:
    the gate on rotation, and §13d named it independently as cause #3 of the hot-loop regressions
    (`mov x0,x1 ; mov x1,x7` in j3's body). It is the one item two other rows are waiting on
 4. ✅ IV/SCEV analysis (`pass/scev.rs`, §13g) — shipped unwired, seven batteries
-5. ⏸️ **pointer-IV** (`pass/iv.rs`, §13h) — built and proven; re-judged on the distribution and
-   GATED OFF (§13i): 1 win / 1 loss / 6 flat, and the winner is paying an isel debt
+5. ⛔ **pointer-IV** (`pass/iv.rs`) — built, proven, and OFF. Gate discharged NEGATIVE on the fixed
+   baseline (§13k): 0 win / 1 loss / 7 flat, worse on every axis. A64's free scaled index makes the
+   premise false; re-opening needs a cycle-level cost model for post-index
 5b. ✅ **isel addressing-mode fold** (§13j) — EXEC ≥30 ms 1.4610 → **1.3789**, 8 of 8 improve, 0
    regress, sqlite flat. Strictly better than row 5 was on every axis
 6. ⬜ final-value, then LFTR — cheap now that the analysis is wired. LFTR is also what would let
