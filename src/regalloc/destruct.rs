@@ -137,7 +137,11 @@ pub fn apply_colors(f: &mut MFunc, color: &[Option<PReg>]) -> Result<(), String>
 
 /// Turn each edge's arguments into a parallel copy in the predecessor, then
 /// drop the block parameters.
-pub fn destruct(f: &mut MFunc) {
+pub fn destruct(f: &mut MFunc) -> usize {
+    // how many of the parallel copies below are EDGE copies — the count the R4.2
+    // prediction needs kept apart from isel's ABI marshalling, which uses the
+    // very same instruction (see `movkind_report`).
+    let mut edge_pairs = 0usize;
     for b in 0..f.blocks.len() {
         let mut term = f.blocks[b].term.clone();
         let mut copies: Vec<(Reg, Reg, Width)> = Vec::new();
@@ -148,6 +152,9 @@ pub fn destruct(f: &mut MFunc) {
             let params = f.blocks[t.block as usize].params.clone();
             for (p, a) in params.iter().zip(std::mem::take(&mut t.args)) {
                 let w = width_of(f, *p);
+                if *p != a {
+                    edge_pairs += 1;
+                }
                 copies.push((*p, a, w));
             }
         }
@@ -159,6 +166,7 @@ pub fn destruct(f: &mut MFunc) {
     for b in f.blocks.iter_mut() {
         b.params.clear();
     }
+    edge_pairs
 }
 
 fn width_of(f: &MFunc, r: Reg) -> Width {
@@ -173,7 +181,49 @@ fn width_of(f: &MFunc, r: Reg) -> Width {
 
 /// Expand every `ParallelCopy` into a legal sequence of moves and drop the
 /// self-moves that biased coloring made redundant.
-pub fn sequentialize(f: &mut MFunc) {
+/// R4.2 PREDICTION (`ZCC_MOVKIND=1`) — read-only, changes nothing.
+///
+/// `mov` is 24% of sqlite's excess over gcc -O1, and §13n asks which KIND of
+/// copy it is before any coalescer is written, because Boissinot's merge only
+/// answers one of them. A copy reaching the emitter is one of three things and
+/// they are distinguishable HERE, where each is still structurally what it is,
+/// but not in the `.s`, where all three are the letters `mov`:
+///
+///   * EDGE    — a block argument becoming a `ParallelCopy` at SSA destruction.
+///              Boissinot's merge is about exactly these, and about nothing else.
+///   * ABI     — a `ParallelCopy` isel emitted to place call arguments, a return
+///              value or a division's operands in the registers the AAPCS64
+///              names. It is the SAME instruction as an edge copy and the first
+///              draft of this instrument counted the two together, which
+///              overstated the coalescer's ceiling by 2.8x. They are separated
+///              because only one of them is a coalescing question at all: the
+///              other is an argument-TARGETING question.
+///   * WIDE    — a standalone 64-bit `Copy` surviving biased colouring: isel or
+///              a pass wanted a value in a second name, or an ABI-pinned
+///              register (a call argument, a return value, a division operand)
+///              made the two names un-mergeable. The ABI ones are not a
+///              coalescer's to remove — better argument TARGETING is what
+///              removes those — so this column is mixed and is reported apart.
+///   * NARROW  — a `w`-form standalone copy: the shape a narrowing takes when a
+///              vreg's width is part of its identity. R4.3's subject, not R4.2's,
+///              and counted here so R4.3 inherits a measured starting point.
+///   * FP      — the same-width `FMov` form of the above.
+///
+/// The point of the split is that the `.s` cannot make it: there, all four are
+/// the letters `mov`, and treating the total as one coalescing opportunity is
+/// how a step gets aimed at the wrong layer.
+fn movkind_report(f: &MFunc, edge: usize, abi: usize, wide: usize, narrow: usize, fp: usize) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ZCC_MOVKIND").is_some()) {
+        return;
+    }
+    if edge + abi + wide + narrow + fp > 0 {
+        eprintln!("MOVKIND {} {} {} {} {} {}", f.name, edge, abi, wide, narrow, fp);
+    }
+}
+
+pub fn sequentialize(f: &mut MFunc, edge_pairs: usize) {
     // A self-move is only a NO-OP at the register's full width. `mov w0, w0` is
     // not: DDI 0487 B1.2.1 makes every 32-bit write ZERO bits 63:32, so the
     // instruction truncates, and deleting it leaves whatever the upper half held.
@@ -201,19 +251,33 @@ pub fn sequentialize(f: &mut MFunc) {
             },
         }
     };
+    let (mut edge, mut wide, mut narrow, mut fp) = (0usize, 0usize, 0usize, 0usize);
     for b in f.blocks.iter_mut() {
         let insts = std::mem::take(&mut b.insts);
         let mut out = Vec::with_capacity(insts.len());
         for i in insts {
             match i {
-                MInst::ParallelCopy(pairs) => out.extend(seq_copy(pairs, &nop)),
+                MInst::ParallelCopy(pairs) => {
+                    let seq = seq_copy(pairs, &nop);
+                    edge += seq.len();
+                    out.extend(seq);
+                }
                 MInst::Copy { dst, src, w } if nop(dst, src, w) => {}
                 MInst::FMov { dst, src, dw, sw } if dw == sw && nop(dst, src, dw) => {}
-                other => out.push(other),
+                other => {
+                    match &other {
+                        MInst::Copy { w: Width::W64, .. } => wide += 1,
+                        MInst::Copy { .. } => narrow += 1,
+                        MInst::FMov { dw, sw, .. } if dw == sw => fp += 1,
+                        _ => {}
+                    }
+                    out.push(other);
+                }
             }
         }
         b.insts = out;
     }
+    movkind_report(f, edge_pairs, edge.saturating_sub(edge_pairs), wide, narrow, fp);
 }
 
 /// The windmill: emit a copy whose destination is not still needed as a source;

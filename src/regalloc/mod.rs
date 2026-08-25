@@ -29,11 +29,12 @@ pub fn allocate(f: &mut MFunc) -> Result<(), String> {
     prune_dead_params(f);
     destruct::split_critical_edges(f);
     let (col, lv) = spill_and_color(f)?;
+    coalesce_report(f, &lv, &col);
     phase("  colour-check", || color::check(f, &lv, &col))?;
     phase("  destruct", || {
         destruct::apply_colors(f, &col.color)?;
-        destruct::destruct(f);
-        destruct::sequentialize(f);
+        let edge_pairs = destruct::destruct(f);
+        destruct::sequentialize(f, edge_pairs);
         Ok::<(), String>(())
     })?;
     // The prologue must preserve exactly the callee-saved registers this
@@ -47,6 +48,68 @@ pub fn allocate(f: &mut MFunc) -> Result<(), String> {
     f.saved = saved;
     f.physical = true;
     Ok(())
+}
+
+/// R4.2 PREDICTION (`ZCC_COALESCE=1`) — read-only, changes nothing.
+///
+/// 84% of the copies that survive to the emitter are EDGE copies (measured by
+/// `destruct::movkind_report`), so a coalescer is aimed at the right thing. This
+/// asks the second question, the one that decides whether the step is worth
+/// building: of the parameter/argument pairs that biased colouring FAILED to
+/// give one colour, how many could have had one?
+///
+/// The test is the SSA interference test, not a heuristic. A block parameter `p`
+/// and the argument `a` supplied on one edge can share a register exactly when
+/// their live ranges do not overlap, and on an edge that means `a` must not
+/// still be live INSIDE the successor: if it is, both names are needed there at
+/// once and no colouring can merge them. So the columns are
+///
+///   SAME  — biased colouring already gave the pair one colour; the copy is gone
+///           before this point and is not a coalescing opportunity, it is a
+///           coalescing SUCCESS,
+///   FREE  — different colours, and `a` dies on the edge: a merge is available
+///           and biased colouring simply did not find it. **This column is
+///           Boissinot's ceiling**, and it is the number R4.2 must beat,
+///   BOUND — different colours and `a` is live in the successor: the two names
+///           genuinely coexist, so the copy is REAL and no coalescer removes it.
+///
+/// A prediction taken from the first two columns alone would be an over-claim,
+/// which is exactly what §13n's "classify before building" is there to prevent.
+fn coalesce_report(f: &MFunc, lv: &live::Liveness, col: &color::Coloring) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("ZCC_COALESCE").is_some()) {
+        return;
+    }
+    let (mut same, mut free, mut bound) = (0usize, 0usize, 0usize);
+    for b in 0..f.blocks.len() {
+        for (ti, t) in f.blocks[b].term.targets().iter().enumerate() {
+            let _ = ti;
+            let succ = t.block as usize;
+            for (k, arg) in t.args.iter().enumerate() {
+                let p = match f.blocks[succ].params.get(k).and_then(|p| p.vreg()) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let a = match arg.vreg() {
+                    Some(a) => a,
+                    None => continue,
+                };
+                let cp = col.color.get(p as usize).copied().flatten();
+                let ca = col.color.get(a as usize).copied().flatten();
+                if cp.is_some() && cp == ca {
+                    same += 1;
+                } else if lv.live_in[succ].contains(&lv.sp.idx(Reg::V(a))) {
+                    bound += 1;
+                } else {
+                    free += 1;
+                }
+            }
+        }
+    }
+    if same + free + bound > 0 {
+        eprintln!("COALESCE {} {} {} {}", f.name, same, free, bound);
+    }
 }
 
 /// Spill, then colour — and if the colouring still runs out of registers, force

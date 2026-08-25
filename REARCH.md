@@ -1371,6 +1371,55 @@ header is, and nothing is carried across a back edge — residency restarts ever
 needs a fixpoint over the loop. **R4.1 is therefore NOT exhausted**, and the follow-up belongs in this
 row rather than in a new one.
 
+### R4.2 PREDICTION — taken before building, and it INVERTS the row's premise
+
+§13n's R4.2 row says the prediction to take first is "classify the 44,295 reg-reg movs into edge
+copies / call-argument setup / truncation; only the first is Boissinot's". Taken (`ZCC_MOVKIND=1` in
+`destruct.rs`, `ZCC_COALESCE=1` in `regalloc/mod.rs`, both read-only), the classification says the
+row was aimed at the smallest of the three.
+
+Of **55,338** copies surviving to the emitter on sqlite:
+
+| kind | count | share | whose problem |
+|---|---|---|---|
+| **ABI** — call arguments, returns, fixed operands | **36,911** | **66.7%** | argument TARGETING — no row exists |
+| EDGE — SSA destruction | 9,332 | 16.9% | R4.2, the coalescer |
+| NARROW — truncation | 7,527 | 13.6% | R4.3 |
+| WIDE — standalone 64-bit | 1,514 | 2.7% | mixed |
+| FP | 54 | 0.1% | — |
+
+And of the **16,778** parameter/argument pairs the coalescer could act on, biased colouring **already
+merges 11,848 (70.6%)**; **4,782 (28.5%)** are FREE — different colours although the argument dies on
+the edge, so a merge was available and greedy colouring missed it — and 148 are BOUND, genuinely
+coexisting names that no coalescer removes. **R4.2's ceiling is therefore ~4,782 copies, not the
++19,910 the row's KPI names.**
+
+**The first version of this measurement was WRONG and is recorded because the error is instructive.**
+It counted every `ParallelCopy` as an edge copy and reported 46,243 — 2.8× the truth. `isel` emits the
+SAME instruction for ABI marshalling, so at the emitter all of them are the letters `mov` and the two
+are indistinguishable unless the count is taken where each is still structurally what it is. Acting on
+that number would have aimed a coalescer at a category it cannot touch.
+
+**Independent confirmation on the `.s`, because one instrument is not evidence.** Counting register
+movs immediately preceding a `bl`:
+
+| | calls | movs before a call | per call |
+|---|---|---|---|
+| zcc | 12,378 | 27,501 | **2.22** |
+| gcc -O1 | 11,901 | 11,949 | **1.00** |
+
+**≈15,552 excess movs are call-argument setup — 78% of the whole `mov` excess (+19,910), and ~21% of
+the remaining instruction gap.** zcc's ABI marshalling alone (36,911 copies) is larger than gcc's
+ENTIRE copy budget (33,608 movs). Two instruments, one at MIR and one on the emitted text, agree.
+
+**Consequence for the ladder, stated but NOT acted on.** The largest measured copy class has no row in
+§13n, and R4's own definition is "attack the largest class". Adding a row is a re-plan and belongs to
+the user, so R4.2 stands as written and this measurement is banked underneath it. What the numbers say
+if it is opened: the lever is argument TARGETING (place the value in its AAPCS64 register at its
+definition rather than copying it there at the call), which is a `regalloc`/`isel` question and NOT a
+coalescing one — `#21` on `main` did the same thing for the >8-argument hazard path and cut sqlite by
+906 instructions.
+
 ### Two standing cautions, both earned this session
 1. **Expect exec and insn to come apart.** j2_histogram regressed at IDENTICAL instruction count, and
    IV widening removed an instruction for exactly zero time. Spill traffic is memory ops in the hot
