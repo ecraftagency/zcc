@@ -1246,3 +1246,68 @@ fn scev_refuses_a_value_outside_the_affine_fragment() {
         assert!(quad, "i*i is not affine and must not evaluate");
     });
 }
+
+// ── pointer induction variables (§13h; shipped default-OFF, see §13i) ──────
+
+/// The optimized module, then this pass by hand — `module(src, true)` cannot
+/// reach it while it ships disabled, and a disabled theorem still owes its
+/// square.
+fn with_iv(src: &str) -> (Module, bool) {
+    let ast = frontend(src);
+    let mut m = build::build(&ast);
+    super::run_module_with(&mut m, &crate::compile::pinned_symbols(&ast));
+    let mut any = false;
+    for f in m.funcs.iter_mut() {
+        any |= super::iv::force(f);
+        verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    }
+    (m, any)
+}
+
+/// Loads whose address is a block PARAMETER — a pointer being walked, rather
+/// than an address rebuilt from a counter.
+fn walked_loads(f: &Func) -> usize {
+    let params: std::collections::HashSet<u32> =
+        f.blocks.iter().flat_map(|b| b.params.iter().copied()).collect();
+    f.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, Inst::Load { addr: Operand::Val(v), .. } if params.contains(v)))
+        .count()
+}
+
+#[test]
+fn a_strided_load_walks_a_pointer() {
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
+    let (before, _) = (build::build(&frontend(src)), 0);
+    let _ = &before;
+    let (after, fired) = with_iv(src);
+    assert!(fired, "an affine load address must be strength-reduced");
+    assert_eq!(walked_loads(func(&after, "f")), 1, "p[i] becomes a walking pointer");
+    // ⟦f⟧ = ⟦iv f⟧, both equal what C99 says
+    let plain = {
+        let ast = frontend(src);
+        let mut m = build::build(&ast);
+        super::run_module_with(&mut m, &crate::compile::pinned_symbols(&ast));
+        m
+    };
+    let ast = frontend(src);
+    match (run(&plain, &ast), run(&after, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == 42 => {}
+        (x, y) => panic!("⟦f⟧={:?} ⟦iv f⟧={:?} want 42", x, y),
+    }
+}
+
+#[test]
+fn a_stored_address_keeps_its_scaled_index() {
+    // Loads only, and it is a COST rule: A64 reaches `p[i]` with a free scaled
+    // index, so replacing it pays only when the increment then vanishes into a
+    // post-index — which A64 offers for loads alone. A store-only walk was
+    // measured a LOSS (j2_histogram's zeroing loop, 60 → 69 ms).
+    let src = "void f(int *p,int n){int i;for(i=0;i<n;i++)p[i]=i;}\
+               int main(void){int a[3];f(a,3);return a[0]+a[1]*2+a[2]*20;}";
+    let (after, fired) = with_iv(src);
+    assert!(!fired, "a store address is left to the addressing mode");
+    assert_eq!(walked_loads(func(&after, "f")), 0);
+}

@@ -41,7 +41,40 @@
 use super::*;
 use std::collections::HashMap;
 
+/// SHIPPED DEFAULT-OFF, on the measurement rather than on a doubt about the
+/// theorem (§13i). Over the eight programs above the harness's noise floor this
+/// row is **1 win / 1 loss / 6 flat**: g1_memcpy 74 → 48 ms, j2_histogram
+/// 60 → 68 ms, everything else inside ±3%. Take the single winner out and the
+/// geomean goes the WRONG way — 1.4498 → 1.4840 — for +0.8% on sqlite.
+///
+/// And the winner is compensating for a gap one layer down. With this pass off,
+/// isel emits `sxtw ; add ; add ; ldr [x1] ; str [x2]` for `d[i] = s[i]` where
+/// gcc emits `ldrb w3, [x1, x2] ; strb w3, [x0, x2]` — it does not fold the add
+/// into the addressing mode when TWO accesses share one index. So most of the
+/// 35% is this pass paying off an isel debt, which the addressing mode should
+/// pay directly: no new parameter, no register, no size, and no post-index µop
+/// to lose on (j2 regresses at IDENTICAL instruction count).
+///
+/// The gate is therefore: fix the fold, then re-measure. What is left of this
+/// row afterwards is the post-index form alone, and j2 is the standing evidence
+/// that that is not reliably a win. `ZCC_IV=1` forces it on for the re-measure.
+const ENABLED: bool = false;
+
+fn enabled() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| ENABLED || std::env::var("ZCC_IV").is_ok())
+}
+
 pub fn run(f: &mut Func) -> bool {
+    if !enabled() {
+        return false;
+    }
+    force(f)
+}
+
+/// The pass past the default-off gate. The batteries call this: a theorem that
+/// ships disabled still owes its square.
+pub fn force(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);
     let lf = dom::loops(&c, &dt);

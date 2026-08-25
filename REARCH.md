@@ -1016,6 +1016,47 @@ necessary but not sufficient. Closing it is a cost-model question, category (b).
 
 ---
 
+## §13i ROW 5 re-judged on the DISTRIBUTION, and gated off. The winner was paying an isel debt.
+
+§13h banked pointer-IV on a geomean. Asked the sharper question — is the win BROAD? — the answer is
+no, and the row does not survive it.
+
+| set (≥30 ms, best-of-5) | row 3 | row 5 |
+|---|---|---|
+| all 8 | 1.4610 | 1.4125 (−3.3%) |
+| **minus g1_memcpy** | 1.4498 | **1.4840 (+2.4% WORSE)** |
+| all timed, minus g1_memcpy | 1.3917 | 1.4051 (+1.0% worse) |
+
+**1 win / 1 loss / 6 flat**: g1_memcpy −35%, j2_histogram +13%, the other six inside ±3%. Take the
+single winner away and the row is a net loss for +0.8% on sqlite. That is not a row that earns its
+place, and a geomean that says otherwise is the "single number flatters" trap this branch already
+wrote down twice.
+
+**Where the winner actually comes from.** With pointer-IV OFF, `d[i] = s[i]` compiles to
+
+```
+    zcc     sxtw x1,w0 ; add x2,x3,x1 ; add x1,x4,x1 ; ldr w1,[x1] ; str w1,[x2]
+    gcc     ldrb w3,[x1,x2] ; strb w3,[x0,x2]
+```
+
+isel does NOT fold the add into the addressing mode — for `char` OR `int` — when TWO accesses share
+one index. It does fold when there is one (`j2`: `ldr w4,[x2,w1,sxtw #2]`). So most of the 35% is
+pointer-IV paying off an ISEL debt, and the addressing mode should pay it directly: no extra
+parameter, no extra register, no size, and no post-index µop to lose on. `d[i] = s[i]` — two
+accesses sharing an index — is about the commonest loop shape there is.
+
+So the pass ships `ENABLED = false` (`ZCC_IV=1` forces it), batteries and square intact, and the
+gate is: **fix the addressing-mode fold, then re-measure.** What remains of the row afterwards is
+the post-index form alone, and j2 — regressing at IDENTICAL instruction count — is standing evidence
+that that is not reliably a win.
+
+This is the second time a row measured worthless because a LOWER layer was leaving instructions on
+the table (§13e → §13f was the first, and there the fix made rotation a large win). The lesson is
+about ordering, and it is now written twice: when a transform's number disappoints, look DOWN before
+looking sideways.
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -1074,9 +1115,10 @@ its value are downstream of the same R4 item. The revised order:
    the gate on rotation, and §13d named it independently as cause #3 of the hot-loop regressions
    (`mov x0,x1 ; mov x1,x7` in j3's body). It is the one item two other rows are waiting on
 4. ✅ IV/SCEV analysis (`pass/scev.rs`, §13g) — shipped unwired, seven batteries
-5. ✅ **pointer-IV** (`pass/iv.rs`, §13h) — g1_memcpy 1.542 → **1.000**, EXEC ≥30 ms 1.4610 →
-   **1.4125**. The trip-count prerequisite §13g predicted was dissolved rather than paid: the
-   loop's own exit test bounds the counter by its TYPE, which needs no bound value at all
+5. ⏸️ **pointer-IV** (`pass/iv.rs`, §13h) — built and proven; re-judged on the distribution and
+   GATED OFF (§13i): 1 win / 1 loss / 6 flat, and the winner is paying an isel debt
+5b. ⬜ **isel addressing-mode fold** — the debt: `add` + load is not folded when two accesses share
+   an index, which is `d[i] = s[i]`. Fix, then re-measure row 5
 6. ⬜ final-value, then LFTR — cheap now that the analysis is wired. LFTR is also what would let
    `mycopy` drop its separate counter and test the pointer instead, which is the last instruction
    between that loop and gcc's
