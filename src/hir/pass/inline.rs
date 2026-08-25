@@ -24,6 +24,7 @@
 // convention is a property of a real call), and any function in a cycle of the
 // call graph (β-reduction on a recursive term does not terminate).
 use super::*;
+
 use std::collections::{HashMap, HashSet};
 
 /// The size of the CALL SEQUENCE a body would replace: one instruction to place
@@ -57,6 +58,21 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                                 return None;
                             }
                             let g = &m.funcs[gi];
+                            // `is_static` is NOT a conflation with the dead-body
+                            // sweep — it is the whole economics of the rule, and
+                            // R4.14 (3) proposed dropping it on a premise the
+                            // measurement refuted. A callee with EXTERNAL linkage
+                            // can be called from another translation unit, so its
+                            // out-of-line body can never be deleted: inlining it
+                            // duplicates the body permanently. Measured over the
+                            // 35-program suite, dropping the requirement bought
+                            // EXEC 1.1627 → 1.0841 and cost INSN 1.1493 → 1.3326
+                            // — a 16% size regression for a 7% speed one, which
+                            // fails THE ULTIMATUM's "both axes" outright. gcc's
+                            // own `-finline-functions-called-once` says "all
+                            // STATIC functions called once" for exactly this
+                            // reason; §13n read e2's inlined `mix` as evidence of
+                            // a rule gcc does not have.
                             let called_once =
                                 counts.get(n).copied().unwrap_or(0) == 1 && g.is_static;
                             let want = called_once || body_size(g) <= call_cost(&g.sig);

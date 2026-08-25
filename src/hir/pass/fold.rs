@@ -125,11 +125,67 @@ fn fold_cmp(op: CmpOp, ty: Ty, a: Operand, b: Operand) -> Option<Operand> {
 /// instruction, so they cannot be expressed as "this value equals that operand".
 /// Run as part of the ladder, before value numbering, so the canonical form is
 /// what gets numbered.
+/// The exact reciprocal of a floating constant, when the division by it and the
+/// multiplication by it denote the SAME function on every input.
+///
+/// This is the one float row rule 2 admits, and it admits it because it is not
+/// an approximation. A power of two has an all-zero significand, so its
+/// reciprocal is also a power of two and is EXACTLY representable — and IEEE 754
+/// §5.4 makes both `x / 2^k` and `x · 2^-k` the correctly-rounded result of the
+/// same exact real number, so the two agree bit for bit on every finite input,
+/// on ±0, on ±∞ and on every NaN payload (a NaN propagates through either
+/// operation unchanged). The rounding mode does not enter: the exact result is
+/// already representable whenever `x` is normal, and when it is not, both
+/// operations underflow to the same value by the same rule.
+///
+/// TWO exclusions, both about representability rather than about rounding:
+///   * a zero or subnormal exponent field, and the infinity/NaN field — those
+///     are not powers of two in this sense;
+///   * an exponent whose reciprocal would land on the subnormal boundary
+///     (`2^-k` with the exponent field at 0), where the reciprocal is no longer
+///     exact and the identity fails.
+///
+/// f2_double_poly divides by 1024.0 in its inner loop: `fdiv` is 10+ cycles on
+/// this machine and `fmul` is 3 (§13n R4.14 (1)).
+fn exact_reciprocal(bits: u64, ty: Ty) -> Option<u64> {
+    let (ebits, mbits) = match ty {
+        Ty::F64 => (11u32, 52u32),
+        Ty::F32 => (8u32, 23u32),
+        _ => return None,
+    };
+    let emax = (1u64 << ebits) - 1; // the all-ones field: infinity / NaN
+    let bias = (1u64 << (ebits - 1)) - 1;
+    let sign = bits >> (ebits + mbits);
+    let e = (bits >> mbits) & emax;
+    let m = bits & ((1u64 << mbits) - 1);
+    if m != 0 || e == 0 || e == emax {
+        return None; // not a normal power of two
+    }
+    // value = (-1)^s · 2^(e-bias); reciprocal exponent field = 2·bias - e
+    let re = 2 * bias.checked_sub(0)? ;
+    let re = re.checked_sub(e)?;
+    if re == 0 || re >= emax {
+        return None; // the reciprocal is subnormal or overflows
+    }
+    Some((sign << (ebits + mbits)) | (re << mbits))
+}
+
 pub fn canon(f: &mut Func) -> bool {
     let mut changed = false;
     for b in f.blocks.iter_mut() {
         for inst in b.insts.iter_mut() {
             if let Inst::Bin { op, ty, a, b: rhs, .. } = inst {
+                // `x / 2^k = x · 2^-k`, EXACTLY — see `exact_reciprocal`.
+                if *op == BinOp::FDiv {
+                    if let Operand::Fimm(k) = *rhs {
+                        if let Some(r) = exact_reciprocal(k, *ty) {
+                            *op = BinOp::FMul;
+                            *rhs = Operand::Fimm(r);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
                 // `x * 2^k = x << k` in two's complement, at every width. Worth a
                 // rule of its own because it is what lets isel see an ARRAY
                 // INDEX: `a[i]` is `base + i * elemsize`, and only the SHIFT form

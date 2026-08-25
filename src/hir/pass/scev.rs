@@ -620,8 +620,33 @@ impl LoopScev {
         let ex = exiting?;
         // A test in the MIDDLE of the body counts different halves differently;
         // there is no single trip count to report.
-        let top = ex == self.header && !self.latches.contains(&self.header);
-        if !top && !self.latches.contains(&ex) {
+        //
+        // TOP vs BOTTOM IS A DATA-FLOW QUESTION, NOT A PLACEMENT ONE — the same
+        // lesson `rotate.rs` records about its own termination argument, and it
+        // was learned here the same way. This used to read "the exiting block is
+        // the header and the header is not a latch", which is true of a
+        // top-tested loop and ALSO true of the shape rotation now produces:
+        // rotation puts the body into the header and `cfg::merge` then absorbs
+        // the latch, leaving one block that does the work and THEN tests. That
+        // block is the header, and the latch is the empty back-edge block, so
+        // the placement test said "top" for a loop whose test is at the bottom
+        // and the count came out one short (10 iterations reported as 9,
+        // battery `scev_counts_the_trips_of_a_literal_loop`).
+        //
+        // What actually distinguishes them: a TOP test executes before any body
+        // work, so the exiting block computes NOTHING but the condition — every
+        // instruction in it lies in the condition's transitive cone. The moment
+        // one does not, that instruction is body work performed before the test,
+        // and the body has run once more than the test has said "stay".
+        let top = ex == self.header
+            && !self.latches.contains(&self.header)
+            && block_is_only_the_test(f, ex);
+        // A bottom test must be the LAST thing an iteration does: either it sits
+        // at a latch, or it sits in the header itself with the body above it
+        // (rotation's shape, once `cfg::merge` has absorbed the latch). In both
+        // the exiting block runs exactly once per iteration, which is what makes
+        // "body executions = k + 1" true.
+        if !top && !(self.latches.contains(&ex) || ex == self.header) {
             return None;
         }
         let (cond, taken_in) = match &f.blocks[ex as usize].term {
@@ -675,6 +700,38 @@ impl LoopScev {
         }
         u64::try_from(if top { k } else { k + 1 }).ok()
     }
+}
+
+/// Does this block compute nothing but its own branch condition? Every
+/// instruction must lie in the transitive cone of the terminator's condition;
+/// one that does not is body work performed before the test.
+fn block_is_only_the_test(f: &Func, b: BlockId) -> bool {
+    let blk = &f.blocks[b as usize];
+    let cond = match &blk.term {
+        Term::Br(c, ..) | Term::Switch(c, ..) => *c,
+        _ => return false,
+    };
+    let mut at: std::collections::HashMap<ValueId, usize> = std::collections::HashMap::new();
+    for (i, inst) in blk.insts.iter().enumerate() {
+        if let Some(d) = inst.dst() {
+            at.insert(d, i);
+        }
+    }
+    let mut keep = vec![false; blk.insts.len()];
+    let mut work: Vec<ValueId> = cond.val().into_iter().collect();
+    while let Some(v) = work.pop() {
+        let Some(&i) = at.get(&v) else { continue };
+        if keep[i] {
+            continue;
+        }
+        keep[i] = true;
+        blk.insts[i].uses(|o| {
+            if let Operand::Val(x) = o {
+                work.push(x);
+            }
+        });
+    }
+    keep.iter().all(|&x| x)
 }
 
 fn invert(op: CmpOp) -> Option<CmpOp> {

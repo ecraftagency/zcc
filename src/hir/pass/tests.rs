@@ -13,7 +13,7 @@
 //       disappears, a branch that becomes a jump). Law 4: a green test that
 //       cannot distinguish "correct" from "absent" is not evidence.
 use super::super::interp::{Trap, new_machine};
-use super::super::{BinOp, Func, Inst, Module, Operand, Term, build, verify};
+use super::super::{BinOp, BlockId, Func, Inst, Module, Operand, Term, build, verify};
 use crate::testutil::frontend;
 
 fn module(src: &str, opt: bool) -> Module {
@@ -799,7 +799,14 @@ fn calls_in_loops(f: &Func) -> usize {
 /// The summing helper every case below calls: read-only (it stores nothing) and
 /// big enough that the inliner leaves it alone, so what the batteries observe is
 /// the hoist and not β-reduction.
-const SUM: &str = "int g(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}";
+/// The callee these fences are about. It carries a SECOND call site (`gg`,
+/// never called) on purpose: `-finline-functions-called-once` inlines a callee
+/// with exactly one call site whatever its linkage (R4.14 (3)), and an inlined
+/// callee has no CALL for `calls_in_loops` to count — the fence would then read
+/// green for the wrong reason. Two sites keep the call observable, which is what
+/// these batteries measure.
+const SUM: &str = "int g(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+                   int gg(int *p){return g(p,1);}";
 
 #[test]
 fn an_invariant_pure_call_leaves_the_loop() {
@@ -841,6 +848,7 @@ fn an_impure_call_is_not_hoisted() {
     // The purity fence. Hoisting this would run the counter's increment once
     // instead of five times — a visible change, not an optimization.
     let src = "static int c;int g(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];c=c+1;return s;}\
+               int gg(int *p){return g(p,1);}\
                int main(void){int a[2];a[0]=1;a[1]=2;int k,s=0;\
                for(k=0;k<5;k++)s+=g(a,2);return s+c;}";
     let after = module(src, true);
@@ -1382,4 +1390,73 @@ fn a_load_survives_one_edge_into_a_single_predecessor_block() {
          int main(void){int a[2];a[0]=3;a[1]=7;w(a);return a[0]*10+a[1];}",
         84,
     );
+}
+
+// ── R4.11 / R4.14: rotation over every exit, and the exact reciprocal ──────
+
+#[test]
+fn a_loop_with_an_early_return_rotates() {
+    // R4.11. Rotation used to demand a SINGLE door: one exit block, with one
+    // predecessor, dominating every reader of a header value. The residual print
+    // measured what that costs on sqlite — 1,837 loops refused for "the exit
+    // block is a merge" and 221 for "outside the exit's dominance", the two
+    // largest fixable reasons. Both shapes are ordinary C: a loop with an early
+    // `return` has two exits, and `while (a && b)` reaches one exit from two
+    // different in-loop blocks.
+    let src = "int find(int*p,int n,int k){int i;for(i=0;i<n;i++)if(p[i]==k)return i;return -1;}\
+               int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i*3;\
+               return find(a,4,6)*10+find(a,4,5)+11;}";
+    square(src, 30);
+    let m = module(src, true);
+    let f = func(&m, "find");
+    // Bottom-tested: the block that exits the loop is one of its latches, so
+    // the back edge IS the test and no unconditional branch returns to a header.
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    assert_eq!(lf.loops.len(), 1, "one loop");
+    let l = &lf.loops[0];
+    let inl = |b: BlockId| l.body.contains(&b);
+    let exiting: Vec<BlockId> = l
+        .body
+        .iter()
+        .copied()
+        .filter(|&b| f.blocks[b as usize].term.succs().iter().any(|&s| !inl(s)))
+        .collect();
+    assert!(
+        exiting.iter().any(|e| l.latches.contains(e)),
+        "the loop still tests at the top: exiting {:?} latches {:?}",
+        exiting,
+        l.latches
+    );
+    // …and the two-exit shape keeps working when a header value leaves through
+    // BOTH doors.
+    square(
+        "int f(int*p,int n){int i,s=0;for(i=0;i<n;i++){s+=p[i];if(s>10)return i;}return s;}\
+         int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i*4;return f(a,4)+f(a,2);}",
+        6,
+    );
+}
+
+#[test]
+fn a_division_by_a_power_of_two_becomes_a_multiplication() {
+    // R4.14 (1). Exact under IEEE 754: a power of two has an all-zero
+    // significand, so its reciprocal is representable, and both operations are
+    // the correctly-rounded result of the same exact real number. `fdiv` is 10+
+    // cycles on this machine and `fmul` is 3.
+    let src = "double f(double x){return x/1024.0;} \
+               int main(void){return (int)(f(4096.0)*2.0);}";
+    square(src, 8);
+    let m = module(src, true);
+    let f = func(&m, "f");
+    assert_eq!(count(f, |i| matches!(i, Inst::Bin { op: BinOp::FDiv, .. })), 0);
+    assert_eq!(count(f, |i| matches!(i, Inst::Bin { op: BinOp::FMul, .. })), 1);
+    // a divisor that is NOT a power of two keeps its division
+    let g = module("double f(double x){return x/10.0;} int main(void){return (int)f(100.0);}", true);
+    let g = func(&g, "f");
+    assert_eq!(count(g, |i| matches!(i, Inst::Bin { op: BinOp::FDiv, .. })), 1);
+    // …and so does one whose reciprocal is not representable
+    square("double f(double x){return x/1e300;} int main(void){return f(1e300)==1.0;}", 1);
+    square("float f(float x){return x/8.0f;} int main(void){return (int)f(64.0f);}", 8);
+    square("double f(double x){return x/-2.0;} int main(void){return (int)f(-8.0);}", 4);
 }

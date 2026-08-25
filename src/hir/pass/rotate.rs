@@ -101,6 +101,16 @@ pub fn force(f: &mut Func) -> bool {
     changed
 }
 
+/// `ZCC_RESIDUAL=1` names, per refused loop, WHICH condition refused it — the
+/// same instrument `licm.rs` carries, for the same reason. Law 4 asks for the
+/// residual of every shipped theorem, and §13n recorded rotation's absence as a
+/// gap in itself: "the pass prints no residual". Reading the pass instead of
+/// measuring it is the guesswork Law 2 forbids.
+fn residual_wanted() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_RESIDUAL").is_ok())
+}
+
 fn rotate_one(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);
@@ -109,9 +119,18 @@ fn rotate_one(f: &mut Func) -> bool {
     // innermost first: the inner loop is the hot one
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    let report = residual_wanted();
     for li in order {
-        if try_rotate(f, &c, &dt, &lf, li, &pin) {
-            return true;
+        match try_rotate(f, &c, &dt, &lf, li, &pin) {
+            Ok(()) => return true,
+            Err(why) => {
+                if report && why != "already bottom-tested" {
+                    eprintln!(
+                        "rotate-residual {} loop@bb{} depth{}: {}",
+                        f.name, lf.loops[li].header, lf.loops[li].depth, why
+                    );
+                }
+            }
         }
     }
     false
@@ -124,13 +143,27 @@ fn try_rotate(
     lf: &dom::LoopForest,
     li: usize,
     pin: &[bool],
-) -> bool {
+) -> Result<(), &'static str> {
     let h = lf.loops[li].header;
-    if pin[h as usize] || !f.blocks[h as usize].labels.is_empty() {
-        return false;
+    // A block whose IDENTITY is observable cannot move: `&&label` puts its
+    // address in a static initializer, and a computed goto names it. `pinned`
+    // knows exactly which those are — a plain C label does NOT pin anything,
+    // because a `goto` to it is an ordinary edge and rotation redirects edges.
+    // This used to refuse EVERY labelled header, which §13n measured as the
+    // reason d3 and d4 keep two branches per iteration.
+    //
+    // The one case a plain label still blocks: `emit` writes `mov sp, x29` at a
+    // labelled block of a function with a dynamic frame (C99 6.8.6.1, a `goto`
+    // leaving a VLA's scope). The guard would not get that instruction, so a
+    // VLA function keeps the old refusal.
+    if pin[h as usize] {
+        return Err("header address-taken or a computed-goto target");
+    }
+    if !f.blocks[h as usize].labels.is_empty() && f.has_vla {
+        return Err("labelled header in a VLA function (sp restore at the label)");
     }
     if f.blocks[h as usize].insts.len() > MAX_HEADER_INSTS {
-        return false;
+        return Err("header larger than max-loop-header-insns");
     }
     // The header is COPIED, so nothing in it may be observable twice in the
     // source text. Reads are fine — `while (*p)` is the shape this transform
@@ -144,7 +177,7 @@ fn try_rotate(
         .iter()
         .any(|i| matches!(i.effect(), Effect::Write | Effect::Call))
     {
-        return false;
+        return Err("header stores, calls or allocas");
     }
     let mut inloop = vec![false; f.blocks.len()];
     for &b in &lf.loops[li].body {
@@ -158,10 +191,10 @@ fn try_rotate(
         }
     };
     if lf.loops[li].latches.iter().any(|&l| exits(l)) {
-        return false;
+        return Err("already bottom-tested");
     }
     if lf.loops[li].latches.contains(&h) {
-        return false;
+        return Err("already bottom-tested");
     }
     // THE HEADER MUST BE THE TEST AND NOTHING ELSE — gcc's pass is called "copy
     // loop HEADERS" for this reason. Copying a header that also holds body work
@@ -179,29 +212,29 @@ fn try_rotate(
     // header holds the body, the body does not feed the exit condition, and no
     // amount of code motion changes that.
     if !header_is_only_the_test(f, h) {
-        return false;
+        return Err("header holds body work (copying it would be peeling)");
     }
     // The header must BE the exit test: a two-way branch with one arm inside.
     let (t_in, t_out) = match &f.blocks[h as usize].term {
         Term::Br(_, a, b) => match (inloop[a.block as usize], inloop[b.block as usize]) {
             (true, false) => (a.block, b.block),
             (false, true) => (b.block, a.block),
-            _ => return false,
+            _ => return Err("header's branch has both arms inside the loop"),
         },
-        _ => return false,
+        _ => return Err("header does not end in a two-way branch"),
     };
     // The block the test falls into becomes the new header, and it must be able
     // to take the guard's edge as a second predecessor without merging two
     // unrelated paths. Critical edges are split before the ladder runs, so a
     // single predecessor is the normal state here.
     if c.preds[t_in as usize].len() != 1 {
-        return false;
+        return Err("the block the test falls into has other predecessors");
     }
     // Every entry edge must be redirectable, so none may come from a computed
     // goto (whose successors are a set, not a target list).
     for &p in &c.preds[h as usize] {
         if matches!(f.blocks[p as usize].term, Term::GotoPtr(..)) {
-            return false;
+            return Err("an entry edge comes from a computed goto");
         }
     }
 
@@ -244,15 +277,56 @@ fn try_rotate(
             out_users.push(b as BlockId);
         }
     }
+    // LOOP-CLOSED SSA, over EVERY exit of the loop (R4.11). The first version of
+    // this refused unless `t_out` was the single door — one predecessor and
+    // dominating every reader. The residual print measured what that costs on
+    // sqlite: **1,837 loops refused for "the exit block is a merge" and 221 more
+    // for "outside the exit's dominance"**, the two biggest fixable reasons and
+    // between them d3 and j5. A loop with an early `return` has TWO exits, and a
+    // `while (a && b)` reaches one exit from two different in-loop blocks; both
+    // are ordinary C, not obstacles.
+    //
+    // The general construction: for each EXIT BLOCK e — outside the loop, with
+    // at least one predecessor inside it — a header value read below e leaves
+    // through e as a parameter, and every predecessor of e supplies the value it
+    // itself can see:
+    //   * `h` still defines the value, so it passes it directly;
+    //   * `g`, the guard, passes its own clone;
+    //   * any other in-loop predecessor sits BELOW the new header, so it passes
+    //     the parameter that `reparam` gives the new header — which is why the
+    //     value must get one whether or not the body reads it.
+    // Every predecessor of e must be inside the loop (or the guard): an edge
+    // from outside owes an argument it has no value for.
+    let mut exit_of: Vec<(BlockId, BlockId)> = Vec::new(); // (reader, its exit)
     if !out_users.is_empty() {
-        // The exit block must be the one place those uses are reached through,
-        // and it must be able to take a parameter — which means the header is
-        // its only predecessor, so no other edge owes the new argument.
-        if c.preds[t_out as usize].len() != 1 {
-            return false;
+        let mut exits: Vec<BlockId> = Vec::new();
+        for &b in &lf.loops[li].body {
+            for &sx in f.blocks[b as usize].term.succs().iter() {
+                if !inloop[sx as usize] && !exits.contains(&sx) {
+                    exits.push(sx);
+                }
+            }
         }
-        if !out_users.iter().all(|&b| dt.dominates(t_out, b)) {
-            return false;
+        for &u in &out_users {
+            // the exit this reader is reached through; dominators of a node are
+            // totally ordered, so "the deepest one that dominates it" is unique
+            let mut best: Option<BlockId> = None;
+            for &e in &exits {
+                if dt.dominates(e, u) && best.is_none_or(|b| dt.dominates(b, e)) {
+                    best = Some(e);
+                }
+            }
+            match best {
+                Some(e) => exit_of.push((u, e)),
+                None => {
+                    return Err("a header value is read where no single loop exit dominates it");
+                }
+            }
+        }
+        for &(_, e) in &exit_of {
+            if c.preds[e as usize].iter().any(|&p| !inloop[p as usize]) {
+                return Err("an exit block carrying a header value has a predecessor outside the loop");
+            }
         }
     }
 
@@ -294,8 +368,34 @@ fn try_rotate(
     // as a block parameter and each of the two predecessors supplies its own.
     let in_body: Vec<BlockId> =
         lf.loops[li].body.iter().copied().filter(|&b| b != h).collect();
-    reparam(f, &dh, &map, h, g, t_in, &in_body);
-    reparam(f, &dh, &map, h, g, t_out, &out_users);
+    // Values that must reach the new header whether or not the BODY reads them:
+    // an in-loop predecessor of an exit passes the value on, and below the new
+    // header the parameter is the only name it has.
+    let forced: Vec<ValueId> = if exit_of.is_empty() {
+        Vec::new()
+    } else {
+        dh.iter()
+            .copied()
+            .filter(|&v| {
+                exit_of.iter().any(|&(u, e)| {
+                    uses_value(f, u, v)
+                        && c.preds[e as usize].iter().any(|&p| p != h && inloop[p as usize])
+                })
+            })
+            .collect()
+    };
+    let rw_body = reparam(f, &dh, &map, h, g, t_in, &in_body, &forced);
+    // …then every exit, each predecessor supplying the name it can see.
+    let mut by_exit: Vec<(BlockId, Vec<BlockId>)> = Vec::new();
+    for &(u, e) in &exit_of {
+        match by_exit.iter_mut().find(|(x, _)| *x == e) {
+            Some((_, rs)) => rs.push(u),
+            None => by_exit.push((e, vec![u])),
+        }
+    }
+    for (e, readers) in by_exit {
+        close_exit(f, &dh, &map, &rw_body, h, g, e, &readers, &inloop);
+    }
 
     // ── every edge from outside now enters the guard instead ───────────────
     let outside: Vec<BlockId> = c.preds[h as usize]
@@ -311,7 +411,7 @@ fn try_rotate(
         }
     }
     refresh_defs(f);
-    true
+    Ok(())
 }
 
 fn sub(map: &[Option<Operand>], o: Operand) -> Operand {
@@ -343,45 +443,64 @@ fn set_dst(inst: &mut Inst, nd: ValueId) {
 /// The header itself is never a reader here: its terminator arguments are what
 /// feed the new parameters, so rewriting them would tie each parameter to
 /// itself. Nor is the guard, for the same reason.
-fn reparam(
+/// Does this block read this value, in an instruction or its terminator?
+fn uses_value(f: &Func, b: BlockId, v: ValueId) -> bool {
+    let mut hit = false;
+    let mut see = |o: Operand| {
+        if o == Operand::Val(v) {
+            hit = true;
+        }
+    };
+    for inst in &f.blocks[b as usize].insts {
+        inst.uses(&mut see);
+    }
+    f.blocks[b as usize].term.uses(&mut see);
+    hit
+}
+
+/// A header value leaves through `exit` as a parameter, and every predecessor of
+/// `exit` — all of them inside the loop, checked by the caller — supplies the
+/// name IT can see: the guard its clone, the old header the value itself, and a
+/// body block the new header's parameter (`rw_body`).
+fn close_exit(
     f: &mut Func,
     dh: &[ValueId],
     map: &[Option<Operand>],
+    rw_body: &[Option<Operand>],
     h: BlockId,
     g: BlockId,
-    succ: BlockId,
+    exit: BlockId,
     readers: &[BlockId],
+    inloop: &[bool],
 ) {
     let mut rw: Vec<Option<Operand>> = vec![None; f.values.len()];
     let mut any = false;
     for &v in dh {
-        let mut used = false;
-        for &b in readers {
-            let mut see = |o: Operand| {
-                if o == Operand::Val(v) {
-                    used = true;
-                }
-            };
-            for inst in &f.blocks[b as usize].insts {
-                inst.uses(&mut see);
-            }
-            f.blocks[b as usize].term.uses(&mut see);
-        }
-        if !used {
+        if !readers.iter().any(|&b| uses_value(f, b, v)) {
             continue;
         }
-        let k = f.blocks[succ as usize].params.len() as u32;
-        let np = f.new_value(f.ty_of(v), Def::Param(succ, k));
-        f.blocks[succ as usize].params.push(np);
-        for t in f.blocks[h as usize].term.targets_mut() {
-            if t.block == succ {
-                t.args.push(Operand::Val(v));
-            }
-        }
-        let gv = map[v as usize].expect("a header definition has a clone");
-        for t in f.blocks[g as usize].term.targets_mut() {
-            if t.block == succ {
-                t.args.push(gv);
+        let preds: Vec<BlockId> = (0..f.blocks.len() as BlockId)
+            .filter(|&p| {
+                // `inloop` was sized before the guard block existed
+                (p == g || inloop.get(p as usize).copied().unwrap_or(false))
+                    && f.blocks[p as usize].term.succs().contains(&exit)
+            })
+            .collect();
+        let k = f.blocks[exit as usize].params.len() as u32;
+        let np = f.new_value(f.ty_of(v), Def::Param(exit, k));
+        f.blocks[exit as usize].params.push(np);
+        for p in preds {
+            let arg = if p == g {
+                map[v as usize].expect("a header definition has a clone")
+            } else if p == h {
+                Operand::Val(v)
+            } else {
+                rw_body[v as usize].unwrap_or(Operand::Val(v))
+            };
+            for t in f.blocks[p as usize].term.targets_mut() {
+                if t.block == exit {
+                    t.args.push(arg);
+                }
             }
         }
         rw[v as usize] = Some(Operand::Val(np));
@@ -413,6 +532,69 @@ fn reparam(
             }
         }
     }
+}
+
+fn reparam(
+    f: &mut Func,
+    dh: &[ValueId],
+    map: &[Option<Operand>],
+    h: BlockId,
+    g: BlockId,
+    succ: BlockId,
+    readers: &[BlockId],
+    forced: &[ValueId],
+) -> Vec<Option<Operand>> {
+    let mut rw: Vec<Option<Operand>> = vec![None; f.values.len()];
+    let mut any = false;
+    for &v in dh {
+        let used = forced.contains(&v) || readers.iter().any(|&b| uses_value(f, b, v));
+        if !used {
+            continue;
+        }
+        let k = f.blocks[succ as usize].params.len() as u32;
+        let np = f.new_value(f.ty_of(v), Def::Param(succ, k));
+        f.blocks[succ as usize].params.push(np);
+        for t in f.blocks[h as usize].term.targets_mut() {
+            if t.block == succ {
+                t.args.push(Operand::Val(v));
+            }
+        }
+        let gv = map[v as usize].expect("a header definition has a clone");
+        for t in f.blocks[g as usize].term.targets_mut() {
+            if t.block == succ {
+                t.args.push(gv);
+            }
+        }
+        rw[v as usize] = Some(Operand::Val(np));
+        any = true;
+    }
+    if !any {
+        return rw;
+    }
+    for &b in readers {
+        let blk = &mut f.blocks[b as usize];
+        let repl = |o: &mut Operand| {
+            if let Operand::Val(v) = *o {
+                if let Some(n) = rw[v as usize] {
+                    *o = n;
+                }
+            }
+        };
+        for inst in blk.insts.iter_mut() {
+            inst.uses_mut(repl);
+        }
+        match &mut blk.term {
+            Term::Br(x, ..) | Term::Switch(x, ..) | Term::GotoPtr(x, _) => repl(x),
+            Term::Ret(Some(x)) => repl(x),
+            _ => {}
+        }
+        for t in blk.term.targets_mut() {
+            for a in t.args.iter_mut() {
+                repl(a);
+            }
+        }
+    }
+    rw
 }
 
 /// Is every instruction in the header part of computing its exit condition?

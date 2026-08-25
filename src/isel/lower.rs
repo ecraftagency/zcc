@@ -19,6 +19,10 @@ use super::imm;
 use crate::hir::{self, BinOp, CmpOp, CvtOp, Inst, Operand, Term, UnOp, ValueId};
 use crate::mir::*;
 
+/// The jump-table density threshold (REARCH §13n R4.14 (2)) — the case count at
+/// which a table beats a compare tree on THIS machine, taken on the clock.
+const MIN_CASES: usize = 4;
+
 pub fn lower(m: &hir::Module) -> MModule {
     MModule {
         funcs: m.funcs.iter().map(lower_func).collect(),
@@ -1905,6 +1909,8 @@ impl<'a> L<'a> {
     /// The density rule is gcc's: at least four cases, and at least half the
     /// span occupied. Below that the table is mostly padding and a compare chain
     /// is both smaller and — for a handful of cases — no slower.
+    /// The case count at which a jump table beats a compare tree. MEASURED, not
+    /// chosen: see `jump_table` and REARCH §13n R4.14 (2).
     fn jump_table(
         &mut self,
         x: Reg,
@@ -1912,8 +1918,17 @@ impl<'a> L<'a> {
         arms: &[(i64, hir::Target)],
         dflt: &MTarget,
     ) -> Option<MTerm> {
-        const MIN_CASES: usize = 4;
-        if arms.len() < MIN_CASES {
+        // Article E, "the spec's number or my convenience's number?". R3.3 chose
+        // 4 by taste; gcc -O1 builds a `cmp`/`tbnz`/`csel` compare TREE for
+        // d1_switch's 8 cases and wins 1.33× on it, because an indirect branch
+        // through a table is unpredictable while a tree of two or three
+        // predictable compares is not. So the number is one to MEASURE, and
+        // `ZCC_JT` sets it while the crossover is being taken.
+        let min_cases: usize = std::env::var("ZCC_JT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MIN_CASES);
+        if arms.len() < min_cases {
             return None;
         }
         let lo = arms.iter().map(|(k, _)| *k).min()?;

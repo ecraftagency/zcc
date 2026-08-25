@@ -506,6 +506,14 @@ side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), 
 from size-weighted to measured-programs-owned.
 **R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
 **1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green).
+**R4.11 ✅ + R4.14 ⚠️ (2026-08-25)** — rotation over EVERY loop exit (its
+residual print refuted §13n's guess and named the real reason), and one of
+R4.14's three orphans: **EXEC geomean 1.0777, median 1.001, only 5 programs
+above 1.1×**; d3 **1.969 → 0.969** and j5 **1.940 → 1.002**; sqlite 201,727 =
+**1.2842×**. R4.14 (3) REFUTED by A/B (16% INSN for 7% EXEC) and reverted;
+R4.14 (2) measured and left open — the case count is not the variable.
+**Next ⬜ is R4.3**, and the five remaining exec losers are now owned by the
+SIZE rows (e2→R4.3, h2→R4.4, f2→R4.6), so the two axes have converged.
 **R4.5 + R4.9 ✅ BANKED together (2026-08-25)** — booleans stay flags (cfg
 threading identities (e)/(f)) and memory crosses one edge (`mem.rs` seeded from
 a single predecessor): sqlite **199,979 = 1.2731×**, EXEC geomean **1.1490**,
@@ -1394,8 +1402,8 @@ FPR half unmeasured. So the criterion becomes **measured programs owned × certa
 order is:
 
 ```
-R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️(discharged) → R4.5 ✅ → R4.9 ✅ → R4.11
-        → R4.14 → R4.6 → R4.3 → R4.4 → R4.8 → R4.10 → R4.12
+R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️ → R4.5 ✅ → R4.9 ✅ → R4.11 ✅ → R4.14 ⚠️(1 of 3)
+        → R4.3 → R4.4 → R4.6 → R4.10 → R4.8 → R4.12
 ```
 
 **AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
@@ -1994,6 +2002,126 @@ fresh processes. Batteries: `a_short_circuit_condition_reaches_the_branch_as_fla
 `b.cc`. That is a further row of R4.5 needing a `CCmp` MIR instruction and a
 two-block isel pattern; category (b), named, unshipped. `csel` and `cset` after
 threading are re-measured under R4.12 as that row already says.
+
+### R4.11 + R4.14 — BANKED (partly REFUTED). EXEC geomean **1.1490 → 1.0777**, median **1.001**, only **5** programs above 1.1×; sqlite 199,979 → **201,727** (1.2731× → **1.2842×**)
+
+**R4.11's residual print came FIRST, as the row demands, and it named a reason
+nobody had guessed.** §13n attributed d3 and d4 to `rotate.rs:129`'s refusal of
+any labelled header. The instrument (`ZCC_RESIDUAL=1`, the same one `licm.rs`
+carries) counted every refusal on sqlite:
+
+| reason | before | after |
+|---|---|---|
+| header stores, calls or allocas | 4,070 | 4,610 | 
+| **a header value is read after the loop, and the exit block is a MERGE** | **1,837** | **0** |
+| header holds body work (copying it would be peeling) | 358 | 365 |
+| header larger than `max-loop-header-insns` | 280 | 306 |
+| **a header value is read after the loop, outside the exit's dominance** | **221** | **0** |
+| header's branch has both arms inside the loop | 194 | 196 |
+| an exit block carrying a header value has a predecessor outside the loop | — | 286 |
+| a labelled header | 0 measured — **the guess was wrong** | — |
+
+The labelled-header refusal was fixed anyway (it now tests `pin`, which is what
+address-taken means, keeping the old rule only for a VLA function where `emit`
+writes `mov sp, x29` at a label). But it refused nothing measurable. **The two
+reasons that mattered were both the same thing: the loop-closed-SSA construction
+demanded a SINGLE DOOR** — one exit block, with one predecessor, dominating
+every reader of a header value. A loop with an early `return` has two exits; a
+`while (a && b)` reaches one exit from two different in-loop blocks. Both are
+ordinary C.
+
+**The general construction.** For each EXIT BLOCK e — outside the loop, with a
+predecessor inside it — a header value read below e leaves through e as a
+parameter, and every predecessor of e supplies the name IT can see: the old
+header passes the value (it still defines it), the guard passes its clone, and a
+body block passes the parameter the NEW header was given — which is why a value
+needed only at an exit must get that parameter whether or not the body reads it.
+Refused when an exit has a predecessor from outside the loop, which owes an
+argument it has no value for (286 loops, category (a) for this construction).
+
+**d3_early_exit 1.969 → 0.969** — zcc now beats gcc-O1 on it — and **j5 1.940 →
+1.002**, its loop reaching 7 instructions against gcc's 6 with 2 branches
+against 2. The 8-vs-6 gap R4.5's section predicted rotation would close, closed.
+
+**A LATENT BUG IN A SHIPPED ANALYSIS, exposed by the battery.**
+`scev::compute_trips` classified top- vs bottom-testing by PLACEMENT — "the
+exiting block is the header and the header is not a latch". That is true of a
+top-tested loop and ALSO true of the shape rotation now produces, because
+rotation puts the body INTO the header and `cfg::merge` then absorbs the latch,
+leaving one block that does the work and then tests. The trip count came out one
+short (10 reported as 9; `scev_counts_the_trips_of_a_literal_loop`), and trip
+counts are what the IV-widening overflow proof rests on. Fixed on DATA FLOW, the
+same lesson `rotate.rs` records about its own termination argument: a top test
+computes NOTHING but its condition, so every instruction in its block lies in
+the condition's transitive cone. **This is the third time in this project that a
+placement-based side condition was defeated by a later pass, and it is the
+strongest argument yet for the rule "phrase it about data flow".**
+
+### R4.14 — one row of three shipped, two REFUTED BY MEASUREMENT
+
+**(1) `x / 2^k` → `x · 2^−k` — SHIPPED.** A power of two has an all-zero
+significand, so its reciprocal is representable, and IEEE 754 §5.4 makes both
+operations the correctly-rounded result of the same exact real number: they
+agree bit for bit on every finite input, on ±0, on ±∞ and on every NaN payload.
+Two exclusions, both about representability rather than rounding — a zero,
+subnormal or infinite exponent field, and an exponent whose reciprocal would
+land on the subnormal boundary. This is the ONE float row `fold.rs`'s rule 2
+admits, and it is admitted because it is not an approximation. `fdiv` is 10+
+cycles here and `fmul` is 3.
+
+**(2) small dense `switch` → compare tree — MEASURED, INCONCLUSIVE, NOT
+SHIPPED.** The row's content was that R3.3's density constant (≥4 cases) is an
+Article-E "the spec's number or my convenience's number?" question, to be
+settled on a measured crossover rather than cited. It was measured, and the
+measurement refuses to settle it:
+
+* On d1_switch (8 cases), directly and repeatedly: the jump table is **15 ms**
+  and the compare tree **12 ms** — the tree wins by 20% while emitting **12 MORE
+  instructions** (95 against 83). The table's indirect branch is unpredictable.
+* On a synthetic sweep at 4, 6, 8, 12, 16, 24 and 32 cases, with a
+  pseudorandom (unpredictable) index: **table and tree are within 1 ms of each
+  other at every case count.**
+
+The two disagree, so **the case count is not the variable**, and no constant
+derived from it would be honest. The whole-suite A/B says the same: `ZCC_JT=9`
+moved the EXEC geomean 1.0899 → 1.0639, but d1 alone moves only 13% and the
+geomean would need 35% from it — the rest is cross-program noise. **MIN_CASES
+stays 4, `ZCC_JT` stays as the instrument, and the row is recorded as measured
+and open**: what distinguishes d1 is something about its switch that a case
+count does not name.
+
+**(3) inline a called-once function that is not `static` — REFUTED, REVERTED.**
+§13n read e2's inlined `mix` as evidence of a rule gcc has. gcc's
+`-finline-functions-called-once` says "all **STATIC** functions called once", and
+the reason is structural: a callee with EXTERNAL linkage may be called from
+another translation unit, so its out-of-line body can never be deleted and
+inlining it duplicates the body permanently. Measured over the whole suite by
+A/B:
+
+| config | EXEC | INSN | sqlite |
+|---|---|---|---|
+| neither | 1.1627 | 1.1493 | 199,984 |
+| **R4.11 only** | **1.0782** | **1.1499** | 201,727 |
+| R4.14 (3) only | 1.0841 | **1.3326** | 201,078 |
+| both | 1.0371 | 1.3332 | 202,875 |
+
+A **16% INSN regression for a 7% EXEC one** fails THE ULTIMATUM's "both axes"
+outright, and the A/B is also the cleanest statement yet of what R4.11 costs:
+**EXEC −7.3% for an INSN geomean that does not move (1.1493 → 1.1499) and sqlite
++0.87%.** Reverted, with the reason written into `inline.rs` so the row is not
+re-proposed.
+
+**GATE (all green):** cargo 157/0 · fullsuite 10 PASS / 0 RED · opt-parity
+1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE · determinism 87×8. Batteries:
+`a_loop_with_an_early_return_rotates`,
+`a_division_by_a_power_of_two_becomes_a_multiplication`, and the corrected
+`scev_counts_the_trips_of_a_literal_loop`.
+
+**Where the suite stands.** Five programs above 1.1×, and every one is owned by a
+row the suite was said to be blind to: **d1 1.500** (R4.14 (2), open), **d2
+1.500** (R4.13's add-IV), **e2 1.500** (R4.3's entry copies), **h2 1.222**
+(R4.4's dead frame), **f2 1.200** (R4.6's rebuilt constants). The exec and size
+sides have converged onto the same rows.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 
