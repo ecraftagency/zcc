@@ -779,6 +779,66 @@ R2.4 flip ✅ and **R2+R3 have zero pending**.
 
 ---
 
+## §13d `main` vs `mir-rearch`, SAME harness SAME box SAME session (2026-08-25, after row 1)
+
+Prompted by a claim that `main` reached geo40 EXEC **1.55×** while this branch sits at ~1.7×, i.e.
+that the re-architecture went BACKWARDS on the axis that matters. Both compilers were therefore
+built for the box and run through the SAME `exectime.sh` (`main` = `4fb7a0a`, this branch =
+`09403df`). The 1.55 does not reproduce, and the reason is the one §13c had already written down:
+it was a geomean over a DIFFERENT POOL of programs measured by the pre-patch harness. Same pool,
+same session:
+
+| metric | `main` 4fb7a0a | `mir-rearch` 09403df |
+|---|---|---|
+| EXEC geomean, common 17 | 1.6642 | **1.6232** |
+| INSN geomean, common 34 | 1.6191 | **1.3007** |
+| sqlite static insns | ~285,899 (1.83×) | **240,774 (1.53×)** |
+| DIVERGE | 1 (`f1_float_sum`) | **0** |
+
+So the branch is not behind. But the honest reading of the same table is the finding, and it is
+not comfortable: **`main` is faster on 10 of the 17 individually timed programs.** This branch wins
+the geomean only by killing `main`'s outliers (i1_global_acc 4.316→1.300, f2_double_poly
+3.800→1.400, j5 3.820→2.869). Five hot loops went the other way, every one of them emitting FEWER
+instructions and running SLOWER:
+
+| program | EXEC main → rearch | INSN main → rearch |
+|---|---|---|
+| g1_memcpy_loop | 1.000 → **2.021** | 1.167 → 1.100 |
+| j3_prefix_sum | 1.245 → **1.920** | 1.382 → 1.255 |
+| h2_revbits | 1.222 → **1.865** | 1.594 → 1.438 |
+| h1_popcount | 1.531 → **1.859** | 1.429 → 1.314 |
+| g3_reverse | 1.692 → **1.962** | 1.830 → 1.277 |
+
+Fewer instructions and slower is a Law-2 signal, not a mystery: the count fell where it does not
+execute, and rose where it does. Read at the instruction level (`mycopy`, g1), the inner loop says
+it plainly — `main` 3 instructions per iteration plus the test, this branch 7 plus the test:
+
+```
+main:      ldrb w1, [x20], #1 ; strb w1, [x19], #1 ; b .L1     (+ cmp/b.hs)
+rearch:    sxtw x1, w0 ; add x2, x3, x1 ; add x6, x4, x1 ;
+           ldrb w1, [x6] ; strb w1, [x2] ; add w1, w0, #1 ;
+           mov x0, x1 ; b .L1                                  (+ cmp/b.lt)
+```
+
+Four named causes, and three of them are ROWS ALREADY ON THE §13c LIST:
+1. **two branches per iteration** — the loop is top-tested. §13c **row 2, rotation**.
+2. **the index is rebuilt every iteration** (`sxtw` of a 32-bit counter, then address arithmetic
+   from scratch) where `main` walked a POINTER with post-increment. §13c **row 5, pointer-IV** —
+   and note `auto_inc` (R3.2, shipped) cannot fire until the pointer IV exists to attach it to.
+3. **un-coalesced edge copies** (`mov x0, x1 ; mov x1, x7` in j3's body) — the SSA-destruction
+   residual §13b sized at `mov` +33,487. **R4.**
+4. `main` INLINED `mycopy` into the hot caller and this branch does not — inline policy, and
+   `-finline-functions-called-once` does not cover it because the callee is not static.
+
+**This CORRECTS the projection given earlier in this session**, which called rows 2–5 modest and
+put the money in R4. That was inferred from the sqlite static histogram, where these loops barely
+appear; measured on the hot-loop programs, rows 2 and 5 attack roughly half the per-iteration
+instructions of the worst regressions. The plan order in §13c stands unchanged — rotation second,
+pointer-IV fifth — but their EXPECTED VALUE is revised UP, and the five programs above are their
+KPI, not sqlite.
+
+---
+
 ## §13 Baselines to beat (from `rc3`, box, 2026-08-24) — measurement only
 
 - sqlite3.c static insns: zcc **279,161** vs gcc-O1 **157,883** = **1.768×** (pre-㉕.1: 286,129 = 1.812×).
