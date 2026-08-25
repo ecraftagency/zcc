@@ -23,8 +23,17 @@
   `float_h`), `tests/ext` 19/19, all five science gates PASS, torture **1471 pass / 0
   FAIL**, opt-parity 1552/0, csmith300 254/0, yarpgen300 300/0, determinism 85 × 8.
   sqlite **241,055 = 1.527×** gcc-O1, geo40 INSN **1.2982**, EXEC **1.5857**
-  (rc3: 1.768× / 1.5835; the R1 origin: 2.997× / 2.5168 / 4.4077). Next: the §13b
-  worklist — spill traffic, then copies, then layout.
+  (rc3: 1.768× / 1.5835; the R1 origin: 2.997× / 2.5168 / 4.4077).
+
+  **NEXT SESSION = R3.4, the Law-1 sync — not more optimization.** Twelve passes
+  shipped in R2/R3 and `THEORY.md` records none of them; it still says
+  `[PLANNED — R2/R3]`. Under Law 1 that is not a documentation lag, it is the
+  SOURCE being wrong about its own object, and the memory
+  `cxc-per-loc-before-test` says the sync happens per phase, before the suite —
+  it was skipped twice. Every theorem to be written already EXISTS, in the doc
+  comment at the head of the pass that realizes it; the row is transcription and
+  Side-II table-filling, not research. Only after that does the §13b worklist
+  (spill traffic, then copies, then layout) open.
 - The box: `docker exec zccbox …`, suites cached at `/suites` (`ZCC_SUITE_CACHE=/suites`), build with
   `CARGO_TARGET_DIR=/ltarget cargo build --release && cp /ltarget/release/zcc /usr/local/bin/zcc`.
 
@@ -467,6 +476,7 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 | R3.1 munch patterns: addressing modes, cmp-branch fusion, csel forms, madd/msub, bfx, extend folding, mul-by-const | ✅ `isel::munch` — one pre-pass deciding which producers each consumer absorbs, because the producer is emitted first and the consumer's choice has to be known before its turn comes. Two licences, not interchangeable: an ADDRESS folds when EVERY use of it is a memory operand (folding into some while still computing it for others only duplicates work); an ALU operand folds on a SINGLE use (the shift or extension happens inside the consumer). Rows: `[base, #off]`, `[slot, #off]`, `[base, idx, ext #shift]`, `add/sub … , sxtw`, `op … , lsl #k`, `madd`/`msub`, `cmp`+`b.cc`, `cbz`/`cbnz`, `cmp`+`csel`. `ubfx`/`sbfx`, `cbz`/`cbnz`, `tbz`/`tbnz` on the sign bit. `mul(x, 2^k) → shl` is an HIR canonicalization (`fold::canon`) because only the shift form folds into an address. A producer that has itself absorbed something may NOT be absorbed again — the value it swallowed would then be defined nowhere |
 | R3.2 cmp_elim, auto_inc, ext_lattice, ldst_pair | 🔨 `ext_lattice` (`mir/pass/ext.rs`), `ldst_pair` (`mir/pass/ldstp.rs`) and `cmp_elim` (`mir/pass/cmpelim.rs`) banked — `uxtb` 3,918 → 344, `uxth` 1,357 → 142, 7,104 `ldp` + 3,224 `stp` where there were none, `cmp` 13,312 → 9,487. cmp_elim fuses only where the CONDITION CODE survives: `cmp d, #0` sets C=1 and V=0 by definition, `adds` sets them from the addition, so only the codes reading N and Z alone carry over — and `lt`/`ge` are rewritten to `mi`/`pl`. **auto_inc still ⬜** |
 | R3.3 switch jump tables, block layout, shrink-wrap | 🔨 jump tables banked: a switch with ≥4 cases occupying ≥half its span becomes `sub`/`cmp`/`b.hi` + `adrp`/`ldrsw`/`br` over a `.rodata` table of signed 32-bit offsets (position-independent, no run-time relocation). Block layout was already R0's; BRANCH RELAXATION was added to it, since `tbz` reaches ±32 KB and `b.cc`/`cbz` ±1 MB against `b`'s ±128 MB and the assembler cannot fix it — a far conditional gets a trampoline, placed AFTER the fall-through inversion so the inversion cannot undo it. **shrink-wrap still ⬜** |
+| R3.4 **Law-1 sync — DO THIS NEXT.** `THEORY.md` ⊕ the specs IS the source of zcc and `src/*.rs` its compiled object; the docs currently describe a compiler that no longer exists. Re-derive them for everything R2/R3 shipped: **A6** (isel is no longer "the base case only, no munching" — `isel::munch` is the table, and there is no `isel/pattern.rs`) · **A7** (the spiller is Braun-Hack now, WITH its two recorded deviations: no SSA reconstruction, and a spilled parameter leaves the IR — both are theory, not implementation notes) · **A7b** (twelve passes are shipped, not `[PLANNED]`) · the MIR ladder (`ext_lattice`, `ldst_pair`, `cmp_elim` shipped) · rematerialization (shipped). **Side-II constants missing entirely**: `ldp`/`stp`'s scaled signed-7 offset · the branch reaches (`tbz` ±32 KB, `b.cc`/`cbz` ±1 MB, `b` ±128 MB) · `ubfx`/`sbfx` · the jump-table density rule · and above all **DDI 0487 B1.2.1, that every 32-bit write zeroes bits 63:32** — three of §15c's defects are that one line, and it appears in no table. `SEMANTICS.md` owes ⟦`Pair`⟧ and ⟦`Bfx`⟧ and the ⟦·⟧ obligation of each new pass | ⬜ |
 | R3 measurement | `corpus25.sh` excess histogram per mnemonic; each class classified fundamental vs convenience (Law-4). Band: sqlite ≤ 1.3×, geo40 INSN/EXEC ≤ 1.2 | 🔨 sqlite **241,055 = 1.527×** (R1 origin 2.997×, rc3 1.768×), geo40 INSN **1.2982** (origin 2.5168, rc3 1.5835), geo40 EXEC **1.5857** (origin 4.4077). Band (≤1.3× / ≤1.2) not yet met — see §13b for the excess histogram and what each class is |
 
 ### R4 — exhaustion toward 1×
