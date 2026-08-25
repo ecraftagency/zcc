@@ -590,10 +590,49 @@ fn assign(
     // AFTER colouring, so a colourer that only hints on instructions it can see
     // is blind to the largest source of copies there is — mem2reg gives every
     // join one parameter per live local.
-    let pick = partners[v as usize]
-        .iter()
-        .filter_map(|q| phys_of(color, sp, *q))
-        .find(|h| h.class == class && free(*h, occ))
+    // R4.10 — THE PARTNER GRAPH IS FOLLOWED, NOT JUST READ ONE HOP.
+    //
+    // A direct partner is often not coloured yet: colouring walks the DOMINATOR
+    // tree, and a block parameter's argument comes from a PREDECESSOR, which
+    // need not be a dominator at all (a back edge is coloured strictly later).
+    // The hint then finds nothing and the parameter takes an arbitrary register,
+    // which is one `mov` on that edge for ever after. `ZCC_COALESCE` measured
+    // the residual: **5,070 pairs where the two do not interfere and biased
+    // colouring simply did not find the merge** — Boissinot's ceiling.
+    //
+    // Following the partner graph transitively reaches a coloured member through
+    // the chain the copies form (`a → p → b`: `p` is uncoloured, `b` is not).
+    // NOTHING ABOUT CORRECTNESS CHANGES: this only proposes a colour, and `free`
+    // still refuses one that is occupied, conflicting or in the wrong half of
+    // the partition — a hint that is wrong costs a `mov`, never a value. The
+    // depth is bounded because a chain longer than a few links is a different
+    // value's neighbourhood, not this one's.
+    let mut seen: Vec<VReg> = vec![v];
+    let mut wave: Vec<Reg> = partners[v as usize].clone();
+    let mut hint: Option<PReg> = None;
+    let depth: usize = std::env::var("ZCC_CODEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    for _ in 0..depth {
+        if hint.is_some() || wave.is_empty() {
+            break;
+        }
+        let mut next: Vec<Reg> = Vec::new();
+        for q in &wave {
+            if let Some(h) = phys_of(color, sp, *q) {
+                if h.class == class && free(h, occ) {
+                    hint = Some(h);
+                    break;
+                }
+            }
+            if let Reg::V(qv) = q {
+                if !seen.contains(qv) {
+                    seen.push(*qv);
+                    next.extend_from_slice(&partners[*qv as usize]);
+                }
+            }
+        }
+        wave = next;
+    }
+    let pick = hint
         .or_else(|| {
             isa::alloc_order(class)
                 .iter()

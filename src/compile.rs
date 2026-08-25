@@ -107,6 +107,7 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
         for f in m.funcs.iter_mut() {
             crate::mir::pass::ext::run(f);
             crate::mir::pass::cmpelim::run(f);
+            crate::mir::pass::const_share::run(f);
             crate::mir::pass::autoinc::run(f);
         }
     });

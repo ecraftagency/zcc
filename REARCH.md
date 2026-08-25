@@ -506,6 +506,10 @@ side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), 
 from size-weighted to measured-programs-owned.
 **R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
 **1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green).
+**R4.6 ✅ + R4.10 ✅ (2026-08-26)** — constants value-numbered (not copied, and
+not across a call) and the copy-partner graph followed transitively: sqlite
+**186,705 = 1.1886×**, EXEC unchanged at ≈1.05, INSN 1.0677. **Only R4.8 and the
+measurement R4.12 are left in R4.**
 **R4.3 ✅ + R4.4 ✅ (2026-08-25)** — a parallel-copy destination takes its own
 dying source, and one epilogue per shape instead of one per return path (plus
 dropping frame slots nothing names): sqlite **189,279 = 1.2050×**, EXEC geomean
@@ -1409,7 +1413,7 @@ order is:
 
 ```
 R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️ → R4.5 ✅ → R4.9 ✅ → R4.11 ✅ → R4.14 ⚠️(1 of 3)
-        → R4.3 ✅ → R4.4 ✅ → R4.6 → R4.10 → R4.8 → R4.12
+        → R4.3 ✅ → R4.4 ✅ → R4.6 ✅ → R4.10 ✅ → R4.8 → R4.12
 ```
 
 **AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
@@ -2201,6 +2205,71 @@ mul-by-constant row), `ccmp` 0 vs 612 (R4.5's residual), `sbfiz`/`ubfiz` 0 vs
 
 **GATE (all green):** cargo 157/0 · fullsuite 10 PASS / 0 RED · opt-parity
 1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE · determinism 87×8.
+
+### R4.6 + R4.10 — BANKED. sqlite **189,205 → 186,705** (1.2046× → **1.1886×**); EXEC unchanged at **≈1.05**, INSN **1.0677**
+
+Both are SIZE rows and both behaved like it: the exec geomean read 1.0357,
+1.0503, 1.0547 and 1.0535 across four runs of essentially this compiler, which
+is one ±1.5% noise band. The number that moved is the deterministic one.
+
+**R4.6 — the constant that was already materialized (`mir/pass/const_share.rs`).**
+HIR carries a constant as an OPERAND, not a value: no definition point, no
+interference, no value number — which is exactly what lets isel fold it into an
+immediate field without first proving single use. The price appears at the one
+place it does not fold, where isel mints a fresh `MovImm` per use and nothing
+shares them. The fix is what HIR already does for every other expression —
+dominator-scoped value numbering — applied to the two instructions that have no
+HIR value to be numbered as, `MovImm` and `Adrp`. Both are pure and constant, so
+a dominating one has already produced the same bits on every run that reaches
+the later.
+
+**THREE MEASUREMENTS, and each changed the shipped pass.**
+
+1. *A copy is not a merge.* Written the obvious way — replace the redundant
+   definition with `Copy` from the dominating one — it was a **+338 REGRESSION**:
+   `movz` fell by 1,678 and `mov` ROSE by 1,478 with 262 extra reloads, because a
+   copy's two ends are two live ranges and colouring merged them only sometimes.
+   Rewriting the USES instead, and deleting the definition, has no second range:
+   **−546**.
+2. *Not across a call.* AAPCS64 §6.1.1 leaves ten callee-saved GPRs, so a value
+   live across a call competes for a file a fifth the size. A constant is the one
+   value for which entering that competition is never worth it — re-materializing
+   costs ONE instruction, holding it costs one of ten. csmith proved it is not
+   merely a bad trade: **thirteen programs failed to allocate**, the allocator
+   reporting "11 call-crossing Gpr values live but only 10 callee-saved". Cutting
+   the dominator scope at every `Call` fixed all thirteen **and improved sqlite
+   by a further 392** — the across-call shares had been paying for themselves in
+   spills.
+3. *The ceiling had already been spent.* §13n's ceiling for this row was
+   6k…12k, taken from "14,393 `movz`/`movn` of which 9,035 repeat". By the time
+   the row was reached, `movz` was 8,823 — **R4.5's threading had removed the
+   `movz #1` boolean constants that were most of those repeats.** A ceiling
+   measured before three other rows ran is a ceiling about a different compiler.
+   Realized: 938. Recorded rather than rationalized.
+
+**R4.10 — the partner graph is FOLLOWED, not read one hop (`regalloc/color.rs`).**
+Biased colouring hints from a copy partner's colour, and a direct partner is
+often not coloured yet: colouring walks the DOMINATOR tree, while a block
+parameter's argument comes from a PREDECESSOR, which need not be a dominator at
+all — a back edge is coloured strictly later. The hint then finds nothing and the
+parameter takes an arbitrary register, which is one `mov` on that edge for ever.
+Following the partner graph transitively reaches a coloured member through the
+chain the copies form. **Nothing about correctness changes**: this only proposes
+a colour, and `free` still refuses one that is occupied, conflicting or in the
+wrong half of the partition — a wrong hint costs a `mov`, never a value.
+
+The depth is MEASURED, not chosen (Article E). Sweeping it over sqlite: depth 1
+(the old one-hop behaviour) 188,659 · 2 = 187,260 · **3 = 187,097** · 5 = 187,081
+· 8 and 16 = 187,104. It saturates at three; `ZCC_CODEPTH` re-runs the sweep.
+
+`ZCC_COALESCE`, which is Boissinot's own ceiling for this row: **FREE 5,070 →
+4,143**, SAME 10,409 → 11,521, and `mov` 37,669 → 36,380. Realized −1,562
+against a 2k…4.8k ceiling — the first row this session to land INSIDE its band.
+
+**GATE (all green):** cargo 159/0 · fullsuite 10 PASS / 0 RED · opt-parity
+1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE / **0 NOT-IMPL** · determinism 87×8.
+Battery: `a_constant_already_materialized_is_not_materialized_again`, whose
+second half asserts the across-call refusal.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

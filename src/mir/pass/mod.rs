@@ -7,6 +7,7 @@ pub mod legalize;
 mod tests;
 pub mod autoinc;
 pub mod cmpelim;
+pub mod const_share;
 pub mod ext;
 pub mod layout;
 pub mod ldstp;

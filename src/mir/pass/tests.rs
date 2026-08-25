@@ -361,3 +361,50 @@ fn one_epilogue_serves_every_return_of_a_shape() {
     let l = m.funcs.iter().find(|f| f.name == "leaf").unwrap();
     assert_eq!(l.frame_size, 0, "every local was promoted, so there is no frame");
 }
+
+#[test]
+fn a_constant_already_materialized_is_not_materialized_again() {
+    // R4.6. HIR carries a constant as an operand, not a value — which is what
+    // lets isel fold it into an immediate field without proving single use — so
+    // at the one place it does NOT fold, isel mints a fresh `MovImm` per use and
+    // nothing shares them. sqlite paid 9,035 repeated immediates for it.
+    use crate::mir::MInst;
+    let src = "int f(int*p,int n){int i,s=0;for(i=0;i<n;i++){s+=p[i]*1000003;p[i]=1000003;}return s;}\
+               int main(void){int a[3];int i;for(i=0;i<3;i++)a[i]=i;return f(a,3)&255;}";
+    same(src);
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let m = allocated(&h).unwrap();
+    let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+    let movs = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::MovImm { imm: 1000003, .. }))
+        .count();
+    assert_eq!(movs, 1, "the same literal was materialized {} times", movs);
+
+    // …but NOT across a call: AAPCS64 §6.1.1 leaves ten callee-saved GPRs, and a
+    // constant is the one value for which competing for one is never worth it —
+    // re-materializing costs one instruction. Shipped without this, thirteen
+    // csmith programs failed to allocate ("11 call-crossing Gpr values live but
+    // only 10 callee-saved").
+    let src = "int g(int);\
+               int f(int x){int a=g(x+1000003);int b=g(a+1000003);return a+b;}\
+               int g(int x){int i,s=0;for(i=0;i<3;i++)s+=x+i;return s;}\
+               int main(void){return f(1)&255;}";
+    same(src);
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let m = allocated(&h).unwrap();
+    let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+    let movs = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::MovImm { imm: 1000003, .. }))
+        .count();
+    assert_eq!(movs, 2, "a constant was shared across a call");
+}
