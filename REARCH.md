@@ -2047,6 +2047,50 @@ its value are downstream of the same R4 item. The revised order:
 
 ---
 
+## §19 PARKED — the real-program measurement spine (opened 2026-08-25 by user directive; NOT started, does NOT change the R4 order)
+
+**Why it is parked and not a row.** The 35-program taxonomy suite times only 18
+programs, and it structurally CANNOT see three things: instruction-cache
+pressure (every kernel fits in L1i, so zcc's +35% instruction count costs zero
+cycles there), register pressure (§13n already records that no function in the
+suite spills — so rows (g)/(i)/R4.8/R4.10, **58% of the measured size gap**,
+cannot move any exec number this project has ever taken), and working sets past
+L2. sqlite is measured for STATIC SIZE and never RUN. Adding more micro-kernels
+fixes none of that; it only makes the geomean cover more of a sample that is
+blind in the same places — and since the 15 currently-skipped kernels are the
+EASY ones (a2 0.973, b3 0.925, f3 1.140), adding them would pull the headline
+DOWN without the compiler being faster. That is the flattering-single-number
+trap the 2026-08-24 directive already rules out.
+
+**The reference shape** — `github.com/harshavmb/compare-claude-compiler`, a
+published GCC-vs-a-new-compiler comparison, measures on more axes than this
+project does. Its spine, recorded so ours can be framed against it:
+
+| axis | what it measures |
+|---|---|
+| compile | wall time, user CPU, **peak RSS of the compiler**, binary size |
+| runtime | total exec time, **per-query breakdown**, user CPU cycles, **peak RSS of the program** |
+| code quality | size-bloat ratio, disassembly line counts, icache efficiency |
+| workload A | Linux 6.9 — 2,844 translation units, link success/failure, system metrics sampled every 5 s |
+| workload B | sqlite 3.46 amalgamation — 42 SQL operations over 10 phases (INSERT/JOIN/subquery/UPDATE/DELETE/GROUP BY…), 100k-row primary + 10k-row secondary table |
+| correctness | 5 crash/edge tests — NULL handling, large BLOBs, recursive CTEs, Unicode, integer overflow |
+| reporting | side-by-side tables with slowdown ratios; per-operation charts; CPU/memory-over-time graphs |
+
+**What ours must add when it is taken up.** `~/.cache/zcc-suites/sqlite/shell.c`
+is already in the corpus, so the sqlite CLI can be built by zcc and by gcc-O1
+and run against a fixed SQL script — one measurement that covers icache and
+spilling, which nothing in this project currently does. **Peak RSS belongs in
+it** (user directive): both the compiler's and the program's, on both axes,
+because a compiler that reaches parity on time by spending unbounded memory has
+not reached parity. Reported paired and as a distribution, per the standing
+measurement method — never as one number.
+
+**Standing rule while parked: this changes nothing about the R4 order.** It is
+a MEASUREMENT project, not a lever; it is taken up when a row's prediction needs
+it or when R4 closes, and never in the middle of a row.
+
+---
+
 ## §16 The O2 headroom shelf — techniques beyond O1, ranked, with the names behind them
 
 Every row is a theorem to realize on THIS architecture (HIR or MIR as noted) under Law 3 — each ships
