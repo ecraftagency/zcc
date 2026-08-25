@@ -668,6 +668,85 @@ layout, then the remaining addressing modes.
 
 ---
 
+## §13c R2-LOOP BASELINE + OPPORTUNITY (box, 2026-08-25, HEAD `02db900`) — the "before" for the remaining loop passes; MEASUREMENT collected, implementation is next session
+
+The only work still pending in R2+R3 is the six loop items in R2.3/R2.4 (iv/strength-
+reduce/pointer-iv/LFTR, rotate/final-value/invariant-pure-call hoist). This section is the
+baseline every one of them is measured against, and — the point of collecting it FIRST — a
+measurement that **re-orders the plan**.
+
+### Baseline dashboard (numbers to beat)
+- sqlite **240,774 = 1.525×** gcc-O1. geo40 **INSN 1.2977** (determ, 35), **EXEC 1.5822**
+  (noisy, 19; median 1.833; worst j5 2.868).
+- sqlite mnemonic excess for the loop-pass targets (zcc − gcc): `mul` **+623**, `msub` +105,
+  `madd` −9 · `bl` **+448** · `b` **+5,833** · `cmp` +2,488.
+
+### The gcc-ZEROED bucket — the biggest EXEC gap vs gcc-O1
+| prog | zcc ms | gcc ms | INSN ratio |
+|---|---|---|---|
+| b4_ptr_diff | 25 | ~0 | 1.255 |
+| c1_struct_sum | 31 | ~0 | 1.281 |
+| c2_bitfield | 30 | ~0 | 1.463 |
+| c3_nested_struct | 29 | ~0 | 1.418 |
+| f3_float_minmax | 106 | ~0 | 1.679 |
+| j1_reduction | 152 | ~0 | 1.457 |
+
+**~373 ms of zcc wall-time that gcc spends ≈0 on.** Emptying this bucket is the single
+largest EXEC win available.
+
+### THE FINDING that re-orders the plan (read the SOURCES, not just the numbers)
+All six have ONE shape: `main` runs `for(k=0;k<K;k++) s += work(array, n)`, where `work`
+reads the array — UNCHANGED across the k-loop — and returns the SAME value every call. gcc
+zeros them by **loop-invariant PURE-CALL hoisting**: hoist `work(array,n)` out of the k-loop
+(compute once), leaving `for(k){s+=const}`, which final-value then closes to `s=const*K`.
+So the bucket is emptied by **invariant-pure-call hoist (R2.4, the old OPT.md #24)**, with
+**final-value** finishing the leftover k-loop — NOT by final-value on the inner loop. This is
+exactly the #24 shape (`2af2702` on `main`: j1 152→~1 ms).
+
+### Infra MISSING on this branch (what next session must build FIRST)
+- **Interprocedural purity** — for pure-call-hoist. Per-instruction `Effect` (Pure|Read|
+  Write|Call, `hir/mod.rs:361`) EXISTS; the FUNCTION-level fixpoint (`is work() pure?`) does
+  NOT — it was `inline.rs::pure_functions` on `main` and was lost in the big-bang. Hoisting
+  `work(a,n)` also needs the outer loop proven MEMORY-CLEAN (nothing in it writes memory the
+  callee may read) — the #24 four-fence: purity · invariant args · memory-clean · ≥1-trip.
+- **IV/SCEV analysis** — for final-value, LFTR, pointer-iv. None exists (`hir/scev.rs` to be
+  written). Target-independent (HIR) → x64 inherits it.
+
+### CORRECTED execution order (edit R2.3/R2.4 IN PLACE when banking; anti-fragmentation)
+1. **Interprocedural purity + invariant-pure-call hoist** (`pass/loop.rs`) — THE bucket-emptier
+   (#24). Highest value. KPI: bucket 6→fewer, geo40 EXEC drop, absolute wall −~373 ms.
+2. **loop rotation** (`pass/loop.rs`) — unblocks licm read-hoist (licm's own recorded residual);
+   gives clean trip count for final-value. KPI: `b` count, EXEC on hot loops.
+3. **final-value / SCEV** (`pass/loop.rs`) — needs IV/SCEV; closes the leftover k-loop after
+   hoist and any counted-loop-final-scalar. KPI: finishes bucket→0, sqlite INSN.
+4. **LFTR** (`pass/iv.rs`) — needs IV; kills the original counter (DCE). KPI: small INSN.
+5. **pointer-IV** (`pass/iv.rs`) — non-pow2 stride → running pointer; x64-relevant (arm64
+   post-index half is `auto_inc`, shipped). KPI: `mul`/`add` in loops.
+- **SKIP scalar mul→add strength-reduction** — `mul` excess is only +623 and mul→add is 1:1
+  static, and A64 (like any OoO core) pipelines `mul` at ~add cost, so the rewrite is ≈0 on
+  every target. Classify as Law-4 category-(a) FUNDAMENTAL (OoO makes it null), not pending.
+  The IV *analysis* under it is still built (for rows 3–5).
+
+### Non-bucket high-EXEC (rotation + licm-read-hoist targets, real O(n) work each call)
+g1_memcpy 2.02 · g2_strlen 2.00 · g3_reverse 1.96 · j3_prefix_sum 1.94 · h1_popcount 1.85 ·
+h2_revbits 1.84 · j2_histogram 1.74. These are hot inner loops; the INSN gap (1.1–1.4×) plus
+one branch/iteration is where rotation + stronger licm pay, not final-value.
+
+### Per-row process + dashboard (fixed)
+predict Δ on the model → implement + inline commuting-square battery → cargo (0.4s) →
+iterate gate opt-parity+torture (~75s) → seal csmith300+yarpgen300 (~3min) → re-measure
+`corpus25.sh` (size + mnemonic) and `exectime.sh` (INSN+EXEC geomean, distribution, **bucket
+count**) → bank (commit+push, edit R2.3/R2.4 in place) or quarantine → advance. Reproduce the
+baseline: `ZCC=/usr/local/bin/zcc GCC=gcc SQLITE=/suites/sqlite/sqlite3.c sh
+tests/bench/corpus25.sh` and `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
+
+### Zero-pending accounting
+R3 is fully ✅. R0, R1, R2.1, R2.2 are ✅. The ONLY non-✅ items in all of R0–R3 are the six
+loop rows above. When rows 1–5 are banked (strength-reduce classified category-(a)), R2.3 and
+R2.4 flip ✅ and **R2+R3 have zero pending**.
+
+---
+
 ## §13 Baselines to beat (from `rc3`, box, 2026-08-24) — measurement only
 
 - sqlite3.c static insns: zcc **279,161** vs gcc-O1 **157,883** = **1.768×** (pre-㉕.1: 286,129 = 1.812×).
