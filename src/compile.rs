@@ -33,9 +33,10 @@ pub fn compile(ast: &Ast) -> String {
     phase("emit", || crate::emit::emit(ast, &m))
 }
 
-/// Every symbol a STATIC INITIALIZER names. A function whose address a data
-/// object holds is referenced by the linker, not by any instruction, so HIR
-/// cannot tell that it is still needed — and the inliner must not delete it.
+/// Every symbol a STATIC INITIALIZER or an ALIAS names. A function whose address
+/// a data object holds, or that an `__attribute__((alias))` resolves to, is
+/// referenced by the linker, not by any instruction, so HIR cannot tell that it
+/// is still needed — and the inliner must not delete it.
 pub fn pinned_symbols(ast: &Ast) -> std::collections::HashSet<String> {
     fn walk(i: &crate::ast::GInit, out: &mut std::collections::HashSet<String>) {
         match i {
@@ -57,6 +58,13 @@ pub fn pinned_symbols(ast: &Ast) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for g in &ast.globals {
         walk(&g.init, &mut out);
+    }
+    // EXT(gcc) `__attribute__((alias("old")))` — musl's `weak_alias(dummy, _init)`
+    // over a `static void dummy(void){}`. `.set _init, dummy` is the ONLY reference
+    // to `dummy` and it lives in the emitted text, not in HIR, so without this the
+    // inliner deletes the target and the link fails on an undefined `dummy`.
+    for (_, old, _) in &ast.aliases {
+        out.insert(old.trim_start_matches('\u{1}').to_string());
     }
     out
 }

@@ -489,18 +489,35 @@ impl<'a> Machine<'a> {
                 self.set(fr, *dst, x);
             }
             // `ldp`/`stp`: the second register sits one element past the first.
+            // The `q` form moves SIXTEEN bytes per register, which no single
+            // `u64` holds, so it goes half at a time — the same shape `Load`,
+            // `Store`, `Spill` and `Reload` already use for `Width::Q`.
             MInst::Pair { w, load, a, b, mem } => {
                 let n = w.bytes();
                 let (base, wb) = self.addr(fr, mem, n)?;
                 let step = n as u64;
+                let (half, q) = if *w == Width::Q { (8, true) } else { (n, false) };
                 if *load {
-                    let (x, y) = (self.mem.load(base, n)?, self.mem.load(base + step, n)?);
+                    let (x, y) = (self.mem.load(base, half)?, self.mem.load(base + step, half)?);
                     self.set(fr, *a, x);
                     self.set(fr, *b, y);
+                    if q {
+                        let (xh, yh) = (
+                            self.mem.load(base + 8, 8)?,
+                            self.mem.load(base + step + 8, 8)?,
+                        );
+                        self.set_hi(fr, *a, xh);
+                        self.set_hi(fr, *b, yh);
+                    }
                 } else {
                     let (x, y) = (self.get(fr, *a), self.get(fr, *b));
-                    self.mem.store(base, n, x)?;
-                    self.mem.store(base + step, n, y)?;
+                    self.mem.store(base, half, x)?;
+                    self.mem.store(base + step, half, y)?;
+                    if q {
+                        let (xh, yh) = (self.get_hi(fr, *a), self.get_hi(fr, *b));
+                        self.mem.store(base + 8, 8, xh)?;
+                        self.mem.store(base + step + 8, 8, yh)?;
+                    }
                 }
                 if let Some((r, x)) = wb {
                     self.set(fr, r, x);

@@ -56,7 +56,12 @@ impl Mem {
         }
         Err(Trap::BadAddress(a))
     }
+    /// `n` is at most 8: a `u64` is the widest scalar μ hands back, and a
+    /// 16-byte access (`Width::Q`) is two of these by construction. Asserting it
+    /// here is Law 3 at the layer that owns the invariant — the alternative is a
+    /// shift that overflows in debug and silently loses the top half in release.
     pub fn load(&mut self, a: u64, n: u32) -> Result<u64, Trap> {
+        debug_assert!(n <= 8, "μ load of {} bytes: a scalar access is at most 8", n);
         let s = self.slice(a, n as u64)?;
         let mut v = 0u64;
         for (i, &b) in s.iter().enumerate() {
@@ -65,6 +70,7 @@ impl Mem {
         Ok(v)
     }
     pub fn store(&mut self, a: u64, n: u32, v: u64) -> Result<(), Trap> {
+        debug_assert!(n <= 8, "μ store of {} bytes: a scalar access is at most 8", n);
         let s = self.slice(a, n as u64)?;
         for (i, b) in s.iter_mut().enumerate() {
             *b = (v >> (8 * i)) as u8;

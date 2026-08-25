@@ -3026,19 +3026,61 @@ impl P<'_> {
         let t = self.expr()?;
         self.expect(Tok::Punct(":"))?;
         let e = self.cond_expr()?;
-        // the two operands converge to a common type (scalar); struct/ptr keeps the left operand
-        let (tt_, te) = (self.ty(t), self.ty(e));
-        if self.scalar(tt_) && self.scalar(te) && self.tt.is_integer(tt_) | self.tt.is_float(tt_) {
+        // C99 6.5.15p5-6, in the standard's own order. An array operand decays to a
+        // pointer first — keeping the array type would make a variadic argument
+        // spilled to the stack be store_narrow-ed to the array size (git diff.c
+        // `? " " : ""` → strh 2 bytes → a garbage pointer, segv per layout).
+        let (tt_, te) = (self.arr_decay(self.ty(t)), self.arr_decay(self.ty(e)));
+        let (ptr_t, ptr_e) = (self.is_ptr(tt_), self.is_ptr(te));
+        if !ptr_t && !ptr_e && self.scalar(tt_) && self.scalar(te)
+            && self.tt.is_integer(tt_) | self.tt.is_float(tt_)
+        {
+            // both arithmetic: the usual arithmetic conversions
             let ct = self.common_ty(tt_, te);
             let (t, e) = (self.cast(t, ct), self.cast(e, ct));
             Ok(self.push(Node::Cond(c, t, e), ct))
+        } else if ptr_t && self.null_const(e) {
+            // "one operand is a pointer and the other a null pointer constant: the
+            // result has the pointer type". The constant MUST be converted — it is an
+            // `int` until it is, and a 32-bit join parameter fed a 64-bit pointer from
+            // the other arm is a type error the HIR verifier rejects (musl getpass:
+            // `return l < 0 ? 0 : password;`).
+            let e = self.cast(e, tt_);
+            Ok(self.push(Node::Cond(c, t, e), tt_))
+        } else if ptr_e && self.null_const(t) {
+            let t = self.cast(t, te);
+            Ok(self.push(Node::Cond(c, t, e), te))
+        } else if ptr_t && ptr_e && (self.is_void_ptr(tt_) || self.is_void_ptr(te)) {
+            // "one is a pointer to void, the other a pointer to an object type: the
+            // result is a pointer to void" — both arms already have the same width, so
+            // only the label changes
+            let vt = if self.is_void_ptr(tt_) { tt_ } else { te };
+            Ok(self.push(Node::Cond(c, t, e), vt))
         } else {
-            // C99 6.5.15: an array operand decays to a pointer — keeping the array type would
-            // make a variadic argument spilled to the stack be store_narrow-ed to the array size
-            // (git diff.c `? " " : ""` → strh 2 bytes → a garbage pointer, segv per layout)
-            let rt = self.arr_decay(tt_);
+            // compatible pointers, or the same struct/union type: the left operand's
+            let rt = tt_;
             Ok(self.push(Node::Cond(c, t, e), rt))
         }
+    }
+    fn is_ptr(&self, t: TypeId) -> bool {
+        matches!(self.tt.tys[t as usize], Ty::Ptr(_))
+    }
+    fn is_void_ptr(&self, t: TypeId) -> bool {
+        match self.tt.tys[t as usize] {
+            Ty::Ptr(e) => matches!(self.tt.tys[e as usize], Ty::Void),
+            _ => false,
+        }
+    }
+    /// C99 6.3.2.3p3 — a null pointer constant: an integer constant expression with
+    /// the value 0, or such an expression cast to `void *`.
+    fn null_const(&self, n: NodeId) -> bool {
+        let t = self.ty(n);
+        if self.is_void_ptr(t) {
+            if let Node::Cast(inner) = self.nodes[n as usize] {
+                return self.null_const(inner);
+            }
+        }
+        self.tt.is_integer(t) && self.fold(n) == Ok(0)
     }
     // lvalue conversion C99 6.3.2.1p3: array → pointer-to-element (value = address;
     // codegen for an array expr already returns the address, so only the type changes)

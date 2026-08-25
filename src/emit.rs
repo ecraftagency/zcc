@@ -41,6 +41,17 @@ pub fn emit(ast: &Ast, m: &MModule) -> String {
     for w in &ast.weak_decls {
         let _ = writeln!(s, "\t.weak {}", sym_name(w));
     }
+    // The same rule for a weak OBJECT declaration this TU only references:
+    // `data()` skips an extern (it reserves no storage), so without this the
+    // reference is a STRONG undefined one and a static link that has no
+    // definition fails instead of resolving it to 0. musl's
+    // `extern weak hidden const size_t _DYNAMIC[];` is exactly this, and the
+    // `if (_DYNAMIC)` guarding it is written to read false when it is absent.
+    for g in &ast.globals {
+        if g.is_extern && g.is_weak {
+            let _ = writeln!(s, "\t.weak {}", sym_name(&g.name));
+        }
+    }
     s
 }
 

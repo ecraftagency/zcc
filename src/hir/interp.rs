@@ -53,7 +53,11 @@ pub fn f64_to_f128(b: u64) -> (u64, u64) {
             split(m, 16383 - 1022 - sh)
         }
         0x7ff => split(man, 0x7fff), // ±∞ and NaN keep their payload
-        _ => split(man, exp - 1023 + 16383),
+        // `exp + 16383 - 1023`, NOT `exp - 1023 + 16383`: `exp` is unsigned and
+        // every binary64 exponent below 1023 (i.e. every value under 1.0)
+        // underflows the first subtraction. The sum is the same either way, so
+        // release wrapped around to the right answer and only debug caught it.
+        _ => split(man, exp + 16383 - 1023),
     }
 }
 
