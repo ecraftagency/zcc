@@ -143,6 +143,9 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     if on("cfg") {
         cfg::run(f);
     }
+    if iv::fv_wanted() {
+        iv::fv_opportunity(f);
+    }
 }
 
 /// `ZCC_NOPASS=gvn,mem` disables the named rows. This is a BISECTION tool, not a

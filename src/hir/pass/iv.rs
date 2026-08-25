@@ -260,6 +260,62 @@ fn append(f: &mut Func, b: BlockId, mut inst: Inst) -> Operand {
 // instruction this pass exists to remove; a loop with more than one entry edge,
 // since the widened start has to be materialized on it; and an unsigned test,
 // whose `zext` twin is a separate fact this does not claim.
+/// `ZCC_FVDBG=1` counts the loops a FINAL-VALUE pass could close: a known trip
+/// count, and a body that computes nothing but affine accumulators and the
+/// counter. Law 4 asks for the size of an opportunity before it is built.
+pub fn fv_wanted() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_FVDBG").is_ok())
+}
+
+pub fn fv_opportunity(f: &Func) {
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    let lf = dom::loops(&c, &dt);
+    for li in 0..lf.loops.len() {
+        let s = match scev::LoopScev::analyze(f, &c, &dt, &lf, li) {
+            Some(s) => s,
+            None => continue,
+        };
+        let n = s.trips;
+        // every instruction in the body must be affine over the loop
+        // The loop's own exit test is CONTROL, not data — a closed form replaces
+        // the accumulators and deletes the test, so requiring the compare to be
+        // affine would report every loop as unclosable. (It did: the first cut
+        // of this counter said 0 everywhere, including on a hand-written
+        // known-positive. Validate the oracle before believing the verdict.)
+        let mut conds: Vec<ValueId> = Vec::new();
+        for &b in &lf.loops[li].body {
+            if let Term::Br(Operand::Val(v), ..) = &f.blocks[b as usize].term {
+                conds.push(*v);
+            }
+        }
+        let mut closed = true;
+        let mut insts = 0;
+        for &b in &lf.loops[li].body {
+            for inst in &f.blocks[b as usize].insts {
+                let d = match inst.dst() {
+                    Some(d) => d,
+                    None => {
+                        closed = false;
+                        continue;
+                    }
+                };
+                if conds.contains(&d) {
+                    continue;
+                }
+                insts += 1;
+                if s.eval(f, Operand::Val(d)).is_none() {
+                    closed = false;
+                }
+            }
+        }
+        if closed && insts > 0 {
+            eprintln!("FV closable trips={:?} insts={} fn={}", n, insts, f.name);
+        }
+    }
+}
+
 pub fn widen(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);

@@ -466,8 +466,8 @@ Legend: ⬜ todo · 🔨 in progress · ✅ banked (commit + measurement recorde
 |---|---|
 | R2.1 cfg_simplify, sccp, gvn, dce (+ batteries) | ✅ `e7473c9`. `cargo test` 52 → 67: `hir::tests::check` now runs EVERY battery program through both sides of ⟦f⟧=⟦P f⟧, and `isel`/`regalloc` do the same, so the R0/R1 corpus became the ladder's proof corpus at no authoring cost. Yield on its own is ~0 (every local is still a memory cell — that is what R2.2 fixes); one defect found: a literal address rode in ZR, which `Rn=31` decodes as SP (torture `930719-1`), now refused by `mir::verify` |
 | R2.2 sroa+mem2reg, load_elim/dse, alias oracle. **Blocking prerequisite**: mem2reg is what first creates long-lived values, so Braun & Hack 2009 proper — per-block working set across edges, Belady MIN eviction, rematerialization of pure producers, SSA reconstruction (Braun 2013) — must land in `regalloc/spill.rs` FIRST, with its own battery. **The rc3 allocator KPI (frame-slot mem-ops ≪ 27,403, reg-reg `mov` ≪ 40,573) is measured here**, not at R1 | ✅ sqlite **473,253 → 322,606** (2.997× → **2.043×**), geo40 INSN **2.5168 → 1.5244** (rc3 was 1.5835). `add` 133,264 → 35,357, `ldr` 90,906 → 63,286, frame-slot mem-ops 12,253 → 64,185 (the spill traffic promotion creates), reg-reg+imm `mov` 59,224 → 68,138 — the new top of the killable floor, and R3's target. Deviation from the plan, recorded: SSA RECONSTRUCTION was not needed and is not there. A reload's fresh register is used only inside the block that created it, so its live range is dominated by its definition and SSA holds by construction; a value that stays in the working set across an edge keeps its ORIGINAL name. The price is one reload per block-residency instead of one per program region. What the milestone did NOT anticipate, and what the measurement forced: (a) a spilled BLOCK PARAMETER cannot be stored at its definition — the parameter is removed and each predecessor writes the slot; (b) a join can be wider than the register file, and no eviction relieves an edge argument, so the successor's parameter is spilled instead; (c) one slot per SSA WEB, merged only where the members do not interfere — without it a spilled parameter copies between slots on every edge, which cost `sqlite3VdbeExec` 110,000 stores and made the milestone a REGRESSION (571,648) before it was a win |
-| R2.3 inline (+purity), licm (unconditional), iv/pointer-iv/LFTR | 🔨 inline + licm + **purity** banked; **iv/pointer-iv/LFTR still ⬜** (scalar strength-reduction CLOSED as Law-4 category-(a), §13c). purity (`pass/purity.rs`, 2026-08-25): the interprocedural read-only predicate the pure-call hoist rests on — gcc's `pure`, not `const`, so a caller must also prove memory-clean. Optimistic fixpoint, which is what makes a RECURSIVE read-only callee read-only: "performs a write" is existential over the body. 317 of sqlite's 2,528 functions qualify, so purity is NOT the binding constraint — the loop fences are (§13c residual). licm: EXEC geo40 1.9415 → 1.8374 (−5.4%) for +0.011 INSN and +0.75% sqlite — banked because §13a's directive makes EXEC the target and size the byproduct. inline: the bound is DERIVED, not tuned — a body no larger than the call sequence it replaces (`params + 2`: one instruction to place each argument, the `bl`, one to take the result) cannot grow the program — plus gcc-O1's own `-finline-functions-called-once`. Net EXEC 1.8374 → 1.7468, INSN 1.5357 → 1.5148, sqlite 315,665 → 317,285. A called-once callee must also be DELETED once its last call site is gone, or the rule is a pure size loss: sqlite grew 25% before that existed |
-| R2.4 if_convert, rotate/final-value/pure-call hoist (+ sink, added) | 🔨 if_convert and sink banked (`pass/ifconv.rs`): a side-effect-free diamond becomes `select`, speculating at most two pure trap-free instructions per arm. Refuses a store, a load, a division whose divisor is not a non-zero literal, and — for now — a FLOAT diamond, since `fcsel` has no MIR form yet. `pass/sink.rs` is licm's dual and was added here rather than planned: §13b ranked register pressure as the largest remaining item, and sinking is the cheapest thing that shortens a live range. **invariant-pure-call hoist ✅ BANKED 2026-08-25** (`licm::hoist_call`, REARCH §13c row 1) — the bucket-emptier. Four fences, each checked: purity (`pass/purity.rs`) · invariant arguments (definitions dominate the preheader) · MEMORY-CLEAN over the whole body (a read-only callee is a function OF memory, so a single store anywhere in the loop breaks the equality — including one AFTER the call, which changes what the NEXT iteration would have read) · GUARANTEED EXECUTION on the first iteration (≥1-trip by evaluating the header test under the preheader's own edge arguments; the call's block dominates every latch AND every other block the loop exits from). Non-termination needed its own argument, since purity does not imply it: the memory-clean fence plus exit-dominance leave only a prior call or a nested loop as a way to diverge ahead of the hoisted call, and both are refused. A FAULT ahead of it needs no fence — a first iteration that faults is UB. **Result: the gcc-ZEROED bucket 6 → 0** (b4/c1/c2/c3/f3/j1, ~371 ms of zcc wall-time), and TWO new asymptotic wins over gcc-O1 in the mirror bucket (e1_recursion gcc 345 ms → zcc ≈0, g2_strlen gcc 161 ms → zcc ≈0). INSN geo40 1.3260 → **1.3043**, median 1.277 → 1.273. EXEC geomean on the COMMON timed set 1.6405 → 1.6232 (n=17, same box, same session) — the pass touches none of those 17 programs, so read that as unchanged, not as a win; the whole effect is in the two buckets and in INSN. sqlite **240,774, byte-for-byte the baseline** (it fires nowhere there — see the residual), compile time +0.5%. **rotate ✅ BANKED 2026-08-25 (shipped OFF, then ON — §13e → §13f)** (`pass/rotate.rs`, gcc's `-ftree-ch`): the square is argued by COUNTING EXECUTIONS — the guard IS the header's first execution — so a copied header need not be pure, it is relocated rather than speculated. It does not pay and §13e says why: rotation makes the back edge critical, the split block is where SSA destruction parks the loop-carried copy, and the branch removed is the branch that copy block adds back (10 instructions per iteration before AND after). Forced on: sqlite +2.7% and +1,732 BRANCHES, geo40 INSN 1.3043 → 1.3972, none of the five §13d loops improved. Quarantined with the gate NAMED — coalesce the loop-carried copy. **THE GATE WAS THEN OPENED (§13f) and rotation is ✅ ON**: `regalloc/color.rs` now frees a dying operand before placing the destination (six lines of `reads_before_writes`, replacing a conservative order that cost one `mov` in every counted loop), and `mir/pass/layout.rs` threads the block that is then empty. EXEC geomean 1.6232 → **1.4276** (≥30 ms only: 1.8423 → **1.4610**), INSN 1.3043 → **1.2437**, sqlite 240,774 → **236,886** with branches 19,151 → **14,711**; h1_popcount now beats gcc-O1 at 0.960, j2_histogram 1.017 and g3_reverse 1.000 reach parity. **final-value still ⬜** |
+| R2.3 inline (+purity), licm (unconditional), iv/pointer-iv/LFTR | ✅ **COMPLETE**. inline + licm + **purity** + **scev** (`pass/scev.rs`, §13g) + **IV widening** (§13l — five instructions against gcc's five on the array-copy loop; subsumes LFTR for that shape, the narrow counter and its test both gone). **pointer-IV BUILT, PROVEN, and OFF** — gate discharged NEGATIVE on the fixed isel baseline (§13i/§13k): A64's free scaled index makes its premise false. Scalar strength-reduction CLOSED as Law-4 category-(a) (§13c). purity (`pass/purity.rs`, 2026-08-25): the interprocedural read-only predicate the pure-call hoist rests on — gcc's `pure`, not `const`, so a caller must also prove memory-clean. Optimistic fixpoint, which is what makes a RECURSIVE read-only callee read-only: "performs a write" is existential over the body. 317 of sqlite's 2,528 functions qualify, so purity is NOT the binding constraint — the loop fences are (§13c residual). licm: EXEC geo40 1.9415 → 1.8374 (−5.4%) for +0.011 INSN and +0.75% sqlite — banked because §13a's directive makes EXEC the target and size the byproduct. inline: the bound is DERIVED, not tuned — a body no larger than the call sequence it replaces (`params + 2`: one instruction to place each argument, the `bl`, one to take the result) cannot grow the program — plus gcc-O1's own `-finline-functions-called-once`. Net EXEC 1.8374 → 1.7468, INSN 1.5357 → 1.5148, sqlite 315,665 → 317,285. A called-once callee must also be DELETED once its last call site is gone, or the rule is a pure size loss: sqlite grew 25% before that existed |
+| R2.4 if_convert, rotate/final-value/pure-call hoist (+ sink, added) | ✅ **COMPLETE**. if_convert and sink banked (`pass/ifconv.rs`): a side-effect-free diamond becomes `select`, speculating at most two pure trap-free instructions per arm. Refuses a store, a load, a division whose divisor is not a non-zero literal, and — for now — a FLOAT diamond, since `fcsel` has no MIR form yet. `pass/sink.rs` is licm's dual and was added here rather than planned: §13b ranked register pressure as the largest remaining item, and sinking is the cheapest thing that shortens a live range. **invariant-pure-call hoist ✅ BANKED 2026-08-25** (`licm::hoist_call`, REARCH §13c row 1) — the bucket-emptier. Four fences, each checked: purity (`pass/purity.rs`) · invariant arguments (definitions dominate the preheader) · MEMORY-CLEAN over the whole body (a read-only callee is a function OF memory, so a single store anywhere in the loop breaks the equality — including one AFTER the call, which changes what the NEXT iteration would have read) · GUARANTEED EXECUTION on the first iteration (≥1-trip by evaluating the header test under the preheader's own edge arguments; the call's block dominates every latch AND every other block the loop exits from). Non-termination needed its own argument, since purity does not imply it: the memory-clean fence plus exit-dominance leave only a prior call or a nested loop as a way to diverge ahead of the hoisted call, and both are refused. A FAULT ahead of it needs no fence — a first iteration that faults is UB. **Result: the gcc-ZEROED bucket 6 → 0** (b4/c1/c2/c3/f3/j1, ~371 ms of zcc wall-time), and TWO new asymptotic wins over gcc-O1 in the mirror bucket (e1_recursion gcc 345 ms → zcc ≈0, g2_strlen gcc 161 ms → zcc ≈0). INSN geo40 1.3260 → **1.3043**, median 1.277 → 1.273. EXEC geomean on the COMMON timed set 1.6405 → 1.6232 (n=17, same box, same session) — the pass touches none of those 17 programs, so read that as unchanged, not as a win; the whole effect is in the two buckets and in INSN. sqlite **240,774, byte-for-byte the baseline** (it fires nowhere there — see the residual), compile time +0.5%. **rotate ✅ BANKED 2026-08-25 (shipped OFF, then ON — §13e → §13f)** (`pass/rotate.rs`, gcc's `-ftree-ch`): the square is argued by COUNTING EXECUTIONS — the guard IS the header's first execution — so a copied header need not be pure, it is relocated rather than speculated. It does not pay and §13e says why: rotation makes the back edge critical, the split block is where SSA destruction parks the loop-carried copy, and the branch removed is the branch that copy block adds back (10 instructions per iteration before AND after). Forced on: sqlite +2.7% and +1,732 BRANCHES, geo40 INSN 1.3043 → 1.3972, none of the five §13d loops improved. Quarantined with the gate NAMED — coalesce the loop-carried copy. **THE GATE WAS THEN OPENED (§13f) and rotation is ✅ ON**: `regalloc/color.rs` now frees a dying operand before placing the destination (six lines of `reads_before_writes`, replacing a conservative order that cost one `mov` in every counted loop), and `mir/pass/layout.rs` threads the block that is then empty. EXEC geomean 1.6232 → **1.4276** (≥30 ms only: 1.8423 → **1.4610**), INSN 1.3043 → **1.2437**, sqlite 240,774 → **236,886** with branches 19,151 → **14,711**; h1_popcount now beats gcc-O1 at 0.960, j2_histogram 1.017 and g3_reverse 1.000 reach parity. **final-value CLOSED on measured absence of demand** (§13m: 0 closable loops in sqlite, 0 in geo40). **R2.4 COMPLETE** |
 | R2 gate + measurement | opt-parity (passes off vs on) 0 DIVERGE; csmith/yarpgen 0 DIVERGE. KPI: INSN geo ≤ 1.58 (rc3), sqlite ≤ 1.5×. **Merge-to-main eligibility starts here** | ✅ **both KPIs met and passed**: opt-parity 1552/0, csmith300 254/0, yarpgen300 300/0, torture 1471/0. See the R3 measurement row for the numbers — R2 and R3 were measured together because the isel and MIR rows landed in the same session |
 
 ### R3 — machine passes (§8) + isel munch table complete (§6)
@@ -772,10 +772,33 @@ count**) → bank (commit+push, edit R2.3/R2.4 in place) or quarantine → advan
 baseline: `ZCC=/usr/local/bin/zcc GCC=gcc SQLITE=/suites/sqlite/sqlite3.c sh
 tests/bench/corpus25.sh` and `ZCC=/usr/local/bin/zcc sh tests/bench/exectime.sh`.
 
-### Zero-pending accounting
-R3 is fully ✅. R0, R1, R2.1, R2.2 are ✅. The ONLY non-✅ items in all of R0–R3 are the six
-loop rows above. When rows 1–5 are banked (strength-reduce classified category-(a)), R2.3 and
-R2.4 flip ✅ and **R2+R3 have zero pending**.
+### Zero-pending accounting — REACHED 2026-08-25
+**R0, R1, R2.1, R2.2, R2.3, R2.4 and all of R3 are ✅. R2 and R3 have ZERO PENDING ROWS.**
+
+How the six loop rows closed, each by measurement rather than by fiat:
+| row | outcome |
+|---|---|
+| invariant pure-call hoist | ✅ shipped — gcc-ZEROED bucket 6 → 0 (§13c row 1) |
+| rotation | ✅ shipped ON, after §13f fixed the two things below it that were cancelling it |
+| iv/scev | ✅ shipped — `pass/scev.rs`, and **IV widening** reaches instruction-for-instruction parity with gcc-O1 on the array-copy loop (§13l) |
+| LFTR | ✅ subsumed by widening for the shape that matters: the narrow counter and its test are both gone |
+| pointer-IV | ⛔ built, proven, and OFF — gate discharged NEGATIVE (§13k). A64's free scaled index makes the premise false |
+| scalar strength-reduction | ⛔ Law-4 category-(a): an out-of-order core pipelines `mul` at ≈`add` cost (§13c) |
+| final-value | ⛔ closed on MEASURED absence of demand — 0 closable loops in sqlite, 0 in geo40 (§13m) |
+
+Two rows were closed by turning them OFF and one by not building it, and that is the point: three of
+the seven outcomes are negative, every one of them backed by a number, and none of them was decided
+by how the transform looked on paper.
+
+### Where the compiler stands at zero-pending
+geo40 EXEC **1.3654** (over 18, median 1.269, worst j5 2.856) · INSN **1.2410** (over 35, median
+1.217) · sqlite **237,025 = 1.51× gcc-O1** · gcc-ZEROED bucket EMPTY · zcc-ZEROED bucket holds
+e1_recursion (gcc 335 ms → ≈0) and g2_strlen (gcc 156 ms → ≈0). Session arc: EXEC 1.6232 → 1.3654,
+INSN 1.3043 → 1.2410. Against `main` measured through the same harness (1.6642 EXEC / 1.6191 INSN),
+this branch is ~20% ahead on exec and ~24% on instruction count.
+
+The R4 band (≤1.3× / ≤1.2) is still not met, and §13b already says where the remaining mass is:
+spill traffic and copies, not loops.
 
 ---
 
@@ -1197,6 +1220,36 @@ an absent one.** `is_invariant` vs `is_loop_invariant`; "the add folds" vs "the 
 
 ---
 
+## §13m FINAL-VALUE — closed on MEASURED absence of demand. R2 and R3 have zero pending.
+
+The last open row. gcc -O1 does perform it (`for (i=0;i<100;i++) s+=i;` returns a literal 4950 there
+and runs an emptied countdown), so the question was never whether the transform is real — it was
+whether this corpus contains one.
+
+`iv::fv_opportunity` (`ZCC_FVDBG=1`) counts loops a final-value pass could close: every value the
+body defines has an affine evolution, so the whole loop reduces to a closed form. The answer:
+
+| corpus | closable loops |
+|---|---|
+| sqlite (2,046 functions) | **0** |
+| geo40 (35 programs) | **0** |
+
+**The oracle was validated before the verdict was believed, and it needed to be.** Its first cut
+reported 0 everywhere INCLUDING on a hand-written known-positive, because it demanded that the
+loop's own exit COMPARE be affine — control, not data, and never affine. Believing that run would
+have closed this row on a lie. It now finds `s += 1` against a symbolic bound and correctly misses
+`s += i`, which is quadratic and outside the affine fragment `scev` claims.
+
+So the row closes under Article A — **no feature before a real `.c` demands it** — with the demand
+measured rather than assumed, and the measurement reproducible. Two things make the absence
+unsurprising in hindsight: row 1's invariant pure-call hoist already emptied the gcc-ZEROED bucket,
+which was the asymptotic gap final-value was meant to finish; and a WEAKER form that closes only the
+accumulator while the loop keeps running would save one `add` per loop, not an order of growth.
+
+**R2 and R3 now have zero pending rows.**
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -1263,7 +1316,8 @@ its value are downstream of the same R4 item. The revised order:
 6a. ✅ **IV widening** (`pass/iv.rs::widen`, §13l) — the last instruction between `mycopy`'s loop
    and gcc's. Five instructions each, one for one. EXEC-neutral, INSN 1.2419 → 1.2410. Subsumes
    LFTR for this shape: the narrow counter AND its test are gone
-6b. ⬜ final-value — the only row of R2/R3 still open
+6b. ✅ **final-value** — CLOSED on measured absence of demand (§13m): 0 closable loops in sqlite
+   and 0 in geo40, with the counting oracle validated against a known-positive first
 
 ---
 
