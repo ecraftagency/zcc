@@ -506,14 +506,19 @@ side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), 
 from size-weighted to measured-programs-owned.
 **R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
 **1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green).
+**R4.5 + R4.9 ✅ BANKED together (2026-08-25)** — booleans stay flags (cfg
+threading identities (e)/(f)) and memory crosses one edge (`mem.rs` seeded from
+a single predecessor): sqlite **199,979 = 1.2731×**, EXEC geomean **1.1490**,
+median **1.000**, j5 **2.857 → 1.940**. **Next ⬜ is R4.11** (rotation), which
+owns d3 (2.000×, now pure rotation) and closes j5's remaining count gap.
 **R4.7 ✅ BANKED (2026-08-25)** — the eight §17 rows verified one by one:
 sqlite **212,066 = 1.3501×**, EXEC geomean **1.3386 → 1.2044** (median 1.225 →
 1.073), and the plan's first CYCLE prediction validated to the third decimal
 (j3 1.940 → **1.000** at identical instruction count). **R4.13 ⚠️ DISCHARGED by
 its own residual print** — two of its three shapes are category (a) on this
-target, the third's bug half banked under R4.7 (d2 2.111 → 1.500). **Next ⬜ is
-R4.5**, which the amended order puts first because j5 (2.857×, 81% of the
-suite's wall time) is its program.
+target, the third's bug half banked under R4.7 (d2 2.111 → 1.500). R4.5 was
+put first because j5 (2.857×, 81% of the suite's wall time) is its program, and
+it delivered.
 Fourteen rows now; §13n holds the table, the evidence and the order.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
@@ -1366,11 +1371,11 @@ every row, paired, in one session, as a distribution.
 | **R4.2** | **ABI-boundary truncation is a no-op** (a). A truncating copy whose destination is a fixed argument register at a call, or whose source is a fixed result register after one, or the return register before `ret`, is dropped: the reader reads the declared width. Cite AAPCS64 §6.4.2 in the code; the same rule for `fmov` with v31. The `mir::verify` width rule must still hold, so the rule lives in `destruct::nop` where the physical register's reader is known, or the `Copy` is never emitted by isel | `regalloc/destruct.rs`, `isel` call result width | the 4,208 + 3,462 + 692 counts ARE the prediction: −12,570 | `mov x16` before `bl` = 0; `mov wN,wN` after `bl` = 0; sqlite ≤ 220k; **`fmov v31` pairs = 0** | ✅ **BANKED (both halves).** GPR half 218,776; **FPR twin** `fmov d31` windmill **783 → 4 pairs** (−779 = **−1,558 `fmov`**), sqlite **218,776 → 217,160** (−1,616), **1.3928× → 1.3826×**. Residual 4 = genuine `d8↔d9` swaps (real 2-cycles, scratch mandatory) → category (a) fundamental, **exhausted**. See "R4.2 IS NOT EXHAUSTED" below |
 | **R4.3** | **A parallel-copy destination takes its own dying source** (b). Amend the "free AFTER" rule: at a `ParallelCopy`, a destination may take the register of the source of ITS OWN pair when that source dies here; the simultaneity argument forbids only the other pairs' sources. `color::check` already asserts no two live values share a colour, so the proof obligation is met by the existing checker | `regalloc/color.rs` walk | count pairs `(d ← s)` with `s` dying at the copy and `colour(d) ≠ colour(s)` — that number is the ceiling; report it split entry / call / other | movs before `bl` per call → ≈1.0 (gcc 1.00); entry copies ≈ 0 | ⬜ |
 | **R4.4** | **returns merged, dead slots dropped, frame adjust folded** (e) | HIR `unify_ret`; `mir/pass/frame.rs` | extra `ret` 1,928 → ≤ 400; 289 leaf frames → 0; `sub sp` count → ≈ number of functions with no save pair | sqlite −4k…−6k | ⬜ |
-| **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ⬜ |
+| **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ✅ **BANKED with R4.9** (cfg identities (e) threading-a-known-condition + (f) branch-on-select-of-literals; the `cset`/`csinc`/`csneg` rows shipped early under R4.7). **Residual: `ccmp` 0 vs 612 — category (b), needs a `CCmp` MIR instruction; named, unshipped.** See "R4.5 + R4.9" below |
 | **R4.6** | **constants shared** (c): dominator-scoped `MovImm`/`Adrp` sharing on MIR, before spilling; the spiller's remat decides pressure. **Amended 2026-08-25:** the inspection found the INTEGER loop bound rebuilt every iteration too (`movz w0,#2304; movk w0,#61,lsl 16` inside f2's and e2's loops, where gcc holds it in a callee-saved register), not only f2's FP constant — a loop-invariant immediate must be hoisted to the preheader, and the row's ceiling counts those | new `mir/pass/const_share.rs` | repeats 16,085 minus what R4.5 removes = the ceiling; realistic target zcc immediates → ≈ gcc's 12.7k; **plus** count of `MovImm`/`Adrp` inside a loop whose value is loop-invariant | `movz+movn+mov,zr` ≤ 14k; **f2, e2 exec** | ⬜ |
 | **R4.7** | **§17 verified, row by row** (f): extending loads (`ldrsb/ldrsh/ldrsw`, and prefer the extension in the LOAD over the ALU operand when the value feeds a loop-carried chain — the j3 latency fact, recorded as a cost-model caveat since `cost = \|MIR\|` cannot see it), `cmpelim` across non-flag-writing instructions and `and`+`cmp` → `tst`, `fmov #imm8`, `csneg/csinc`, shifted-operand commute, constant-LHS `cmp` commute, `tbz` for sign/bit tests, `sbfiz`. Each row: its count vs gcc BEFORE, its battery, its count AFTER — the ✔ becomes a number | `isel/lower.rs`, `cmpelim.rs`, `ext_lattice`, **`mir/isa.rs` latency table (Side II — MEASURED, see "THE MISSING DUAL")** | the per-mnemonic table above, **and the first CYCLE prediction the plan has ever carried**: j3's loop-carried chain is `add xN,xN,wM,sxtw` (2 cyc) → `ldrsw`+`add` (1 cyc), bound 2.0 → 1.0; measured today 1.940, so the row predicts **j3 ≈ 1.0×** and, on the same table, **i1 and e2's `sxtw` chains**. **Amended 2026-08-25:** the KPI below WAS a size KPI ("±10% per mnemonic"); the inspection showed this row's value is on the clock and predictable before the build | **j3 exec 1.94 → ≤ 1.1** (the cycle prediction, validated against the clock); each mnemonic within ±10% of gcc; **i1, e2, h2, d4, f2 exec** — 5 of the 10 programs above 1.2× | ✅ **BANKED.** j3 **1.940 → 1.000** (the cycle prediction, to the third decimal), d4 **1.400 → 1.000**, i1 **1.333 → 0.750**, d2 **2.111 → 1.500**; sqlite **217,160 → 212,066** (1.3826× → **1.3501×**); EXEC geomean **1.3386 → 1.2044**, median **1.225 → 1.073**. Eight rows, each with a square AND a count. Residual: `sbfiz`/`ubfiz`/`fmov #imm8`/`mul`-by-constant = category (b), named; `tst` = category (a). See "R4.7 — BANKED" below |
 | **R4.8** | **spill, second pass** (g): entry-set fixpoint across back edges (carry into loop headers); spill-store placement at the eviction frontier | `regalloc/spill.rs` | `ZCC_SPILLCEIL` in-loop 7,607 and dom-ceiling 3,485 are the reload ceiling; for stores, count spilled definitions with a path that never reloads | frame `ldr` ≪ 17,052, frame `str` ≪ 12,239 | ⬜ |
-| **R4.9** | **memory-aware GVN** (h) — FRE | `hir/pass/gvn.rs` + alias classes from `effects()` | count loads whose address was loaded in a dominating block with no clobbering store/call between — measured before a line is written, like R4.1 | non-frame `ldr` → ≈ gcc's 14,567; **j5 exec** | ⬜ |
+| **R4.9** | **memory-aware GVN** (h) — FRE | `hir/pass/gvn.rs` + alias classes from `effects()` | count loads whose address was loaded in a dominating block with no clobbering store/call between — measured before a line is written, like R4.1 | non-frame `ldr` → ≈ gcc's 14,567; **j5 exec** | ✅ **BANKED with R4.5.** Shipped in `mem.rs`, not `gvn.rs`: `mem.rs` already had the alias oracle, and what it lacked was a block big enough to see across. A block whose ONLY predecessor is P is seeded with P's exit table — sound with no dataflow. **Residual: the fully general FRE over arbitrary control flow still needs a memory SSA — category (b), §12** |
 | **R4.10** | **Boissinot merge** on the FREE residual (i) | `regalloc/color.rs` | 4,782 | edge copies ≪ 9,332 | ⬜ |
 | **R4.11** | **rotation residual + store motion** (j): `rotate.rs` tests `pin`, not `labels`; add the refusal-reason residual print; trace and lift the early-return shape; LICM store motion for a loop-invariant address with no aliasing access | `hir/pass/rotate.rs`, `hir/pass/licm.rs` | residual print first — the count of refused loops per reason IS the prediction | **d3, d4, i1 exec**; sqlite branch count | ⬜ |
 | **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ⬜ |
@@ -1389,8 +1394,8 @@ FPR half unmeasured. So the criterion becomes **measured programs owned × certa
 order is:
 
 ```
-R4.2 (FPR twin) ✅ →  R4.7 ✅ →  R4.13 ⚠️(discharged) →  R4.5  →  R4.9  →  R4.11
-                 →  R4.14  →  R4.6  →  R4.3  →  R4.4  →  R4.8  →  R4.10  →  R4.12
+R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️(discharged) → R4.5 ✅ → R4.9 ✅ → R4.11
+        → R4.14 → R4.6 → R4.3 → R4.4 → R4.8 → R4.10 → R4.12
 ```
 
 **AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
@@ -1885,6 +1890,110 @@ the order: **the hot-loop inspection's own numbers now put j5 (2.857×, and 81%
 of the suite's absolute wall time) squarely on R4.5** — `cmp; movz; csel; cbnz`
 per iteration where gcc branches on flags — with R4.9's repeated `p[j]` load and
 R4.11's block layout behind it. The order below is amended on that measurement.
+
+### R4.5 + R4.9 — BANKED together. sqlite **212,066 → 199,979** (1.3501× → **1.2731×**); EXEC geomean **1.2044 → 1.1490**, median **1.000**; **j5 2.857 → 1.940**
+
+Taken as one batch because they are the same program's two mechanisms: §13n's
+hot-loop inspection attributed j5 — 2.85× and the largest absolute wall time in
+the suite — to bool-then-branch (R4.5) and a `p[j]` loaded twice (R4.9), and
+neither can be judged with the other still in place.
+
+**R4.5 — identities (e) and (f) in `cfg.rs`.** C's `&&`/`||` build a VALUE: one
+arm computes a relation, the other passes a literal, and the merge block is
+branched on. §13n row (d) measured what that costs — 3,707 pure-boolean `csel`
+each with its `movz`, and 669 `csel → cbnz`, against gcc's 9.
+
+* **(e) THREADING A KNOWN CONDITION.** If S is instruction-free and ends in
+  `br p, X, Y` with `p` one of S's OWN parameters, a predecessor passing a
+  literal for `p` already knows the answer — `⟦br k,X,Y⟧` is `⟦jmp X⟧` for k≠0.
+  It names X directly, carrying S's arguments with S's parameters substituted by
+  what that edge passed. Identity (d) then merges what is left of the merge
+  block into the block that computed the relation, and isel's existing
+  compare-branch fusion does the rest: j5's `cmp; movz; csel; cbnz` becomes
+  `cmp; b.gt`.
+* **(f) A BRANCH ON A SELECT OF TWO LITERALS** is a branch on its condition —
+  the same shape, reached when the merge has already been if-converted.
+
+**THE SIDE CONDITION, and the defect that found it.** Skipping S skips the
+DEFINITION of S's parameters, and SSA licences a use anywhere S dominates —
+arbitrarily far below the successor the substitution reaches. Shipped without
+it, a loop header whose induction parameter the body read directly threaded into
+that body and left the parameter undefined: `hir::verify` reported `t: %24 used
+in bb6 but defined in bb2` on torture pr54937, `main: %17 used before its
+definition` on pr109925, `bar: use of undefined %93` on pr116799, and
+`unixLock: %298 used in bb73 but defined in bb66` on sqlite. **Four cases, one
+run, caught at the layer that owns the invariant** — Law 3 exactly as written,
+and the reason the rule now reads: S is threadable only when every parameter it
+defines is used NOWHERE but its own terminator, so the substitution is total.
+(Nothing else can lose dominance: a strict dominator D of S dominates every
+predecessor P of S — extend any path entry→P by the edge P→S, and D must lie on
+it with D ≠ S — so every value the threaded edge still names is defined above P.)
+
+**R4.9 — one edge, no dataflow (`mem.rs`).** `mem.rs` already had the alias
+oracle and the three memory transforms; what it lacked was a block big enough to
+see across. A block C whose ONLY predecessor is P is entered exactly once per
+execution of P, immediately after it, by no other route — so the memory state at
+C's entry IS the state at P's exit, which is the same statement the block-local
+walk already makes about two adjacent INSTRUCTIONS, applied to two adjacent
+BLOCKS. C's table is seeded with P's, under three conditions: `preds(C) = {P}`;
+P is visited first (reverse postorder, so a back edge seeds nothing); and a
+carried entry loses its store-deletion candidacy, because forwarding a store to
+a later load is a fact about memory while DELETING it would need C to always
+follow P, and P may have other successors. The value a carried entry names is
+defined in P or above it, and P dominates its only successor's every use.
+
+That is the whole of j5's second `p[j]`: the body's only predecessor is the
+condition block that just loaded it.
+
+**Result on j5's inner loop — 11 instructions before this session, 8 now:**
+
+```
+zcc, now (8)                            gcc -O1 (6)
+.L5: tbnz w4,#31, exit                  .L3: ldr  w3,[x2,-4]
+     ldr  w5,[x2,w4,sxtw #2]                 cmp  w3,w4
+     cmp  w5,w1                              ble  .L4
+     b.gt body                               str  w3,[x2],-4
+body:add  w6,w4,#1                           subs w1,w1,#1
+     str  w5,[x2,w6,sxtw #2]                 bpl  .L3
+     sub  w4,w4,#1
+     b    .L5
+```
+
+**What is left on j5, named — and it is NOT size.** Its insn ratio is **0.881**:
+zcc emits FEWER static instructions than gcc for the whole program and still
+runs 1.94×. Two causes, both control-flow and latency:
+1. **Not rotated (R4.11).** The `j>=0` test sits at the TOP and needs an
+   unconditional `b` to return; gcc rotated the loop so that test IS the
+   back-branch (`bpl`). Two instructions, two branches per iteration against
+   one — and that alone is the entire 8-against-6 count gap.
+2. **The address recurrence.** zcc's loop-carried chain is `sub w4,w4,#1` →
+   `tbnz w4` → `ldr [x2, w4, sxtw #2]`: the index is sign-extended and scaled
+   INSIDE the address every iteration. gcc's `str w3,[x2],-4` makes the store's
+   own writeback the decrement, so the next address is already in a register —
+   a shorter recurrence, and `add w6,w4,#1` disappears with it.
+
+Cause 2 is **R4.13 shape 1**, which this session measured negative on the
+whole-suite aggregate. That measurement stands and j5 does not overturn it: it
+identifies WHERE the shape would pay, which is the per-loop cost question §13k
+named and the global on/off switch cannot answer. It is also a STORE post-index,
+which `autoinc.rs` refuses by design (`STR Xt,[Xn],#imm` with t == n is
+CONSTRAINED UNPREDICTABLE, so the pass takes loads only and buys a side
+condition it never has to discharge). **R4.11 goes first**, since it owns d3
+(2.000×, now pure rotation) as well and closes j5's count gap; j5 is re-measured
+after it, before shape 1 is re-opened.
+
+**GATE (all green):** cargo 155/0 · fullsuite 10 PASS / 0 RED (shape, cpp,
+decay, alg, abi, cases, ext, torture 1378 pass / 0 FAIL, cts, musl) ·
+opt-parity 1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE · determinism 87×8
+fresh processes. Batteries: `a_short_circuit_condition_reaches_the_branch_as_flags`,
+`threading_refuses_a_block_whose_parameter_is_read_below_it`,
+`a_load_survives_one_edge_into_a_single_predecessor_block`.
+
+**Law-4 residual.** `ccmp` 0 vs gcc's 612 is NOT closed: threading turns
+`a && b` into two branches, where gcc turns it into one `cmp` + one `ccmp` + one
+`b.cc`. That is a further row of R4.5 needing a `CCmp` MIR instruction and a
+two-block isel pattern; category (b), named, unshipped. `csel` and `cset` after
+threading are re-measured under R4.12 as that row already says.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

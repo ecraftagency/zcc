@@ -15,10 +15,11 @@
 //   * two different linker symbols.
 // Everything else MAY alias, including any pointer against anything.
 //
-// THE TRANSFORMS, all block-local. A block is where the oracle is exact enough
-// to be worth the walk; the global versions (`-ftree-fre`, `-ftree-dse` across
-// blocks) need a memory SSA and are recorded as residual in REARCH §12 rather
-// than half-built here.
+// THE TRANSFORMS. Each is block-local in its reasoning; what R4.9 adds is not a
+// new transform but a bigger BLOCK to reason over — see "ACROSS ONE EDGE" below.
+// A block is where the oracle is exact enough to be worth the walk; the fully
+// general versions (`-ftree-fre`, `-ftree-dse` over arbitrary control flow) need
+// a memory SSA and stay a residual in REARCH §12 rather than half-built here.
 //   * STORE→LOAD FORWARDING — a load of a location whose value was just stored
 //     is that value. ⟦·⟧: memory is a function, and reading what was written
 //     returns it.
@@ -28,6 +29,28 @@
 //     location, with no read that may see it in between, is invisible.
 // A volatile access, a call, an `alloca` and a `memcpy`/`memset` all clear the
 // table: C99 6.7.3 forbids touching the first, and the rest may write anything.
+//
+// ACROSS ONE EDGE (R4.9 — gcc's `-ftree-fre`, in the one case that needs no
+// dataflow). A block C whose ONLY predecessor is P is entered exactly once per
+// execution of P, immediately after it, by no other route. So the memory state
+// at C's entry IS the state at P's exit — the same statement the block-local
+// walk already makes about two adjacent instructions, applied to two adjacent
+// BLOCKS — and C's table may be seeded with P's. The three side conditions are
+// what make it a proof rather than an analogy:
+//   * `preds(C) = {P}`, so no other path can reach C with a different memory;
+//   * P is visited before C (reverse postorder), so a BACK edge — where P has
+//     not run yet in the walk, and where the loop body may have written since —
+//     seeds nothing;
+//   * a carried entry loses its `Some(at)` deletion candidacy. A store in P may
+//     be forwarded to a load in C (memory is a function; reading what was
+//     written returns it), but DELETING that store because C overwrites it would
+//     need C to always follow P, and P may have other successors.
+// The value a carried entry names is defined in P or above it, and P dominates
+// C — its only predecessor — so it dominates every use in C.
+//
+// This is the case §13n row (h) measured on j5: `p[j]` is loaded in the loop's
+// condition and loaded AGAIN in the body, which has that condition block as its
+// only predecessor.
 use super::*;
 
 /// A memory location, as precisely as the oracle can name it.
@@ -61,6 +84,11 @@ fn same(a: &(Loc, u32), b: &(Loc, u32)) -> bool {
     a.1 == b.1 && a.0 == b.0
 }
 
+/// What memory is known to hold: the location, the type it was accessed at, the
+/// value, and — for a store — its instruction index, so a later store that makes
+/// it invisible can delete it.
+type Avail = Vec<((Loc, u32), Ty, Operand, Option<usize>)>;
+
 pub fn run(f: &mut Func) -> bool {
     // where each value's address comes from
     let mut addr: Vec<Option<Loc>> = vec![None; f.values.len()];
@@ -85,11 +113,27 @@ pub fn run(f: &mut Func) -> bool {
 
     let mut map: Vec<Option<Operand>> = vec![None; f.values.len()];
     let mut dead: Vec<(usize, usize)> = Vec::new();
-    for b in 0..f.blocks.len() {
+    // R4.9: the table each block LEAVES, so a single-predecessor successor can
+    // start from it instead of from nothing. Reverse postorder is what makes the
+    // predecessor's entry already present when its successor is reached.
+    let cfg = dom::cfg(f);
+    let mut exit: Vec<Option<Avail>> = vec![None; f.blocks.len()];
+    for &blk in &cfg.rpo {
+        let b = blk as usize;
         // what each location is known to hold, and — for a STORE — where the
         // instruction that put it there sits, so it can be deleted if a later
         // store makes it invisible
-        let mut avail: Vec<((Loc, u32), Ty, Operand, Option<usize>)> = Vec::new();
+        let mut avail: Avail = match cfg.preds[b].as_slice() {
+            [p] => exit[*p as usize]
+                .clone()
+                .map(|t| {
+                    // carried in, a store is no longer a deletion candidate: C
+                    // does not always follow P
+                    t.into_iter().map(|(k, ty, v, _)| (k, ty, v, None)).collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         for i in 0..f.blocks[b].insts.len() {
             match f.blocks[b].insts[i].clone() {
                 Inst::Load { dst, ty, addr: a, vol: false, .. } => {
@@ -154,6 +198,7 @@ pub fn run(f: &mut Func) -> bool {
                 _ => avail.clear(),
             }
         }
+        exit[b] = Some(avail);
     }
     if dead.is_empty() && map.iter().all(|x| x.is_none()) {
         return false;

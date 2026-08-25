@@ -18,6 +18,26 @@
 //       blocks are always executed in sequence, and S's parameters take `a` on
 //       the one edge that exists — so substituting a for them and concatenating
 //       is the same run.
+//   (e) THREADING A KNOWN CONDITION (R4.5). If S is instruction-free and ends in
+//       `br p, X, Y` where `p` is one of S's own parameters, then a predecessor
+//       that passes a LITERAL for `p` already knows which edge S will take —
+//       ⟦br k,X,Y⟧ is ⟦jmp X⟧ for k≠0 and ⟦jmp Y⟧ for k=0, exactly identity (a),
+//       except that the literal is not in S's terminator but on one incoming
+//       edge. That predecessor names X (or Y) directly, and the run is the same:
+//       S contributes no state transition, and the arguments X/Y receive are
+//       S's own, with S's parameters replaced by what that edge passed for them.
+//       This is what C's `&&` and `||` produce — one arm computes a relation,
+//       the other passes 0 — and it is why §13n row (d) measured 3,707
+//       pure-boolean `csel` and 669 `csel → cbnz` against gcc's 9: the two arms
+//       met in a φ and the φ was branched on, where gcc branches on flags. After
+//       (e) the constant arm skips the merge entirely and (d) folds what is left
+//       into the block that computed the relation, which is what lets isel fuse
+//       the compare into the branch.
+//   (f) A BRANCH ON A SELECT OF TWO LITERALS. `br (c ? k₁ : k₂), X, Y` observes
+//       only whether the selected literal is nonzero, so it is `br c` (both
+//       literals nonzero/zero collapse to a jump, and a swapped pair swaps the
+//       targets). The same shape as (e), reached when the merge has already been
+//       if-converted into a value.
 //
 // UNREACHABLE blocks are emptied rather than removed, because a block INDEX is
 // observable in two places (`Sym::Label`, `goto *`'s edge set) and renumbering
@@ -33,6 +53,7 @@ pub fn run(f: &mut Func) -> bool {
         let mut changed = fold_terms(f);
         changed |= drop_unreachable(f);
         changed |= thread(f);
+        changed |= thread_known_condition(f);
         changed |= merge(f);
         any |= changed;
         if !changed {
@@ -42,9 +63,171 @@ pub fn run(f: &mut Func) -> bool {
     any
 }
 
-/// (a) + (b)
-fn fold_terms(f: &mut Func) -> bool {
+/// (f) — a branch whose condition is a select between two literals observes only
+/// which literal is nonzero.
+fn fold_select_conditions(f: &mut Func) -> bool {
     let mut changed = false;
+    for b in 0..f.blocks.len() {
+        let (v, x, y) = match &f.blocks[b].term {
+            Term::Br(Operand::Val(v), x, y) => (*v, x.clone(), y.clone()),
+            _ => continue,
+        };
+        let Def::Inst(db, di) = f.values[v as usize].def else { continue };
+        let Some(Inst::Select { c, a, b: fb, .. }) = f.blocks[db as usize].insts.get(di as usize)
+        else {
+            continue;
+        };
+        let (c, a, fb) = (*c, *a, *fb);
+        let (Operand::Imm(k1), Operand::Imm(k2)) = (a, fb) else { continue };
+        f.blocks[b].term = match (k1 != 0, k2 != 0) {
+            (true, false) => Term::Br(c, x, y),
+            (false, true) => Term::Br(c, y, x),
+            (true, true) => Term::Jmp(x),
+            (false, false) => Term::Jmp(y),
+        };
+        changed = true;
+    }
+    changed
+}
+
+/// (e) — a predecessor that passes a literal for the parameter a forwarding
+/// block branches on already knows which way that branch goes.
+fn thread_known_condition(f: &mut Func) -> bool {
+    let c = dom::cfg(f);
+    let pin = pinned(f);
+    let n = f.blocks.len();
+    // THE SIDE CONDITION THAT MAKES THIS A PROOF. Skipping S skips the
+    // DEFINITION of S's parameters, and a parameter may be read far below S —
+    // every block S dominates could use it, which is precisely what SSA
+    // licences. Substituting the parameters into the arguments of the target
+    // reaches only the first block; a use one level deeper would be left naming
+    // a value that the threaded path never defines. So S is threadable only
+    // when every parameter it defines is used NOWHERE but its own terminator,
+    // and the substitution below therefore removes every occurrence.
+    //
+    // (Nothing else about S can lose dominance: a strict dominator D of S
+    // dominates every predecessor P of S — extend any path entry→P by the edge
+    // P→S and D must lie on it, and D ≠ S — so the values the threaded edge
+    // still names are all defined above P.)
+    //
+    // Found by `hir::verify` in one run: without it, `t: %24 used in bb6 but
+    // defined in bb2` — a loop header whose induction parameter the body read
+    // directly (torture pr54937, pr109925, pr116799, and sqlite `unixLock`).
+    let mut uses = vec![0u32; f.values.len()];
+    for b in &f.blocks {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    uses[v as usize] += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                uses[v as usize] += 1;
+            }
+        });
+    }
+    // `known[s] = Some((param index, X, Y))` for a block whose whole content is
+    // a branch on one of its own parameters.
+    let mut known: Vec<Option<(usize, Target, Target)>> = vec![None; n];
+    for s in 0..n {
+        if pin[s] || !c.reachable(s as BlockId) || !f.blocks[s].labels.is_empty() {
+            continue;
+        }
+        let blk = &f.blocks[s];
+        if !blk.insts.is_empty() {
+            continue;
+        }
+        let Term::Br(Operand::Val(v), x, y) = &blk.term else { continue };
+        // …and it must be S's OWN parameter: a value defined elsewhere is not
+        // decided by the incoming edge.
+        let Some(k) = blk.params.iter().position(|p| p == v) else { continue };
+        if x.block as usize == s || y.block as usize == s {
+            continue; // a self-edge would thread into the block being skipped
+        }
+        // every parameter used only here, so the substitution below is total
+        let mut here = vec![0u32; blk.params.len()];
+        blk.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                if let Some(j) = blk.params.iter().position(|p| p == &v) {
+                    here[j] += 1;
+                }
+            }
+        });
+        if blk.params.iter().zip(&here).any(|(p, n)| uses[*p as usize] != *n) {
+            continue;
+        }
+        known[s] = Some((k, x.clone(), y.clone()));
+    }
+    if known.iter().all(|x| x.is_none()) {
+        return false;
+    }
+    let mut changed = false;
+    for b in 0..n {
+        if !c.reachable(b as BlockId) {
+            continue;
+        }
+        let mut term = f.blocks[b].term.clone();
+        {
+            // As in `thread`: a predecessor must not name one successor twice
+            // with different arguments — `Cfg` dedups successors, so the second
+            // edge would vanish from every analysis while ⟦·⟧ still takes it.
+            let mut seen: Vec<BlockId> = term.targets().iter().map(|t| t.block).collect();
+            for (i, t) in term.targets_mut().into_iter().enumerate() {
+                let Some((k, x, y)) = &known[t.block as usize] else { continue };
+                let taken = match t.args.get(*k) {
+                    Some(Operand::Imm(v)) => {
+                        if *v != 0 {
+                            x
+                        } else {
+                            y
+                        }
+                    }
+                    _ => continue,
+                };
+                if taken.block as usize == b
+                    || seen.iter().enumerate().any(|(j, &sb)| j != i && sb == taken.block)
+                {
+                    continue;
+                }
+                // S's parameters, as this edge binds them, substituted into the
+                // arguments S would have passed on.
+                let params = &f.blocks[t.block as usize].params;
+                let mut dest = taken.clone();
+                for a in dest.args.iter_mut() {
+                    if let Operand::Val(v) = *a {
+                        if let Some(j) = params.iter().position(|p| *p == v) {
+                            match t.args.get(j) {
+                                Some(o) => *a = *o,
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                // …but only if every parameter it names was actually bound: a
+                // half-substituted argument would name a value defined in a
+                // block this edge no longer passes through.
+                let ok = dest.args.iter().all(|a| match a {
+                    Operand::Val(v) => !params.contains(v),
+                    _ => true,
+                });
+                if !ok {
+                    continue;
+                }
+                seen[i] = dest.block;
+                *t = dest;
+                changed = true;
+            }
+        }
+        f.blocks[b].term = term;
+    }
+    changed
+}
+
+/// (a) + (b) + (f)
+fn fold_terms(f: &mut Func) -> bool {
+    let mut changed = fold_select_conditions(f);
     for b in f.blocks.iter_mut() {
         let new = match &b.term {
             Term::Br(Operand::Imm(k), x, y) => {

@@ -1311,3 +1311,75 @@ fn a_stored_address_keeps_its_scaled_index() {
     assert!(!fired, "a store address is left to the addressing mode");
     assert_eq!(walked_loads(func(&after, "f")), 0);
 }
+
+// ── R4.5 / R4.9: booleans stay flags, and memory crosses one edge ──────────
+
+#[test]
+fn a_short_circuit_condition_reaches_the_branch_as_flags() {
+    // §13n row (d): `a && b` builds a VALUE — one arm computes a relation, the
+    // other passes 0 — and the merge is then branched on. sqlite paid 3,707
+    // pure-boolean `csel` and 669 `csel → cbnz` for it against gcc's 9.
+    // Identity (e): the arm that passes a LITERAL already knows which way the
+    // merge's branch goes, so it names the destination directly; identity (d)
+    // then folds what is left into the block that computed the relation, and
+    // isel fuses the compare into the branch.
+    let src = "int f(int*p,int n,int k){int i=0;while(i<n&&p[i]!=k)i++;return i;}\
+               int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i;return f(a,4,2);}";
+    square(src, 2);
+    let m = module(src, true);
+    let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+    // no boolean is materialized: the `&&` is two branches, not a value
+    assert_eq!(count(f, |i| matches!(i, Inst::Select { .. })), 0, "a boolean survived");
+    // and the two relations still exist — the pass threaded, it did not delete
+    assert!(count(f, |i| matches!(i, Inst::Cmp { .. })) >= 2);
+}
+
+#[test]
+fn threading_refuses_a_block_whose_parameter_is_read_below_it() {
+    // THE SIDE CONDITION. Skipping a block skips the DEFINITION of its
+    // parameters, and SSA licences a use anywhere that block dominates —
+    // arbitrarily far below the immediate successor the substitution reaches.
+    // A loop header whose induction parameter the body reads directly is
+    // exactly that shape, and without the condition `hir::verify` reports
+    // `%24 used in bb6 but defined in bb2` (torture pr54937/pr109925/pr116799,
+    // and sqlite `unixLock`). The battery's obligation here is that the pass
+    // REFUSES: `module` verifies every function, so a bad thread is a panic.
+    square(
+        "void g(int);\
+         void t(int c){int i;for(i=0;i<c;i++){if(i)g(i);}}\
+         int s;void g(int x){s+=x;}\
+         int main(void){t(5);return s;}",
+        10,
+    );
+    square(
+        "int f(int n,int m){int i,r=0;for(i=0;i<n;i++){if(i&1)r+=i;else r+=m;}return r;}\
+         int main(void){return f(6,10);}",
+        39,
+    );
+}
+
+#[test]
+fn a_load_survives_one_edge_into_a_single_predecessor_block() {
+    // R4.9 (§13n row (h), gcc's `-ftree-fre`). A block whose ONLY predecessor
+    // is P is entered exactly once per execution of P, immediately after it —
+    // so the memory state at its entry IS P's exit state, and a load P already
+    // performed need not be repeated. j5_insertion_sort loads `p[j]` in the
+    // loop's condition and again in the body, which has that condition block as
+    // its only predecessor.
+    let src = "void s(int*p,int n){int i,j;for(i=1;i<n;i++){int k=p[i];j=i-1;\
+               while(j>=0&&p[j]>k){p[j+1]=p[j];j--;}p[j+1]=k;}}\
+               int main(void){int a[5];int i;for(i=0;i<5;i++)a[i]=5-i;\
+               s(a,5);return a[0]*10000+a[1]*1000+a[2]*100+a[3]*10+a[4];}";
+    square(src, 12345);
+    let m = module(src, true);
+    let f = m.funcs.iter().find(|f| f.name == "s").unwrap();
+    let loads = count(f, |i| matches!(i, Inst::Load { .. }));
+    // the condition's `p[j]` and the body's `p[j]` are one load, not two
+    assert!(loads <= 2, "the body re-loaded what the condition already read ({} loads)", loads);
+    // …and a store between two loads still forces the second
+    square(
+        "void w(int*p){p[0]=p[1];p[1]=p[0]+p[1];}\
+         int main(void){int a[2];a[0]=3;a[1]=7;w(a);return a[0]*10+a[1];}",
+        84,
+    );
+}
