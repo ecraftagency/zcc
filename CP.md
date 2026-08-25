@@ -113,7 +113,7 @@ Then the HIR sites by their 27 % share, cheapest-high-value first (the exponenti
 | **CP2.1** | spiller fixpoint invariants | rebuild CFG + liveness every round | build CFG once above the loop (topology invariant across rounds); liveness stays per-round | bound× → 1× | **✅ banked** |
 | **CP2.2** ⭐ | `live::compute` (keystone) | `while changed` round-robin + `BTreeSet` clone/block/round | **predecessor worklist** (re-queue preds only when `live_in` changes — Kildall), seeded reverse-RPO | fewer visits | **✅ banked** |
 | **CP2.3** | spiller `spilled` set | `BTreeSet<VReg>` contains on the per-operand hot path | dense `Vec<bool>` over the (fixed) vreg index; `physlive` left as-is (order-iterated) | log→O(1) | **✅ banked (small)** |
-| **CP2.4** | spiller fixpoint region | re-simulate whole function each round; s0025 spill 16.5 s is ROUND-COUNT bound, not contains | dirty-worklist: re-simulate only blocks touched by newly-spilled values | bound×n → Σtouched | ⬜ **NEXT — risky, needs bounded attempt** |
+| **CP2.4** | spiller `simulate` per-call cost | s0025 spill 16.5 s = 3 rounds × `simulate(6555 blk, 10039 spilled)` — the cost is INSIDE `simulate`, NOT round count (measured, `ZCC_ROUNDS`) | profile `simulate`; cheapen the per-point work; a dirty-worklist only caps at 3→1 | needs profile | ⬜ **NEXT — profile-first** |
 | **CP2.5** | `scev::eval_fuel` | unmemoized, up to 2^16 per `eval` on DAGs | per-call memo `(ValueId, fuel)` | **exp→linear** | **✅ banked** |
 | **CP2.6** | `LoopForest::new` | per-header `vec![false;n]` | one `mark` scratch reused, cleared by body | O(loops×n)→O(Σbody) | **✅ banked (scratch)** |
 | **CP2.6b** | `LoopForest::new` parent nesting | O(loops²×body) `body.contains(header)` | per-loop membership bitset → O(1) contains (O(loops²)) | N²×body→N² | ⬜ |
@@ -157,12 +157,19 @@ Marginal by design: s0025 spill 16,954 → 16,493 ms (−3 %), sqlite neutral (l
 removed the log factor, but the spiller's dominant cost on the high-pressure yarpgen function is the
 NUMBER OF FIXPOINT ROUNDS (each re-simulates the whole function), not the per-lookup constant.
 
-**Next ⬜ = CP2.4 (the big remaining spiller lever, and the risky one).** s0025's 16.5 s spill is
-round-count bound. Making `simulate` incremental (re-plan only blocks affected by newly-spilled
-values, reuse the plan elsewhere) is where the win is — but the per-block plan depends on cross-block
-entry sets that shift when an upstream value spills, so byte-identical is NOT free. Per the campaign
-rule: ONE bounded attempt; if the locality/convergence argument does not close, mark BLOCKED, keep
-CP2.1–2.3, advance. Then CP2.6b / CP2.7–2.10 for the HIR tail.
+**Measurement correction (Law-2, `ZCC_ROUNDS`):** the spiller fixpoint runs only **3 rounds** on
+s0025 (6555 blocks, 10039 spilled) and ≤5 on sqlite's biggest functions — it is NOT round-count
+bound. The 16.5 s is `3 × simulate(...)`; the cost lives INSIDE one `simulate` call, superlinear in
+the pressure (10039 memory-resident values), not in the number of rounds. So a dirty-worklist that
+cut 3→1 caps at −66 % and carries real byte-identical risk (the per-block plan depends on cross-block
+entry sets) — it is NOT the first move.
+
+**Next ⬜ = profile `simulate` itself** (`ZCC_TIME`-style coarse timers around its setup vs its RPO
+per-point loop, then within the loop) to find the construct that scales with the resident-value count,
+and cheapen THAT (same memory-for-speed pattern as CP2.3 — a bitset/index where a set/scan sits on the
+per-point path). `physlive` is bounded by the ~32 physical registers, so it is unlikely to be the
+sink; the suspect is value-level residency tracking (`w` / `held` / `room`) over the up-to-nsp working
+set. Measure before converting. Then CP2.6b / CP2.7–2.10 for the HIR tail.
 
 ## The per-fix loop (constitution's iteration process; unchanged)
 
