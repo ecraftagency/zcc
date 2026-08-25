@@ -2271,6 +2271,70 @@ against a 2k…4.8k ceiling — the first row this session to land INSIDE its ba
 Battery: `a_constant_already_materialized_is_not_materialized_again`, whose
 second half asserts the across-call refusal.
 
+### §13o — THE EXCESS, RE-DECOMPOSED (2026-08-26, on the R4.10 compiler). sqlite **186,705** vs gcc-O1 **157,074**, gap **29,631**
+
+§13n's class table was taken at **237,025 instructions** and every number in it
+now describes a compiler that no longer exists: `mov` excess went +19,147 →
++6,813, `csel` 4,498 → 599. §13n itself was born from re-taking a stale
+histogram; this is the same step, and the tool is `tests/bench/excess.sh` —
+EVERY mnemonic in either output, ranked by `zcc − gcc`, rather than a hand-picked
+list that can only find classes someone already suspected.
+
+**THE INSTRUMENT LIED TWICE BEFORE IT WAS TRUSTED**, and both corrections are in
+the script so the next reader does not repeat them. The two assemblers do not
+spell the same instruction the same way:
+1. A constant materialization is `movz`/`movn` in zcc's output and `mov wN, …`
+   in gcc's, so the first ranking put **`movz` 8,020 vs 0** at the top — pure
+   dialect — while gcc's `mov` column silently carried its own immediates.
+2. A conditional branch is `b.eq` in one dialect and `beq` in the other, which
+   put ~5,000 of phantom excess in eight rows and ~5,000 of phantom deficit in
+   eight more.
+3. And after fixing (1) by matching `, #`, gcc turned out to OMIT the sigil —
+   it writes `mov w0, 0` — so the immediates were STILL hiding. Match the
+   operand, not the punctuation.
+A ranking that cannot survive being read literally is not evidence (Article E,
+applied to the instrument itself).
+
+| class | zcc | gcc-O1 | excess | % of gap |
+|---|---|---|---|---|
+| **`ldr` + `str`** | 48,233 | 31,794 | **+16,439** | **55.5%** |
+| — of which **frame `[sp,#…]`** | 22,819 | 12,456 | **+10,363** | **35.0%** |
+| — of which non-frame | 25,414 | 19,338 | +6,076 | 20.5% |
+| **`ldp` + `stp`** | 6,772 | 12,637 | **−5,865** | −19.8% |
+| register `mov` (reg←reg) | 29,281 | 22,468 | +6,813 | 23.0% |
+| constant materialization | 16,485 | 11,624 | +4,861 | 16.4% |
+| `add` + `sub` + `cmp` | 25,710 | 20,804 | +4,906 | 16.6% |
+| `cbnz` against gcc's `tst` + `ccmp` | 4,414 | 3,536 | +878 | 3.0% |
+| `mul` + `sdiv` (by a constant) | 1,021 | 201 | +820 | 2.8% |
+| `sxtw`/`uxtb`/`uxth` against `sbfiz`/`uxtw`/`rev` | 1,787 | 1,448 | +339 | 1.1% |
+
+**THE FINDING: over half the remaining gap is ONE SUBSYSTEM, and it is two rows,
+one of which nobody had counted.**
+
+* **Frame traffic, +10,363 (35% of the gap on its own).** `ldr [sp,#…]` 13,507
+  against 7,976 and `str [sp,#…]` 9,312 against 4,480. This is R4.8, and it is
+  larger than every other named row left combined.
+* **PAIRING, 5,865 instructions, and it is NOT IN §13n AT ALL.** gcc emits
+  **12,637** `ldp`/`stp` to zcc's **6,772**. Every pair replaces two singles, so
+  gcc's frame traffic is cheaper partly BECAUSE it pairs and we do not — the
+  `ldstp` pass exists but its coverage was never measured against the reference.
+  This is a genuinely new card, found only because the ranking included the rows
+  where zcc emits FEWER of something.
+
+**They compound, so they are taken together.** Pairing the spills is exactly how
+gcc gets both numbers down at once: a spill slot pair `stp x19, x20, [sp, #16]`
+is one instruction where zcc writes two. Sequencing R4.8 before pair coverage
+would measure the spiller against a frame layout that cannot pair, and then
+measure pairing against a spill set already shrunk — neither number would be the
+row's own.
+
+**What the tail says.** Register `mov` +6,813 is the coalescing residual
+(`ZCC_COALESCE` prints FREE 4,143 of it); constants +4,861 is R4.6's residual
+after the across-call refusal; `add`/`sub`/`cmp` +4,906 is address arithmetic and
+loop bookkeeping with no row of its own. Those three are where R4.3/R4.6/R4.10
+have already been grinding, and they are at diminishing returns — which is the
+honest reason the next step is the frame, not another peephole.
+
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 
 **j3 is the cleanest evidence in the project.** Six instructions against six, and 1.940× slower:

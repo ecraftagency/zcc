@@ -1,0 +1,3 @@
+SELECT count(*) FROM main_t m WHERE EXISTS(SELECT 1 FROM side_t s WHERE s.k=m.k AND s.w>2000);
+SELECT sum(v) FROM main_t WHERE k > (SELECT avg(k) FROM side_t);
+WITH RECURSIVE f(n,a) AS (SELECT 1,1 UNION ALL SELECT n+1,a*n FROM f WHERE n<20) SELECT n,a FROM f ORDER BY n DESC LIMIT 3;
