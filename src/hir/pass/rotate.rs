@@ -28,9 +28,12 @@
 // entered zero times still runs the header exactly once, now spelled `guard`.
 //
 // WHAT IS REFUSED, each because it is a property of the IR and not a heuristic:
-//   * a loop whose LATCH already exits — it is bottom-tested already. This is
-//     also what makes the pass terminate: after rotating, the header IS a latch
-//     and does exit, so the same loop can never be rotated twice.
+//   * a loop with no work outside its header — it is bottom-tested already, and
+//     there is no body for the test to move past. This is what makes the pass
+//     terminate, and it is deliberately phrased about the BODY rather than about
+//     the latch: `split_critical_edges` puts an empty block on the back edge, so
+//     "the latch exits" stops being true of a rotated loop the moment the ladder
+//     is re-entered (§13f).
 //   * a header whose definitions are used OUTSIDE the loop. After rotation the
 //     header no longer dominates the exit (the guard reaches it too), so such a
 //     use would leave SSA. Passing a value as an edge ARGUMENT is fine — that is
@@ -48,37 +51,23 @@ use super::*;
 /// thing is to take the reference compiler's rate and say where it came from.
 const MAX_HEADER_INSTS: usize = 20;
 
-/// SHIPPED DEFAULT-OFF, and the reason is a MEASUREMENT, not a doubt about the
-/// theorem (§13e). Rotation is supposed to buy one branch per iteration. It does
-/// not, yet, because of where the loop-carried copy lands:
+/// Rotation was measured WORTHLESS when it first landed, and turning it on took
+/// removing two things that were cancelling it — both of them elsewhere, which
+/// is why the sequence is worth recording (§13e → §13f).
 ///
-/// ```text
-///   before          .L1: cmp w0,w5 ; b.lt .L2
-///                   .L2: ...work... ; add w1,w0,#1 ; mov x0,x1 ; b .L1      = 10
-///   after rotation  .L2: ...work... ; add w1,w0,#1 ; cmp w1,w5 ; b.lt .L13
-///                   .L13: mov x0,x1 ; b .L2                                 = 10
-/// ```
+/// It makes the back edge CRITICAL: the header gains a second successor and the
+/// new header a second predecessor. The edge is therefore split, and the split
+/// block is exactly where SSA destruction parks the loop-carried copy. So the
+/// branch rotation removes was replaced by a copy block that needs a branch of
+/// its own — 10 instructions per iteration before AND after, with the guard as
+/// pure addition (sqlite +2.7%, and +1,732 BRANCHES, the metric it targets).
 ///
-/// Rotation makes the back edge CRITICAL (the header now has two successors and
-/// the new header two predecessors), so it is split, and the split block is
-/// exactly where SSA destruction parks the loop-carried copy `mov x0, x1`. The
-/// branch rotation removes is the branch the copy block adds back, so the
-/// per-iteration count is EXACTLY unchanged at 10 while the guard is pure
-/// addition. Measured (`ZCC_ROTATE=1`): sqlite 240,774 → **247,202** insns and
-/// 19,151 → **20,883 branches** — the metric it targets moves the wrong way —
-/// geo40 INSN 1.3043 → **1.3972** (35 of 35 programs now over 1.1×, up from 32),
-/// EXEC 1.6232 → 1.6269, median 1.746 → 1.800. Not one of the five §13d hot
-/// loops improved: g1 2.021 → 2.021, j3 1.920 → 1.939, g3 1.962 → 1.923,
-/// h1 1.859 → 1.806, h2 1.865 → 1.833.
-///
-/// The gate to turn this on is therefore NAMED and not a matter of taste:
-/// **coalesce the loop-carried copy** (§13b's `mov` +33,487, R4). With the copy
-/// gone the latch block is empty, cfg_simplify merges it, and the loop becomes
-/// the single `...work... ; cmp ; b.lt` that the theorem promised. Re-measure
-/// then; the theorem and its batteries are already proven and waiting.
-///
-/// `ZCC_ROTATE=1` forces it on for exactly that re-measurement.
-const ENABLED: bool = false;
+/// The two fixes: `regalloc::color` now frees a DYING operand before placing the
+/// instruction's destination, so `add w1,w0,#1 ; mov x0,w1` becomes
+/// `add w0,w0,#1` and the copy is gone; and `mir::pass::layout` THREADS the
+/// block that is then empty, so the branch to a branch is gone too. Only after
+/// both does the loop become the `work ; cmp ; b.lt` the theorem promised.
+const ENABLED: bool = true;
 
 fn enabled() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -174,6 +163,27 @@ fn try_rotate(
         return false;
     }
     if lf.loops[li].latches.contains(&h) {
+        return false;
+    }
+    // Rotation moves the exit test PAST the body, so there must BE a body to
+    // move it past. If every block of the loop but the header is empty, the
+    // header already is the body — which is what an ALREADY-ROTATED loop looks
+    // like after cfg_simplify has merged it into one block and critical-edge
+    // splitting has handed it an empty forwarding latch.
+    //
+    // That last sentence is the whole reason this test exists, and it cost a
+    // failing idempotence battery to find: asking whether the LATCH exits is not
+    // enough, because `split_critical_edges` runs at the top of every ladder
+    // entry and inserts an empty block on the back edge. The empty block becomes
+    // the latch, the latch no longer exits, and a rotated loop presents itself as
+    // top-tested again — peeling its whole seven-instruction body into a second
+    // guard. A termination argument that a later pass can quietly invalidate is
+    // not a termination argument.
+    if !lf.loops[li]
+        .body
+        .iter()
+        .any(|&b| b != h && !f.blocks[b as usize].insts.is_empty())
+    {
         return false;
     }
     // The header must BE the exit test: a two-way branch with one arm inside.

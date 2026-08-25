@@ -852,6 +852,33 @@ fn an_impure_call_is_not_hoisted() {
     square(src, 20);
 }
 
+/// The ladder with ROTATION suppressed. Rotation legitimately REMOVES the
+/// condition the ≥1-trip fence refuses on — a rotated loop reaches its preheader
+/// only through the guard, so it has already run once — which is exactly what
+/// §13c predicted and what makes the fence invisible through `module(src, true)`.
+/// The fence still has to be proven, so it is proven on the shape it was written
+/// against.
+fn unrotated(src: &str) -> Module {
+    let ast = frontend(src);
+    let mut m = build::build(&ast);
+    let ro = super::purity::readonly_functions(&m);
+    for f in m.funcs.iter_mut() {
+        super::super::dom::split_critical_edges(f);
+        for _ in 0..super::ROUNDS {
+            super::cfg::run(f);
+            super::sroa::run(f);
+            super::sccp::run(f);
+            super::fold::canon(f);
+            super::gvn::run(f);
+            super::mem::run(f);
+            super::licm::run_with(f, &ro);
+            super::dce::run(f);
+        }
+        verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    }
+    m
+}
+
 #[test]
 fn a_pure_call_is_not_speculated_into_a_loop_that_may_not_run() {
     // The ≥1-trip fence. The bound is a parameter, so the entry test is not
@@ -862,11 +889,31 @@ fn a_pure_call_is_not_speculated_into_a_loop_that_may_not_run() {
          int main(void){{int a[2];a[0]=1;a[1]=2;return h(a,0)+42;}}",
         SUM
     );
-    let after = module(&src, true);
     assert_eq!(
-        calls_in_loops(func(&after, "h")),
+        calls_in_loops(func(&unrotated(&src), "h")),
         1,
         "an unknown trip count refuses the hoist"
+    );
+    square(&src, 42);
+}
+
+#[test]
+fn rotation_licences_the_hoist_the_trip_count_fence_refused() {
+    // The other side of the same coin, and the reason rotation was sequenced
+    // before this row. Once the loop is rotated its preheader sits UNDER the
+    // guard, so reaching it already means the body runs — and the call may be
+    // computed there. The square is the proof that this is not wishful: `m` is
+    // 0, so the guard fails, the preheader is never entered, and the hoisted
+    // call is never made.
+    let src = format!(
+        "{}int h(int *a,int m){{int k,s=0;for(k=0;k<m;k++)s+=g(a,2);return s;}}\
+         int main(void){{int a[2];a[0]=1;a[1]=2;return h(a,0)+42;}}",
+        SUM
+    );
+    assert_eq!(
+        calls_in_loops(func(&module(&src, true), "h")),
+        0,
+        "under the guard the call is loop-invariant and runs once"
     );
     square(&src, 42);
 }

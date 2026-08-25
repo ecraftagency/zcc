@@ -10,10 +10,20 @@
 // and inverts, never adds or removes an edge. Its square is the identity on
 // ⟦·⟧, which the interpreter confirms because the interpreter follows edges,
 // not order.
+//
+// It opens by THREADING empty blocks, which is the one thing here that does
+// change the edge set. An empty block is not an accident: critical edges are
+// split before allocation precisely so SSA destruction has somewhere to put a
+// parallel copy, and when coalescing succeeds in giving both sides the same
+// register there is no copy left to put. What remains is a block containing
+// nothing but a branch to a branch. Removing it is not cosmetic — it is the
+// difference between one branch per loop iteration and two, and it is the second
+// half of the reason loop rotation was measured worthless (§13e).
 use crate::cfg::{Cfg, LoopForest, DomTree};
 use crate::mir::*;
 
 pub fn run(f: &mut MFunc) {
+    thread_empty_blocks(f);
     let cfg = crate::mir::verify::cfg(f);
     let dt = DomTree::new(&cfg, f.entry);
     let lf = LoopForest::new(&cfg, &dt);
@@ -134,6 +144,65 @@ fn relax_branches(f: &mut MFunc) {
                 _ => {}
             }
             f.order.insert(oi + 1, mid);
+        }
+    }
+}
+
+/// Redirect every edge that lands on a block containing nothing but `b LABEL`
+/// straight to that label.
+///
+/// COMMUTING SQUARE: an empty block executes no instruction, so a trace through
+/// it and the trace that skips it visit the same states in the same order. The
+/// block is left in place and simply becomes unreachable; `f.order` is rebuilt
+/// from the reachable set immediately afterwards, so it is never printed.
+///
+/// Three blocks are never threaded THROUGH, each for a reason about identity
+/// rather than about cost: the entry (the ABI materializes parameters there), a
+/// block carrying a C `goto` label or named by a computed goto (`BrReg` lists
+/// the address-taken set, and an address must keep pointing at something), and a
+/// block with parameters — after SSA destruction there should be none, and one
+/// that survives is carrying an edge value that this walk would drop.
+fn thread_empty_blocks(f: &mut MFunc) {
+    let n = f.blocks.len();
+    let mut pinned = vec![false; n];
+    pinned[f.entry as usize] = true;
+    for b in &f.blocks {
+        if let MTerm::BrReg(_, bs) = &b.term {
+            for &t in bs {
+                pinned[t as usize] = true;
+            }
+        }
+    }
+    // Where each block forwards to, resolved through chains of empty blocks.
+    let mut to: Vec<Option<MBlockId>> = vec![None; n];
+    for (i, b) in f.blocks.iter().enumerate() {
+        if pinned[i] || !b.labels.is_empty() || !b.params.is_empty() || !b.insts.is_empty() {
+            continue;
+        }
+        if let MTerm::B(t) = &b.term {
+            if t.block != i as MBlockId && t.args.is_empty() {
+                to[i] = Some(t.block);
+            }
+        }
+    }
+    let resolve = |mut x: MBlockId, to: &Vec<Option<MBlockId>>| -> MBlockId {
+        // A cycle of empty blocks is an infinite loop with no body; the bound
+        // stops the walk rather than the compiler.
+        for _ in 0..n {
+            match to[x as usize] {
+                Some(y) if y != x => x = y,
+                _ => break,
+            }
+        }
+        x
+    };
+    if to.iter().all(|x| x.is_none()) {
+        return;
+    }
+    let snapshot = to.clone();
+    for b in f.blocks.iter_mut() {
+        for t in b.term.targets_mut() {
+            t.block = resolve(t.block, &snapshot);
         }
     }
 }

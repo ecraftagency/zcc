@@ -112,17 +112,31 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
         for (i, inst) in blk.insts.iter().enumerate() {
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
-            // A PLAIN copy whose source dies here may hand its register straight
-            // to the destination — the two are not simultaneous, so the register
-            // is free the instant the copy has read it, and taking it turns the
-            // copy into a self-move that `sequentialize` deletes. The
-            // conservative "free dying operands only after the definitions" order
-            // is kept for everything else, and above all for a PARALLEL copy,
-            // whose assignments really are simultaneous.
-            if let MInst::Copy { src, .. } | MInst::FMov { src, .. } = inst {
-                if last[sp.idx(*src)] == Some(i) && live_here.remove(&sp.idx(*src)) {
-                    if let Some(p) = color_of(&color, sp, sp.idx(*src)) {
-                        occ.sub(p);
+            // An operand that DIES here hands its register to this
+            // instruction's destination, because on A64 an instruction reads
+            // every source before it writes any destination — so the register is
+            // free the instant the reads are done, and the definition taking it
+            // is what turns a loop-carried edge copy into a self-move that
+            // `sequentialize` deletes.
+            //
+            // This used to apply to a plain `Copy` alone, with the conservative
+            // order kept "for everything else" to avoid the case analysis. The
+            // case analysis is `reads_before_writes`, it is six lines, and the
+            // convenience cost exactly the copy this branch was measured on:
+            // `add w1, w0, #1 ; mov x0, w1` at the bottom of every counted loop,
+            // because w1 was placed while the dying w0 still held its register.
+            if reads_before_writes(inst) {
+                let mut dying: Vec<usize> = Vec::new();
+                inst.visit(&mut |r, c| {
+                    if matches!(c, Constraint::Use) {
+                        dying.push(sp.idx(r));
+                    }
+                });
+                for x in dying {
+                    if last[x] == Some(i) && live_here.remove(&x) {
+                        if let Some(p) = color_of(&color, sp, x) {
+                            occ.sub(p);
+                        }
                     }
                 }
             }
@@ -194,6 +208,38 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
         }
     }
     Ok(Coloring { color, used })
+}
+
+/// May a DESTINATION of this instruction take the register of a source that dies
+/// at it?
+///
+/// On A64 an instruction reads all of its source registers before writing any
+/// destination, so for an ordinary one the answer is yes. Every exception is a
+/// rule rather than a caution:
+///   * `ParallelCopy` is not one instruction — its assignments are SIMULTANEOUS,
+///     and a destination taking a dying source's register would destroy a value
+///     another pair of the same copy still has to read.
+///   * `StlXr`: DDI 0487 makes `stlxr Ws, Xt, [Xn]` CONSTRAINED UNPREDICTABLE
+///     when Ws is Xt or Xn, so the status register may never inherit either.
+///   * `Pair` transfers TWO registers and `Asm` is an opaque template whose
+///     operands may be tied; neither is a single read-then-write.
+///   * `Call` defines fixed registers and clobbers the caller-saved half.
+///   * `StackAlloc` moves sp and then materializes a base — two instructions.
+///   * a pre/post-index access is settled above, where the writeback is TIED to
+///     the base deliberately (R3.2).
+fn reads_before_writes(inst: &MInst) -> bool {
+    match inst {
+        MInst::ParallelCopy(_)
+        | MInst::StlXr { .. }
+        | MInst::Pair { .. }
+        | MInst::Asm { .. }
+        | MInst::Call { .. }
+        | MInst::StackAlloc { .. } => false,
+        MInst::Load { mem, .. } | MInst::Store { mem, .. } => {
+            !matches!(mem, AddrMode::PreIdx { .. } | AddrMode::PostIdx { .. })
+        }
+        _ => true,
+    }
 }
 
 /// Registers that hold the SAME value at some program point and would therefore
