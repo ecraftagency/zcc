@@ -126,6 +126,30 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
                     }
                 }
             }
+            // A pre/post-index writeback updates the BASE register in place —
+            // `emit` prints only the base — so `wb` MUST take the base's physical
+            // register. `auto_inc` folds only when the base dies at the access, so
+            // hand its colour to `wb` here, BEFORE the transfer register is
+            // placed: the transfer register then cannot take it and Xt != Xn holds
+            // by construction (DDI 0487 C6.2). base leaves the live set and wb
+            // enters the SAME register, so occupancy is unchanged. `check` asserts
+            // the tie; a base that did NOT die here leaves both live in one
+            // register and is caught there rather than miscompiled.
+            if let MInst::Load { mem, .. } | MInst::Store { mem, .. } = inst {
+                if let AddrMode::PreIdx { base, wb, .. } | AddrMode::PostIdx { base, wb, .. } =
+                    mem
+                {
+                    let bp = phys_of(&color, sp, *base);
+                    color[sp.idx(*wb)] = bp;
+                    if let Some(p) = bp {
+                        used.add(p);
+                    }
+                    if last[sp.idx(*base)] == Some(i) {
+                        live_here.remove(&sp.idx(*base));
+                    }
+                    live_here.insert(sp.idx(*wb));
+                }
+            }
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
                     assign(f, lv, &mut color, &mut used, &mut occ, *r, &partners, has_calls)
@@ -336,6 +360,26 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
         for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
+            // A pre/post-index writeback lands in the base register (emit prints
+            // only the base), so the two must be tied. With base then dead, the
+            // `probe` below also holds; were base live-out, probe would flag the
+            // shared register. Together: base tied to wb AND base dead here.
+            if let MInst::Load { mem, .. } | MInst::Store { mem, .. } = inst {
+                if let AddrMode::PreIdx { base, wb, .. } | AddrMode::PostIdx { base, wb, .. } =
+                    mem
+                {
+                    let bp = color_of(&col.color, sp, sp.idx(*base));
+                    let wp = color_of(&col.color, sp, sp.idx(*wb));
+                    if bp != wp {
+                        return Err(format!(
+                            "{}: bb{}[{}] pre/post-index base and writeback got \
+                             different registers ({:?} vs {:?}); the writeback updates \
+                             the base in place, so they must be tied",
+                            f.name, bi, i, bp, wp
+                        ));
+                    }
+                }
+            }
             probe(&live, format!("bb{}[{}]", bi, i), "before the definitions")?;
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {

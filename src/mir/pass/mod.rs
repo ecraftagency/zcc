@@ -5,6 +5,7 @@ pub mod frame;
 pub mod legalize;
 #[cfg(test)]
 mod tests;
+pub mod autoinc;
 pub mod cmpelim;
 pub mod ext;
 pub mod layout;

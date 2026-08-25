@@ -155,3 +155,59 @@ fn legalization_of_out_of_range_frame_offsets() {
          int main(void){return sum(12);}",
     );
 }
+
+// auto_inc (REARCH.md §8, R3.2) — the pre-allocation post-index fold. Its square
+// is `⟦mir_v⟧ = ⟦autoinc(mir_v)⟧`: the fold moves a pointer bump into the load,
+// changing no value. The test also asserts the pass FIRES on the canonical
+// pointer-walk shape (Law 4 — a pass that never fires is worse than absent), and
+// that the interpreter applies the writeback (so the equality is not vacuous).
+#[test]
+fn auto_inc_fires_and_preserves_meaning() {
+    let src = "int main(void){int a[6]={1,2,3,4,5,6};int*p=a;int s=0;int i;\
+               for(i=0;i<6;i++){s+=*p;p++;}return s;}";
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    // the HIR ladder first — mem2reg is what promotes the pointer local to a
+    // value, without which isel emits slot loads and there is nothing to fold.
+    crate::hir::pass::run_module(&mut h);
+    // virtual MIR through the earlier pre-allocation passes, to match the real
+    // pipeline order (ext, cmpelim) before auto_inc is measured.
+    let mk = || {
+        let mut m = crate::isel::lower(&h);
+        for f in m.funcs.iter_mut() {
+            crate::mir::pass::ext::run(f);
+            crate::mir::pass::cmpelim::run(f);
+        }
+        m
+    };
+    let m_before = mk();
+    let before = mi::new_machine(&m_before, &ast)
+        .call("main", &[], &[])
+        .expect("⟦mir_v⟧ trapped");
+    assert_eq!(before as i32, 21, "the oracle: 1+2+3+4+5+6");
+
+    let mut m_after = mk();
+    let mut fired = false;
+    for f in m_after.funcs.iter_mut() {
+        crate::mir::pass::autoinc::run(f);
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let crate::mir::MInst::Load {
+                    mem: crate::mir::AddrMode::PostIdx { .. },
+                    ..
+                } = i
+                {
+                    fired = true;
+                }
+            }
+        }
+    }
+    assert!(fired, "auto_inc did not fire on a pointer-walk loop");
+    let after = mi::new_machine(&m_after, &ast)
+        .call("main", &[], &[])
+        .expect("⟦autoinc(mir_v)⟧ trapped");
+    assert_eq!(
+        before as i32, after as i32,
+        "auto_inc changed the meaning of the function"
+    );
+}
