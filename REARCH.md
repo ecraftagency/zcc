@@ -918,6 +918,39 @@ That is §13d cause #2 and it is the next row — pointer-IV, on top of the IV/S
 
 ---
 
+## §13g SCEV — the affine analysis the last three rows sit on (2026-08-25)
+
+`pass/scev.rs`. An ANALYSIS, so no commuting square; what it owes is that every
+recurrence it reports is TRUE, because pointer-IV, final-value and LFTR each turn a false one into
+a miscompile. A value's evolution is `{base + off, +, step}` — one loop-invariant symbolic term,
+constant step, no nesting. That is the affine fragment of chains of recurrences, and it covers
+every shape the three consumers need (`i`, `p + i*4`, `n - i`). Outside it, `None` — never an
+approximation. Seven batteries, including two that pin REFUSALS.
+
+**The one deep fact, and it is a consequence of this compiler's own semantics.** `sext(i)` for a
+32-bit counter is affine only while `i` does not wrap. Every other compiler gets that free from
+"signed overflow is undefined"; **SEMANTICS.md §7 defines it as WRAPPING here**, so the shortcut is
+unavailable and the no-wrap fact has to be PROVEN — from the trip count, in `stays_in_range`.
+Consequence, pinned by `scev_refuses_the_widening_it_cannot_bound`: `p[i]` in a loop whose bound is
+a parameter has NO evolution. With a literal bound it reports `{p + 0, +, 4}`. This is the
+analysis's largest Law-4 residual and it is category (b) — a value-range analysis on `i` (§16 ★2)
+closes it without any trip count.
+
+**The trip count counts BODY executions, and where the test sits is part of the answer.** Let `k` be
+the number of times the test says "stay in". A top-tested loop asks before the body, so the body
+runs `k`; a bottom-tested one — which is now every counted loop, since rotation ships — asks after,
+so it runs `k + 1`. Both shapes are pinned by battery. A test in the MIDDLE of the body is refused
+outright: the two halves run different numbers of times and there is no single count to report.
+`i += 3` to a bound of 10 is four trips, not three, and that is a battery too, because an
+off-by-one here is written straight into the program by final-value.
+
+Shipped UNWIRED — no pipeline row calls it yet, and the tree is byte-identical to `5118da0` over 56
+programs. That is a deliberate exception to Article A's "no feature before a real `.c` demands it",
+taken because the three demanders are named rows of this plan and because the analysis is the part
+that has to be right BEFORE any of them is written. It is dead weight if the next row is not built.
+
+---
+
 ## §13e ROW 2 (rotation) — measured worthless, quarantined with a named gate. **Superseded by §13f: the gate was opened and rotation is ON.** Kept because the diagnosis is the reason row 3 existed.
 
 §13d named rotation as cause #1 of every hot-loop regression: `mycopy`'s inner loop pays a
@@ -975,9 +1008,14 @@ its value are downstream of the same R4 item. The revised order:
 3. ⬜ **coalescing** — was R4's second item; the measurement has PROMOTED it, because it is now
    the gate on rotation, and §13d named it independently as cause #3 of the hot-loop regressions
    (`mov x0,x1 ; mov x1,x7` in j3's body). It is the one item two other rows are waiting on
-4. ⬜ IV/SCEV analysis, then pointer-IV (§13d cause #2 — `main` walked a pointer with
-   post-increment where this branch rebuilds the index from a 32-bit counter every iteration),
-   then final-value, then LFTR
+4. ✅ IV/SCEV analysis (`pass/scev.rs`, §13g) — shipped unwired, seven batteries
+5. ⬜ **pointer-IV** — §13d cause #2, and now the sharpest target on the board: g1_memcpy is at
+   INSN **1.000**, instruction-count parity with gcc-O1, and still costs 1.542 on the clock. What
+   is left is the DEPENDENCE CHAIN `sxtw x1,w0 ; add x1,x4,x1 ; ldrb w1,[x1]` — three dependent
+   operations before every load, where gcc issues `ldrb w1,[x20],#1` at once. NOTE the prerequisite
+   §13g exposes: the widening is only affine under a known trip count, so pointer-IV either takes
+   loops with literal bounds first, or brings the value-range analysis (§16 ★2) with it
+6. ⬜ final-value, then LFTR — cheap once the analysis is wired
 
 ---
 

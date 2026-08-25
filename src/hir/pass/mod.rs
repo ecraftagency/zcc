@@ -20,6 +20,7 @@ pub mod licm;
 pub mod mem;
 pub mod purity;
 pub mod rotate;
+pub mod scev;
 #[cfg(test)]
 mod tests;
 pub mod sccp;

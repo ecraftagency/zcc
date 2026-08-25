@@ -1096,3 +1096,134 @@ fn rotation_is_not_applied_twice() {
         assert!(!super::rotate::force(f), "rotation must be idempotent");
     }
 }
+
+// ── scalar evolution (REARCH §13f — the prerequisite for pointer-IV / LFTR) ──
+
+/// The optimized module plus the scev of its first loop in `name`.
+fn scev_of(src: &str, name: &str) -> (Module, Option<usize>) {
+    let m = module(src, true);
+    let f = func(&m, name);
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    let li = (0..lf.loops.len()).find(|&i| {
+        super::scev::LoopScev::analyze(f, &c, &dt, &lf, i).is_some()
+    });
+    (m.clone(), li)
+}
+
+/// Run `k` over the scev of the first analysable loop of `name`.
+fn with_scev<R>(src: &str, name: &str, k: impl Fn(&Func, &super::scev::LoopScev, &super::dom::Cfg) -> R) -> R {
+    let (m, li) = scev_of(src, name);
+    let f = func(&m, name);
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    let li = li.expect("no analysable loop");
+    let s = super::scev::LoopScev::analyze(f, &c, &dt, &lf, li).unwrap();
+    k(f, &s, &c)
+}
+
+#[test]
+fn scev_finds_the_counter_of_a_counted_loop() {
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
+    with_scev(&src, "f", |_f, s, _c| {
+        let iv = s.ivs.values().find(|a| a.step == 1).expect("a +1 counter");
+        assert_eq!(iv.base, None, "the counter starts at a literal");
+        assert_eq!(iv.off, 0, "and that literal is 0");
+    });
+}
+
+#[test]
+fn scev_reads_an_address_as_base_plus_stride() {
+    // The shape pointer-IV exists for: `p[i]` is `p + sext(i)*4`, an affine
+    // recurrence over the invariant base `p` with the element size as its step.
+    // The bound is a LITERAL, and it has to be: seeing through the widening is
+    // what needs the trip count (`stays_in_range`).
+    let src = "int f(int *p){int i,s=0;for(i=0;i<3;i++)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a);}";
+    with_scev(&src, "f", |f, s, _c| {
+        let mut strides: Vec<i64> = Vec::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Load { addr, .. } = inst {
+                    if let Some(a) = s.eval(f, *addr) {
+                        if a.step != 0 {
+                            assert!(a.base.is_some(), "the address is based on the pointer");
+                            strides.push(a.step);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(strides, vec![4], "one load, striding by sizeof(int)");
+    });
+}
+
+#[test]
+fn scev_refuses_the_widening_it_cannot_bound() {
+    // The same program with the bound as a PARAMETER. `p[i]` is still
+    // `p + sext(i)*4`, but there is no trip count, so there is no proof that the
+    // 32-bit counter does not wrap — and SEMANTICS §7 makes wrapping DEFINED
+    // here, so the usual "signed overflow is undefined" shortcut is unavailable.
+    // The address therefore has no evolution. This is the analysis's largest
+    // Law-4 residual and it is category (b): a range analysis on `i` would close
+    // it without a trip count at all.
+    let src = "int f(int *p,int n){int i,s=0;for(i=0;i<n;i++)s+=p[i];return s;}\
+               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a,3);}";
+    with_scev(&src, "f", |f, s, _c| {
+        assert_eq!(s.trips, None, "an unknown bound has no trip count");
+        let strided = f.blocks.iter().flat_map(|b| b.insts.iter()).any(|inst| {
+            matches!(inst, Inst::Load { addr, .. }
+                if s.eval(f, *addr).map_or(false, |a| a.step != 0))
+        });
+        assert!(!strided, "without a bound the widening is not affine");
+    });
+}
+
+#[test]
+fn scev_counts_the_trips_of_a_literal_loop() {
+    let src = "int f(void){int i,s=0;for(i=0;i<10;i++)s+=i;return s;}\
+               int main(void){return f();}";
+    with_scev(&src, "f", |_f, s, c| {
+        let _ = c; assert_eq!(s.trips, Some(10));
+    });
+}
+
+#[test]
+fn scev_counts_a_stride_that_does_not_divide_the_range() {
+    // 0,3,6,9 — four trips, not three: `ceil((10-0)/3)`. An off-by-one here is
+    // written straight into the program by final-value, so it is pinned.
+    let src = "int f(void){int i,s=0;for(i=0;i<10;i+=3)s+=i;return s;}\
+               int main(void){return f();}";
+    with_scev(&src, "f", |_f, s, c| {
+        let _ = c; assert_eq!(s.trips, Some(4));
+    });
+}
+
+#[test]
+fn scev_refuses_a_bound_it_cannot_see() {
+    // The bound is a parameter, so there is no exact count — and `None` is the
+    // answer, never a guess.
+    let src = "int f(int n){int i,s=0;for(i=0;i<n;i++)s+=i;return s;}\
+               int main(void){return f(9);}";
+    with_scev(&src, "f", |_f, s, c| {
+        let _ = c; assert_eq!(s.trips, None);
+    });
+}
+
+#[test]
+fn scev_refuses_a_value_outside_the_affine_fragment() {
+    // A counter multiplied by ITSELF is quadratic; the analysis has no form for
+    // it and must say so rather than linearize it.
+    let src = "int f(int n){int i,s=0;for(i=0;i<n;i++)s+=i*i;return s;}\
+               int main(void){return f(4);}";
+    with_scev(&src, "f", |f, s, _c| {
+        let quad = f.blocks.iter().flat_map(|b| b.insts.iter()).any(|inst| {
+            matches!(inst, Inst::Bin { op: BinOp::Mul, dst, .. }
+                if s.eval(f, Operand::Val(*dst)).is_none())
+        });
+        assert!(quad, "i*i is not affine and must not evaluate");
+    });
+}
