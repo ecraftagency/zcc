@@ -449,8 +449,11 @@ impl<'a> Machine<'a> {
                 }
                 let raw = self.mem.load(a, op.bytes())?;
                 let v = match op {
-                    MemOp::SB => raw as u8 as i8 as i64 as u64,
-                    MemOp::SH => raw as u16 as i16 as i64 as u64,
+                    // the `w` forms extend within 32 bits and zero above
+                    MemOp::SB => raw as u8 as i8 as i32 as u32 as u64,
+                    MemOp::SBX => raw as u8 as i8 as i64 as u64,
+                    MemOp::SH => raw as u16 as i16 as i32 as u32 as u64,
+                    MemOp::SHX => raw as u16 as i16 as i64 as u64,
                     MemOp::SW => raw as u32 as i32 as i64 as u64,
                     _ => raw,
                 };

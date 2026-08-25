@@ -334,30 +334,28 @@ fn addr(ast: &Ast, f: &MFunc, m: &AddrMode) -> String {
 fn mem_mnemonic(op: MemOp, load: bool) -> &'static str {
     match (op, load) {
         (MemOp::B, true) => "ldrb",
-        (MemOp::SB, true) => "ldrsb",
+        (MemOp::SB, true) | (MemOp::SBX, true) => "ldrsb",
         (MemOp::H, true) => "ldrh",
-        (MemOp::SH, true) => "ldrsh",
+        (MemOp::SH, true) | (MemOp::SHX, true) => "ldrsh",
         (MemOp::SW, true) => "ldrsw",
         (MemOp::W, true) | (MemOp::X, true) | (MemOp::S, true) | (MemOp::D, true)
         | (MemOp::Q, true) => "ldr",
-        (MemOp::B, false) | (MemOp::SB, false) => "strb",
-        (MemOp::H, false) | (MemOp::SH, false) => "strh",
+        (MemOp::B, false) | (MemOp::SB, false) | (MemOp::SBX, false) => "strb",
+        (MemOp::H, false) | (MemOp::SH, false) | (MemOp::SHX, false) => "strh",
         (_, false) => "str",
     }
 }
 
 /// The register form a load/store names: a narrow integer access uses the
-/// w-form, `ldrsb/ldrsh/ldrsw` name the width of the RESULT.
-fn mem_width(op: MemOp, r: Reg, f: &MFunc) -> Width {
+/// w-form, and each sign-extending load names the width of its RESULT — which
+/// the opcode carries, because the destination register does not (see
+/// `MemOp::SB`).
+fn mem_width(op: MemOp, _r: Reg, _f: &MFunc) -> Width {
     match op {
-        MemOp::X => Width::W64,
+        MemOp::X | MemOp::SBX | MemOp::SHX | MemOp::SW => Width::W64,
         MemOp::S => Width::S,
         MemOp::D => Width::D,
         MemOp::Q => Width::Q,
-        MemOp::SB | MemOp::SH | MemOp::SW => match r {
-            Reg::V(v) => f.vregs[v as usize].width,
-            Reg::P(_) => Width::W64,
-        },
         _ => Width::W32,
     }
 }

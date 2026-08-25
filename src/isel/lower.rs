@@ -77,6 +77,25 @@ fn cc_of(op: CmpOp) -> CC {
     }
 }
 
+/// The same relation with its operands exchanged. DDI 0487 C1.2.4's condition
+/// table is symmetric under this, so `k < x` and `x > k` denote one comparison —
+/// which lets a constant that C wrote on the LEFT reach A64's immediate field,
+/// which exists only on the second source operand. Float predicates are left
+/// alone: exchanging them also exchanges which side an unordered result favours.
+fn swap_cmp(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Slt => CmpOp::Sgt,
+        CmpOp::Sgt => CmpOp::Slt,
+        CmpOp::Sle => CmpOp::Sge,
+        CmpOp::Sge => CmpOp::Sle,
+        CmpOp::Ult => CmpOp::Ugt,
+        CmpOp::Ugt => CmpOp::Ult,
+        CmpOp::Ule => CmpOp::Uge,
+        CmpOp::Uge => CmpOp::Ule,
+        _ => op,
+    }
+}
+
 /// One end of a composite move: an address in a register, or a fixed offset in
 /// the outgoing-argument area (which has no base register — it is always sp).
 #[derive(Clone, Copy)]
@@ -137,6 +156,17 @@ struct Munch {
     br: std::collections::HashMap<hir::BlockId, CmpSrc>,
     /// a select whose condition is a single-use compare
     sel: std::collections::HashMap<ValueId, CmpSrc>,
+    /// a narrow load whose single consumer is a `sext`: the load performs the
+    /// extension itself (`ldrsb`/`ldrsh`/`ldrsw`) and writes the EXTENSION's
+    /// register, so the `Cvt` is never emitted
+    ldext: std::collections::HashMap<ValueId, (MemOp, ValueId)>,
+    /// a block whose branch is a single-bit test: `(value, type, bit, branch
+    /// when the bit is SET)`
+    tb: std::collections::HashMap<hir::BlockId, (ValueId, hir::Ty, u8, bool)>,
+    /// a select whose false arm is a negation, complement or increment of a
+    /// value the true arm already names: `(form, kept operand, the negated /
+    /// complemented / incremented source, invert the condition)`
+    csop: std::collections::HashMap<ValueId, (CSelOp, Operand, ValueId, bool)>,
     /// producers whose every use folded, so they are never emitted
     dead: std::collections::HashSet<ValueId>,
 }
@@ -158,6 +188,20 @@ fn munch(h: &hir::Func) -> Munch {
     let n = h.values.len();
     let mut uses = vec![0u32; n];
     let mut def: Vec<Option<&hir::Inst>> = vec![None; n];
+    // Which block defines each value. A fold that absorbs a producer from
+    // ANOTHER block moves that producer's work to wherever the consumer runs —
+    // for a shift or an extension that is free (it rides inside the consumer's
+    // encoding), but a MULTIPLY is a multiply, and pulling one that LICM has
+    // just hoisted back into the loop body is a de-optimization dressed as a
+    // munch row (d2_nested_loops: `madd` every inner iteration).
+    let mut blk = vec![u32::MAX; n];
+    for (bi, b) in h.blocks.iter().enumerate() {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst() {
+                blk[d as usize] = bi as u32;
+            }
+        }
+    }
     for b in &h.blocks {
         for inst in &b.insts {
             if let Some(d) = inst.dst() {
@@ -187,8 +231,57 @@ fn munch(h: &hir::Func) -> Munch {
             _ => None,
         }
     };
+    // ── extending loads (§17 row "extending loads", R4.7) ──────────────────
+    // DDI 0487 C6.2: `ldrsb`/`ldrsh`/`ldrsw` sign-extend INSIDE the load, so a
+    // `sext` whose only source is a narrow load is performed by the load and
+    // needs no instruction of its own. TWO things fall out, and the second is
+    // the reason this row sits first in R4's order:
+    //   * the `sxtb`/`sxth` disappears — one instruction (sqlite: 687 `sxth`
+    //     against gcc's 90, 0 `ldrsh` against gcc's 492);
+    //   * the value arrives ALREADY WIDE, so a consumer that would otherwise
+    //     have absorbed the extension as an ALU OPERAND takes the plain form.
+    //     `add x1,x1,w5,sxtw` is an extended-register ALU op at 2 cycles where
+    //     `ldrsw x5,[…]` + `add x1,x1,x5` is 1 — IDENTICAL instruction count,
+    //     half the latency on a loop-carried recurrence. `cost = |MIR|` cannot
+    //     see that, which is the cost-model caveat R4.7 records (j3, 1.94×).
+    // The extension REPLACES the load's own destination register: the load has
+    // exactly one use (checked), so nothing reads the raw narrow value, and
+    // writing the wide register at the load's own position moves nothing.
+    let mut ldext: HashMap<ValueId, (MemOp, ValueId)> = HashMap::new();
+    let mut in_load: HashSet<ValueId> = HashSet::new();
+    for b in &h.blocks {
+        for inst in &b.insts {
+            let hir::Inst::Cvt { dst, op: hir::CvtOp::Sext, from, to, a: Operand::Val(v) } = inst
+            else {
+                continue;
+            };
+            if uses[*v as usize] != 1 {
+                continue;
+            }
+            match def.get(*v as usize).and_then(|d| *d) {
+                Some(hir::Inst::Load { ty, .. }) if ty == from => {}
+                _ => continue,
+            }
+            let op = match (from, to) {
+                (hir::Ty::I8, hir::Ty::I32) => MemOp::SB,
+                (hir::Ty::I8, hir::Ty::I64) => MemOp::SBX,
+                (hir::Ty::I16, hir::Ty::I32) => MemOp::SH,
+                (hir::Ty::I16, hir::Ty::I64) => MemOp::SHX,
+                (hir::Ty::I32, hir::Ty::I64) => MemOp::SW,
+                _ => continue,
+            };
+            ldext.insert(*v, (op, *dst));
+            in_load.insert(*dst);
+        }
+    }
+
     // `sext`/`zext` from I32 to I64 — the two extensions the operand field holds
     let ext_of = |v: ValueId| -> Option<(ValueId, ExtKind)> {
+        // …unless the LOAD already performed it: then there is no extension
+        // left to absorb, and the value is a full-width register.
+        if in_load.contains(&v) {
+            return None;
+        }
         let (op, from, to, a) = cvt(v)?;
         let src = a.val()?;
         if from != hir::Ty::I32 || to != hir::Ty::I64 {
@@ -218,6 +311,10 @@ fn munch(h: &hir::Func) -> Munch {
     };
 
     let mut m = Munch::default();
+    for d in &in_load {
+        m.dead.insert(*d);
+    }
+    m.ldext = ldext;
     // ── compares that feed exactly one consumer ────────────────────────────
     // A `cmp` followed by `cset` followed by `cbnz` is three instructions where
     // the machine wants one compare and one conditional branch; sqlite paid
@@ -247,6 +344,121 @@ fn munch(h: &hir::Func) -> Munch {
             }
         }
     }
+    // ── single-bit tests (§17 "compare-and-branch", R4.7) ──────────────────
+    // `if (x & (1<<k))` is `and` + `cbz` here and ONE `tbz`/`tbnz` on the
+    // machine (DDI 0487 C6.2.375). The sign-bit case is already handled at the
+    // terminator; this is the general bit, which sqlite pays 1,721-against-326
+    // for. The mask must be a single bit — a wider mask has no `tb` form, and
+    // `tst` + `b.cc` is two instructions exactly like `and` + `cbz`, so there
+    // is nothing to win there (recorded as category (a) for the `tst` row).
+    // `v = x & (1<<k)` used once as a truth value, `set` = branch when the bit is 1.
+    let one_bit = |v: ValueId| -> Option<(ValueId, hir::Ty, u8)> {
+        if uses[v as usize] != 1 {
+            return None;
+        }
+        let (hir::BinOp::And, ty, x, y) = bin(v)? else { return None };
+        let (src, mask) = match (x, y) {
+            (Operand::Val(s), Operand::Imm(k)) | (Operand::Imm(k), Operand::Val(s)) => (s, k),
+            _ => return None,
+        };
+        let m = mask as u64;
+        if mask <= 0 || !m.is_power_of_two() || m.trailing_zeros() >= ty.bits() {
+            return None;
+        }
+        Some((src, ty, m.trailing_zeros() as u8))
+    };
+    let mut tb: HashMap<hir::BlockId, (ValueId, hir::Ty, u8, bool)> = HashMap::new();
+    let mut tb_dead: Vec<ValueId> = Vec::new();
+    for (bi, b) in h.blocks.iter().enumerate() {
+        let blk = bi as hir::BlockId;
+        // Two spellings reach the same branch: `if (x & 8)`, which C tests
+        // against zero directly and HIR carries as `br(value)`, and
+        // `if ((x & 8) != 0)`, which arrives as a fused compare.
+        let (masked, cty, set) = match (m.br.get(&blk).copied(), &b.term) {
+            (Some((op, ty, a, c)), _)
+                if matches!(op, hir::CmpOp::Eq | hir::CmpOp::Ne) && !ty.is_float() =>
+            {
+                match (a, c) {
+                    (Operand::Val(v), Operand::Imm(0)) | (Operand::Imm(0), Operand::Val(v)) => {
+                        (v, Some(ty), op == hir::CmpOp::Ne)
+                    }
+                    _ => continue,
+                }
+            }
+            (None, Term::Br(Operand::Val(c), ..)) => (*c, None, true),
+            _ => continue,
+        };
+        let Some((src, ty, bit)) = one_bit(masked) else { continue };
+        if cty.is_some_and(|t| t != ty) {
+            continue;
+        }
+        tb.insert(blk, (src, ty, bit, set));
+        tb_dead.push(masked);
+    }
+    for v in tb_dead {
+        m.dead.insert(v);
+    }
+    m.tb = tb;
+
+    // ── the conditional-select family (§17, R4.7) ──────────────────────────
+    // DDI 0487 C6.2.83-86: `csinc`/`csinv`/`csneg` apply an increment, a
+    // complement or a negation to the SECOND source as part of the select. C
+    // writes `c ? x : -x` and `c ? x+1 : x`, and each is two instructions here
+    // — the arithmetic, then the select — where the machine has one. sqlite
+    // emits none of the three against gcc's 94.
+    //
+    // COMMUTING SQUARE: `csneg d,x,x,cc` denotes `cc ? x : -x` by definition of
+    // the instruction, which is the select's own denotation; the arithmetic
+    // moves INTO the select and is otherwise unobserved (single use, checked).
+    // When the transformed arm is the TRUE one the condition is inverted, which
+    // is exact — `CC::invert` is the ISA's own pairing.
+    let mut csop: HashMap<ValueId, (CSelOp, Operand, ValueId, bool)> = HashMap::new();
+    for b in &h.blocks {
+        for inst in &b.insts {
+            let hir::Inst::Select { dst, ty, a, b: fb, .. } = inst else { continue };
+            if ty.is_float() {
+                continue;
+            }
+            // `v` performs `op` on `x`; the other arm must name `x` itself.
+            let form = |v: ValueId| -> Option<(CSelOp, ValueId)> {
+                if uses[v as usize] != 1 {
+                    return None;
+                }
+                match def.get(v as usize).and_then(|d| *d) {
+                    Some(hir::Inst::Un { op: hir::UnOp::Neg, ty: t, a, .. }) if t == ty => {
+                        Some((CSelOp::Csneg, a.val()?))
+                    }
+                    Some(hir::Inst::Bin { op: hir::BinOp::Xor, ty: t, a, b, .. })
+                        if t == ty && (*a == Operand::Imm(-1) || *b == Operand::Imm(-1)) =>
+                    {
+                        Some((CSelOp::Csinv, a.val().or_else(|| b.val())?))
+                    }
+                    Some(hir::Inst::Bin { op: hir::BinOp::Add, ty: t, a, b, .. })
+                        if t == ty && (*a == Operand::Imm(1) || *b == Operand::Imm(1)) =>
+                    {
+                        Some((CSelOp::Csinc, a.val().or_else(|| b.val())?))
+                    }
+                    _ => None,
+                }
+            };
+            let plan = fb
+                .val()
+                .and_then(form)
+                .filter(|(_, x)| *a == Operand::Val(*x))
+                .map(|(k, x)| (k, *a, x, false, fb.val().unwrap()))
+                .or_else(|| {
+                    let v = a.val()?;
+                    let (k, x) = form(v)?;
+                    (*fb == Operand::Val(x)).then_some((k, *fb, x, true, v))
+                });
+            if let Some((k, keep, x, inv, folded)) = plan {
+                csop.insert(*dst, (k, keep, x, inv));
+                m.dead.insert(folded);
+            }
+        }
+    }
+    m.csop = csop;
+
     // ── addresses ──────────────────────────────────────────────────────────
     let mut cand: HashMap<ValueId, Folded> = HashMap::new();
     for b in &h.blocks {
@@ -266,6 +478,20 @@ fn munch(h: &hir::Func) -> Munch {
                             // `base + index*scale`: whichever side is the scaled
                             // one is the index
                             let pick = |i: ValueId, base: ValueId| -> Option<Folded> {
+                                // An extension the LOAD performed is already a
+                                // full 64-bit register, so the address needs no
+                                // extension in its index — and `src == idx` is
+                                // safe to mark dead here because the value is
+                                // defined by the load, not by the `Cvt`.
+                                if in_load.contains(&i) {
+                                    return Some(Folded::Indexed {
+                                        src: i,
+                                        base,
+                                        idx: i,
+                                        ext: None,
+                                        shift: 0,
+                                    });
+                                }
                                 if uses[i as usize] == 1 {
                                     let (idx, ext, shift) = scaled(i)?;
                                     return Some(Folded::Indexed { src: i, base, idx, ext, shift });
@@ -383,7 +609,7 @@ fn munch(h: &hir::Func) -> Munch {
         uses[v as usize] == 1 && !m.dead.contains(&v) && !m.alu.contains_key(&v)
     };
     let mut m2 = m;
-    for b in &h.blocks {
+    for (bi, b) in h.blocks.iter().enumerate() {
         for inst in &b.insts {
             let (dst, op, ty, a, bb) = match inst {
                 hir::Inst::Bin { dst, op, ty, a, b } if !ty.is_float() => (*dst, *op, *ty, *a, *b),
@@ -450,7 +676,7 @@ fn munch(h: &hir::Func) -> Munch {
             // product's register disappears with it.
             let mul_of = |v: Operand| -> Option<(ValueId, ValueId)> {
                 let v = v.val()?;
-                if !foldable(v, &m2) {
+                if !foldable(v, &m2) || blk[v as usize] != bi as u32 {
                     return None;
                 }
                 match bin(v)? {
@@ -494,9 +720,24 @@ fn munch(h: &hir::Func) -> Munch {
             ) {
                 continue;
             }
-            // `op a, b, sxtw` / `op a, b, lsl #k`
-            let rhs = bb.val().filter(|v| foldable(*v, &m2));
-            if let Some(v) = rhs {
+            // `op a, b, sxtw` / `op a, b, lsl #k`.
+            //
+            // A64 performs the shift/extension in the SECOND source operand
+            // only. C writes the shifted side wherever it likes, so for a
+            // COMMUTATIVE operation the two sides are tried in both orders:
+            // `t = x << 1; y | t` is `orr w0, w3, w0, lsl #1` and not a
+            // separate `lsl` (h2_revbits, sqlite's `orr` excess). Subtraction
+            // is not commutative and keeps the single order.
+            let commutes = matches!(
+                op,
+                hir::BinOp::Add | hir::BinOp::And | hir::BinOp::Or | hir::BinOp::Xor
+            );
+            let mut order = [(a, bb), (bb, a)];
+            if !commutes {
+                order[1] = order[0];
+            }
+            for (base, shifted) in order {
+                let Some(v) = shifted.val().filter(|v| foldable(*v, &m2)) else { continue };
                 // DDI 0487 C6.2: only ADD/SUB (and their flag-setting forms)
                 // take an EXTENDED register operand. The logical instructions
                 // take a shifted one and nothing else — `orr x0, x1, w3, uxtw`
@@ -504,8 +745,8 @@ fn munch(h: &hir::Func) -> Munch {
                 if ty == hir::Ty::I64 && matches!(op, hir::BinOp::Add | hir::BinOp::Sub) {
                     if let Some((src, e)) = ext_of(v) {
                         m2.dead.insert(v);
-                        m2.alu.insert(dst, AluFold::Extended(a, src, e));
-                        continue;
+                        m2.alu.insert(dst, AluFold::Extended(base, src, e));
+                        break;
                     }
                 }
                 if let Some((sop, st, sa, Operand::Imm(k))) = bin(v) {
@@ -518,7 +759,8 @@ fn munch(h: &hir::Func) -> Munch {
                     if let (Some(kind), Some(src)) = (kind, sa.val()) {
                         if st == ty && k >= 0 && (k as u32) < ty.bits() {
                             m2.dead.insert(v);
-                            m2.alu.insert(dst, AluFold::Shifted(a, src, kind, k as u8));
+                            m2.alu.insert(dst, AluFold::Shifted(base, src, kind, k as u8));
+                            break;
                         }
                     }
                 }
@@ -552,6 +794,12 @@ struct L<'a> {
     br: std::collections::HashMap<hir::BlockId, CmpSrc>,
     /// per select: a compare that is its only condition
     sel: std::collections::HashMap<ValueId, CmpSrc>,
+    /// narrow loads that sign-extend in the load and write the extension's reg
+    ldext: std::collections::HashMap<ValueId, (MemOp, ValueId)>,
+    /// per block: a branch that is one `tbz`/`tbnz`
+    tb: std::collections::HashMap<hir::BlockId, (ValueId, hir::Ty, u8, bool)>,
+    /// per select: the `csinc`/`csinv`/`csneg` form it collapses into
+    csop: std::collections::HashMap<ValueId, (CSelOp, Operand, ValueId, bool)>,
     /// the current block's fused compare, taken by `terminator`
     fuse: Option<CmpSrc>,
 }
@@ -715,11 +963,11 @@ impl<'a> L<'a> {
             }
             Inst::Cmp { dst, op, ty, a, b } => {
                 let d = self.dst_of(*dst);
-                let fl = self.compare(*op, *ty, *a, *b);
+                let (fl, cc) = self.compare(*op, *ty, *a, *b);
                 self.push(MInst::CSet {
                     w: Width::W32,
                     dst: d,
-                    cc: cc_of(*op),
+                    cc,
                     flags: fl,
                 });
             }
@@ -738,9 +986,16 @@ impl<'a> L<'a> {
                 ..
             } => {
                 let mem = self.addr_mode(*addr);
-                let d = self.dst_of(*dst);
+                // The munch table's extending-load row: the `sext` that is this
+                // load's only consumer is performed BY the load, into that
+                // extension's own register (`ldrsw x5,[…]` for `ldr w5` +
+                // `sxtw x5,w5`). Nothing moves — the load stays where it is.
+                let (op, d) = match self.ldext.get(dst).copied() {
+                    Some((op, ext)) => (op, self.vmap[ext as usize]),
+                    None => (memop(*ty), self.dst_of(*dst)),
+                };
                 self.push(MInst::Load {
-                    op: memop(*ty),
+                    op,
                     dst: d,
                     mem,
                     vol: *vol,
@@ -811,9 +1066,40 @@ impl<'a> L<'a> {
             Inst::Select { dst, ty, c, a, b } => {
                 let d = self.dst_of(*dst);
                 let (fl, cc) = match self.sel.get(dst).copied() {
-                    Some((op, cty, x, y)) => (self.compare(op, cty, x, y), cc_of(op)),
+                    Some((op, cty, x, y)) => self.compare(op, cty, x, y),
                     None => (self.test(*c), CC::Ne),
                 };
+                // `c ? 1 : 0` is `cset` — one instruction (DDI 0487 C6.2.87,
+                // the `csinc d,zr,zr,invert(cc)` alias), where materializing
+                // the 1 and selecting it is two. C reaches this shape through
+                // every `&&`/`||` that is not directly a branch condition.
+                if let (Operand::Imm(1), Operand::Imm(0)) | (Operand::Imm(0), Operand::Imm(1)) =
+                    (*a, *b)
+                {
+                    self.push(MInst::CSet {
+                        w: wid(*ty),
+                        dst: d,
+                        cc: if *a == Operand::Imm(1) { cc } else { cc.invert() },
+                        flags: fl,
+                    });
+                    return;
+                }
+                // The `csinc`/`csinv`/`csneg` row: the arithmetic on the other
+                // arm happens INSIDE the select.
+                if let Some((k, keep, src, inv)) = self.csop.get(dst).copied() {
+                    let x = self.reg(keep, *ty);
+                    let y = self.reg(Operand::Val(src), *ty);
+                    self.push(MInst::CSel {
+                        op: k,
+                        w: wid(*ty),
+                        dst: d,
+                        a: x,
+                        b: y,
+                        cc: if inv { cc.invert() } else { cc },
+                        flags: fl,
+                    });
+                    return;
+                }
                 let (x, y) = (self.reg(*a, *ty), self.reg(*b, *ty));
                 self.push(MInst::CSel {
                     op: CSelOp::Csel,
@@ -857,7 +1143,10 @@ impl<'a> L<'a> {
     }
 
     /// `cmp`/`fcmp`, returning the flag value it defines.
-    fn compare(&mut self, op: CmpOp, ty: hir::Ty, a: Operand, b: Operand) -> Reg {
+    /// The flags this relation sets, and the condition code that reads them —
+    /// which is not always `cc_of(op)`: the operands may be exchanged to reach
+    /// the immediate field, and the relation goes with them.
+    fn compare(&mut self, op: CmpOp, ty: hir::Ty, a: Operand, b: Operand) -> (Reg, CC) {
         let fl = self.f.new_flags();
         if ty.is_float() {
             let x = self.reg(a, ty);
@@ -870,23 +1159,42 @@ impl<'a> L<'a> {
                 zero,
                 flags: fl,
             });
-        } else {
-            let _ = op;
-            // `cmp` is `subs`: the same register-31-is-SP rule applies
-            let y = self.rhs(b, ty, AluOp::Sub);
-            let x = match &y {
-                Rhs::Imm(_) => self.reg_nonzr(a, ty),
-                _ => self.reg(a, ty),
-            };
-            self.push(MInst::Cmp {
-                kind: CmpKind::Cmp,
-                w: wid(ty),
-                a: x,
-                b: y,
-                flags: fl,
-            });
+            return (fl, cc_of(op));
         }
-        fl
+        // A constant C wrote on the left has no immediate field to ride in and
+        // would be materialized for nothing; exchanging both operands and the
+        // relation is exact and costs no instruction. `Imm(0)` is left where it
+        // is — the zero register serves either side for free.
+        let (op, a, b) = match (a, b) {
+            (Operand::Imm(k), Operand::Val(_)) if k != 0 => (swap_cmp(op), b, a),
+            _ => (op, a, b),
+        };
+        // `cmp x, #-k` subtracts a negative. `cmn x, #k` ADDS the same magnitude
+        // — bit for bit the same arithmetic, so bit for bit the same NZCV — and
+        // its immediate field is the one that can hold `k` (DDI 0487 C6.2.62;
+        // the add/sub imm12 field is unsigned, so the negative form has none).
+        let (kind, b) = match b {
+            Operand::Imm(k) => match k.checked_neg().filter(|n| *n > 0 && isa::add_imm(*n).is_some())
+            {
+                Some(n) => (CmpKind::Cmn, Operand::Imm(n)),
+                None => (CmpKind::Cmp, b),
+            },
+            _ => (CmpKind::Cmp, b),
+        };
+        // `cmp` is `subs`: the same register-31-is-SP rule applies
+        let y = self.rhs(b, ty, AluOp::Sub);
+        let x = match &y {
+            Rhs::Imm(_) => self.reg_nonzr(a, ty),
+            _ => self.reg(a, ty),
+        };
+        self.push(MInst::Cmp {
+            kind,
+            w: wid(ty),
+            a: x,
+            b: y,
+            flags: fl,
+        });
+        (fl, cc_of(op))
     }
 
     /// `cmp c, #0` for a value used as a truth value.
@@ -1891,6 +2199,15 @@ impl<'a> L<'a> {
             }
             // The condition is an I32 that C says is "nonzero = true": `cbnz`
             // tests it directly, with no compare instruction at all.
+            // `if (x & (1<<k))` — one instruction, no mask and no compare
+            // (DDI 0487 C6.2.375). Decided in `munch`, where the use counts are.
+            Term::Br(_, x, y) if self.tb.contains_key(&(self.cur as hir::BlockId)) => {
+                self.fuse = None;
+                let (v, ty, bit, set) = self.tb[&(self.cur as hir::BlockId)];
+                let r = self.reg_nonzr(Operand::Val(v), ty);
+                let (x, y) = (self.target(x), self.target(y));
+                MTerm::Tb { w: wid(ty), reg: r, bit, set, t: x, f: y }
+            }
             Term::Br(c, x, y) => match self.fuse.take() {
                 // `x == 0` / `x != 0` needs no compare at all: `cbz`/`cbnz` test
                 // the register and branch in one instruction (DDI 0487 C6.2.42).
@@ -1927,9 +2244,9 @@ impl<'a> L<'a> {
                     }
                 }
                 Some((op, ty, a, b)) => {
-                    let fl = self.compare(op, ty, a, b);
+                    let (fl, cc) = self.compare(op, ty, a, b);
                     let (x, y) = (self.target(x), self.target(y));
-                    MTerm::Bcc(cc_of(op), fl, x, y)
+                    MTerm::Bcc(cc, fl, x, y)
                 }
                 None => {
                     let r = self.reg(*c, hir::Ty::I32);
@@ -2118,6 +2435,9 @@ fn lower_func(h: &hir::Func) -> MFunc {
         alu: m.alu,
         br: m.br,
         sel: m.sel,
+        ldext: m.ldext,
+        tb: m.tb,
+        csop: m.csop,
         dead: m.dead,
         fuse: None,
     };

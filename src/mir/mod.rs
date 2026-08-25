@@ -302,10 +302,22 @@ pub enum ExtOp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MemOp {
     B,
+    /// `ldrsb Wt` / `ldrsb Xt` — DDI 0487 C6.2.192 gives the sign-extending
+    /// loads a 32-bit AND a 64-bit form, and they are different instructions:
+    /// the `w` form zeroes bits 63:32 after extending within 32. The result
+    /// width therefore belongs to the OPCODE, not to the destination register —
+    /// after register allocation the destination is physical and carries no
+    /// width at all (a `Reg::P` is 64 bits wide by definition), so inferring it
+    /// there printed `ldrsb x0` for a 32-bit extension and computed
+    /// `(unsigned)(signed char)-4` as −4 instead of 4294967292 (torture
+    /// pr19606).
     SB,
+    SBX,
     H,
     SH,
+    SHX,
     W,
+    /// `ldrsw Xt` only — A64 has no 32-bit sign-extending word load
     SW,
     X,
     /// FP forms: `ldr s` / `ldr d` / `ldr q`
@@ -317,8 +329,8 @@ pub enum MemOp {
 impl MemOp {
     pub fn bytes(self) -> u32 {
         match self {
-            MemOp::B | MemOp::SB => 1,
-            MemOp::H | MemOp::SH => 2,
+            MemOp::B | MemOp::SB | MemOp::SBX => 1,
+            MemOp::H | MemOp::SH | MemOp::SHX => 2,
             MemOp::W | MemOp::SW | MemOp::S => 4,
             MemOp::X | MemOp::D => 8,
             MemOp::Q => 16,

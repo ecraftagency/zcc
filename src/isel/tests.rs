@@ -463,3 +463,137 @@ fn a_bitfield_read_is_one_instruction() {
     // an offset past the register: not a bitfield, and must not become one
     equiv("unsigned f(unsigned x){return (x>>30)&0xff;}int main(void){return (int)f(0xc0000000u);}");
 }
+
+// ── R4.7: the §17 rows, each with its square and its count ────────────────
+// A row here has TWO obligations. The square (`equiv`) says the machine
+// sequence means what the C means; the COUNT says the row actually fired —
+// §13n's finding (f) was precisely that §17's ✔ marks were claims and the
+// mnemonics were measurably absent. A square alone would have stayed green
+// with nothing selected.
+
+/// The MIR of one function, before register allocation.
+fn mir_of(src: &str, name: &str) -> crate::mir::MFunc {
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let m = lower(&h);
+    m.funcs
+        .into_iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("no function `{}`", name))
+}
+
+fn count(f: &crate::mir::MFunc, p: impl Fn(&crate::mir::MInst) -> bool) -> usize {
+    f.blocks.iter().flat_map(|b| b.insts.iter()).filter(|i| p(i)).count()
+}
+
+#[test]
+fn a_sign_extending_load_needs_no_extension() {
+    use crate::mir::{MInst, MemOp};
+    // `ldrsh w0,[x0]`, not `ldrh w0,[x0]` + `sxth w0,w0` (DDI 0487 C6.2.192).
+    let f = mir_of("int f(short*p){return *p;} int main(void){short x=-5;return f(&x);}", "f");
+    assert_eq!(count(&f, |i| matches!(i, MInst::Load { op: MemOp::SH, .. })), 1);
+    assert_eq!(count(&f, |i| matches!(i, MInst::Ext { .. })), 0);
+    equiv("int f(short*p){return *p;} int main(void){short x=-5;return f(&x);}");
+    equiv("int f(signed char*p){return *p;} int main(void){signed char x=-5;return f(&x);}");
+    equiv("long f(int*p){return *p;} int main(void){int x=-5;return (int)f(&x);}");
+    // …and the loop-carried case the row exists for: the extension in the LOAD
+    // leaves the accumulate a plain 1-cycle `add` instead of `add …,sxtw`.
+    equiv("long g(int*a,int n){long s=0;int i;for(i=0;i<n;i++)s+=a[i];return s;}\
+           int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i-2;return (int)g(a,4);}");
+}
+
+#[test]
+fn the_extension_width_belongs_to_the_opcode_not_the_register() {
+    use crate::mir::{MInst, MemOp};
+    // `ldrsb Wt` and `ldrsb Xt` are DIFFERENT instructions: the `w` form zeroes
+    // bits 63:32. After allocation the destination is physical and carries no
+    // width, so the form must be in the opcode — inferring it from the register
+    // printed `ldrsb x0` for a 32-bit extension and computed
+    // `(unsigned)(signed char)-4` as −4 (torture pr19606).
+    let src = "signed char a=-4;\
+               int f(void){return ((unsigned)(int)a)/2LL;}\
+               int main(void){return f()==2147483646;}";
+    let f = mir_of(src, "f");
+    assert_eq!(count(&f, |i| matches!(i, MInst::Load { op: MemOp::SB, .. })), 1);
+    assert_eq!(count(&f, |i| matches!(i, MInst::Load { op: MemOp::SBX, .. })), 0);
+    equiv(src);
+    equiv("signed char a=-4; long f(void){return a;} int main(void){return (int)f()+4;}");
+}
+
+#[test]
+fn a_single_bit_test_is_one_branch() {
+    use crate::mir::{AluOp, MInst, MTerm};
+    // `tbz`/`tbnz` (DDI 0487 C6.2.375): no mask, no compare.
+    // A store in the arm keeps this a BRANCH — `if-conv` would otherwise turn
+    // the value-only shape into a `csel`, which is a different (and correct)
+    // answer that does not exercise this row.
+    let src = "int f(int x,int*p){if(x&8){*p=1;return 1;}return 0;}\
+               int main(void){int q=0;return f(8,&q)+f(4,&q)+q;}";
+    let f = mir_of(src, "f");
+    assert!(f.blocks.iter().any(|b| matches!(b.term, MTerm::Tb { .. })));
+    assert_eq!(count(&f, |i| matches!(i, MInst::Alu { op: AluOp::And, .. })), 0);
+    equiv(src);
+    equiv("int f(unsigned x){return (x&0x80000000u)?7:9;} int main(void){return f(0x80000000u);}");
+    // a MULTI-bit mask has no `tb` form and must keep the mask
+    equiv("int f(int x,int*p){if(x&12){*p=1;return 1;}return 0;}\
+           int main(void){int q=0;return f(8,&q)+f(3,&q)+q;}");
+}
+
+#[test]
+fn the_conditional_select_family_absorbs_its_arithmetic() {
+    use crate::mir::{CSelOp, MInst};
+    // `csneg`/`csinv`/`csinc` (DDI 0487 C6.2.83-86) perform the negation,
+    // complement or increment on the second source AS PART of the select.
+    let src = "int f(int c,int x){return c?x:-x;} int main(void){return f(0,-42);}";
+    let f = mir_of(src, "f");
+    assert_eq!(count(&f, |i| matches!(i, MInst::CSel { op: CSelOp::Csneg, .. })), 1);
+    equiv(src);
+    // `c ? 1 : 0` is `cset` alone — the 1 is never materialized.
+    let src = "int f(int a,int b,int c){return (a<b&&b<c)?11:22;} int main(void){return f(1,2,3);}";
+    let g = mir_of(src, "f");
+    assert_eq!(count(&g, |i| matches!(i, MInst::MovImm { imm: 1, .. })), 0);
+    equiv(src);
+    equiv("int f(int c,int x){return c?-x:x;} int main(void){return f(1,-42);}");
+    equiv("int f(int c,int x){return c?x:~x;} int main(void){return f(0,-43);}");
+    equiv("int f(int c,int x){return c?x:x+1;} int main(void){return f(0,41);}");
+}
+
+#[test]
+fn a_constant_operand_reaches_the_immediate_field_from_either_side() {
+    use crate::mir::{CmpKind, MInst};
+    // A64's immediate field is on the SECOND operand only, so `7 < x` must be
+    // read as `x > 7`; and `cmp x,#-1` has no encoding while `cmn x,#1` is the
+    // same arithmetic and the same NZCV (DDI 0487 C6.2.62).
+    let src = "int f(int x){return 7<x;} int main(void){return f(9);}";
+    let f = mir_of(src, "f");
+    assert_eq!(count(&f, |i| matches!(i, MInst::MovImm { .. })), 0);
+    equiv(src);
+    let src = "int f(int x){return x==-1;} int main(void){return f(-1)+f(3);}";
+    let g = mir_of(src, "f");
+    assert_eq!(count(&g, |i| matches!(i, MInst::Cmp { kind: CmpKind::Cmn, .. })), 1);
+    equiv(src);
+    equiv("int f(int x){return -3<=x;} int main(void){return f(-4)+f(0);}");
+    equiv("int f(unsigned x){return 5u>x;} int main(void){return f(1)+f(9);}");
+    equiv("int f(int x){return x>-4096;} int main(void){return f(-5000)+f(0);}");
+}
+
+#[test]
+fn a_shift_folds_into_a_commutative_operation_from_either_side() {
+    use crate::mir::{AluOp, MInst, Rhs};
+    // A64 shifts the SECOND source; C writes the shifted side wherever it
+    // likes. `orr w0,w1,w2,lsl #1`, not `lsl` + `orr`.
+    let src = "unsigned f(unsigned x,unsigned y){return (x<<1)|y;} int main(void){return (int)f(3,4);}";
+    let f = mir_of(src, "f");
+    assert_eq!(count(&f, |i| matches!(i, MInst::Alu { op: AluOp::Lsl, .. })), 0);
+    assert_eq!(
+        count(&f, |i| matches!(i, MInst::Alu { op: AluOp::Orr, b: Rhs::Shifted(..), .. })),
+        1
+    );
+    equiv(src);
+    equiv("unsigned f(unsigned x,unsigned y){return (x<<3)+y;} int main(void){return (int)f(3,4);}");
+    equiv("unsigned f(unsigned x,unsigned y){return (x>>3)^y;} int main(void){return (int)f(64,4);}");
+    // subtraction does NOT commute
+    equiv("unsigned f(unsigned x,unsigned y){return (x<<2)-y;} int main(void){return (int)f(3,4);}");
+    equiv("unsigned f(unsigned x,unsigned y){return y-(x<<2);} int main(void){return (int)f(3,40);}");
+}

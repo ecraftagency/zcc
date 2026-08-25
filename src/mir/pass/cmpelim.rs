@@ -17,19 +17,19 @@ use crate::mir::*;
 pub fn run(f: &mut MFunc) {
     for b in 0..f.blocks.len() {
         let mut i = 0;
-        while i + 1 < f.blocks[b].insts.len() {
+        while i < f.blocks[b].insts.len() {
             match fuse(f, b, i) {
-                Some((cc_fixes, fl)) => {
+                Some((cc_fixes, fl, at)) => {
                     // The condition codes are rewritten BEFORE the compare is
                     // removed: a consumer in this same block sits at an index the
                     // removal would shift.
-                    for (bb, at, cc) in cc_fixes {
-                        set_cc(f, bb, at, cc);
+                    for (bb, k, cc) in cc_fixes {
+                        set_cc(f, bb, k, cc);
                     }
                     if let MInst::Alu { flags, .. } = &mut f.blocks[b].insts[i] {
                         *flags = Some(fl);
                     }
-                    f.blocks[b].insts.remove(i + 1);
+                    f.blocks[b].insts.remove(at);
                 }
                 None => i += 1,
             }
@@ -40,7 +40,25 @@ pub fn run(f: &mut MFunc) {
 /// Where a condition code lives: an instruction index, or the terminator.
 type Site = (usize, Option<usize>, CC);
 
-fn fuse(f: &MFunc, b: usize, i: usize) -> Option<(Vec<Site>, Reg)> {
+/// Does this instruction read or write NZCV? The fusion moves the flag
+/// definition BACK to the arithmetic, so anything in between that touches the
+/// flags would have two values live at once — which the allocator rejects
+/// outright (NZCV is a register class of size one), and a `Call` clobbers
+/// architecturally. This is the whole side condition of searching past an
+/// instruction rather than requiring the compare to be the very next one.
+fn touches_flags(i: &MInst) -> bool {
+    match i {
+        MInst::Alu { flags, .. } => flags.is_some(),
+        MInst::Cmp { .. }
+        | MInst::CSel { .. }
+        | MInst::CSet { .. }
+        | MInst::FpCmp { .. }
+        | MInst::Call { .. } => true,
+        _ => false,
+    }
+}
+
+fn fuse(f: &MFunc, b: usize, i: usize) -> Option<(Vec<Site>, Reg, usize)> {
     let (op, dst) = match &f.blocks[b].insts[i] {
         MInst::Alu { op, dst, flags: None, .. }
             if matches!(op, AluOp::Add | AluOp::Sub | AluOp::And) =>
@@ -49,9 +67,20 @@ fn fuse(f: &MFunc, b: usize, i: usize) -> Option<(Vec<Site>, Reg)> {
         }
         _ => return None,
     };
-    let fl = match &f.blocks[b].insts[i + 1] {
-        MInst::Cmp { kind: CmpKind::Cmp, a, b: Rhs::Imm(0), flags, .. } if *a == dst => *flags,
-        _ => return None,
+    // The compare need not be the NEXT instruction — only the next one that
+    // touches the flags. gcc's `-fcompare-elim` searches the same window, and
+    // it is what makes a count-down loop's `sub`+`cmp`+`b.ne` collapse to
+    // `subs`+`b.ne` when the scheduler has put the loop's other work between
+    // them (R4.13's count-down IV shape).
+    let mut at = i + 1;
+    let (fl, at) = loop {
+        match f.blocks[b].insts.get(at)? {
+            MInst::Cmp { kind: CmpKind::Cmp, a, b: Rhs::Imm(0), flags, .. } if *a == dst => {
+                break (*flags, at);
+            }
+            other if touches_flags(other) => return None,
+            _ => at += 1,
+        }
     };
     let _ = op;
     // every consumer of these flags must read only N and Z
@@ -73,7 +102,7 @@ fn fuse(f: &MFunc, b: usize, i: usize) -> Option<(Vec<Site>, Reg)> {
     if sites.is_empty() {
         return None;
     }
-    Some((sites, fl))
+    Some((sites, fl, at))
 }
 
 /// The same test against flags whose C and V come from the arithmetic rather

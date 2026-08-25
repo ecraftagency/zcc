@@ -505,7 +505,15 @@ side of §13n for the first time: R4.2 REOPENED for its FPR twin (1,558 insns), 
 **R4.13** (the IV family, R2's residual) and **R4.14** (three orphans) opened, and the ORDER changed
 from size-weighted to measured-programs-owned.
 **R4.2's FPR half ✅ BANKED 2026-08-25** (`fmov` windmill 783 → 4 pairs, −1,616 insns, 1.3928× →
-**1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green). **Next ⬜ is R4.7.**
+**1.3826×**; residual 4 = fundamental double-swaps, exhausted; full gate green).
+**R4.7 ✅ BANKED (2026-08-25)** — the eight §17 rows verified one by one:
+sqlite **212,066 = 1.3501×**, EXEC geomean **1.3386 → 1.2044** (median 1.225 →
+1.073), and the plan's first CYCLE prediction validated to the third decimal
+(j3 1.940 → **1.000** at identical instruction count). **R4.13 ⚠️ DISCHARGED by
+its own residual print** — two of its three shapes are category (a) on this
+target, the third's bug half banked under R4.7 (d2 2.111 → 1.500). **Next ⬜ is
+R4.5**, which the amended order puts first because j5 (2.857×, 81% of the
+suite's wall time) is its program.
 Fourteen rows now; §13n holds the table, the evidence and the order.
 Measured worklist: `ldr`+`str` are 34% of the excess and `mov` 24%, so **58% of the gap is one
 subsystem, the allocator**; the loop rows have reached everything they can.
@@ -1360,13 +1368,13 @@ every row, paired, in one session, as a distribution.
 | **R4.4** | **returns merged, dead slots dropped, frame adjust folded** (e) | HIR `unify_ret`; `mir/pass/frame.rs` | extra `ret` 1,928 → ≤ 400; 289 leaf frames → 0; `sub sp` count → ≈ number of functions with no save pair | sqlite −4k…−6k | ⬜ |
 | **R4.5** | **booleans stay flags** (d): `br(select c,k1,k2)` → `br c` threading in `cfg.rs`; `cset`/`csinc`/`csneg` rows; then `ccmp` for `&&`/`\|\|` chains | `hir/pass/cfg.rs`, `isel/lower.rs` | pure-boolean `csel` 3,707 and `csel→cbnz` 669 are the ceiling | `csel` ≈ gcc's 542 + real if-conversions; **j5 exec** | ⬜ |
 | **R4.6** | **constants shared** (c): dominator-scoped `MovImm`/`Adrp` sharing on MIR, before spilling; the spiller's remat decides pressure. **Amended 2026-08-25:** the inspection found the INTEGER loop bound rebuilt every iteration too (`movz w0,#2304; movk w0,#61,lsl 16` inside f2's and e2's loops, where gcc holds it in a callee-saved register), not only f2's FP constant — a loop-invariant immediate must be hoisted to the preheader, and the row's ceiling counts those | new `mir/pass/const_share.rs` | repeats 16,085 minus what R4.5 removes = the ceiling; realistic target zcc immediates → ≈ gcc's 12.7k; **plus** count of `MovImm`/`Adrp` inside a loop whose value is loop-invariant | `movz+movn+mov,zr` ≤ 14k; **f2, e2 exec** | ⬜ |
-| **R4.7** | **§17 verified, row by row** (f): extending loads (`ldrsb/ldrsh/ldrsw`, and prefer the extension in the LOAD over the ALU operand when the value feeds a loop-carried chain — the j3 latency fact, recorded as a cost-model caveat since `cost = \|MIR\|` cannot see it), `cmpelim` across non-flag-writing instructions and `and`+`cmp` → `tst`, `fmov #imm8`, `csneg/csinc`, shifted-operand commute, constant-LHS `cmp` commute, `tbz` for sign/bit tests, `sbfiz`. Each row: its count vs gcc BEFORE, its battery, its count AFTER — the ✔ becomes a number | `isel/lower.rs`, `cmpelim.rs`, `ext_lattice`, **`mir/isa.rs` latency table (Side II — MEASURED, see "THE MISSING DUAL")** | the per-mnemonic table above, **and the first CYCLE prediction the plan has ever carried**: j3's loop-carried chain is `add xN,xN,wM,sxtw` (2 cyc) → `ldrsw`+`add` (1 cyc), bound 2.0 → 1.0; measured today 1.940, so the row predicts **j3 ≈ 1.0×** and, on the same table, **i1 and e2's `sxtw` chains**. **Amended 2026-08-25:** the KPI below WAS a size KPI ("±10% per mnemonic"); the inspection showed this row's value is on the clock and predictable before the build | **j3 exec 1.94 → ≤ 1.1** (the cycle prediction, validated against the clock); each mnemonic within ±10% of gcc; **i1, e2, h2, d4, f2 exec** — 5 of the 10 programs above 1.2× | ⬜ second, after R4.2's FPR half |
+| **R4.7** | **§17 verified, row by row** (f): extending loads (`ldrsb/ldrsh/ldrsw`, and prefer the extension in the LOAD over the ALU operand when the value feeds a loop-carried chain — the j3 latency fact, recorded as a cost-model caveat since `cost = \|MIR\|` cannot see it), `cmpelim` across non-flag-writing instructions and `and`+`cmp` → `tst`, `fmov #imm8`, `csneg/csinc`, shifted-operand commute, constant-LHS `cmp` commute, `tbz` for sign/bit tests, `sbfiz`. Each row: its count vs gcc BEFORE, its battery, its count AFTER — the ✔ becomes a number | `isel/lower.rs`, `cmpelim.rs`, `ext_lattice`, **`mir/isa.rs` latency table (Side II — MEASURED, see "THE MISSING DUAL")** | the per-mnemonic table above, **and the first CYCLE prediction the plan has ever carried**: j3's loop-carried chain is `add xN,xN,wM,sxtw` (2 cyc) → `ldrsw`+`add` (1 cyc), bound 2.0 → 1.0; measured today 1.940, so the row predicts **j3 ≈ 1.0×** and, on the same table, **i1 and e2's `sxtw` chains**. **Amended 2026-08-25:** the KPI below WAS a size KPI ("±10% per mnemonic"); the inspection showed this row's value is on the clock and predictable before the build | **j3 exec 1.94 → ≤ 1.1** (the cycle prediction, validated against the clock); each mnemonic within ±10% of gcc; **i1, e2, h2, d4, f2 exec** — 5 of the 10 programs above 1.2× | ✅ **BANKED.** j3 **1.940 → 1.000** (the cycle prediction, to the third decimal), d4 **1.400 → 1.000**, i1 **1.333 → 0.750**, d2 **2.111 → 1.500**; sqlite **217,160 → 212,066** (1.3826× → **1.3501×**); EXEC geomean **1.3386 → 1.2044**, median **1.225 → 1.073**. Eight rows, each with a square AND a count. Residual: `sbfiz`/`ubfiz`/`fmov #imm8`/`mul`-by-constant = category (b), named; `tst` = category (a). See "R4.7 — BANKED" below |
 | **R4.8** | **spill, second pass** (g): entry-set fixpoint across back edges (carry into loop headers); spill-store placement at the eviction frontier | `regalloc/spill.rs` | `ZCC_SPILLCEIL` in-loop 7,607 and dom-ceiling 3,485 are the reload ceiling; for stores, count spilled definitions with a path that never reloads | frame `ldr` ≪ 17,052, frame `str` ≪ 12,239 | ⬜ |
 | **R4.9** | **memory-aware GVN** (h) — FRE | `hir/pass/gvn.rs` + alias classes from `effects()` | count loads whose address was loaded in a dominating block with no clobbering store/call between — measured before a line is written, like R4.1 | non-frame `ldr` → ≈ gcc's 14,567; **j5 exec** | ⬜ |
 | **R4.10** | **Boissinot merge** on the FREE residual (i) | `regalloc/color.rs` | 4,782 | edge copies ≪ 9,332 | ⬜ |
 | **R4.11** | **rotation residual + store motion** (j): `rotate.rs` tests `pin`, not `labels`; add the refusal-reason residual print; trace and lift the early-return shape; LICM store motion for a loop-invariant address with no aliasing access | `hir/pass/rotate.rs`, `hir/pass/licm.rs` | residual print first — the count of refused loops per reason IS the prediction | **d3, d4, i1 exec**; sqlite branch count | ⬜ |
 | **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ⬜ |
-| **R4.13** | **the IV family — R2's exhaustion residual** (l, opened 2026-08-25 on the hot-loop inspection). Three shapes SCEV does not fire on, all one theorem over `scev.rs`/`iv.rs`: (1) a **pointer / 64-bit IV** where the source has a 32-bit counter — zcc recomputes `[xB, wI, sxtw #2]` every iteration, gcc walks a pointer with post-index writeback (`str w3, [x2], -4`; j5, d3); (2) a **count-down IV** whose decrement SETS THE FLAGS so the exit test is free (`subs w1,w1,#1; bpl` — j5, h2), where zcc keeps a separate `cmp`/`tbz`; (3) **strength reduction of `i*j+k` in a nested loop** to an add-IV (d2: `madd` every inner iteration vs gcc's `add`). Every one is `-O1` (`-fauto-inc-dec`, `-ftree-slsr`, IV canonicalization). NOT folded into R4.11 — that row owns rotation refusals and store motion, and Article G forbids blurring a theorem seam. §13n missed this family because it was decomposed from a STATIC sqlite histogram, where an IV shape costs zero instructions | `hir/pass/scev.rs`, `hir/pass/iv.rs`; the post-index fold is `isel/lower.rs` | **residual print FIRST**, as R4.11 requires of rotation: for every loop, is there an IV `scev` recognizes but `iv` refuses to widen/rewrite, and WHY — the count per refusal reason IS the prediction. Then per shape: (1) loops with an address `[base, w, sxtw]` on a recognized IV; (2) counted loops whose exit compare is against 0 or a hoistable bound; (3) inner-loop `mul`/`madd` on two IVs | **j5 exec** (11 → ~7 insns/iter), **d3, d2, h2 exec**; each shape's residual classified (a)/(b) | ⬜ |
+| **R4.13** | **the IV family — R2's exhaustion residual** (l, opened 2026-08-25 on the hot-loop inspection). Three shapes SCEV does not fire on, all one theorem over `scev.rs`/`iv.rs`: (1) a **pointer / 64-bit IV** where the source has a 32-bit counter — zcc recomputes `[xB, wI, sxtw #2]` every iteration, gcc walks a pointer with post-index writeback (`str w3, [x2], -4`; j5, d3); (2) a **count-down IV** whose decrement SETS THE FLAGS so the exit test is free (`subs w1,w1,#1; bpl` — j5, h2), where zcc keeps a separate `cmp`/`tbz`; (3) **strength reduction of `i*j+k` in a nested loop** to an add-IV (d2: `madd` every inner iteration vs gcc's `add`). Every one is `-O1` (`-fauto-inc-dec`, `-ftree-slsr`, IV canonicalization). NOT folded into R4.11 — that row owns rotation refusals and store motion, and Article G forbids blurring a theorem seam. §13n missed this family because it was decomposed from a STATIC sqlite histogram, where an IV shape costs zero instructions | `hir/pass/scev.rs`, `hir/pass/iv.rs`; the post-index fold is `isel/lower.rs` | **residual print FIRST**, as R4.11 requires of rotation: for every loop, is there an IV `scev` recognizes but `iv` refuses to widen/rewrite, and WHY — the count per refusal reason IS the prediction. Then per shape: (1) loops with an address `[base, w, sxtw]` on a recognized IV; (2) counted loops whose exit compare is against 0 or a hoistable bound; (3) inner-loop `mul`/`madd` on two IVs | **j5 exec** (11 → ~7 insns/iter), **d3, d2, h2 exec**; each shape's residual classified (a)/(b) | ⚠️ **RESIDUAL TAKEN → 2 of 3 shapes REFUTED on this target.** (1) pointer/64-bit IV: `ZCC_IV=1` re-measured post-R4.7 is still NEGATIVE (INSN 1.1493 → 1.1538, EXEC 1.2044 → 1.2140) — **category (a)**, the pass stays off. (2) count-down IV: zcc's `j>=0` is ALREADY one `tbz`, so `sub`+`tbz` = gcc's `subs`+`bpl` — **category (a)**, nothing to win; the general form shipped as R4.7's `cmp_elim` window. (3) `i*j+k`: the BUG half (cross-block `madd` undoing LICM) banked under R4.7, d2 **2.111 → 1.500**; the add-IV/exit-rewrite half is the ONE **category (b)** left, owning one program. See "R4.13" below |
 | **R4.14** | **three orphans, one row so they stay tracked** (m, opened 2026-08-25): (1) **`x / 2^k` → `x · 2^−k`** — exact under IEEE 754 since the reciprocal of a power of two is representable, so the commuting square is an identity on every input including ±0/∞/NaN (f2: `fdiv` 10+ cyc → `fmul` 3); (2) **small dense `switch` → compare tree, not a jump table** — R3.3's density constant ("≥4 cases, ≥½ span") is exactly Article E's "the spec's number or my convenience's number?": gcc-O1 builds a `cmp`/`tbnz`/`csel`/`csinc` tree for d1's 8 cases and wins 1.33× on it, so the constant is re-judged against a measured crossover, not cited; (3) **inline a called-once function that is not `static`** — `inline.rs` requires `is_static` for the called-once rule; gcc's `-finline-functions-called-once` does not, and keeps the out-of-line body (e2: `mix` marshals 10 arguments per call). Three sites, three proofs, each a few lines; grouped only so none is lost | `hir/pass/fold.rs`; `isel/lower.rs::jump_table` (the policy constant); `hir/pass/inline.rs` | (1) count `fdiv` by a constant power of two on sqlite and the suite; (2) measure the crossover: compare-tree vs table exec at 4, 6, 8, 12, 16 cases, on the clock; (3) count non-`static` functions with exactly one call site in the module | **f2, d1, e2 exec**; each with its own square | ⬜ |
 
 ### Order, and why — RE-PLANNED 2026-08-25 (user), on the hot-loop inspection
@@ -1381,9 +1389,21 @@ FPR half unmeasured. So the criterion becomes **measured programs owned × certa
 order is:
 
 ```
-R4.2 (FPR twin)  →  R4.7  →  R4.13  →  R4.11  →  R4.14  →  R4.5  →  R4.9
-                 →  R4.6  →  R4.3  →  R4.4  →  R4.8  →  R4.10  →  R4.12
+R4.2 (FPR twin) ✅ →  R4.7 ✅ →  R4.13 ⚠️(discharged) →  R4.5  →  R4.9  →  R4.11
+                 →  R4.14  →  R4.6  →  R4.3  →  R4.4  →  R4.8  →  R4.10  →  R4.12
 ```
+
+**AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
+PLACE, not renumbered.** R4.13 was placed second because it "touches four (j5,
+d3, d2, h2) and is where j5 is decided". Its residual, taken first as the row
+itself requires, refuted that: two of its three shapes are category (a) on this
+target and the third owns d2 alone. What actually decides j5 — 2.857× and **81%
+of the suite's absolute wall time** — is the `cmp; movz; csel; cbnz` per
+iteration that R4.5 owns, with R4.9's repeated `p[j]` load behind it. So **R4.5
+moves to the front**, R4.9 follows it (both are j5's, and R4.9's prediction
+should be taken on the loop as R4.5 leaves it), then R4.11 (d3 2.000× is now
+PURE rotation — its IV half was the refuted shape). Nothing was renumbered and
+no row was invented: only the order changed, on a measurement.
 
 **Why each sits where it does.** R4.2's FPR half is not a re-plan item at all — it is an unfinished
 row under Law 4, 1,558 instructions on a theorem already proven, and the R4.1 precedent says a
@@ -1693,6 +1713,178 @@ CP2.x algorithm ladder (spiller-first) — lives there and is edited in place th
 `CP.md` is DELETED when the campaign closes; its durable results cook back here (final baseline) and
 into `THEORY.md` (any load-bearing algorithm). One-line status: **Phases 0–1 DONE (profiled, ranked);
 Phase 2 = the CP2.x ladder, NOT started, spiller `spill_with` is target #1 at 51–64 % of compile.**
+
+### R4.7 — BANKED. The §17 rows, verified one by one. sqlite **217,160 → 212,066** (1.3826× → **1.3501×**); EXEC geomean **1.3386 → 1.2044**, median **1.225 → 1.073**, count>1.1× **10 → 8**
+
+**The row's whole content was that §13n finding (f) is true: §17's ✔ marks were
+claims.** Every number below is a `grep` over the emitted `.s` of the sqlite
+amalgamation, taken before and after on the same box in the same session.
+
+| mnemonic | before | after | gcc-O1 | what closed it |
+|---|---|---|---|---|
+| `ldrsb` | 0 | 106 | 111 | extending loads |
+| `ldrsh` | 0 | 541 | 492 | extending loads |
+| `ldrsw` | 29 | 438 | 329 | extending loads |
+| `sxtb` | 120 | 14 | 11 | …their consequence |
+| `sxth` | 687 | 146 | 90 | …their consequence |
+| `sxtw` | 1,488 | ~1,180 | 641 | …their consequence + the no-op operand row |
+| `tbz` | 156 | 449 | 749 | single-bit tests |
+| `tbnz` | 170 | 714 | 972 | single-bit tests |
+| `cmn` | 0 | 116 | 134 | negative compare immediate |
+| `csneg` | 0 | 8 | 25 | conditional-select family |
+| `csinc` | 0 | 39 | 39 | conditional-select family |
+| `csinv` | 0 | 1 | 30 | conditional-select family |
+| shifted ALU operand (`lsl #`) | 480 | 613 | — | commuted from either side |
+| **module total** | **217,160** | **212,066** | 157,074 | **−5,094** |
+
+**The eight rows shipped, each with its square in `isel/tests.rs` (a square AND
+a count — a square alone stays green with nothing selected, which is exactly how
+§17 acquired eight false ✔ marks).**
+
+1. **Extending loads** — a `sext` whose only source is a narrow load is
+   performed BY the load, into the extension's own register. Nothing moves; the
+   load has one use, checked. This is the row R4.7 was ordered first for, and
+   the reason is NOT the instruction it removes.
+2. **The extension width belongs to the OPCODE.** `ldrsb Wt` and `ldrsb Xt` are
+   different instructions — the `w` form zeroes bits 63:32 — and after
+   allocation the destination is physical and carries no width at all. `emit.rs`
+   inferred it from the register and printed `ldrsb x0` for a 32-bit extension:
+   torture `pr19606` went RED, `(unsigned)(signed char)-4` computing −4 instead
+   of 4,294,967,292. **A Law-2 Side-II defect** (a spec fact — the two forms —
+   applied wrongly), found by the gate in one run, fixed by splitting `MemOp`
+   into `SB`/`SBX`/`SH`/`SHX`/`SW`, which is what DDI 0487 C6.2.192 actually
+   lists. Battery row: `the_extension_width_belongs_to_the_opcode_not_the_register`.
+3. **Single-bit tests** — `tbz`/`tbnz` for `x & (1<<k)`, in both spellings C
+   uses (the bare truth value, which HIR carries as `br(value)`, and the
+   explicit `!= 0`, which arrives as a fused compare). A multi-bit mask is
+   refused: `tst` + `b.cc` is two instructions exactly like `and` + `cbz`, so
+   gcc's 489 `tst` against zcc's 0 is **category (a) — a naming difference, not
+   an excess**, and the `tst` row of §17 is closed on that argument.
+4. **The conditional-select family** — `csneg`/`csinv`/`csinc` absorb the
+   negation, complement or increment on the arm the other one does not name; and
+   `c ? 1 : 0` is `cset` alone, where materializing the 1 and selecting it was
+   two instructions. Every `&&`/`||` that is not directly a branch condition
+   reaches that shape.
+5. **A constant operand reaches the immediate field from either side** —
+   A64's immediate field is on the second source only, so `7 < x` is read as
+   `x > 7` (the condition table is symmetric); `Imm(0)` is left alone because
+   the zero register serves either side free.
+6. **`cmn` for a negative compare immediate** — `cmp x,#-1` has no encoding
+   (the add/sub imm12 field is unsigned) and was materialized into a register;
+   `cmn x,#1` is bit-for-bit the same arithmetic and therefore bit-for-bit the
+   same NZCV.
+7. **A shift folds into a commutative operation from either side** — C writes
+   the shifted side wherever it likes; `t = x<<1; y|t` is `orr w0,w3,w0,lsl #1`.
+   Subtraction keeps the single order.
+8. **`cmp_elim` searches to the next flag-touching instruction**, not only to
+   the next instruction. The side condition is the whole content: moving the
+   flag definition back is legal exactly when nothing in between reads or writes
+   NZCV (which the allocator would reject outright — NZCV is a class of size
+   one) and no `Call` clobbers it.
+
+**THE CYCLE PREDICTION, VALIDATED.** §13n predicted, from a latency table and
+with no build, that j3's loop-carried `add xN,xN,wM,sxtw` (2 cycles) becoming
+`ldrsw` + `add` (1 cycle) would take j3 from a measured **1.940** to **≈1.0**.
+Measured after: **1.000**. The instruction COUNT is unchanged — six against six,
+before and after — so `cost = |MIR|` scored the two loops identically and always
+would have. This is the first quantitative time prediction the plan has made and
+it came in at the third decimal. It is the argument "THE MISSING DUAL" was
+waiting for, and the time-dual row is now opened on evidence rather than on
+taste.
+
+**Its Law-4 residual, taken and closed.** `ext_lattice` removed the standalone
+`sxtw`; an extension riding INSIDE an operand (`add x1,x1,w0,sxtw`) is a
+different instruction — 2 cycles against 1 — and the lattice never looked at
+one. `s += (i*j+k)&31` put exactly that on d2's loop-carried recurrence for an
+extension that provably does nothing (`and w,#31` leaves bits 63:32 zero and
+bit 31 clear, which is what `sxtw` would write). `mir/pass/ext.rs::plain_operand`
+proves it on the same lattice and rewrites the operand to the plain register.
+d2 **2.111 → 1.500**. Battery row in `mir/pass/tests.rs`.
+
+**And a second residual, which was a de-optimization dressed as a munch row.**
+The `madd` fold absorbed a multiply from ANOTHER block. For a shift or an
+extension that is free — the producer rides inside the consumer's encoding — but
+a multiply is a multiply, and the one it kept pulling back into d2's inner loop
+had just been HOISTED OUT of it by LICM. A fold may now absorb a `Mul3` producer
+only from its own block. Same instruction count, one multiply per iteration
+gone.
+
+**Per-program exec, before → after** (same box, paired with the deterministic
+insn ratio). **The wall-clock noise is stated, not hidden:** two runs of the
+final tree region gave EXEC geomeans of **1.1870** and **1.2044** — the second
+run's absolute times were ~2% higher across every program, box load — so the
+honest reading of the row is "EXEC 1.34 → 1.19…1.20", and the DETERMINISTIC
+column (sqlite −5,094 instructions, INSN geomean 1.1568 → 1.1493) is the one
+with no error bar.
+
+| program | before | after | what moved it |
+|---|---|---|---|
+| j3_prefix_sum | 1.940 | **1.000** | `ldrsw` on the loop-carried chain (the prediction) |
+| d4_goto | 1.400 | **1.000** | `csneg` + `tbz` |
+| i1_global_acc | 1.333 | **0.750** | `ldrsw`; zcc now FASTER than gcc-O1 |
+| d2_nested_loops | 2.111 | **1.500** | no-op operand extension + the cross-block `madd` |
+| d3_early_exit | 2.065 | 1.969 | the rest is rotation — R4.11 |
+| e2_many_args | 1.500 | 1.500 | `ldrsw` banked; the rest is R4.3 + R4.14 |
+| h2_revbits | 1.250 | 1.237 | the shift commute; the rest is R4.4's dead frame |
+| j5_insertion_sort | 2.850 | 2.857 | untouched — see R4.13 below |
+| d1_switch · f2_double_poly | 1.326 · 1.800 | 1.500 · 1.200 | not this row's (R4.14, R4.6) |
+
+**What R4.7 did NOT close, classified.** `sbfiz` 0 vs 477 and `ubfiz` 0 vs 94 —
+**category (b)**, a convenience truncation: `Bfx` is UBFM-as-extract and the
+insert form needs a MIR variant of its own; 571 instructions, no measured exec
+target, left as a named residual. `fmov #imm8` — **category (b)**, needs an
+`FMovImm` variant; f2's row. `ccmp` 0 vs 612 and `csel` 4,450 vs 542 — **not
+this row's**: they are R4.5's boolean-vs-flags theorem. `mul` 736 vs 108 —
+**category (b)**, the `x*k → shift+add` half of §17's mul-by-constant row is
+unshipped; SPEED-positive and SIZE-neutral-to-negative, so it needs its own
+paired measurement and is left as a named residual rather than guessed at.
+`uxtb`/`uxth` 516 vs 0 — the `ext_lattice` residual, sources that are not loads.
+
+### R4.13 — the IV family: the residual was taken FIRST, and it refuted two of the three shapes on THIS compiler
+
+The row's own instruction is "residual print FIRST … the count per refusal
+reason IS the prediction". Taken on the post-R4.7 compiler:
+
+**Shape (1), the pointer / 64-bit IV.** `hir/pass/iv.rs` already implements it
+and is shipped default-OFF on a measurement (§13k). Re-measured on today's
+compiler with `ZCC_IV=1`, the whole suite: **INSN 1.1493 → 1.1538 and sqlite
+grows** — still negative, and now for a sharper reason than in §13k. A64's
+scaled-index addressing makes rebuilding an address from a counter free, and
+R4.7 has just removed the last thing that was NOT free about it: the `sxtw` in
+the ALU that fed the chain. **Category (a) — fundamental on this target**, and
+the gate §13k named ("re-opening needs a cost model that can say WHEN a
+writeback pays") is not discharged. The pass stays off.
+
+**Shape (2), the count-down IV whose decrement sets the flags.** The premise was
+that gcc's `subs w1,w1,#1 ; bpl` beats zcc's separate compare. Counted on the
+emitted code: zcc's `j >= 0` test is ALREADY one instruction — `tbz` on the sign
+bit, the §17 row that has been shipped since R3 — so `sub` + `tbz` is two
+instructions against gcc's `subs` + `bpl`, also two. **There is nothing here to
+win**; the shape was read off gcc's output and assumed to be a gap without
+counting zcc's. Category (a). What the row's *general* form does buy — a compare
+that the arithmetic before it has already performed, when the two are not
+adjacent — shipped in R4.7 as the `cmp_elim` window.
+
+**Shape (3), strength-reducing `i*j+k` in a nested loop.** Half of it was a
+BUG, not a missing theorem: LICM had hoisted `i*j` out of the inner loop and
+isel's `madd` row was pulling it back in, every iteration. Fixed under R4.7
+(cross-block `Mul3` refused) and d2 went **2.111 → 1.500** with the multiply
+gone from the loop. The remaining half is real and is what gcc's `-ftree-slsr`
+does: gcc's inner loop is **5** instructions to zcc's **6** because its loop
+COUNTER *is* `i*j+k` — one add-IV serving both the value and the exit test,
+where zcc keeps a counter and computes the value from it. That needs a new IV to
+be created, the exit condition rewritten in terms of it, and the old counter
+proven dead — a genuine SCEV/`iv.rs` theorem with its own commuting square.
+**Category (b), and it is the ONLY (b) left in this row**; it owns one program
+(d2, now 1.500×) and is re-ranked accordingly.
+
+**So R4.13 as written is discharged**: two of its three shapes are category (a)
+on this target — measured, not argued — and the third has had its bug half
+banked. The residual add-IV theorem stays a row, but it no longer sits second in
+the order: **the hot-loop inspection's own numbers now put j5 (2.857×, and 81%
+of the suite's absolute wall time) squarely on R4.5** — `cmp; movz; csel; cbnz`
+per iteration where gcc branches on flags — with R4.9's repeated `p[j]` load and
+R4.11's block layout behind it. The order below is amended on that measurement.
 
 ### THE MISSING DUAL — why a row can be right about size and blind about time
 

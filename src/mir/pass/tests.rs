@@ -266,3 +266,33 @@ fn shrink_wrap_moves_saves_off_the_fast_path() {
         "shrink_wrap did not move the saves off the entry"
     );
 }
+
+#[test]
+fn a_no_op_extension_leaves_the_alu_operand_plain() {
+    // R4.7's Law-4 residual: `ext_lattice` removed the standalone `sxtw`, but
+    // an extension that rides INSIDE an operand (`add x1,x1,w0,sxtw`) is a
+    // different instruction from the plain form — 2 cycles against 1 — and the
+    // lattice never looked at it. `s += (x*y+k)&31` put one on the
+    // loop-carried recurrence of d2_nested_loops (2.11×) for an extension that
+    // provably does nothing: `and w,#31` leaves bits 63:32 zero and bit 31
+    // clear, which is exactly what `sxtw` would write.
+    use crate::mir::{MInst, Rhs};
+    let src = "long f(int n,int x,int y){long s=0;int k;\
+               for(k=0;k<n;k++)s+=(x*y+k)&31;return s;}\
+               int main(void){return (int)f(9,3,4);}";
+    let ast = frontend(src);
+    let h = hir::build::build(&ast);
+    let p = allocated(&h).unwrap();
+    let f = p.funcs.iter().find(|f| f.name == "f").unwrap();
+    let ext = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::Alu { b: Rhs::Extended(..), .. }))
+        .count();
+    assert_eq!(ext, 0, "a provably no-op extension stayed in the operand");
+    same(src);
+    // …and one that is NOT a no-op must stay: the value's top bits are unknown.
+    same("long f(int n,int*a){long s=0;int k;for(k=0;k<n;k++)s+=a[k];return s;}\
+          int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i-9;return (int)f(4,a);}");
+}

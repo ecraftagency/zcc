@@ -77,6 +77,7 @@ pub fn run(f: &mut MFunc) {
             if let Some(rep) = redundant(&f.blocks[bi].insts[i], &known) {
                 f.blocks[bi].insts[i] = rep;
             }
+            plain_operand(&mut f.blocks[bi].insts[i], &known);
             record(&f.blocks[bi].insts[i], &mut known, &width);
         }
     }
@@ -94,9 +95,9 @@ fn record(i: &MInst, known: &mut HashMap<VReg, Known>, width: &dyn Fn(Reg) -> Wi
         MInst::Load { op, dst, .. } => {
             match op {
                 MemOp::B => set(*dst, 8, true),
-                MemOp::SB => set(*dst, 8, false),
+                MemOp::SB | MemOp::SBX => set(*dst, 8, false),
                 MemOp::H => set(*dst, 16, true),
-                MemOp::SH => set(*dst, 16, false),
+                MemOp::SH | MemOp::SHX => set(*dst, 16, false),
                 MemOp::W => set(*dst, 32, true),
                 MemOp::SW => set(*dst, 32, false),
                 _ => {}
@@ -180,4 +181,55 @@ fn redundant(i: &MInst, known: &HashMap<VReg, Known>) -> Option<MInst> {
         return None;
     }
     Some(MInst::Copy { w, dst, src })
+}
+
+/// The same fact, applied to an extension that rides INSIDE an operand.
+///
+/// `add x1, x1, w0, sxtw` and `add x1, x1, x0` are the same value when the
+/// extension is a no-op — and they are NOT the same instruction: the
+/// extended-register form is a 2-cycle operation where the plain one is 1
+/// (DDI 0487 C6.2.4 is silent on timing; the latency is the measured Side-II
+/// fact of §13n's "MISSING DUAL"). On a LOOP-CARRIED recurrence that is the
+/// whole difference — `s += a[i] & 31` runs at half speed for an extension
+/// that does nothing (d2_nested_loops, 2.11×). `cost = |MIR|` scores the two
+/// identically, which is exactly why this is proven on the lattice and not
+/// discovered on the clock.
+///
+/// COMMUTING SQUARE: the rewrite fires only when the recorded fact says bits
+/// 63:32 ALREADY hold what the extension would put there, so the two operands
+/// denote the same 64-bit value; the destination, the flags and every other
+/// field are untouched. The fact itself is established only by instructions
+/// whose architectural definition establishes it (see `record`).
+fn plain_operand(i: &mut MInst, known: &HashMap<VReg, Known>) {
+    let (w, b) = match i {
+        MInst::Alu { w, b, .. } | MInst::Cmp { w, b, .. } => (*w, b),
+        _ => return,
+    };
+    // the fold is about the 64-bit form only: at `w` there is nothing above
+    // bit 31 for an extension to write
+    if !w.is64() {
+        return;
+    }
+    let (r, e) = match b {
+        Rhs::Extended(r, e, 0) => (*r, *e),
+        _ => return,
+    };
+    let k = match r {
+        Reg::V(v) => match known.get(&v) {
+            Some(k) => *k,
+            None => return,
+        },
+        Reg::P(_) => return,
+    };
+    // `uxtw` is a no-op when bits 63:32 are already zero; `sxtw` when they
+    // already hold bit 31 — which a `w`-form write with a clear bit 31 gives
+    // (top zero, sign zero), as does a value already sign-extended over 64.
+    let noop = match e {
+        ExtKind::Uxtw => k.w32 || (k.zero && k.bits <= 32),
+        ExtKind::Sxtw => (k.w32 && k.zero && k.bits <= 31) || (!k.w32 && !k.zero && k.bits <= 32),
+        _ => false,
+    };
+    if noop {
+        *b = Rhs::Reg(r);
+    }
 }
