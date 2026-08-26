@@ -125,6 +125,98 @@ fn switch_chains() {
     ]);
 }
 
+// promote (REARCH.md §13p, R4.16) — region-resident spill: a memory-resident
+// value a wholly-free callee-saved register could hold goes back to a register.
+#[test]
+fn promote_moves_a_spilled_value_out_of_memory() {
+    // THE MEANING half. These force spilling (many values live across calls) and
+    // exercise the fixed-use path specifically: a promoted value read into an ABI
+    // argument register before a call must keep its `mov` and NOT be propagated
+    // into the call — the miscompile the guard fixes (torture 20180921-1).
+    same_all(&[
+        "int e(int x){return x+1;}\
+         int hot(int p){int a=e(p),b=e(p),c=e(p),d=e(p),f=e(p),g=e(p);\
+           return e(p)+a+b+c+d+f+g+e(p)*p+p;}\
+         int main(void){return hot(3);}",
+        "int e(int a,int b){return a-b;}\
+         int hot(int p){int s=0,i;for(i=0;i<8;i++)s+=e(p,i)+e(i,p);return s+p;}\
+         int main(void){return hot(5);}",
+        "int fib(int n){return n<2?n:fib(n-1)+fib(n-2);} int main(void){return fib(13);}",
+    ]);
+
+    // THE EFFECT half — otherwise the meaning half stays green for a pass that
+    // promotes NOTHING. Promotion fires only where the allocator LEFT a
+    // callee-saved register free while spilling, a suboptimality that appears at
+    // scale (sqlite3VdbeExec) but not in a small clean function, so the mechanism
+    // is exercised on a hand-built physical function: one spill store dominating
+    // three reloads, x19–x28 all free. Promotion must convert every reload out of
+    // memory (no `Reload` survives), route the value through a callee-saved
+    // register (a `Copy` reads one), and record it in `saved` so `frame` preserves
+    // it.
+    use crate::mir::*;
+    let alu = |dst: u8, a: u8| MInst::Alu {
+        op: AluOp::Add,
+        w: Width::W64,
+        dst: Reg::P(PReg::gpr(dst)),
+        a: Reg::P(PReg::gpr(a)),
+        b: Rhs::Imm(1),
+        flags: None,
+    };
+    let reload = |dst: u8| MInst::Reload { slot: 0, dst: Reg::P(PReg::gpr(dst)), w: Width::W64 };
+    let blk = |insts: Vec<MInst>, term: MTerm| MBlock {
+        params: Vec::new(),
+        insts,
+        term,
+        weight: 1,
+        labels: Vec::new(),
+    };
+    let to = |b: MBlockId| MTarget { block: b, args: Vec::new() };
+    let mut f = MFunc {
+        name: "hot".into(),
+        blocks: vec![
+            blk(
+                vec![
+                    MInst::MovImm { w: Width::W64, dst: Reg::P(PReg::gpr(0)), imm: 5 },
+                    MInst::Spill { slot: 0, src: Reg::P(PReg::gpr(0)), w: Width::W64 },
+                ],
+                MTerm::B(to(1)),
+            ),
+            blk(vec![reload(1), alu(2, 1)], MTerm::B(to(2))),
+            blk(vec![reload(3), alu(4, 3), reload(5), alu(6, 5)], MTerm::Ret),
+        ],
+        vregs: Vec::new(),
+        slots: vec![StackSlot { size: 8, align: 8, kind: SlotKind::Spill, off: 0 }],
+        entry: 0,
+        is_static: false,
+        is_weak: false,
+        order: Vec::new(),
+        laid_out: false,
+        frame_size: 0,
+        saved: RegSet::default(),
+        dyn_stack: false,
+        has_vla: false,
+        outgoing: 0,
+        fp_slot: 0,
+        cs_saves: Vec::new(),
+        physical: true,
+    };
+    super::promote::run(&mut f);
+
+    let reloads_left = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, MInst::Reload { .. }))
+        .count();
+    assert_eq!(reloads_left, 0, "promotion left a reload in memory");
+    let via_callee = f.blocks.iter().flat_map(|b| b.insts.iter()).any(|i| {
+        matches!(i, MInst::Copy { src: Reg::P(p), .. } if isa::is_callee_saved(*p))
+    });
+    assert!(via_callee, "the value was not routed through a callee-saved register");
+    let saved_a_callee = f.saved.iter().any(isa::is_callee_saved);
+    assert!(saved_a_callee, "the promoted register was not added to `saved`");
+}
+
 #[test]
 fn high_pressure_forces_the_spiller() {
     // More simultaneously live values than k = 26 general registers, so the

@@ -16,6 +16,7 @@
 pub mod color;
 pub mod destruct;
 pub mod live;
+pub mod promote;
 pub mod spill;
 #[cfg(test)]
 mod tests;
@@ -48,6 +49,10 @@ pub fn allocate(f: &mut MFunc) -> Result<(), String> {
     }
     f.saved = saved;
     f.physical = true;
+    // R4.16: a value the spiller sent to memory, but which a wholly-free
+    // callee-saved register could hold across its range, goes back into a
+    // register (adds to `f.saved`, which is why it runs here, after it is set).
+    promote::run(f);
     Ok(())
 }
 

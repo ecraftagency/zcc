@@ -534,10 +534,31 @@ leads; fallback: big frame + VLA keep `SpAdj`/printed adjust) + `frame_fold_
 preserves_meaning`; full gate 15/15, provenance non-vacuous.
 **R4.12** (`csel` re-judged): paired A/B `ZCC_NOPASS=ifconv`, ON = EXEC 1.0576 /
 INSN 1.0677 vs OFF 1.0732 / 1.0694 — ON wins both axes, same distribution.
-**KEEP as-is.** **What remains in R4 is only residual: R4.8 refuted (pairing half
-shipped), R4.13/R4.14 category-(b) residuals owning one program each.** The
-allocator-mass rows (spill traffic §13n(g), edge copies (i)) are the road to
-1× from here, on the R5/§16 shelf.
+**KEEP as-is.**
+
+**R4.16 ✅ (2026-08-26) — region-resident spill (the allocator road to 1× re-opened).**
+R4 is NOT closed: 1× is the goal and sqlite stood at 1.1667×. Re-decomposed the
+excess (§13p): **ldr+str = 15,025 of the 26,179 gap (57%), and 11,532 of that is
+FRAME (spill) traffic** — `sqlite3VdbeExec` reloads the `Vdbe *p` parameter
+([sp,#96]) **116 times, stored once, never modified, while x28 sits UNUSED**;
+gcc-O1 keeps it in a callee-saved register (0 frame ops in 6,041 insns). The
+allocator's own passes UNDER-utilize the register file — the user's diagnosis,
+confirmed. `regalloc/promote.rs` puts such a value back: a spill slot with one
+store that DOMINATES its ≥3 reloads, when a callee-saved register is wholly free
+in the function, is bound to that register (store → `mov r,src`, reloads → reads
+of `r`, added to `saved`). Local copy-propagation deletes a reload whose
+destination dies in-block; a FIXED (ABI-argument) use keeps its `mov` and is
+never propagated into the call — the miscompile the guard fixes (torture
+20180921-1 segfault). sqlite **182,956 = 1.1648×** (−297 static), but the true
+win is **−2,146 memory loads** ([sp,#96] 116→1) — an EXEC/cache win geo40 CANNOT
+see (nothing in the suite spills, §19), so geo40 stays EXEC 1.049 / INSN 1.027.
+Square `promote_moves_a_spilled_value_out_of_memory` (same_all meaning + hand-built
+effect: reloads→0, callee-saved copy, saved updated); full gate 15/15.
+**STILL NOT 1×.** The dominant remaining class is spill VOLUME — VdbeExec stores
+2,810 frame slots to gcc's 0. `promote` only rescues values a FREE register can
+hold; matching gcc needs the spiller to keep values register-resident across the
+switch fan-out (lift the block-local residency truncation, §7.2) — the next lever,
+still O1, still R4.
 **R4.3 ✅ + R4.4 ✅ (2026-08-25)** — a parallel-copy destination takes its own
 dying source, and one epilogue per shape instead of one per return path (plus
 dropping frame slots nothing names): sqlite **189,279 = 1.2050×**, EXEC geomean
