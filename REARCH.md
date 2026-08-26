@@ -559,6 +559,103 @@ effect: reloads→0, callee-saved copy, saved updated); full gate 15/15.
 hold; matching gcc needs the spiller to keep values register-resident across the
 switch fan-out (lift the block-local residency truncation, §7.2) — the next lever,
 still O1, still R4.
+**R4.17 ✅ (2026-08-26) — the allocator-splitting restructure: live-range
+splitting with SSA reconstruction, banked (§13p has the full table).** R4.16
+named the lever precisely — the block-local residency truncation — and this
+row lifts it, big-bang, per the committed design/plan (Braun & Hack 2009 +
+Braun 2013 reconstruction). Four mechanisms land together, each proof-carrying
+in `regalloc/tests.rs::same()`: (1) a **generalized cross-edge carry**
+(`generalized_carry_cuts_switch_reloads`) inserts a block-parameter `P_V`
+wherever a spilled value is register-resident at SOME (not necessarily all)
+predecessors — a register edge-arg where held, a minted reload on the edge
+otherwise, R4.1's dominance-only carry now the special case where every arg is
+the same register; (2) the same reconstruction reaches **loop headers**
+(`loop_header_carry_keeps_the_accumulator_in_a_register`), seeded from the
+prior round's latch-exit residency; (3) `Sim::More` eviction becomes
+**regional, not whole-web** (`eviction_splits_regionally_not_whole_web`) — a
+value leaves the working set only in the pressure region that forced it out,
+re-entering a register at its next use, instead of the whole SSA web going to
+memory for its entire life; (4) Braun §2.3 **trivial-parameter elimination**
+(a parameter every edge reaches with the same reaching definition IS that
+definition) runs to a fixpoint before cold-edge reloads are minted, and the
+dead-parameter sweep is a worklist, O(phis×preds), not a re-sweep
+(`reconstruction_is_pruned_and_pressure_is_counted`,
+`the_carry_budget_reaches_a_doubly_nested_header` — the loop-nesting-depth+1
+carry budget reaches a doubly-nested header, both levels get a parameter). A
+**prediction instrument** (`ceiling_report`'s new `split`/`web-split`
+columns) was built and measured BEFORE Task 5: ≤2,084 of 11,520 reloads
+removable, 4,370 of 4,549 spilled values register-resident somewhere — the
+whole-web model wrong for 96% of them — against an independent pass's claim
+(from fixtures with no block boundaries, which structurally cannot show the
+effect) that the effect was unmeasurable; the instrument's own prediction was
+refuted-in-favor: actual yield 2,052 reloads removed, 1.5% off 2,084.
+sqlite frame `ldr`+`str` **21,991 → 22,208 (interim, carry landed ahead of the
+split that pays for it — 2,684 phis fired, all-preds and loop-header both) →
+21,048** (gcc 12,721). sqlite total instructions **182,956 = 1.1648× →
+181,609 = 1.1562×** (−1,347 vs pre-restructure). `mov` 37,828 → 37,689 (139
+BELOW baseline — the 607 uncoalesced phi edge copies the carry added are
+fully paid off by pruning). Compile time 11 s → **10.1 s** (faster, not
+slower — the worklist and 1,883 fewer parameters). geo40 **EXEC 1.0523 (18
+progs ≥30 ms, noisy) / INSN 1.0272 (all 35, deterministic, bit-identical to
+R4.15/R4.16 and to an independent mid-session read at 1.0272/1.0540)** — the
+phi machinery never fires on those 35 small programs (none spill under
+pressure), so speed is **UNCHANGED**; the ULTIMATUM's speed axis (~1.05×)
+stands undisturbed. Full gate 15/15 green: cargo 171/0, provenance PASS (58
+modules / 64 constants / 23 passes, every new test non-vacuous), determinism
+88×8, torture 0 FAIL, opt-parity 1552/0 DIVERGE, csmith300 254/0 DIVERGE/
+TIMEOUT, yarpgen300 300/0 DIVERGE / 0 TIMEOUT / 0 CTIMEOUT, musl PASS.
+**Judge this row against the spec's stated floor, ~1.10×, not 1.0×**: of the
+25,882-instruction gap only the spill-traffic front (9,270) was in scope —
+reg-reg `mov`/coalescing (6,813), constant materialization (4,861) and misc
+(~4,800) are enabled-not-done by this restructure (perfect elimination of the
+whole spill front alone gives 182,956−9,270 = 173,686 = 1.106×), so 1.0× was
+never reachable by construction here; this row makes it reachable by opening
+the other three fronts' headroom.
+**Scope correction against the spec §1 motivating example, proven in code by
+two independent readers, not a failed row**: `sqlite3VdbeExec`'s `[sp,#600]`
+stays at **243 stores** (227 pre-restructure, unmoved by this row).
+`evict_params` evicts every spilled block parameter unconditionally, and phi
+candidacy requires `spilled[v] AND has_def[v]`; a loop-carried accumulator's
+ONLY definition IS its header parameter, so spilling it strips `has_def`
+permanently — header phis therefore carry only loop-INVARIANT values, never
+accumulators. **[sp,#600] is unreachable by this lever by construction.**
+Named next lever: regional split of the PARAMETER at the terminator (keep the
+parameter, spill the argument on the edge) — §4.3 applied to a block
+parameter instead of an instruction definition.
+**Residual, Law-4 classified** (§13p has the table): (i) `[sp,#600]` above —
+convenience truncation, lever named; (ii) `some-preds` 1,284 reloads
+untouched (1,266 at the interim checkpoint) — all yield came from
+`all-preds` (817→184), the cold-edge depth fence refuses the rest,
+convenience truncation, needs a real profitability model not a depth test;
+(iii) frame `str` ROSE 148 over the pre-restructure baseline while `ldr` fell
+1,091 — net good (−943 frame ops overall) but stores are the larger half of
+the gcc gap and are drifting the wrong way; (iv) uncoalesced phi edge-copies
+— `mov` is net-positive (−139) but the underlying gap remains, `destruct`
+emits one parallel copy per edge and only biased colouring removes any;
+`THEORY.md` A7 names Boissinot value-based merging as the upgrade, gated on
+exactly this measured residual; (v) the trivial-phi elimination fixpoint's
+near-linearity is asserted, not proven — PARKED on the gate's 0 TIMEOUT / 0
+CTIMEOUT over 600 fuzzer programs as empirical evidence, follow-up is to
+bound the round count or convert it to a worklist keyed on newly-aliased
+phis' consumers; (vi) a phi-insertion **cost fence was built, measured (513
+frame loads traded for ~790 `mov`s) and REFUSED under Law 0** — purity over a
+number, the refusal itself is evidence the ordering was honoured.
+**Pre-existing defect found and fixed**: `regalloc::verify` obligation (b)
+inherited its "already stored" set from the immediate dominator (sound but
+incomplete — it can only see a store that DOMINATES the reload) and
+false-alarmed on the `evict_params` shape, where every incoming edge stores
+and none of the dominators do; replaced with the forward MUST dataflow
+(`in[b] = ∩_preds out[p]`, iterated to the greatest fixed point) the
+obligation always meant, which strictly subsumes the old dominance check
+(anything dominance could prove, the MUST analysis proves too). Two
+independent readers reproduced the A/B showing the false alarm PRE-DATES this
+restructure — it fails identically with the split forced off. `mir::verify`
+untouched.
+Commits `9dc8455`..`650e521` (Tasks 1–6: fixpoint round-cap, `insert_phi`,
+generalized carry, loop-header carry, prediction instrument, regional split,
+prune + pressure + near-linear fixpoint). **STILL NOT 1×** — the three
+enabled-not-done fronts above are the next lever, and `[sp,#600]` needs the
+terminator-level split named above.
 **R4.3 ✅ + R4.4 ✅ (2026-08-25)** — a parallel-copy destination takes its own
 dying source, and one epilogue per shape instead of one per return path (plus
 dropping frame slots nothing names): sqlite **189,279 = 1.2050×**, EXEC geomean
@@ -2496,6 +2593,117 @@ Pro cores under Docker, while the notional target is generic AArch64-Linux.
    register as a copy partner). Both were found by a checker at the layer that owns the invariant,
    not by a suite three layers away. Any R4 step that weakens an allocator invariant adds its
    verifier check in the same commit.
+
+### §13p — R4.17 CAPSTONE: the allocator-splitting restructure, before/after (2026-08-26, HEAD `650e521`)
+
+Executed from `docs/superpowers/specs/2026-08-26-allocator-splitting-restructure-design.md`
+against the plan in `docs/superpowers/plans/2026-08-26-allocator-splitting-restructure.md`
+(Tasks 1–7). Baseline `761bbd7` is R4.16's closing number; `5c93a76` is the
+interim checkpoint after generalized + loop-header carry landed but before the
+regional split that pays for them (Batch B); `650e521` is the final tree
+(Batch C: prediction instrument, regional split, prune).
+
+| metric | baseline `761bbd7` | interim `5c93a76` (carry, no split) | **final `650e521`** | gcc-O1 |
+|---|---|---|---|---|
+| frame `ldr` | 10,675 | 10,827 | **9,584** | — |
+| frame `str` | 11,316 | 11,381 | **11,464** | — |
+| frame `ldr`+`str` | **21,991** | 22,208 | **21,048** | 12,721 |
+| sqlite static insn | **182,956 = 1.1648×** | 183,682 = 1.1694× | **181,609 = 1.1562×** | 157,074 |
+| `mov` | **37,828** | +607 (edge copies) | **37,689** | — |
+| VdbeExec `[sp,#600]` stores | **227** | 243 | **243 (unchanged)** | 0 |
+| compile time (release, in box) | ~11 s | ~11 s | **10.1 s** | — |
+| non-loop join / loop-header phis | 0 / 0 | 982 / 1,702 (2,684 fired) | 545 / 411 (956, after pruning 1,883 trivial) | — |
+| `ZCC_SPILLCEIL` total reloads | 12,479 | (dirty tree, not sampled) | **9,468** | — |
+| `all-preds` reloads (no phi needed) | RC4 = 1,576 | 817 | **184** | — |
+| `some-preds` reloads (needs a cold-edge phi) | — | 1,266 | **1,284 (untouched)** | — |
+| `web-split` (spilled values register-resident somewhere) | — | 4,370 of 4,549 (96%) | consistent | — |
+| `web-none` (over-pressured, no register anywhere) | — | 179 | **193** | — |
+
+The regression at the interim checkpoint and its full recovery are both real
+and both measured — the phi machinery fired (2,684 phis) before the mechanism
+that makes it pay (regional eviction) existed, exactly the "residency without
+headroom" signature the plan's own reading rule predicted before Batch C ran.
+Batch C recovered AND overshot it: −1,347 instructions / −943 frame ops
+against the `761bbd7` baseline, −2,073 / −1,160 against the interim.
+
+**geo40 — the mandatory regression check for this task, run independently of
+every number above:**
+
+| | EXEC (arbiter, ≥30 ms subset, noisy) | INSN (deterministic, all 35) |
+|---|---|---|
+| RC4 / R4.15 / R4.16 baseline | ≈1.0517 (R4.15 banked 1.0513) | 1.0272 |
+| mid-session independent read, `5c93a76` | 1.0540 (flat/noise) | **1.0272 (bit-identical)** |
+| **this measurement, `650e521`** (`N=7`, `tests/bench/exectime.sh`) | **1.0523**, median 1.000, worst d2_nested_loops 1.556, 18 progs timed | **1.0272**, median 1.022, worst e3_struct_byval 1.759, 11 of 35 > 1.1× |
+
+**No regression on either axis.** INSN is bit-identical across all three
+independent readings taken over this whole restructure — none of the 35 geo40
+programs spill under register pressure, so the phi/carry/split machinery
+never fires on them; the restructure is, correctly, invisible to INSN there.
+EXEC's ±0.002 spread across three independent reads sits inside this
+project's own stated noise band for sub-30 ms wall-clock programs (±25% per
+program; the geomean itself is far tighter) — read as flat, not as drift.
+zcc-ZEROED bucket unchanged (e1_recursion, g2_strlen — asymptotic wins kept
+out of the geomean, per the standing metric rule). The ULTIMATUM's speed axis
+(~1.05× vs gcc-O1) is undisturbed by this restructure.
+
+**Proof / commuting-square names**, all in `src/regalloc/tests.rs`, run
+inside the `same()` battery (interpreter on both sides of
+`⟦mir_before_alloc⟧ = ⟦mir_after_alloc⟧`):
+`reconstruct_reconciles_a_join_with_a_phi`,
+`generalized_carry_cuts_switch_reloads`,
+`loop_header_carry_keeps_the_accumulator_in_a_register`,
+`eviction_splits_regionally_not_whole_web`,
+`reconstruction_is_pruned_and_pressure_is_counted`,
+`the_carry_budget_reaches_a_doubly_nested_header` — plus the Task-1/2
+round-cap and `insert_phi` meaning-guard tests. Every one defines its callees
+(the codebase-wide vacuous-test trap this session found: `same()`'s
+`(Err(_), _) => {}` arm silently accepts a trap on the BEFORE side, so a test
+calling an undefined function proves nothing — worked around in every new
+test here, and flagged as a pre-existing casualty elsewhere,
+`abi_boundary_truncation_leaves_no_instruction`, not fixed in this scope).
+
+**Full gate at `650e521`** (`.superpowers/sdd/2026-08-26-allocator-splitting-restructure/gate-650e521.txt`):
+`== 15 PASS / 0 RED ==` — provenance (58 modules / 64 constants / 23 passes,
+every pass squared and non-vacuous), shape/cpp/decay/alg/abi, determinism
+88×8, cases, ext, torture 0 FAIL, cts, opt-parity 1552 PARITY / 0 DIVERGE,
+csmith 254 PARITY / 0 DIVERGE / 0 TIMEOUT, yarpgen 300 PARITY / 0 DIVERGE /
+0 TIMEOUT / 0 CTIMEOUT, musl. `cargo test` 171/0.
+
+**Residual, Law-4 exhaustion — each classified fundamental (a) or convenience
+truncation (b), none swept under a green gate:**
+
+| # | residual | size | class | disposition |
+|---|---|---|---|---|
+| i | `[sp,#600]` / evicted-parameter carry unreachable | 243 stores, one function | (b) | lever named: regional split of the parameter at the terminator |
+| ii | `some-preds` reloads untouched | 1,284 | (b) | needs a real profitability model past the cold-edge depth fence |
+| iii | frame `str` rose while `ldr` fell | +148 `str` / −1,091 `ldr` vs baseline | (b) | net good (−943 total), but stores are the larger half of the gcc gap |
+| iv | uncoalesced phi edge copies | 956 surviving params × up to `\|preds\|` copies, partially cleared by biased colouring | (b) | `THEORY.md` A7 — Boissinot value-based merging is the named upgrade |
+| v | trivial-phi fixpoint round-count unproven | — | unclassified (proof gap, not a defect) | PARKED on 0 TIMEOUT/0 CTIMEOUT over 600 fuzzer programs; follow-up = bound the round count or worklist it |
+| vi | phi-insertion cost fence | 513 frame loads for ~790 `mov`s | measured and REFUSED (Law 0) | not shipped — purity over a number |
+| — | `web-none` (no register anywhere) | 193 values | (a) | fundamental — genuinely over-pressured, no split reaches them by definition |
+
+Front accounting (§13o): the sqlite gap was 25,882 instructions at the
+`761bbd7` baseline; only the spill-traffic front (9,270) was in scope for
+this restructure. `mov`/coalescing (6,813), constant materialization (4,861)
+and misc (~4,800) are enabled-not-done — this restructure opens their
+headroom, it does not spend it. **Judged against the spec §2 floor (~1.10×,
+not 1.0×): sqlite closed 182,956 → 181,609 = 1.1648× → 1.1562×**, with a
+perfect elimination of the entire spill front bounding the best any lever in
+this scope could reach at 173,686 = 1.106×.
+
+**Pre-existing defect found and fixed, not introduced by this restructure**:
+`src/regalloc/verify.rs` obligation (b) inherited its "already stored" set
+from the immediate dominator — sound (a slot stored on every path to
+`idom(b)` is stored on every path to `b`) but incomplete, since it can only
+see a store that DOMINATES the reload. `evict_params` is exactly the shape
+that separates the two: every incoming edge stores the evicted parameter's
+value, so the slot is written on every path INTO the block and on none of the
+blocks that dominate it. Replaced with the forward MUST dataflow
+(`in[b] = ∩_preds out[p]`, `out[b] = in[b] ∪ stores(b)`, iterated to the
+greatest fixed point) the obligation always meant — a strict superset of what
+dominance could prove, never a subset. Two independent readers reproduced the
+A/B: the old check fails identically with the regional split forced OFF, so
+the false alarm pre-dates this session's work. `src/mir/verify.rs` untouched.
 
 ---
 

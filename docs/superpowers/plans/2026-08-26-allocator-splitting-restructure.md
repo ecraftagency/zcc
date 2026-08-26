@@ -439,4 +439,151 @@ Only on explicit user instruction (RC cuts are user-gated): `git checkout main &
 
 ## Progress
 
-(Task 0 fills this in.)
+**Executed 2026-08-26, branch `mir-rearch`, no worktree (user-directed). Batched
+2 tasks at a time (Batch A = Tasks 1+2, Batch B = Tasks 3+4, Batch C = Tasks
+5+6, instrumented first), full gate after every 2 batches, `cargo test`-only
+between. All seven tasks landed; full gate green at HEAD `650e521`; BANKED,
+not quarantined.** Controller ledger with every measurement, ruling and
+finding: `.superpowers/sdd/2026-08-26-allocator-splitting-restructure/progress.md`;
+Batch-C implementer report: `.superpowers/sdd/2026-08-26-allocator-splitting-restructure/batch-C-report.md`.
+
+### Baseline (Task 0, HEAD `761bbd7`)
+
+frame `ldr` 10,675 + `str` 11,316 = **21,991** (gcc-O1 12,721); sqlite static
+insn **182,956 = 1.1648×** (gcc-O1 157,074); `ZCC_SPILLCEIL`: reloads=12,479
+ceil=3,502 in-loop=7,661 all-preds=1,182 all-preds-in-loop=780 remat=956.
+
+### Batch A — Task 1 (fixpoint round-cap, flag OFF) + Task 2 (`insert_phi`)
+
+Commits `9dc8455`, `d17fa3f`. `cargo test` 166/0; provenance PASS; refactor
+gate byte-identical over 57 programs (both tasks ship flag-OFF / unwired, so
+the tree cannot yet change output — verified, not assumed). Found: the
+codebase-wide vacuous-test trap (`same()`'s `(Err(_), _) => {}` arm accepts
+any BEFORE-side trap silently); worked around in every new test from here on,
+and named as a pre-existing casualty elsewhere
+(`abi_boundary_truncation_leaves_no_instruction`), not fixed in this scope.
+Confirmed by forcing the flag ON: the Task-1 carry provably cannot fire
+before Task 3's reconstruction exists (zero back-edge carries, byte-identical
+output) — reconstruction is a precondition, not an independent follow-on.
+
+### Batch B — Task 3 (generalized cross-edge carry) + Task 4 (loop-header carry)
+
+Commits `fb20d9c`, `5c93a76`. `cargo test` 168/0, provenance PASS. **KPI
+regressed as predicted for a half-built mechanism**: frame 21,991 → 22,208
+(+217), insn 182,956 → 183,682 (+726), VdbeExec `[sp,#600]` stores 227 → 243.
+Carries fired hard (`ZCC_PHICOUNT`): 982 non-loop join phis + 1,702
+loop-header phis = 2,684 (model had predicted all-preds 1,182 /
+all-preds-in-loop 780). Per the reading rule fixed before the number arrived
+— carry fires, traffic worse, block-params up = "residency without
+headroom", the predicted half-built signature — this was a diagnostic
+checkpoint, not a quarantine trigger; ruled ADVANCE to Task 5.
+
+Two defects found and fixed inside the batch, both real: (i) an
+**infinite-loop miscompile** — `evict_params` leaves a name with uses and no
+def (its def is the per-edge store), and carrying a register copy of it
+around a back edge hands the next iteration the stale previous value; fenced
+with `has_def`. Consequence, load-bearing for the rest of this session: a
+header phi CANNOT carry a loop-carried accumulator (that is exactly the
+evicted-parameter case), so **spec §1's `[sp,#600]` example is not reachable
+by this lever** — discovered here, confirmed independently twice more below.
+(ii) a **compile hang** (`sqlite3BitvecBuiltinTest`, 113,024 rounds) from an
+oscillating residency re-computation; fixed by dropping the cross-round
+register-residency fixpoint entirely — a plan is accepted un-converged on the
+argument that it is self-consistent within its own round, carry budget =
+loop-nesting-depth+1.
+
+Full gate at `5c93a76`: **15 PASS / 0 RED**, provenance PASS, determinism
+88×8, torture 0 FAIL, opt-parity 1552/0, csmith 254/0, yarpgen 300/0, musl
+PASS — correct so far, size negative only. Independent review (Batch A+B):
+SPEC/QUALITY approved with 1 Important (relayed to Batch C: the flat
+round-cap assumed monotone `entry_resident`, which the fix above sidesteps by
+dropping the cross-round fixpoint) + minors; independently reproduced the
+`[sp,#600]`-unreachable finding by reading `evict_params`/`phi_cand` in code.
+
+### Batch C — prediction instrument + Task 5 (regional split) + Task 6 (prune)
+
+Worktree build, merged fast-forward: `0f11a85` (instrument), `fb665dd`
+(Task 5), `650e521` (Task 6). `cargo test` 171/0, provenance PASS (58 modules
+/ 64 constants / 23 passes).
+
+**Instrument first, per the ruling that Task 5 was the one task with no
+prediction.** `ceiling_report` gained `split`/`web-split`/`web-none` columns.
+Measured on sqlite at `5c93a76`, read-only (KPI unchanged): **≤2,084 of
+11,520 reloads removable** (of which 817 need no phi — resident at every
+predecessor), **4,370 of 4,549 spilled values register-resident somewhere**
+— the whole-web eviction model wrong for 96% of them. This directly refuted
+an independent mid-session pass that had concluded (from fixtures with no
+block boundaries — structurally incapable of showing the effect) that
+whole-web eviction "may not cost real size"; Batch C reproduced that negative
+result exactly before contradicting it with a measurement that cuts the
+other way.
+
+**Actual yield: 2,052 of 11,520 reloads removed (11,520 → 9,468), 1.5% off
+the 2,084 prediction.** sqlite frame `ldr`+`str` 22,208 → **21,048**; static
+insn 183,682 → **181,609**; `mov` 37,689 (139 below the `761bbd7` baseline —
+Batch B's +607 edge copies fully paid off by pruning); compile time
+~11 s → **10.1 s**. **The Batch-B regression is recovered and overshot**:
+−1,347 instructions / −943 frame ops against the `761bbd7` baseline.
+
+Task 5 found and fixed a second pre-existing defect: `regalloc::verify`
+obligation (b) inherited "already stored" from the immediate dominator and
+false-alarmed on the `evict_params` shape (every incoming edge stores, none
+of the dominators do); replaced with the forward MUST dataflow the
+obligation always meant, which strictly subsumes the old check. A/B'd with
+the split forced OFF to prove the false alarm pre-dates this session — it
+does. `mir::verify` untouched. A phi-insertion cost fence (trading frame
+loads for `mov`s) was built, measured (513 loads for ~790 movs), and
+**refused under Law 0** — not shipped.
+
+Full gate at `650e521`: **15 PASS / 0 RED** — provenance, shape, cpp, decay,
+alg, abi, determinism 88×8, cases, ext, torture 0 FAIL, cts, opt-parity 1552
+PARITY / 0 DIVERGE, csmith 254 PARITY / 0 DIVERGE / 0 TIMEOUT, yarpgen 300
+PARITY / 0 DIVERGE / 0 TIMEOUT / 0 CTIMEOUT, musl. Log:
+`.superpowers/sdd/2026-08-26-allocator-splitting-restructure/gate-650e521.txt`.
+Independent review (Batch C): SPEC/QUALITY approved for the instrument, Task
+5 and Task 6, all four Q-items (termination, `has_def` fence, non-vacuity,
+`regalloc::verify` strengthening) verified in code, one Important parked (the
+trivial-phi elimination fixpoint's near-linearity is asserted, not proven —
+see Task 7 residual below).
+
+### Task 7 — final measurement (this record)
+
+**geo40 regression check** (`ZCC_REL=1 sh tests/box.sh s
+'SUITE=... N=7 sh tests/bench/exectime.sh'`, HEAD `650e521`): **EXEC geomean
+1.0523** (arbiter, 18 timed programs ≥30 ms, noisy — median 1.000, worst
+d2_nested_loops 1.556), **INSN geomean 1.0272** (deterministic, all 35
+programs — median 1.022, worst e3_struct_byval 1.759). Both bit-/near-
+identical to the RC4 baseline (~1.0517 / 1.0272) and to an independent
+mid-session read at `5c93a76` (1.0540 / 1.0272 bit-identical) — **no speed
+regression**; the phi/carry/split machinery never fires on the 35 geo40
+programs (none of them spill under pressure), so INSN is untouched by
+construction and EXEC's small spread across three independent reads is
+inside this project's own stated noise band for sub-30 ms wall time. Full
+seven-step brief followed; see `REARCH.md` §12 (new **R4.17** row) and §13p
+for the complete before/after table, the proof/square names, and the
+Law-4-classified residual list. Committed as `REARCH.md` +
+this file only, per the brief — push is the controller's call, not made
+here.
+
+### Final KPI vs baseline and gcc-O1
+
+| | baseline `761bbd7` | final `650e521` | gcc-O1 |
+|---|---|---|---|
+| frame `ldr`+`str` | 21,991 | **21,048** | 12,721 |
+| sqlite static insn | 182,956 = 1.1648× | **181,609 = 1.1562×** | 157,074 |
+| `mov` | 37,828 | **37,689** | — |
+| VdbeExec `[sp,#600]` stores | 227 | **243** | 0 |
+| compile time (release, box) | ~11 s | **10.1 s** | — |
+| geo40 EXEC / INSN | ~1.0517 / 1.0272 | **1.0523 / 1.0272** | 1.0 / 1.0 |
+
+**Judged against the spec §2 floor of ~1.10×, not 1.0×** (only the
+9,270-instruction spill-traffic front of the 25,882-instruction gap was in
+scope; `mov`/coalescing, constant materialization and misc are
+enabled-not-done): the restructure is **BANKED**, correctness intact (full
+gate green throughout, two pre-existing defects found and fixed along the
+way, one cost fence measured and refused under Law 0), speed axis
+undisturbed, size improved beyond the pre-restructure baseline and past the
+interim regression it passed through on the way. The spec §1 motivating
+example (`[sp,#600]`) is a named, proven-in-code scope correction, not a
+failure — the lever that would reach it (regional split of a block parameter
+at the terminator) is recorded in `REARCH.md` §12/§13p for the next session.
