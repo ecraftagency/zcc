@@ -318,6 +318,23 @@ fn a_variably_indexed_array_stays_in_memory() {
 }
 
 #[test]
+fn a_pointer_local_dead_across_a_loop_is_promoted_by_pruned_ssa() {
+    // Regression (csmith c2331 miscompile / c6148 SIGSEGV). A pointer-valued local
+    // `p` is defined from a global chain, dereferenced to read and write, and dead
+    // — all within one loop-body block. Its store is a pointer written and read
+    // back inside that block; nothing reads `p` on any later block. MINIMAL SSA
+    // (parameters at the whole iterated dominance frontier of the stores) threaded
+    // its value through the loop header as a block parameter no one reads; that
+    // dead loop-carried parameter is a no-op in HIR but the backend miscompiled it.
+    // PRUNED SSA gates placement on liveness, so a piece live in a single block
+    // gets no parameter. The commuting square (opt == -O0 == the reference exit)
+    // is the proof; g = 3 + (0+1+..+6) = 24.
+    let src = "int main(void){int g=3;int*q=&g;int i;\
+               for(i=0;i<7;i++){int*p=q;int v=*p;*p=v+i;}return g&0x7f;}";
+    square(src, 24);
+}
+
+#[test]
 fn gvn_sees_through_a_promoted_local() {
     // The R2.1 form of this test could only dedup a global's address, because
     // every local was a memory cell and two reads of it were two loads. After

@@ -304,6 +304,59 @@ fn promote(f: &mut Func, pieces: &[Piece]) -> bool {
             }
         }
     }
+    // PRUNED SSA (Choi–Cytron–Sarkar 1991). Minimal SSA places a parameter at
+    // every iterated-DF block of a piece's stores whether or not the value is READ
+    // there. A piece used only inside its defining block then still collects dead
+    // parameters carried around every enclosing loop: a semantic no-op in HIR, but
+    // it extends the live range into the loop and hands the backend a loop-carried
+    // block parameter it miscompiles (csmith c2331 — the store `frame[16]=v` is a
+    // pointer read back and dereferenced entirely within one block, yet minimal SSA
+    // threaded its value through the loop header). Gating placement on liveness
+    // removes them, and a parameter that carries no live value cannot exist.
+    //   uev[b][k]  — a load of k in b not preceded by a store of k in b.
+    //   kill[b][k] — a store of k in b (it defines the piece, ending upward liveness).
+    let mut uev = vec![vec![false; nv]; n];
+    let mut kill = vec![vec![false; nv]; n];
+    for b in 0..n {
+        let mut stored = vec![false; nv];
+        for inst in &f.blocks[b].insts {
+            match inst {
+                Inst::Load { addr: Operand::Val(a), .. } => {
+                    if let Some(&k) = var_of_addr.get(a) {
+                        if !stored[k] {
+                            uev[b][k] = true;
+                        }
+                    }
+                }
+                Inst::Store { addr: Operand::Val(a), .. } => {
+                    if let Some(&k) = var_of_addr.get(a) {
+                        stored[k] = true;
+                        kill[b][k] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // live_in[b][k] = uev[b][k] ∨ (live_out[b][k] ∧ ¬kill[b][k]),
+    // live_out[b][k] = ⋃_{s∈succ(b)} live_in[s][k]. Backward to a fixed point.
+    let mut live_in = vec![vec![false; nv]; n];
+    let mut going = true;
+    while going {
+        going = false;
+        for b in (0..n).rev() {
+            for k in 0..nv {
+                if live_in[b][k] {
+                    continue;
+                }
+                let live_out = c.succs[b].iter().any(|&s| live_in[s as usize][k]);
+                if uev[b][k] || (live_out && !kill[b][k]) {
+                    live_in[b][k] = true;
+                    going = true;
+                }
+            }
+        }
+    }
     // `added[b]` = the variables that gained a parameter at b, in the order the
     // parameters were appended — the same order every incoming edge appends its
     // arguments in.
@@ -358,6 +411,8 @@ fn promote(f: &mut Func, pieces: &[Piece]) -> bool {
             ever[b as usize] = false;
             seen[b as usize] = false;
         }
+        // PRUNED SSA: keep only the frontier blocks where the piece is live-in.
+        sites.retain(|&y| live_in[y as usize][k]);
         if sites.iter().any(|&y| argless[y as usize]) {
             promoted[k] = false;
             continue;
