@@ -511,13 +511,33 @@ R4.8 REFUTED by it: frame slot-touches are 35,550 against gcc's 34,931 (+1.8%),
 so the spiller is at parity on VOLUME and the whole +5,044 frame excess is
 PAIRING DENSITY (39.6% of touches paired against gcc's 65.6%). The pairing half
 shipped — spills-first frame layout and a window that looks past disjoint frame
-accesses — for sqlite **186,262 = 1.1858×**. **Next ⬜ is R4.15**: the frame
-adjust becomes a real MIR instruction so an ordinary pass can fold it into the
-first save pair, ≈3,300 instructions, the largest named card left.
+accesses — for sqlite **186,262 = 1.1858×**. R4.15 (below) then made the frame
+adjust a real MIR instruction and folded it into the first save pair, ≈3,300
+instructions — the largest named card, now banked.
 **R4.6 ✅ + R4.10 ✅ (2026-08-26)** — constants value-numbered (not copied, and
 not across a call) and the copy-partner graph followed transitively: sqlite
-**186,705 = 1.1886×**, EXEC unchanged at ≈1.05, INSN 1.0677. **Only R4.8 and the
-measurement R4.12 are left in R4.**
+**186,705 = 1.1886×**, EXEC unchanged at ≈1.05, INSN 1.0677.
+**R4.15 ✅ + R4.12 ✅ (2026-08-26)** — R4 CLOSED. The frame adjust is now an
+ordinary `SpAdj` MIR instruction (the "emit invents two instructions" wart gone,
+`cost = |MIR|` exact) that `frame_fold` fuses into the first save pair as a
+pre-index `stp x19,x20,[sp,#-N]!` and the last restore as a post-index `ldp …,
+[sp],#N` (DDI 0487 C6.2.130). Guards: ordinary frame (`!dyn_stack`, `outgoing=0`
+so offset 0 is free — `frame` places the callee-saves there under that
+condition), in the writeback's POSITIVE reach (pair N≤504, single N≤255 — the
+post-index end binds, was the `ldr x30,[sp],#256` reject), and the offset-0 save
+present at the prologue head / epilogue tail (the reloads commute, so it is moved
+to the tail to free last). sqlite **186,705 → 183,253 = 1.1886× → 1.1667×**
+(−3,452), geo40 **INSN 1.0677 → 1.0272**, EXEC **1.0576 → 1.0513** (0 DIVERGE) —
+a per-function −2 across the whole suite. Commuting square `frame_fold_folds_the_
+adjust_into_the_save_pair` (effect: writeback present, no `SpAdj`, pre-index
+leads; fallback: big frame + VLA keep `SpAdj`/printed adjust) + `frame_fold_
+preserves_meaning`; full gate 15/15, provenance non-vacuous.
+**R4.12** (`csel` re-judged): paired A/B `ZCC_NOPASS=ifconv`, ON = EXEC 1.0576 /
+INSN 1.0677 vs OFF 1.0732 / 1.0694 — ON wins both axes, same distribution.
+**KEEP as-is.** **What remains in R4 is only residual: R4.8 refuted (pairing half
+shipped), R4.13/R4.14 category-(b) residuals owning one program each.** The
+allocator-mass rows (spill traffic §13n(g), edge copies (i)) are the road to
+1× from here, on the R5/§16 shelf.
 **R4.3 ✅ + R4.4 ✅ (2026-08-25)** — a parallel-copy destination takes its own
 dying source, and one epilogue per shape instead of one per return path (plus
 dropping frame slots nothing names): sqlite **189,279 = 1.2050×**, EXEC geomean
@@ -1404,7 +1424,8 @@ every row, paired, in one session, as a distribution.
 | **R4.9** | **memory-aware GVN** (h) — FRE | `hir/pass/gvn.rs` + alias classes from `effects()` | count loads whose address was loaded in a dominating block with no clobbering store/call between — measured before a line is written, like R4.1 | non-frame `ldr` → ≈ gcc's 14,567; **j5 exec** | ✅ **BANKED with R4.5.** Shipped in `mem.rs`, not `gvn.rs`: `mem.rs` already had the alias oracle, and what it lacked was a block big enough to see across. A block whose ONLY predecessor is P is seeded with P's exit table — sound with no dataflow. **Residual: the fully general FRE over arbitrary control flow still needs a memory SSA — category (b), §12** |
 | **R4.10** | **Boissinot merge** on the FREE residual (i) | `regalloc/color.rs` | 4,782 | edge copies ≪ 9,332 | ⬜ |
 | **R4.11** | **rotation residual + store motion** (j): `rotate.rs` tests `pin`, not `labels`; add the refusal-reason residual print; trace and lift the early-return shape; LICM store motion for a loop-invariant address with no aliasing access | `hir/pass/rotate.rs`, `hir/pass/licm.rs` | residual print first — the count of refused loops per reason IS the prediction | **d3, d4, i1 exec**; sqlite branch count | ⬜ |
-| **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ⬜ |
+| **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ✅ **KEEP.** ON = EXEC 1.0576 / INSN 1.0677; OFF = 1.0732 / 1.0694 — ON wins both axes, identical distribution (median 1.000, worst d2 1.556). No program regresses; no narrowing warranted |
+| **R4.15** | **the frame adjust becomes an ordinary MIR instruction** (§13o), which `frame_fold` fuses into the first save pair (pre-index `stp …,[sp,#-N]!`) and the last restore (post-index `ldp …,[sp],#N`), DDI 0487 C6.2.130 | new `MInst::SpAdj` + `AddrMode::FrameWb`; `mir/pass/frame_fold.rs`; `frame` places callee-saves at offset 0; `emit` stops inventing the adjust for an ordinary frame | 1,588 `sub sp` + 1,726 `add sp` = ≈3,300 the pre/post-index forms fold for free | sqlite ≪ 186,705; the standalone adjust gone on every ordinary frame | ✅ **BANKED.** sqlite **183,253 = 1.1667×** (−3,452); geo40 INSN 1.0677 → **1.0272**, EXEC 1.0576 → **1.0513**, 0 DIVERGE. Guards: `!dyn_stack`, `outgoing=0`, pair N≤504 / single N≤255 (post-index end binds — the `ldr x30,[sp],#256` reject), offset-0 save at prologue head / epilogue tail. Square `frame_fold_folds_the_adjust_into_the_save_pair` + `_preserves_meaning`; full gate 15/15 |
 | **R4.13** | **the IV family — R2's exhaustion residual** (l, opened 2026-08-25 on the hot-loop inspection). Three shapes SCEV does not fire on, all one theorem over `scev.rs`/`iv.rs`: (1) a **pointer / 64-bit IV** where the source has a 32-bit counter — zcc recomputes `[xB, wI, sxtw #2]` every iteration, gcc walks a pointer with post-index writeback (`str w3, [x2], -4`; j5, d3); (2) a **count-down IV** whose decrement SETS THE FLAGS so the exit test is free (`subs w1,w1,#1; bpl` — j5, h2), where zcc keeps a separate `cmp`/`tbz`; (3) **strength reduction of `i*j+k` in a nested loop** to an add-IV (d2: `madd` every inner iteration vs gcc's `add`). Every one is `-O1` (`-fauto-inc-dec`, `-ftree-slsr`, IV canonicalization). NOT folded into R4.11 — that row owns rotation refusals and store motion, and Article G forbids blurring a theorem seam. §13n missed this family because it was decomposed from a STATIC sqlite histogram, where an IV shape costs zero instructions | `hir/pass/scev.rs`, `hir/pass/iv.rs`; the post-index fold is `isel/lower.rs` | **residual print FIRST**, as R4.11 requires of rotation: for every loop, is there an IV `scev` recognizes but `iv` refuses to widen/rewrite, and WHY — the count per refusal reason IS the prediction. Then per shape: (1) loops with an address `[base, w, sxtw]` on a recognized IV; (2) counted loops whose exit compare is against 0 or a hoistable bound; (3) inner-loop `mul`/`madd` on two IVs | **j5 exec** (11 → ~7 insns/iter), **d3, d2, h2 exec**; each shape's residual classified (a)/(b) | ⚠️ **RESIDUAL TAKEN → 2 of 3 shapes REFUTED on this target.** (1) pointer/64-bit IV: `ZCC_IV=1` re-measured post-R4.7 is still NEGATIVE (INSN 1.1493 → 1.1538, EXEC 1.2044 → 1.2140) — **category (a)**, the pass stays off. **RE-ENTRY TRIGGER: the time-dual cost model shipping** — that is §13k's own named gate ("re-opening needs a cost model that can say WHEN a writeback pays"), and R4.7's validated j3 cycle prediction is the argument that may open it. Re-entry is one command, no code. (2) count-down IV: zcc's `j>=0` is ALREADY one `tbz`, so `sub`+`tbz` = gcc's `subs`+`bpl` — **category (a)**, nothing to win; the general form shipped as R4.7's `cmp_elim` window. (3) `i*j+k`: the BUG half (cross-block `madd` undoing LICM) banked under R4.7, d2 **2.111 → 1.500**; the add-IV/exit-rewrite half is the ONE **category (b)** left, owning one program. **RE-ENTRY TRIGGER: after R4.5 → R4.9 → R4.11, re-measure d2** — it also carries R4.10's edge copies in the loop nest, so what is left of its gap by then may not be the add-IV at all. **The row is NOT ✅: a (b) residual means Law 4 is not satisfied, only that nothing downstream waits on it.** See "R4.13" below |
 | **R4.14** | **three orphans, one row so they stay tracked** (m, opened 2026-08-25): (1) **`x / 2^k` → `x · 2^−k`** — exact under IEEE 754 since the reciprocal of a power of two is representable, so the commuting square is an identity on every input including ±0/∞/NaN (f2: `fdiv` 10+ cyc → `fmul` 3); (2) **small dense `switch` → compare tree, not a jump table** — R3.3's density constant ("≥4 cases, ≥½ span") is exactly Article E's "the spec's number or my convenience's number?": gcc-O1 builds a `cmp`/`tbnz`/`csel`/`csinc` tree for d1's 8 cases and wins 1.33× on it, so the constant is re-judged against a measured crossover, not cited; (3) **inline a called-once function that is not `static`** — `inline.rs` requires `is_static` for the called-once rule; gcc's `-finline-functions-called-once` does not, and keeps the out-of-line body (e2: `mix` marshals 10 arguments per call). Three sites, three proofs, each a few lines; grouped only so none is lost | `hir/pass/fold.rs`; `isel/lower.rs::jump_table` (the policy constant); `hir/pass/inline.rs` | (1) count `fdiv` by a constant power of two on sqlite and the suite; (2) measure the crossover: compare-tree vs table exec at 4, 6, 8, 12, 16 cases, on the clock; (3) count non-`static` functions with exactly one call site in the module | **f2, d1, e2 exec**; each with its own square | ⬜ |
 
@@ -1422,7 +1443,7 @@ order is:
 ```
 R4.2 ✅ → R4.7 ✅ → R4.13 ⚠️ → R4.5 ✅ → R4.9 ✅ → R4.11 ✅ → R4.14 ⚠️(1 of 3)
         → R4.3 ✅ → R4.4 ✅ → R4.6 ✅ → R4.10 ✅ → R4.8 ⚠️(refuted; pairing half shipped)
-        → R4.15 (the frame adjust as a MIR instruction, ≈3,300) → R4.12
+        → R4.15 ✅ (frame adjust an `SpAdj`, folded into save pair, −3,452) → R4.12 ✅ (ifconv: KEEP)
 ```
 
 **AMENDED 2026-08-25, on R4.13's own residual print — the spine is edited IN
@@ -2393,15 +2414,11 @@ prologue and epilogue, not body spills.
   and 761 still beyond imm7 in the largest frames.
 * **≈3,300 instructions in the frame adjust**: 1,588 `sub sp` and 1,726 `add sp`
   that `stp x19,x20,[sp,#-N]!` and `ldp x19,x20,[sp],#N` fold away for free
-  (DDI 0487 C6.2.130's pre/post-indexed forms). **This is the largest single
-  named card left in the whole plan** — larger than any remaining §13o class
-  except the pairing it belongs to.
-  It is NOT a peephole and must not be written as one: `emit` currently
-  synthesises the adjust from `f.frame_size`, so folding it there would be
-  `emit` making a decision, which Article B forbids in as many words. The row is
-  **the frame adjust becomes a real MIR instruction**, after which an ordinary
-  MIR pass fuses it with the first save pair and the last restore pair — which
-  also removes the existing "emit invents two instructions" wart.
+  (DDI 0487 C6.2.130's pre/post-indexed forms). ✅ **BANKED as R4.15** — see the
+  §13n table row and the R4 status block. The adjust is now an ordinary
+  `MInst::SpAdj` (not synthesised by `emit`, so Article B is honoured and
+  `cost = |MIR|` is exact) that `mir/pass/frame_fold.rs` fuses into the first
+  save pair and last restore pair. sqlite −3,452 → **183,253 = 1.1667×**.
 
 **GATE (all green):** cargo 159/0 · fullsuite 10 PASS / 0 RED · opt-parity
 1552 / 0 DIVERGE · csmith300 254 / 0 DIVERGE / 0 NOT-IMPL · determinism 88×8.

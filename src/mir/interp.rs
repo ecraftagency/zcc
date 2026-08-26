@@ -365,6 +365,12 @@ impl<'a> Machine<'a> {
                 (fr.slot_addr[*slot as usize] as i64 + *off as i64) as u64,
                 None,
             ),
+            // The folded frame-adjust pair (REARCH §13o R4.15). Its slot sits at
+            // frame offset 0, so its address is exactly `Slot { slot, off: 0 }`;
+            // the sp writeback the real machine performs is the no-op `SpAdj` also
+            // is — the frame is already established (`push_frame`) and sp never
+            // held the caller's value inside the body. Hence no writeback pair.
+            AddrMode::FrameWb { slot, .. } => (fr.slot_addr[*slot as usize], None),
             // The outgoing-argument area rides at the CURRENT sp — that is what
             // makes it survive a `StackAlloc` (REARCH §5.2).
             AddrMode::SpArg { off } => (self.mem.sp + *off as u64, None),
@@ -820,6 +826,10 @@ impl<'a> Machine<'a> {
                 self.mem.store(a, w.bytes(), v)?;
             }
             MInst::Dmb => {}
+            // The frame adjust is a no-op here (see the type's doc): the whole
+            // frame was established at call entry and every slot is addressed
+            // absolutely, so moving sp changes nothing the abstract machine reads.
+            MInst::SpAdj { .. } => {}
             // ⟦·⟧ has one thread, so the thread pointer is the origin and the
             // two halves of the tprel pair simply re-add up to the object's
             // address — the same value the linker's relocation produces.

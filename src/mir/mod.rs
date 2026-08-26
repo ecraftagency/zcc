@@ -219,6 +219,16 @@ pub enum AddrMode {
     SpArg { off: u32 },
     /// `[sym + :lo12:]` after an `adrp` into `base`
     SymLo12 { base: Reg, sym: Sym },
+    /// A callee-save pair/single at frame offset 0 whose access ALSO carries the
+    /// frame adjustment: `[sp, #delta]!` (pre-index store, `delta < 0`) or
+    /// `[sp], #delta` (post-index load, `delta > 0`). Introduced by `frame_fold`
+    /// (REARCH §13o R4.15) from `SpAdj` + the adjacent save/restore pair. `slot`
+    /// is the object at offset 0 the abstract semantics reads/writes (so `⟦·⟧`
+    /// resolves it exactly as `Slot { slot, off: 0 }` — the interpreter's frame is
+    /// already established, and the sp writeback is the no-op `SpAdj` also is);
+    /// `delta` is the frame size, signed to name the direction, which `emit` reads
+    /// to print the writeback that the real machine uses to move sp.
+    FrameWb { slot: SlotId, delta: i32 },
 }
 
 /// AArch64 condition codes (ARM DDI 0487 C1.2.4).
@@ -569,6 +579,19 @@ pub enum MInst {
     },
     /// The same, for the outgoing-argument area: `dst = sp + off`.
     SpAddr { dst: Reg, off: u32 },
+    /// The single frame adjustment (`sub sp, sp, #N` when `delta < 0`; `add sp`
+    /// when `delta > 0`), made an ORDINARY MIR instruction so a pass can fold it
+    /// into the first/last callee-save pair (`frame_fold`, REARCH §13o R4.15) —
+    /// `emit` no longer invents it from `frame_size`. Like `MovImm`/`SlotAddr`
+    /// this is a COST EXCEPTION: a `delta` beyond imm12(<<12) needs a `movz/movk`
+    /// chain into the scratch register first, and `isa::add_imm`/`isa::mov_chain`
+    /// give the exact count before emission, so `cost = |MIR|` stays computable.
+    /// Its abstract meaning is a NO-OP: the interpreter establishes the whole
+    /// frame at call entry (`push_frame`) and addresses every slot absolutely, so
+    /// sp never holds the caller's value inside the body — the adjust it models is
+    /// already done. A dynamic frame (`StackAlloc`) keeps `emit`'s printed adjust
+    /// and never carries this instruction.
+    SpAdj { delta: i32 },
     /// EXT(gcc) `__sync_*` (ARM DDI 0487 B2.9): the load/store-exclusive pair
     /// an atomic read-modify-write is built from. `LdAxr` takes the exclusive
     /// monitor, `StlXr` releases it and reports 0 on success; the retry loop
@@ -782,7 +805,7 @@ macro_rules! visit_addr {
                 $f(base, Constraint::Use);
                 $f(wb, Constraint::Def);
             }
-            AddrMode::Slot { .. } | AddrMode::SpArg { .. } => {}
+            AddrMode::Slot { .. } | AddrMode::SpArg { .. } | AddrMode::FrameWb { .. } => {}
             AddrMode::SymLo12 { base, .. } => $f(base, Constraint::Use),
         }
     };
@@ -802,6 +825,7 @@ impl MInst {
             | MInst::StlXr { .. }
             | MInst::Stlr { .. }
             | MInst::Dmb
+            | MInst::SpAdj { .. }
             | MInst::Asm { .. } => MemEffect::Barrier,
             _ => MemEffect::None,
         }
@@ -936,6 +960,7 @@ impl MInst {
                 g(addr, Constraint::Use);
             }
             MInst::Dmb => {}
+            MInst::SpAdj { .. } => {}
             MInst::Mrs { dst } => g(dst, Constraint::Def),
             MInst::AddTprel { dst, base, .. } => {
                 g(base, Constraint::Use);
@@ -1080,6 +1105,7 @@ impl MInst {
                 f(addr, Constraint::Use);
             }
             MInst::Dmb => {}
+            MInst::SpAdj { .. } => {}
             MInst::Mrs { dst } => f(dst, Constraint::Def),
             MInst::AddTprel { dst, base, .. } => {
                 f(base, Constraint::Use);

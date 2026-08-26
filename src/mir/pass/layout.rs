@@ -95,6 +95,16 @@ fn relax_branches(f: &mut MFunc) {
             .iter()
             .map(|i| match i {
                 MInst::MovImm { imm, w, .. } => isa::mov_chain(*imm, *w == Width::W64).len(),
+                // R4.15: the frame adjust is one `sub`/`add` when the immediate
+                // fits, else a `movz/movk` chain into the scratch then the op.
+                MInst::SpAdj { delta } => {
+                    let n = (*delta).unsigned_abs() as i64;
+                    if isa::add_imm(n).is_some() {
+                        1
+                    } else {
+                        isa::mov_chain(n, true).len() + 1
+                    }
+                }
                 _ => 1,
             })
             .sum();

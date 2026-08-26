@@ -184,6 +184,109 @@ fn slots_do_not_overlap_and_respect_alignment() {
     }
 }
 
+// frame_fold (REARCH.md §13o, R4.15) — the frame adjust folded into the first /
+// last callee-save pair as a pre/post-indexed writeback.
+fn count_framewb(f: &crate::mir::MFunc) -> usize {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| {
+            matches!(
+                i,
+                crate::mir::MInst::Pair { mem: crate::mir::AddrMode::FrameWb { .. }, .. }
+                    | crate::mir::MInst::Load { mem: crate::mir::AddrMode::FrameWb { .. }, .. }
+                    | crate::mir::MInst::Store { mem: crate::mir::AddrMode::FrameWb { .. }, .. }
+            )
+        })
+        .count()
+}
+fn count_spadj(f: &crate::mir::MFunc) -> usize {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, crate::mir::MInst::SpAdj { .. }))
+        .count()
+}
+
+#[test]
+fn frame_fold_folds_the_adjust_into_the_save_pair() {
+    // THE EFFECT half. `frame_fold_preserves_meaning` proves ⟦·⟧ survives; alone
+    // it would stay green for a pass that folded NOTHING (a function whose frame
+    // is unfolded means the same). So first: a function with an ordinary frame in
+    // range must carry the writeback and NOT a standalone adjust.
+    // recursion keeps `n` across the call and is never inlined, so `fib` gets an
+    // ordinary in-range frame with real callee-saved traffic.
+    let src = "int fib(int n){return n<2?n:fib(n-1)+fib(n-2);}\
+               int main(void){return fib(10);}";
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    finish(&mut m);
+    let f = m.funcs.iter().find(|f| f.name == "fib").unwrap();
+    assert!(f.frame_size > 0 && !f.dyn_stack && f.outgoing == 0, "fib is not an ordinary frame");
+    // one writeback in the prologue, one on each return path; the standalone
+    // adjust is gone entirely.
+    assert!(count_framewb(f) >= 2, "the frame adjust was not folded into the save pairs");
+    assert_eq!(count_spadj(f), 0, "an ordinary in-range frame kept a standalone SpAdj");
+    // the prologue's FIRST instruction is the allocate-and-save pre-index
+    let first = &f.blocks[f.entry as usize].insts[0];
+    assert!(
+        matches!(
+            first,
+            crate::mir::MInst::Pair { load: false, mem: crate::mir::AddrMode::FrameWb { delta, .. }, .. } if *delta < 0
+        ) || matches!(
+            first,
+            crate::mir::MInst::Store { mem: crate::mir::AddrMode::FrameWb { delta, .. }, .. } if *delta < 0
+        ),
+        "the prologue does not lead with the pre-index frame allocation"
+    );
+
+    // THE FALLBACK half — where the writeback cannot reach, a real SpAdj carries
+    // the adjust (so `emit` never invents it): a frame past the pair's 512-byte
+    // reach, and a dynamic frame that keeps x29.
+    let big = "int use(int*);\
+               int big(void){int a[400];int i,s=0;for(i=0;i<400;i++)a[i]=i;for(i=0;i<400;i++)s+=a[i];return s;}\
+               int main(void){return big();}";
+    let ast = frontend(big);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    finish(&mut m);
+    let b = m.funcs.iter().find(|f| f.name == "big").unwrap();
+    assert!(b.frame_size > 512, "big's frame did not exceed the pair reach");
+    assert!(count_spadj(b) >= 1, "an out-of-reach frame did not fall back to SpAdj");
+
+    let vla = "int f(int n){int a[n];int i,s=0;for(i=0;i<n;i++)a[i]=i;for(i=0;i<n;i++)s+=a[i];return s;}\
+               int main(void){return f(6);}";
+    let ast = frontend(vla);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let mut m = allocated(&h).unwrap();
+    finish(&mut m);
+    let v = m.funcs.iter().find(|f| f.name == "f").unwrap();
+    assert!(v.dyn_stack, "the VLA function is not a dynamic frame");
+    assert_eq!(count_framewb(v), 0, "a dynamic frame was folded");
+    assert_eq!(count_spadj(v), 0, "a dynamic frame carried an SpAdj (emit prints its adjust)");
+}
+
+#[test]
+fn frame_fold_preserves_meaning() {
+    // THE MEANING half: ⟦mir_p⟧ = ⟦mir_final⟧ across programs that exercise every
+    // fold path — a single-save (x30-only) function, a multi-save function,
+    // multiple return paths (shared and shrink-wrapped epilogues), a leaf with a
+    // frame, a large frame that must fall back, and a dynamic (VLA) frame.
+    same_all(&[
+        "int g(int x){return x+1;} int main(void){return g(4)+g(5);}",
+        "int f(int x){int s=0,i;for(i=0;i<x;i++)s+=i;return s;} int main(void){int a=3;return f(a)+a;}",
+        "int g(int x){return x-1;} int f(int x){if(x<0)return 0;{int s=0,i;for(i=0;i<x;i++)s+=g(i);return s;}} int main(void){return f(6);}",
+        "int fib(int n){return n<2?n:fib(n-1)+fib(n-2);} int main(void){return fib(10);}",
+        "int main(void){int a[40];int i,s=0;for(i=0;i<40;i++)a[i]=i*2;for(i=0;i<40;i++)s+=a[i];return s;}",
+        "int f(int n){int a[n];int i,s=0;for(i=0;i<n;i++)a[i]=i;for(i=0;i<n;i++)s+=a[i];return s;} int main(void){return f(7);}",
+        "int g(int x){return x*x;} int main(void){int s=0,i;for(i=0;i<6;i++)s+=g(i);return s;}",
+    ]);
+}
+
 /// `pass/legalize.rs` — a frame offset past the addressing modes' reach is an
 /// operand to legalize, not an assembler error. Its square is the identity on
 /// ⟦·⟧: `Slot{s, off}` and `BaseImm{IP1, 0}` after `IP1 = &slot + off` denote

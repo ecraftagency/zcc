@@ -123,17 +123,38 @@ pub fn run(f: &mut MFunc) {
     // Nothing else changes: an offset is an offset, and `emit` resolves each
     // slot through the same path either way.
     let mut at: u32 = f.outgoing;
+    let place_one = |s: &mut StackSlot, at: &mut u32| {
+        let a = s.align.max(1);
+        *at = (*at + a - 1) / a * a;
+        s.off = *at as i32;
+        // A zero-size object occupies nothing: nothing can read or write it,
+        // so two of them may share an address (EXT(gcc) empty struct).
+        *at += s.size;
+    };
+    // R4.15 — THE CALLEE-SAVE PAIR AT OFFSET 0, SO `frame_fold` CAN FOLD THE
+    // ADJUST INTO IT. A pre-index `stp x19,x20,[sp,#-N]!` stores at the NEW sp,
+    // i.e. frame offset 0, so the pair it folds must live there. When the fold can
+    // possibly fire — an ordinary (sp-addressed) frame whose bottom is free of the
+    // ABI's outgoing area — the callee-save slots go first; otherwise the layout
+    // is unchanged. The saves stay a contiguous run either way, so R4.8's pairing
+    // is untouched; only their base offset moves, and `emit` resolves it the same.
+    let cs_first = !f.dyn_stack && f.outgoing == 0;
+    if cs_first {
+        for &sl in &cs_slots {
+            place_one(&mut f.slots[sl as usize], &mut at);
+        }
+    }
+    let placed: std::collections::HashSet<SlotId> = if cs_first {
+        cs_slots.iter().copied().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut place = |slots: &mut Vec<StackSlot>, at: &mut u32, kind: SlotKind| {
-        for s in slots.iter_mut() {
-            if s.kind != kind {
+        for (k, s) in slots.iter_mut().enumerate() {
+            if s.kind != kind || placed.contains(&(k as SlotId)) {
                 continue;
             }
-            let a = s.align.max(1);
-            *at = (*at + a - 1) / a * a;
-            s.off = *at as i32;
-            // A zero-size object occupies nothing: nothing can read or write it,
-            // so two of them may share an address (EXT(gcc) empty struct).
-            *at += s.size;
+            place_one(s, at);
         }
     };
     place(&mut f.slots, &mut at, SlotKind::Spill);

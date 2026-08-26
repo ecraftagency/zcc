@@ -75,7 +75,12 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
     // One frame adjustment, by construction (§8): nothing else moves sp — except
     // `StackAlloc`, and a function containing one takes a frame pointer so that
     // every static object keeps a fixed address regardless of where sp went.
-    if f.frame_size > 0 {
+    //
+    // R4.15: for an ordinary (non-dynamic) frame the adjust is a real `SpAdj`
+    // instruction placed by `frame_fold` — or folded into the first save pair —
+    // so `emit` no longer invents it here. A dynamic frame keeps the printed form
+    // because its adjust brackets the instant x29 stops being the caller's value.
+    if f.frame_size > 0 && f.dyn_stack {
         adjust_sp(s, -(f.frame_size as i64));
     }
     if f.dyn_stack {
@@ -328,6 +333,17 @@ fn addr(ast: &Ast, f: &MFunc, m: &AddrMode) -> String {
         }
         AddrMode::SymLo12 { base, sym } => {
             format!("[{}, #:lo12:{}]", reg(*base, Width::W64), sym_text(ast, sym, &f.name))
+        }
+        // The folded frame adjust (REARCH §13o R4.15). `delta < 0` is the prologue
+        // pre-index `stp …, [sp, #-N]!` (allocate, then store at the new sp);
+        // `delta > 0` the epilogue post-index `ldp …, [sp], #N` (load, then free).
+        // The slot rides at offset 0, so [sp] IS its address after the writeback.
+        AddrMode::FrameWb { delta, .. } => {
+            if *delta < 0 {
+                format!("[sp, #{}]!", delta)
+            } else {
+                format!("[sp], #{}", delta)
+            }
         }
     }
 }
@@ -722,6 +738,11 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
         MInst::SpAddr { dst, off } => {
             add_imm_to(s, reg(*dst, Width::W64), "sp", *off as i64);
         }
+        // The frame adjust, now an ordinary instruction (REARCH §13o R4.15) rather
+        // than something `emit` invents from `frame_size`. `adjust_sp` prints the
+        // `sub`/`add` (and, for a frame past imm12, the scratch-register form whose
+        // length the cost model already predicts).
+        MInst::SpAdj { delta } => adjust_sp(s, *delta as i64),
         MInst::LdAxr { w, dst, addr } => {
             let _ = writeln!(
                 s,
@@ -872,7 +893,10 @@ fn emit_term(
                     f.slots[f.fp_slot as usize].off
                 );
             }
-            if f.frame_size > 0 {
+            // R4.15: an ordinary frame's `add sp` is a real `SpAdj` (or folded
+            // into the last restore pair) before this `Ret`; only a dynamic frame
+            // still prints its adjust here.
+            if f.frame_size > 0 && f.dyn_stack {
                 adjust_sp(s, f.frame_size as i64);
             }
             s.push_str("\tret\n");

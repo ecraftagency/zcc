@@ -131,6 +131,7 @@ pub fn finish(m: &mut crate::mir::MModule) {
             crate::mir::pass::frame::merge_epilogues(f);
             crate::mir::pass::legalize::run(f);
             crate::mir::pass::ldstp::run(f);
+            crate::mir::pass::frame_fold::run(f);
             crate::mir::pass::layout::run(f);
         }
     });

@@ -239,6 +239,8 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
         }
         // opaque by construction: the template's registers are already physical
         MInst::Dmb | MInst::Asm { .. } => {}
+        // the frame adjust names no register (sp is implicit)
+        MInst::SpAdj { .. } => {}
         MInst::Alu3 { dst, a, b, c, .. } => {
             for (r, n) in [(dst, "dst"), (a, "a"), (b, "b"), (c, "c")] {
                 want(*r, Class::Gpr, n)?;
@@ -371,7 +373,7 @@ fn check_addr(f: &MFunc, m: &AddrMode) -> Result<(), String> {
         AddrMode::PreIdx { base, wb, .. } | AddrMode::PostIdx { base, wb, .. } => {
             gpr(*base).and(gpr(*wb))
         }
-        AddrMode::Slot { slot, .. } => {
+        AddrMode::Slot { slot, .. } | AddrMode::FrameWb { slot, .. } => {
             if *slot as usize >= f.slots.len() {
                 Err(format!("out-of-range slot {}", slot))
             } else {

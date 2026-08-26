@@ -157,7 +157,7 @@ fn mem_base(m: &AddrMode) -> Option<Reg> {
         | AddrMode::PreIdx { base, .. }
         | AddrMode::PostIdx { base, .. }
         | AddrMode::SymLo12 { base, .. } => Some(*base),
-        AddrMode::Slot { .. } | AddrMode::SpArg { .. } => None,
+        AddrMode::Slot { .. } | AddrMode::SpArg { .. } | AddrMode::FrameWb { .. } => None,
     }
 }
 
