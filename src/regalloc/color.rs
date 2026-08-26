@@ -101,7 +101,7 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
         // destroy the other. (Dead parameters are removed before colouring —
         // `regalloc::prune_dead_params` — so this is not a lost opportunity.)
         for &p in &blk.params {
-            assign(f, lv, &mut color, &mut used, &mut occ, p, &partners, has_calls)
+            assign(f, lv, &mut color, &mut used, &mut occ, p, &partners, has_calls, Some((bi, &live_here)),)
                 .map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
             if live_here.insert(sp.idx(p)) {
                 if let Some(c) = color_of(&color, sp, sp.idx(p)) {
@@ -190,6 +190,7 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
                     occ.sub(sc);
                     let r = assign(
                         f, lv, &mut color, &mut used, &mut occ, d, &partners, has_calls,
+                        Some((bi, &live_here)),
                     );
                     let got = color_of(&color, sp, di);
                     if got == Some(sc) {
@@ -209,7 +210,7 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
             }
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
-                    assign(f, lv, &mut color, &mut used, &mut occ, *r, &partners, has_calls)
+                    assign(f, lv, &mut color, &mut used, &mut occ, *r, &partners, has_calls, Some((bi, &live_here)),)
                         .map_err(|e| with_holders(e, &live_here, &color, sp, f, lv))?;
                     if live_here.insert(sp.idx(*r)) {
                         if let Some(p) = color_of(&color, sp, sp.idx(*r)) {
@@ -511,6 +512,9 @@ pub static HINT_OCCUPIED: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static HINT_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_SPARE_SUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_OCC_LOCAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_OCC_GLOBAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_OCC_UNKNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_NO_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn hint_stats_wanted() -> bool {
@@ -546,6 +550,18 @@ pub fn hint_report() {
         ns,
         if o > 0 { 100.0 * sp as f64 / o as f64 } else { 0.0 }
     );
+    let (lo, gl, un) = (
+        HINT_OCC_LOCAL.load(Relaxed),
+        HINT_OCC_GLOBAL.load(Relaxed),
+        HINT_OCC_UNKNOWN.load(Relaxed),
+    );
+    eprintln!(
+        "[hint] the occupant: {} dies in this block ({:.1}% — locally evictable), {} is live-out (needs global interference), {} unknown",
+        lo,
+        if o > 0 { 100.0 * lo as f64 / o as f64 } else { 0.0 },
+        gl,
+        un
+    );
 }
 
 fn phys_of(color: &[Option<PReg>], sp: Space, r: Reg) -> Option<PReg> {
@@ -567,6 +583,7 @@ fn assign(
     r: Reg,
     partners: &[Vec<Reg>],
     has_calls: bool,
+    ctx: Option<(usize, &BTreeSet<usize>)>,
 ) -> Result<(), ColorErr> {
     let v = match r {
         // A physical definition needs no choice; the CALLER records it in the
@@ -704,6 +721,33 @@ fn assign(
                 } else {
                     HINT_SPARE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     HINT_SPARE_SUM.fetch_add(spare, std::sync::atomic::Ordering::Relaxed);
+                }
+                // THE INTERVAL CHECK. A register free at THIS POINT is only an
+                // upper bound on evictability: moving the occupant needs a
+                // register free across the occupant's WHOLE range. The cheap
+                // discriminator is how far that range reaches — a value that
+                // dies inside this block can be re-coloured against local
+                // information alone, while one that is live-out needs global
+                // interference the colourer does not carry. So classify the
+                // OCCUPANT, which is the live value currently holding `w`.
+                if let Some((bi, live_here)) = ctx {
+                    let occupant = live_here
+                        .iter()
+                        .copied()
+                        .find(|&i| color_of(color, lv.sp, i) == Some(w));
+                    match occupant {
+                        None => {
+                            // `w` is held by something not in the live set — a
+                            // physical definition the caller records separately.
+                            HINT_OCC_UNKNOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Some(i) if lv.live_out[bi].contains(&i) => {
+                            HINT_OCC_GLOBAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Some(_) => {
+                            HINT_OCC_LOCAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
             } else {
                 HINT_OTHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
