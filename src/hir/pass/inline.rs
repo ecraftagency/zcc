@@ -42,6 +42,28 @@ fn call_cost(sig: &Sig) -> usize {
 /// growth from compounding.
 const ROUNDS: u32 = 2;
 
+/// Blocks of `f` that lie in some loop.
+fn loop_blocks(f: &Func) -> Vec<bool> {
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    let lf = dom::loops(&c, &dt);
+    let mut v = vec![false; f.blocks.len()];
+    for lp in &lf.loops {
+        v[lp.header as usize] = true;
+        for &b in &lp.body {
+            v[b as usize] = true;
+        }
+    }
+    v
+}
+
+/// Does `f` contain a loop of its own?
+fn has_loop(f: &Func) -> bool {
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    !dom::loops(&c, &dt).loops.is_empty()
+}
+
 pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
     let mut any = false;
     for _ in 0..ROUNDS {
@@ -52,6 +74,7 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
             m.funcs.iter().enumerate().map(|(i, f)| (f.name.clone(), i)).collect();
         for ci in 0..m.funcs.len() {
             loop {
+                let inloop = loop_blocks(&m.funcs[ci]);
                 let site = m.funcs[ci].blocks.iter().enumerate().find_map(|(b, blk)| {
                     blk.insts.iter().enumerate().find_map(|(i, inst)| match inst {
                         Inst::Call { callee: Callee::Direct(n), sret: None, args, .. } => {
@@ -75,8 +98,36 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                             // STATIC functions called once" for exactly this
                             // reason; §13n read e2's inlined `mix` as evidence of
                             // a rule gcc does not have.
-                            let called_once =
-                                counts.get(n).copied().unwrap_or(0) == 1 && g.is_static;
+                            // THE EXTERNAL HALF, narrowed twice until it paid.
+                            //
+                            // Dropping `is_static` outright is refuted above: 16%
+                            // size for 7% speed. Narrowing it to call sites
+                            // INSIDE A LOOP fixed the size (sqlite moved +2
+                            // instructions) and then lost on SPEED anyway —
+                            // h2_revbits went 43ms to 61ms, because `revbits`
+                            // CONTAINS A LOOP and splicing one loop into another
+                            // changes what the allocator must hold across the
+                            // inner one. So the fence is the shape that
+                            // distinguishes the two cases: a STRAIGHT-LINE body.
+                            // `mix` is ten multiplies and adds with no control
+                            // flow, and e2_many_args pays its ten argument moves
+                            // and two stack stores four million times.
+                            //
+                            // NO SIZE CAP, deliberately. The first cut carried a
+                            // `HOT_EXTERNAL_BODY = 48` and `provenance.sh`
+                            // rejected it — correctly, since 48 was a number this
+                            // author picked, and Article E asks of every constant
+                            // whether it is the spec's or the author's. The
+                            // fences here are all STRUCTURAL — called once, from
+                            // inside a loop, and no loop of its own — so the rule
+                            // needs no threshold to tune and none is invented.
+                            // "Called once and loop-free" already bounds what can
+                            // be duplicated: sqlite moves by 2 instructions.
+                            let once = counts.get(n).copied().unwrap_or(0) == 1;
+                            let called_once = once
+                                && (g.is_static
+                                    || (inloop.get(b).copied().unwrap_or(false)
+                                        && !has_loop(g)));
                             let want = called_once || body_size(g) <= call_cost(&g.sig);
                             if gi != ci && want && !cyclic.contains(&gi) && inlinable(g) {
                                 Some((b, i, gi))
