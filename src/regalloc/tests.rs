@@ -891,13 +891,13 @@ fn generalized_carry_cuts_switch_reloads() {
     // one the effect is measured on, so it is the one the square has to cover
     same(&src);
 
-    let reloads = |on: bool| -> usize {
-        super::spill::set_reconstruct(on);
+    let reloads = |level: u8| -> usize {
+        super::spill::set_reconstruct(level);
         let ast = frontend(&src);
         let mut h = hir::build::build(&ast);
         hir::pass::run_module(&mut h);
         let p = crate::compile::backend(&h).unwrap();
-        super::spill::set_reconstruct(true);
+        super::spill::set_reconstruct(super::spill::RECON_LOOPS);
         let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
         f.blocks
             .iter()
@@ -905,8 +905,8 @@ fn generalized_carry_cuts_switch_reloads() {
             .filter(|i| matches!(i, crate::mir::MInst::Reload { .. }))
             .count()
     };
-    let off = reloads(false);
-    let on = reloads(true);
+    let off = reloads(super::spill::RECON_NONE);
+    let on = reloads(super::spill::RECON_JOINS);
     assert!(
         off > 0,
         "the fixture does not spill at all — the square below it would be vacuous"
@@ -916,5 +916,93 @@ fn generalized_carry_cuts_switch_reloads() {
         "reconstruction removed no reload: {} with it, {} without",
         on,
         off
+    );
+}
+
+
+/// R4-capstone (spec §4.2) — THE LOOP-HEADER CARRY, and what it is actually
+/// made of.
+///
+/// The back-edge fixpoint shipped dark one step ago, and flipping it on is worth
+/// EXACTLY NOTHING by itself: a header's carry used to be an intersection over
+/// its predecessors, and a preheader holds nothing under a latch's name, so the
+/// intersection was empty every time it was asked. The step is the PHI. The
+/// header takes a block parameter, the latch feeds it the register it is still
+/// holding, and the preheader feeds it one reload — paid once, against a reload
+/// the body was paying every iteration. The fixpoint is what lets the header
+/// know what the latch will hold, one round behind; it is the mechanism, not the
+/// step.
+///
+/// WHAT THIS CAN AND CANNOT CARRY, measured rather than hoped. A value whose
+/// block PARAMETER the spiller evicted has no definition left in the IR — its
+/// definition is the store each edge now makes into its slot — and a register
+/// copy of such a name goes stale the moment an edge writes the slot. Carrying
+/// one around a back edge hands the next iteration the previous iteration's
+/// value, induction variable included, and the loop never ends; that is a real
+/// defect this battery caught (see `has_def` in `spill.rs`). So what a header
+/// phi carries is a value with a definition that dominates the loop — a
+/// LOOP-INVARIANT spilled value, reloaded every iteration today because
+/// `Sim::More` sends a value to memory for its whole life however cheap the loop
+/// it is read in. That is R4.16's region-residency, generalized from "a wholly
+/// free register exists" to "a register is free HERE".
+///
+/// The fixture is that shape: 24 values live across a high-pressure statement,
+/// which sends them all to memory, and then a low-pressure loop that reads five
+/// of them. The A/B is `RECON_JOINS` against `RECON_LOOPS`, so the number
+/// belongs to this step alone and not to §4.1's joins. `e` is defined (an
+/// undefined callee traps both interpreters and `same` passes a two-sided trap
+/// in silence) and defined RECURSIVELY (an inlinable `e` removes the call, and
+/// the call is what creates the pressure).
+#[test]
+fn loop_header_carry_keeps_the_accumulator_in_a_register() {
+    // Meaning: the brief's loop-carried programs, small enough to read.
+    same_all(&[
+        "int e(int x){return x*3+1;} int hot(int p){int acc=0,i; for(i=0;i<50;i++){acc=acc+e(i)+p;} return acc; } int main(void){return hot(2);}",
+        "int e(int x){return x*3+1;} int hot(int p){int a=0,b=0,i; for(i=0;i<30;i++){a+=e(i)*p; b+=e(i)+a;} return a+b; } int main(void){return hot(3);}",
+    ]);
+
+    let n = 24;
+    let decls: String = (0..n)
+        .map(|i| format!("int v{}=g[{}]*{}+p;", i, i, i + 2))
+        .collect();
+    let sum: String = (0..n).map(|i| format!("+v{}", i)).collect();
+    let src = format!(
+        "int e(int x){{return x<=0?1:e(x-1)+3;}} int g[64];\n\
+         int hot(int p){{ int i,s=0; {d}\n\
+         s = 0{s};\n\
+         for(i=0;i<20;i++){{ s += e(i)+v0+v1+v2+v3+v4; }}\n\
+         return s{s}; }}\n\
+         int main(void){{ return hot(3); }}\n",
+        d = decls,
+        s = sum
+    );
+    same(&src);
+
+    let count = |level: u8| -> (usize, usize) {
+        super::spill::set_reconstruct(level);
+        let ast = frontend(&src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let p = crate::compile::backend(&h).unwrap();
+        super::spill::set_reconstruct(super::spill::RECON_LOOPS);
+        let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
+        use crate::mir::MInst;
+        let it = || f.blocks.iter().flat_map(|b| b.insts.iter());
+        (
+            it().filter(|i| matches!(i, MInst::Reload { .. })).count(),
+            it().filter(|i| matches!(i, MInst::Spill { .. })).count(),
+        )
+    };
+    let joins = count(super::spill::RECON_JOINS);
+    let loops = count(super::spill::RECON_LOOPS);
+    assert!(
+        joins.0 > 0,
+        "the fixture does not spill at all — the square above it would be vacuous"
+    );
+    assert!(
+        loops.0 < joins.0 && loops.1 <= joins.1,
+        "the loop-header carry removed no frame traffic: {:?} with it, {:?} with joins only",
+        loops,
+        joins
     );
 }
