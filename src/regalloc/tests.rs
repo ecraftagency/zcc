@@ -825,3 +825,96 @@ fn reconstruct_reconciles_a_join_with_a_phi() {
     // and the parameter is a FRESH name, not one of the two it reconciles
     assert!(p != in_reg.vreg().unwrap() && p != reloaded.vreg().unwrap());
 }
+
+
+/// R4-capstone (spec §4.1) — GENERALIZED CROSS-EDGE CARRY, the step that turns
+/// `reconstruct::insert_phi` from a proven object into a working part of the
+/// allocator.
+///
+/// R4.1's carry crosses an edge only where every predecessor holds the value
+/// under ONE name. The switch below is the shape that condition throws away: five
+/// arms that each reload the same variable arrive at the join holding five
+/// DIFFERENT copies of it, so the value is in a register on every single path
+/// and the join reloads it anyway — the dominance test cannot see a value that is
+/// everywhere under five names. Braun 2013's block parameter can: each arm passes
+/// its own copy on its own edge.
+///
+/// THE MEANING half is the battery's ordinary obligation, ⟦mir_v⟧ = ⟦mir_p⟧ over
+/// a program with a real reconstruction in it. THE EFFECT half is what stops the
+/// square from being vacuous (Law 0, spec §5): the SAME program is allocated
+/// twice, once with the reconstruction and once without (`set_reconstruct`), and
+/// the reload count must fall. A square that holds because nothing happened is
+/// not a proof of anything.
+///
+/// TWO THINGS ABOUT THE PROGRAM, both of them measurements rather than taste.
+/// `e` is DEFINED, because an undefined callee traps both interpreters and
+/// `same` passes a two-sided trap in silence — the case would compile, execute
+/// nothing and prove nothing. It is defined RECURSIVELY, because a small
+/// straight-line `e` is inlined away and the call is exactly what creates the
+/// pressure this fixture is about: with an inlinable `e` the same program spills
+/// 23 times instead of 101 and the effect it is meant to show shrinks to noise.
+/// The 24 loop-invariant values are there for the same reason — the ceiling that
+/// forces the spilling is the callee-saved count, and nothing below it spills at
+/// all.
+///
+/// `promote` runs on BOTH sides, so the differential is measured against an
+/// allocator that has already rescued everything a wholly-free callee-saved
+/// register could hold (R4.16). What is left is what only reconstruction reaches.
+#[test]
+fn generalized_carry_cuts_switch_reloads() {
+    // Meaning: the shape, on a program small enough to read.
+    same_all(&[
+        "int e(int x){return x*3+1;} int hot(int p){int s=0,i; for(i=0;i<40;i++){switch(i%5){case 0:s+=e(i)+p;break;case 1:s+=e(i)*p;break;case 2:s+=p-e(i);break;case 3:s+=e(i)+p+p;break;default:s+=e(i);}} return s+p;} int main(void){return hot(3);}",
+    ]);
+
+    let n = 24;
+    let decls: String = (0..n)
+        .map(|i| format!("int v{}=g[{}]*{}+p;", i, i, i + 2))
+        .collect();
+    let sum: String = (0..n).map(|i| format!("+v{}", i)).collect();
+    let src = format!(
+        "int e(int x){{return x<=0?1:e(x-1)+3;}} int g[64];\n\
+         int hot(int p){{ int i,s=0; {d}\n\
+         for(i=0;i<40;i++){{ switch(i%5){{\
+         case 0: s+=e(i){s};break;\
+         case 1: s+=e(i)*p{s};break;\
+         case 2: s+=p-e(i){s};break;\
+         case 3: s+=e(i)+p+p{s};break;\
+         default: s+=e(i){s};}} }}\n\
+         return s{s}; }}\n\
+         int main(void){{ return hot(3); }}\n",
+        d = decls,
+        s = sum
+    );
+
+    // the meaning obligation holds on the pressure-heavy program too — it is the
+    // one the effect is measured on, so it is the one the square has to cover
+    same(&src);
+
+    let reloads = |on: bool| -> usize {
+        super::spill::set_reconstruct(on);
+        let ast = frontend(&src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let p = crate::compile::backend(&h).unwrap();
+        super::spill::set_reconstruct(true);
+        let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
+        f.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i, crate::mir::MInst::Reload { .. }))
+            .count()
+    };
+    let off = reloads(false);
+    let on = reloads(true);
+    assert!(
+        off > 0,
+        "the fixture does not spill at all — the square below it would be vacuous"
+    );
+    assert!(
+        on < off,
+        "reconstruction removed no reload: {} with it, {} without",
+        on,
+        off
+    );
+}

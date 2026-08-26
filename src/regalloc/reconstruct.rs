@@ -55,6 +55,12 @@ use crate::mir::*;
 /// ARGUMENT COUNT rather than by "the first target that matches": a block's
 /// arguments and its successor's parameters are positional, so the edge still
 /// short of this parameter is exactly the one still to fill.
+///
+/// The two halves are also available separately (`new_param` then `feed_phi`),
+/// because a caller that builds SEVERAL phis at once may need every parameter to
+/// exist before any edge can be fed: a phi's argument on one edge can be another
+/// phi's parameter, and around a loop those two point at each other. Building
+/// all the parameters first breaks that knot without any ordering cleverness.
 pub fn insert_phi(
     f: &mut MFunc,
     block: MBlockId,
@@ -62,6 +68,15 @@ pub fn insert_phi(
     width: Width,
     args: &[(MBlockId, Reg)],
 ) -> VReg {
+    let p = new_param(f, block, class, width);
+    feed_phi(f, block, p, args);
+    p
+}
+
+/// Half one: the parameter itself. Until `feed_phi` runs, the block has a
+/// parameter no edge supplies — a state `mir::verify` would reject, and which
+/// the caller is responsible for leaving before it hands the function on.
+pub fn new_param(f: &mut MFunc, block: MBlockId, class: Class, width: Width) -> VReg {
     // `Class::Flags` is a class of one register and is never spilled or carried
     // (it is rematerialized instead — THEORY A7, Briggs 1992), so a phi of flags
     // would be a value the rest of the allocator has no way to honour.
@@ -73,9 +88,23 @@ pub fn insert_phi(
     );
     let p = f.new_vreg(width);
     f.blocks[block as usize].params.push(p);
-    // the position this parameter takes in the block's parameter list, which is
-    // the position its argument takes on every incoming edge
-    let pos = f.blocks[block as usize].params.len() - 1;
+    // `MFunc::new_vreg` mints a virtual register and returns `Reg::V` of it —
+    // there is no other outcome, which is what this unwrap is asserting.
+    p.vreg().expect("MFunc::new_vreg returns a virtual register")
+}
+
+/// Half two: the arguments. `param` must already be one of `block`'s parameters;
+/// its POSITION in that list is the position its argument takes on every
+/// incoming edge, and an edge is filled when its argument list is still exactly
+/// that short (see the note on `insert_phi`). So when a block gains several
+/// parameters at once, the edges must be fed in the same order the parameters
+/// were created.
+pub fn feed_phi(f: &mut MFunc, block: MBlockId, param: VReg, args: &[(MBlockId, Reg)]) {
+    let pos = f.blocks[block as usize]
+        .params
+        .iter()
+        .position(|q| *q == Reg::V(param))
+        .expect("feed_phi: the parameter must already be on the block");
     for &(pred, r) in args {
         let mut filled = false;
         for t in f.blocks[pred as usize].term.targets_mut() {
@@ -92,5 +121,4 @@ pub fn insert_phi(
             pred, block, pos
         );
     }
-    p.vreg().expect("new_vreg returns a virtual register")
 }

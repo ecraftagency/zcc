@@ -88,6 +88,28 @@ use std::collections::{BTreeMap, BTreeSet};
 /// it is the thing that lets the lattice say anything at all.
 const BACKEDGE_CARRY: bool = false;
 
+/// THE A/B SEAM the non-vacuity obligation needs (Law 0, spec §5). A commuting
+/// square proves nothing on an input where the pass never fires, and "fires" is
+/// a DIFFERENCE: the same program allocated with the reconstruction and without
+/// it. This is what lets a test measure that difference.
+///
+/// A thread-local and not a process-wide switch, because the battery runs its
+/// tests in parallel threads — a global would make one test's measurement depend
+/// on another test's timing, which is the measurement itself lying (Law 2's rare
+/// third case, and not one to go inviting).
+thread_local! {
+    // THEORY A7 — the spiller's own theorem. Not a value the compiler computes
+    // with: it is the INSTRUMENT that lets a test ask what the reconstruction
+    // half of that theorem actually did, which is the non-vacuity obligation.
+    static RECONSTRUCT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Turn SSA reconstruction off, or back on, for the CURRENT THREAD.
+#[cfg(test)]
+pub(super) fn set_reconstruct(on: bool) {
+    RECONSTRUCT.with(|c| c.set(on));
+}
+
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
     spill_with(f, &BTreeSet::new(), usize::MAX)
 }
@@ -124,28 +146,43 @@ pub fn spill_with(
             nsp += 1;
         }
     }
-    // TERMINATION — a product of two bounded monotone lattices (spec §4.4).
+    // TERMINATION — two bounded lattices, and the honest shape of their product
+    // (spec §4.4).
     //
     // FIRST LATTICE, memory residency. Every round that does not produce a plan
     // makes at least one more value memory-resident, and a value never leaves
-    // that set, so it can climb at most |vregs| times.
+    // that set, so it can climb at most |vregs| times. This one IS monotone, and
+    // on its own it is the whole of the pre-restructure argument.
     //
-    // SECOND LATTICE, register residency at a block ENTRY — the one this step
-    // adds. A round's plan says what each block is still holding when it ends
-    // (`Plan.wexit`); `backedge_entry_residency` turns that into what each block
-    // may assume on ENTRY, reading the PRIOR round's exit for a predecessor the
-    // current round has not reached yet (a latch, since blocks are walked in
-    // reverse postorder). Each element of that lattice is a subset of the
-    // (block, value) pairs, so it can climb at most |blocks| × |vregs| times.
+    // SECOND LATTICE, register residency at a block EXIT — the one R4-capstone
+    // adds. A round's plan says what each block was still holding when it ended
+    // (`Plan.wexit`), and the next round hands that to a block whose predecessor
+    // it has not reached yet (a loop header reading its latch, since blocks are
+    // walked in reverse postorder). Each element is a subset of the (block,
+    // value) pairs, so ONE climb of it is at most |blocks| × |vregs| rounds.
     //
-    // The two are not independent — spilling a value removes it from every entry
-    // set — so the pair is ordered lexicographically: a round either climbs the
-    // first lattice or, holding it fixed, climbs the second. The number of rounds
-    // is therefore at most the sum of the two heights, which is the cap below.
-    // Exceeding it means one of those two claims is FALSE: a Law-2 defect to be
-    // located, never a budget to raise, which is why the cap is asserted rather
-    // than silently retried.
-    let bound = f.vregs.len() * f.blocks.len() + f.vregs.len() + 2;
+    // WHY THE BOUND IS A PRODUCT AND NOT A SUM. The second lattice is recomputed
+    // from `wexit` each round rather than accumulated, and it is not independent
+    // of the first: a fresh spill makes a value memory-resident, the value leaves
+    // every `wexit`, and the (block, value) pairs that mentioned it leave the
+    // register-residency set with it. So a pair can enter, be knocked out by a
+    // later spill, and climb again — a SHRINK-then-RECLIMB, which a flat sum does
+    // not cover. What does bound it is that a shrink is only ever caused by a
+    // spill, and spills are the first lattice, which climbs at most |vregs|
+    // times: between two consecutive spills the second lattice climbs
+    // monotonically, so the run is at most |vregs| + 1 monotone climbs of it.
+    // Hence the product below. (I chose to keep the recompute and pay for it in
+    // the bound rather than to make the second lattice accumulate: accumulating
+    // would mean a block may assume a value is in a register on the strength of a
+    // round in which it was not spilled, which is a claim about a program that no
+    // longer exists — the cheap bound would be bought with a false invariant.)
+    //
+    // Exceeding the bound means one of those claims is FALSE — a Law-2 defect to
+    // be located, never a budget to raise — so it is asserted in a debug build.
+    // In a RELEASE build it must not be a failed compile: see the graceful last
+    // phase below, which drops the carry and finishes on the first lattice alone.
+    let climb = f.vregs.len() * f.blocks.len() + 1;
+    let bound = (f.vregs.len() + 1) * climb + 1;
     let mut slot_of: BTreeMap<VReg, (SlotId, Width)> = BTreeMap::new();
     let mut web_slot: BTreeMap<VReg, (SlotId, Width)> = BTreeMap::new();
     for &v in forced.iter() {
@@ -162,15 +199,40 @@ pub fn spill_with(
     // live) so it is recomputed inside the loop; `simulate`'s `linear_positions`
     // likewise re-reads the (now longer) instruction lists off the same CFG.
     let cfg = crate::mir::verify::cfg(f);
-    // The second lattice's carrier: per block, what a predecessor the round has
-    // not yet simulated was holding LAST round. Empty on the first round, which
-    // is exactly today's "a back edge holds nothing".
-    let mut entry_resident: Vec<Vec<(VReg, Option<CopyId>)>> = vec![Vec::new(); f.blocks.len()];
+    // Loop nesting, computed ONCE for the same reason the CFG is (CP2.1 above):
+    // the topology does not change across the fixpoint. The spiller asks it one
+    // question — is a reload placed on this edge landing in COLDER code than the
+    // block it serves — which is the profitability half of §4.1's cold-edge
+    // reload, and the reason a loop preheader may pay for a whole loop body.
+    let depth = {
+        let dt = crate::cfg::DomTree::new(&cfg, f.entry);
+        crate::cfg::LoopForest::new(&cfg, &dt).depth
+    };
+    // The second lattice's carrier: per block, what it was still holding in a
+    // register when it ENDED last round. Read only for a predecessor the current
+    // round has not simulated yet. Empty on the first round, which is exactly
+    // today's "a back edge holds nothing".
+    let mut prev_exit: Vec<Vec<(VReg, Option<CopyId>)>> = vec![Vec::new(); f.blocks.len()];
+    let mut carry = BACKEDGE_CARRY;
+    let mut fell_back = false;
     let plan = {
         let mut plan = None;
-        for _ in 0..bound {
+        // `bound` rounds carry the back edge; if the fixpoint has not closed by
+        // then the carry is DROPPED and the remaining rounds are the
+        // pre-restructure fixpoint, whose |vregs|-round argument is
+        // unconditional. So the allocator always converges to AT LEAST the
+        // behaviour it had before the restructure: exhausting the cap costs an
+        // optimization, never a compile. The cap stays a defect detector — the
+        // `debug_assert` below fires on the fallback itself — but a user's
+        // program is not the place to report it.
+        for round in 0..bound + f.vregs.len() + 2 {
+            if round == bound && carry {
+                carry = false;
+                fell_back = true;
+                prev_exit = vec![Vec::new(); f.blocks.len()];
+            }
             let lv = live::compute(f, &cfg);
-            match simulate(f, &lv, &cfg, &spilled, cross_cap, &entry_resident)? {
+            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &depth)? {
                 Sim::Plan(p) => {
                     // A plan is only ANSWER when the residency it produced is the
                     // residency it consumed. Until then the plan describes a
@@ -178,16 +240,11 @@ pub fn spill_with(
                     // concretely, its `CopyId`s are minted per round, so a plan
                     // built on last round's numbering is not one to apply. At the
                     // fixed point the two rounds agree on both.
-                    let converged = !BACKEDGE_CARRY || {
-                        let next = backedge_entry_residency(&cfg, &p.wexit);
-                        let same = next == entry_resident;
-                        entry_resident = next;
-                        same
-                    };
-                    if converged {
+                    if !carry || p.wexit == prev_exit {
                         plan = Some(p);
                         break;
                     }
+                    prev_exit = p.wexit;
                 }
                 Sim::More(vs) => {
                     let before = nsp;
@@ -223,13 +280,23 @@ pub fn spill_with(
         // The cap is a DEFECT DETECTOR, not a budget: reaching it falsifies one
         // of the two lattice-height claims above (spec §4.4), so a debug build
         // says so at the layer that owns the argument rather than letting a
-        // half-spilled function walk down to the colourer.
+        // half-spilled function quietly lose the optimization. Check the SECOND
+        // claim first — that between two spills the register-residency set only
+        // grows — since it is the recomputed one and the one this step added; the
+        // first (a spill is never undone) is inspectable in ten lines above.
         debug_assert!(
-            plan.is_some(),
-            "{}: spilling ran {} rounds without a fixpoint — the lattice-height \
-             argument above is false, not the cap",
+            !fell_back,
+            "{}: spilling ran {} rounds carrying the back edge without a fixpoint, \
+             and fell back to the un-carried allocator — the lattice-height argument \
+             above is false, not the cap (check the register-residency claim first)",
             f.name,
             bound
+        );
+        debug_assert!(
+            plan.is_some(),
+            "{}: spilling did not converge even with the back-edge carry dropped — \
+             the memory-residency claim (a value never leaves the spilled set) is false",
+            f.name
         );
         match plan {
             Some(p) => p,
@@ -503,9 +570,34 @@ struct Plan {
     ncopies: u32,
     /// per block: what is still resident in a register when the block ENDS,
     /// each under the name it is resident as. Not read by `apply`; it is what the
-    /// successors' entry sets are built from (§ "carrying a reload") and what the
-    /// R4.1 ceiling measurement reports.
+    /// successors' entry sets are built from (§ "carrying a reload"), what the
+    /// R4.1 ceiling measurement reports, and — since R4-capstone — what the NEXT
+    /// round hands a loop header on behalf of its latch.
     wexit: Vec<Vec<(VReg, Option<CopyId>)>>,
+    /// per block: the block parameters this plan adds (spec §4.1)
+    phis: Vec<Vec<Phi>>,
+}
+
+/// A block parameter the plan will add — Braun 2013's phi, spelled the way this
+/// IR spells one (spec §4.1).
+///
+/// Downstream the phi behaves as a reload copy and nothing else: it takes a
+/// `CopyId` from the same counter, the block's uses of `v` are substituted to it
+/// by the ordinary `subs` machinery, and successors carry it by the ordinary
+/// carry. What is different is only where its value comes from — an edge rather
+/// than a `Reload` instruction.
+struct Phi {
+    v: VReg,
+    id: CopyId,
+    width: Width,
+    /// `(predecessor, the name that predecessor reaches this block with)`, where
+    /// `None` is the value's own name. One entry per incoming edge.
+    srcs: Vec<(MBlockId, Option<CopyId>)>,
+    /// predecessors the round had not simulated when this phi was decided — a
+    /// latch, since blocks are walked in reverse postorder. Resolved once the
+    /// walk is over and every exit set is known, which is the only moment the
+    /// latch's answer exists.
+    pending: Vec<MBlockId>,
 }
 
 enum Sim {
@@ -525,60 +617,41 @@ struct Res {
     cross: bool,
 }
 
-/// THE SECOND LATTICE (spec §4.4) — what every block may assume is already in a
-/// register when it is ENTERED, derived from what the previous round's plan says
-/// each block was holding when it EXITED.
+/// THE SECOND LATTICE (spec §4.4) — what a block may assume is already in a
+/// register when it is ENTERED, on behalf of a predecessor this round has not
+/// simulated yet.
 ///
-/// It is the same test `carried` makes below — a copy survives an edge only if
-/// EVERY predecessor is holding it, under the same name — with one difference,
-/// which is the whole of the step: it is applied to ALL predecessors, including
-/// the ones a reverse-postorder walk has not reached yet. A loop header's latch
-/// is exactly such a predecessor, so this is where "the value is still in a
-/// register at the bottom of the loop" first becomes something the top of the
-/// loop can read. One round behind, because that is the only place the answer
-/// exists before the loop is walked again.
+/// That carrier is now the previous round's `Plan.wexit` ITSELF, passed straight
+/// through: `simulate` reads `prev_exit[latch]` exactly where it would have read
+/// `exits[latch]` had the latch been simulated. An earlier shape of this step
+/// pre-digested `wexit` into a per-block INTERSECTION over predecessors, which
+/// was the right thing while the carry had to be a dominance carry — an
+/// intersection is what proves "one reaching definition" — and is exactly the
+/// reason nothing ever fired: a preheader holds no copy under the latch's name,
+/// so the intersection at a loop header was always empty. With the block
+/// parameter of `reconstruct` in hand the join no longer needs one name, so the
+/// per-predecessor answer is what is wanted and the intersection is what threw
+/// it away.
 ///
-/// Being an intersection over predecessors, the result at a block is bounded by
-/// its live-in set and cannot mention a value no predecessor holds — the
+/// Being derived from `wexit`, the set at a block is bounded by what a register
+/// file can hold, and mentions only values that block was live in — the
 /// bounded-height half of the termination argument in `spill_with`.
-fn backedge_entry_residency(
-    cfg: &crate::cfg::Cfg,
-    wexit: &[Vec<(VReg, Option<CopyId>)>],
-) -> Vec<Vec<(VReg, Option<CopyId>)>> {
-    // only a reload COPY can be carried; a value under its original name needs
-    // no carrying, the successor's live-in already names it.
-    let keys: Vec<Vec<(VReg, CopyId)>> = wexit
-        .iter()
-        .map(|w| {
-            let mut k: Vec<(VReg, CopyId)> = w.iter().filter_map(|&(v, c)| c.map(|c| (v, c))).collect();
-            k.sort_unstable();
-            k
-        })
-        .collect();
-    let mut out = vec![Vec::new(); wexit.len()];
-    for (bi, o) in out.iter_mut().enumerate() {
-        let Some((first, rest)) = cfg.preds[bi].split_first() else {
-            continue;
-        };
-        *o = keys[*first as usize]
-            .iter()
-            .filter(|k| rest.iter().all(|&p| keys[p as usize].binary_search(k).is_ok()))
-            .map(|&(v, c)| (v, Some(c)))
-            .collect();
-    }
-    out
-}
-
 fn simulate(
     f: &MFunc,
     lv: &live::Liveness,
     cfg: &crate::cfg::Cfg,
     spilled: &[bool],
     cross_cap: usize,
-    // what the PRIOR round left resident at each block's entry — read only for
-    // a predecessor this round has not simulated yet (spec §4.4)
-    entry_resident: &[Vec<(VReg, Option<CopyId>)>],
+    // what the PRIOR round left resident at each block's EXIT — read only for a
+    // predecessor this round has not simulated yet (spec §4.4)
+    prev_exit: &[Vec<(VReg, Option<CopyId>)>],
+    // is the back edge carried at all? (`BACKEDGE_CARRY`, and off in the
+    // graceful last phase of `spill_with`)
+    carry: bool,
+    // loop nesting depth per block — the cost side of a cold-edge reload
+    depth: &[u32],
 ) -> Result<Sim, String> {
+    let reconstruct = RECONSTRUCT.with(|c| c.get());
     let base = linear_positions(f, cfg);
     let uses = use_positions(f, lv, cfg, &base);
     // Once the function contains a call the register file is PARTITIONED: a value
@@ -598,6 +671,7 @@ fn simulate(
         subs: vec![Vec::new(); nb],
         ncopies: 0,
         wexit: vec![Vec::new(); nb],
+        phis: (0..nb).map(|_| Vec::new()).collect(),
     };
     let mut newsp: Vec<VReg> = Vec::new();
     // what each block is still holding when it ends, and whether it has been
@@ -698,23 +772,9 @@ fn simulate(
         //     be sound — see the flag at the top of this file.
         let mut w: Vec<Res> = Vec::new();
         let live_here = |v: VReg| lv.live_in[bi].contains(&lv.sp.idx(Reg::V(v)));
-        let carried: Vec<Res> = if cfg.preds[bi].is_empty() {
+        let all_done = cfg.preds[bi].iter().all(|&p| done[p as usize]);
+        let carried: Vec<Res> = if cfg.preds[bi].is_empty() || !all_done {
             Vec::new()
-        } else if cfg.preds[bi].iter().any(|&p| !done[p as usize]) {
-            if !BACKEDGE_CARRY {
-                Vec::new()
-            } else {
-                entry_resident[bi]
-                    .iter()
-                    .filter(|(v, c)| c.is_some() && !spilled[*v as usize] && live_here(*v))
-                    .map(|&(v, copy)| Res {
-                        v,
-                        copy,
-                        class: class_of(f, Reg::V(v)),
-                        cross: lv.crosses_call[v as usize],
-                    })
-                    .collect()
-            }
         } else {
             let (first, rest) = cfg.preds[bi].split_first().unwrap();
             exits[*first as usize]
@@ -729,6 +789,151 @@ fn simulate(
                 .copied()
                 .collect()
         };
+
+        // (1a) SSA RECONSTRUCTION AT A JOIN (spec §4.1) — the GENERAL case of
+        //      the carry above, and the reason the carry above is only a special
+        //      case of it.
+        //
+        //      The dominance carry needs every predecessor to hold the value
+        //      under ONE name, because one name is one definition and one
+        //      definition reaching every path IS dominance. That condition fails
+        //      for the commonest join there is: five switch arms that each
+        //      reloaded the same variable hold five different copies of it, so
+        //      the value is in a register on every single path and the join
+        //      reloads it anyway. It fails at a loop header too, where the
+        //      preheader's reaching definition and the latch's are two different
+        //      things by construction.
+        //
+        //      Braun 2013's answer is to stop looking for one name: give the join
+        //      a BLOCK PARAMETER and let each predecessor say, on its own edge,
+        //      which of its values that parameter stands for. A predecessor that
+        //      holds nothing supplies a reload placed ON ITS EDGE — which is not
+        //      a saving there, it is a MOVE of the reload out of the join and
+        //      into that one path. `reconstruct::insert_phi` builds the object;
+        //      everything here is the decision of where it is worth building.
+        //
+        //      THREE FENCES, and each is a cost the phi must clear:
+        //        * Braun's minimal-SSA PRUNING — the parameter is built only
+        //          where it removes a reload: the value is memory-resident and is
+        //          read at or below this block, so without the parameter that
+        //          read reloads. (A value not memory-resident is already carried
+        //          under its own name and needs nothing.)
+        //        * PRESSURE — the parameter is a register held at the head, so it
+        //          enters the working set as an ordinary copy and is subject to
+        //          the same budget. One that does not fit is simply not built;
+        //          it can never displace an original name, since the head sorts
+        //          originals first.
+        //        * The COLD EDGE — a reload moved onto an edge is paid every time
+        //          that edge is taken, so it is only accepted where the edge runs
+        //          in strictly SHALLOWER loop nesting than the block it serves.
+        //          A preheader paying once for a body that reloads every
+        //          iteration is the whole of §4.2; two arms of a diamond trading
+        //          one reload for one reload is not, and is refused.
+        //
+        //      An edge into the join must also be a plain `b`: after
+        //      `split_critical_edges` that is what every predecessor of a real
+        //      join has, and it is what makes "one edge per predecessor" (which
+        //      `insert_phi` fills positionally) and "the edge copy cannot clobber
+        //      what the terminator reads" both true by inspection.
+        let mut phi_cand: Vec<(Res, Vec<(MBlockId, Option<CopyId>)>)> = Vec::new();
+        if reconstruct
+            && !cfg.preds[bi].is_empty()
+            && cfg.preds[bi]
+                .iter()
+                .all(|&p| matches!(f.blocks[p as usize].term, MTerm::B(_)))
+        {
+            // Who holds what, built ONCE per block by walking each predecessor's
+            // exit set — O(Σ|exit|) for the whole block. The obvious spelling,
+            // "for each candidate value ask each predecessor", is the
+            // O(preds² × k) scan this allocator has been bitten by before.
+            let mut held: BTreeMap<VReg, Vec<(MBlockId, Option<CopyId>)>> = BTreeMap::new();
+            for &p in &cfg.preds[bi] {
+                let pi = p as usize;
+                if done[pi] {
+                    for r in exits[pi].iter() {
+                        held.entry(r.v).or_default().push((p, r.copy));
+                    }
+                } else if carry {
+                    for &(v, c) in prev_exit[pi].iter() {
+                        held.entry(v).or_default().push((p, c));
+                    }
+                }
+            }
+            // one register more at a predecessor's exit than it already holds
+            let room_at_exit = |p: MBlockId, c: Class| -> bool {
+                let pi = p as usize;
+                let n = if done[pi] {
+                    exits[pi].iter().filter(|r| r.class == c).count()
+                } else {
+                    prev_exit[pi]
+                        .iter()
+                        .filter(|&&(v, _)| class_of(f, Reg::V(v)) == c)
+                        .count()
+                };
+                let mut m = 0u32;
+                for &x in lv.live_out[pi].iter() {
+                    if let Some(pr) = lv.sp.reg(x).preg() {
+                        if pr.class == c {
+                            m |= 1 << pr.num;
+                        }
+                    }
+                }
+                n + (m & masks[ki(c)]).count_ones() as usize + 1 <= isa::k(c)
+            };
+            for (v, hot) in held.iter() {
+                let v = *v;
+                // not memory-resident ⟹ already carried under its own name
+                if !spilled[v as usize] || !live_here(v) {
+                    continue;
+                }
+                // the dominance carry already has it, for free and with no
+                // parameter — Braun's "do not build a phi whose arguments are all
+                // the same value", in the form this allocator meets it
+                if carried.iter().any(|r| r.v == v) {
+                    continue;
+                }
+                let cl = class_of(f, Reg::V(v));
+                if cl == Class::Flags {
+                    continue;
+                }
+                // pruning: it must remove a read
+                if next_use(&uses, lv.sp.idx(Reg::V(v)), head) == usize::MAX {
+                    continue;
+                }
+                // A predecessor the round has not simulated can only be believed
+                // through `prev_exit`; if it did not hold the value there, this
+                // round has no answer for its edge and the phi is not decidable.
+                if !cfg.preds[bi]
+                    .iter()
+                    .all(|&p| done[p as usize] || hot.iter().any(|&(q, _)| q == p))
+                {
+                    continue;
+                }
+                let cold: Vec<MBlockId> = cfg.preds[bi]
+                    .iter()
+                    .copied()
+                    .filter(|p| !hot.iter().any(|&(q, _)| q == *p))
+                    .collect();
+                if !cold.is_empty()
+                    && !cold
+                        .iter()
+                        .all(|&p| depth[p as usize] < depth[bi] && room_at_exit(p, cl))
+                {
+                    continue;
+                }
+                let id = plan.ncopies;
+                plan.ncopies += 1;
+                phi_cand.push((
+                    Res {
+                        v,
+                        copy: Some(id),
+                        class: cl,
+                        cross: lv.crosses_call[v as usize],
+                    },
+                    hot.clone(),
+                ));
+            }
+        }
 
         for c in [Class::Gpr, Class::Fpr] {
             let mut names: Vec<VReg> = lv.live_in[bi]
@@ -745,7 +950,11 @@ fn simulate(
                 .into_iter()
                 .map(|v| Res { v, copy: None, class: c, cross: lv.crosses_call[v as usize] })
                 .collect();
-            for r in carried.iter().filter(|r| r.class == c) {
+            for r in carried
+                .iter()
+                .chain(phi_cand.iter().map(|(r, _)| r))
+                .filter(|r| r.class == c)
+            {
                 if !cand.iter().any(|q| q.v == r.v) {
                     cand.push(*r);
                 }
@@ -820,6 +1029,44 @@ fn simulate(
                     None => break,
                 }
             }
+        }
+
+        // Commit the phis that SURVIVED the head — both the budget and the
+        // call-crossing ceiling above. A candidate that lost its place in the
+        // working set was never built: its `CopyId` is simply never mentioned
+        // again and the block reloads the value exactly as it did before, which
+        // is why the cold-edge reloads are minted HERE and not at the candidate
+        // stage.
+        for (r, hot) in phi_cand {
+            let id = r.copy.unwrap();
+            if !w.iter().any(|q| q.copy == Some(id)) {
+                continue;
+            }
+            let mut srcs: Vec<(MBlockId, Option<CopyId>)> = Vec::new();
+            let mut pending: Vec<MBlockId> = Vec::new();
+            for &p in &cfg.preds[bi] {
+                if !done[p as usize] {
+                    pending.push(p);
+                    continue;
+                }
+                match hot.iter().find(|&&(q, _)| q == p) {
+                    Some(&(_, c)) => srcs.push((p, c)),
+                    None => {
+                        let rid = plan.ncopies;
+                        plan.ncopies += 1;
+                        plan.reloads[p as usize]
+                            .push((f.blocks[p as usize].insts.len(), r.v, rid));
+                        srcs.push((p, Some(rid)));
+                    }
+                }
+            }
+            plan.phis[bi].push(Phi {
+                v: r.v,
+                id,
+                width: f.vregs[r.v as usize].width,
+                srcs,
+                pending,
+            });
         }
 
         // (2) walk the block
@@ -1182,6 +1429,35 @@ fn simulate(
         done[bi] = true;
     }
     if newsp.is_empty() {
+        // Every phi's LATCH argument, now that the walk is over. A loop header
+        // decides to build its parameter on the strength of what the latch held
+        // LAST round (`prev_exit`); what the latch actually holds is known only
+        // once the latch has been simulated, which in reverse postorder is after
+        // the header. So the pending edges are filled here, from THIS round's
+        // exit sets, and a latch that turned out not to hold the value after all
+        // takes a reload on its edge like any other cold predecessor. The two
+        // rounds disagreeing is precisely what the convergence test in
+        // `spill_with` refuses to accept a plan on.
+        for bi in 0..nb {
+            for k in 0..plan.phis[bi].len() {
+                let pend = std::mem::take(&mut plan.phis[bi][k].pending);
+                let v = plan.phis[bi][k].v;
+                for p in pend {
+                    let held = exits[p as usize].iter().find(|r| r.v == v).map(|r| r.copy);
+                    let src = match held {
+                        Some(c) => c,
+                        None => {
+                            let rid = plan.ncopies;
+                            plan.ncopies += 1;
+                            plan.reloads[p as usize]
+                                .push((f.blocks[p as usize].insts.len(), v, rid));
+                            Some(rid)
+                        }
+                    };
+                    plan.phis[bi][k].srcs.push((p, src));
+                }
+            }
+        }
         Ok(Sim::Plan(plan))
     } else {
         newsp.sort_unstable();
@@ -1223,6 +1499,47 @@ fn apply(
             let w = f.vregs[v as usize].width;
             copy_reg[id as usize] = f.new_vreg(w);
         }
+    }
+
+    // SSA RECONSTRUCTION (spec §4.1) — the plan's block parameters, built here
+    // and nowhere else. A phi is a reload copy whose value arrives on an edge
+    // instead of out of a slot, so once its name is in `copy_reg` the rewriting
+    // below substitutes uses to it exactly as it does for a reload, and nothing
+    // else in `apply` needs to know a phi exists.
+    //
+    // EVERY parameter is created before ANY edge is fed. A phi's argument on one
+    // edge can be another phi's parameter, and around a loop the header's
+    // argument from the latch and the latch's own parameter point at each other —
+    // there is no order in which "resolve the arguments, then build" terminates.
+    // Building all the names first dissolves the knot without any ordering
+    // cleverness (`reconstruct::new_param` then `reconstruct::feed_phi`, the two
+    // halves of `insert_phi`). Within one block the two passes keep the SAME
+    // order, which is what makes `feed_phi`'s positional edge-filling line up.
+    let mut params: Vec<(usize, usize, VReg)> = Vec::new();
+    for b in 0..plan.phis.len() {
+        for (k, ph) in plan.phis[b].iter().enumerate() {
+            let p = super::reconstruct::new_param(f, b as MBlockId, ph.width.class(), ph.width);
+            copy_reg[ph.id as usize] = Reg::V(p);
+            params.push((b, k, p));
+        }
+    }
+    for (b, k, p) in params {
+        let args: Vec<(MBlockId, Reg)> = plan.phis[b][k]
+            .srcs
+            .iter()
+            .map(|&(pred, c)| {
+                let r = match c {
+                    Some(id) => copy_reg[id as usize],
+                    // the predecessor still holds the value under its own name,
+                    // whose definition dominates that predecessor because the
+                    // value is live there — so the name is the reaching
+                    // definition and needs no copy
+                    None => Reg::V(plan.phis[b][k].v),
+                };
+                (pred, r)
+            })
+            .collect();
+        super::reconstruct::feed_phi(f, b as MBlockId, p, &args);
     }
     for b in 0..f.blocks.len() {
         let reloads = &plan.reloads[b];
