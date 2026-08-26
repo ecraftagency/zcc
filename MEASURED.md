@@ -369,3 +369,52 @@ guessed at. Issue width, ports, the reorder window, cache misses and branch
 misprediction are not modelled at all — the recurrence is a LOWER bound, and
 programs it scores at 1 while they run slower (j5, g1, d1) are bounded by
 something else, which is itself a useful verdict.
+
+---
+
+## M11. Tail-duplicating a loop latch pays only at a MULTI-WAY dispatch
+
+**VALUE.** `mir/pass/layout.rs::duplicate_latch` copies a loop tail into its
+predecessors only when **three or more** of them reach it by an unconditional
+branch.
+
+**METHOD.** d1_switch's switch arms each end `b .Lwork_3`, and that block is the
+whole loop tail — bump the counter, test it, branch back. Every iteration paid
+TWO taken branches to reach the top. Hand-validated in zcc's own `.s` before the
+pass was written (three passes, output identical at 8000006000000):
+
+| d1_switch | ms |
+|---|---|
+| gcc -O1 | 10 |
+| zcc, arms jump to a shared tail | 12 |
+| zcc, tail copied into each arm | **10** |
+
+**THE THRESHOLD, and what it cost to find.** Firing on TWO or more predecessors
+— which describes any if-else join — fired on nearly every loop in the suite:
+
+| predecessors required | geo40 EXEC | geo40 INSN | sqlite |
+|---|---|---|---|
+| ≥ 2 | 0.9430 | **1.3668** (32 of 35 above 1.1×) | +3,906 |
+| **≥ 3** | **0.9494** | **1.0432** | **+840** |
+
+33% of size for 2% of time is the trade R4.14 refused at 16-for-7. Three is the
+count that distinguishes a multi-way dispatch from a two-armed join, which is
+where a second branch per iteration actually repeats.
+
+**AN EARLIER FENCE, AND THE VERIFIER THAT FOUND IT MISSING.** The first cut
+tested only "conditional terminator, ≥2 unconditional predecessors" — describing
+any join — and duplicating a join that reloads a spilled value moved the reload
+above its store on one path. `regalloc::verify` said so at once: "reload of
+unstored slot 31". A loop TAIL is a join whose terminator branches BACK to a
+block that dominates it, and that is what the pass tests now.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, gcc 14.2.0.
+
+**WHAT USES IT.** `mir/pass/layout.rs::duplicate_latch`.
+
+**OPEN — THE THRESHOLD IS UNSWEPT.** 2 and 3 were measured; 4, 5 and beyond
+were not. Three is where the measurement stopped, not where it was shown to be
+best, and this entry says so rather than dressing a plausible story as a fact —
+`MIN_CASES = 4` sat unswept in `isel/lower.rs` for a milestone and cost d1 50%
+when someone finally measured it (`MEASURED M4`). Sweeping 4/5/6 on INSN and
+sqlite is deterministic and needs no quiet box.

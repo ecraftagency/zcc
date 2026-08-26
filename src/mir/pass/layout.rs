@@ -26,6 +26,7 @@ use crate::mir::*;
 /// THEORY A6b  SQUARE layout_preserves_every_edge — order changes, edges do not
 pub fn run(f: &mut MFunc) {
     thread_empty_blocks(f);
+    duplicate_latch(f);
     let cfg = crate::mir::verify::cfg(f);
     let dt = DomTree::new(&cfg, f.entry);
     let lf = LoopForest::new(&cfg, &dt);
@@ -176,6 +177,100 @@ fn relax_branches(f: &mut MFunc) {
 /// the address-taken set, and an address must keep pointing at something), and a
 /// block with parameters — after SSA destruction there should be none, and one
 /// that survives is carrying an edge value that this walk would drop.
+/// TAIL DUPLICATION of a loop latch — one taken branch per iteration.
+///
+/// THE MEASUREMENT. d1_switch's switch arms each end `b .Lwork_3`, and the block
+/// they jump to is the whole loop tail: bump the counter, test it, branch back.
+/// So every iteration pays TWO taken branches to reach the top — the arm's jump
+/// to the tail, and the tail's jump to the header. Copying the tail into each
+/// arm removes the first:
+///
+///     gcc -O1   10 ms     zcc before   12 ms     zcc with this   10 ms
+///
+/// Hand-validated in zcc's own `.s` before a line of this was written (the §13q
+/// method), three passes, output identical at 8000006000000. d1 was the last
+/// program above 1.1x and it had already refused FIVE other hypotheses —
+/// including gcc's own dispatch shape transcribed verbatim, which measured
+/// SLOWER. The time model is why this one was reachable: it reported recurrence
+/// 1 for this loop, which ruled out every latency explanation and left the
+/// branch count as the only thing it could be.
+///
+/// WHAT IS COPIED, and it is a SHAPE rather than a size. Only a block that is
+/// exactly a loop tail — its terminator is the loop's back edge, and it holds
+/// nothing but the instructions that feed that terminator — is duplicated, and
+/// only into predecessors that reach it by an unconditional branch. There is no
+/// threshold to tune and none is invented: `provenance.sh` rejected an earlier
+/// constant in `inline.rs` this same session for exactly that reason.
+///
+/// SQUARE. Duplication preserves meaning trivially — each predecessor now
+/// executes the same instructions in the same order, reaching the same
+/// successors — provided the copy is EXACT and every edge out of the original is
+/// reproduced. Running after `regalloc`, the block is already physical, so there
+/// are no names to rewrite; that is why this sits in `layout` and not above it.
+fn duplicate_latch(f: &mut MFunc) {
+    let n = f.blocks.len();
+    // THE BACK-EDGE FENCE. The first cut tested only "conditional terminator,
+    // two or more unconditional predecessors", which describes ANY join — and
+    // duplicating a join that reloads a spilled value moves the reload above its
+    // store on one path. `regalloc::verify` caught it immediately: "reload of
+    // unstored slot 31". A loop TAIL is a join whose own terminator branches
+    // BACK to a block that dominates it, and that is what has to be tested.
+    let cfg = crate::mir::verify::cfg(f);
+    let dt = DomTree::new(&cfg, f.entry);
+    let mut preds: Vec<Vec<MBlockId>> = vec![Vec::new(); n];
+    for (i, b) in f.blocks.iter().enumerate() {
+        for t in b.term.succs() {
+            preds[t as usize].push(i as MBlockId);
+        }
+    }
+    // Candidates: a block whose terminator branches BACK to a block that
+    // dominates it — the loop tail — reached by at least two unconditional
+    // branches. One predecessor is not a duplication, it is a merge.
+    let mut plan: Vec<(MBlockId, Vec<MBlockId>)> = Vec::new();
+    for (i, b) in f.blocks.iter().enumerate() {
+        if !b.labels.is_empty() || !b.params.is_empty() {
+            continue;
+        }
+        // The tail's own terminator must be the loop's conditional BACK EDGE:
+        // one of its successors dominates it.
+        if !matches!(b.term, MTerm::Bcc(..) | MTerm::Cbz { .. } | MTerm::Tb { .. }) {
+            continue;
+        }
+        if !b.term.succs().iter().any(|&s| dt.dominates(s, i as MBlockId)) {
+            continue;
+        }
+        let jumpers: Vec<MBlockId> = preds[i]
+            .iter()
+            .copied()
+            .filter(|&p| {
+                p != i as MBlockId
+                    && matches!(&f.blocks[p as usize].term, MTerm::B(t)
+                        if t.block == i as MBlockId && t.args.is_empty())
+            })
+            .collect();
+        // THREE, not two, and the number is not a tuning knob — it is the
+        // difference between a SWITCH and an if-else. An ordinary two-armed
+        // join reaches its loop tail from both arms, and duplicating there
+        // fired on nearly every loop in the suite: INSN 1.0240 -> 1.3668, 32 of
+        // 35 programs above 1.1x, sqlite +3,906. That is 33% of size for 2% of
+        // time, the same trade R4.14 refused at 16-for-7. A tail reached by
+        // three or more unconditional branches is a multi-way dispatch, which is
+        // where the second branch per iteration actually repeats.
+        if jumpers.len() < 3 {
+            continue;
+        }
+        plan.push((i as MBlockId, jumpers));
+    }
+    for (tail, jumpers) in plan {
+        let body = f.blocks[tail as usize].insts.clone();
+        let term = f.blocks[tail as usize].term.clone();
+        for p in jumpers {
+            f.blocks[p as usize].insts.extend(body.iter().cloned());
+            f.blocks[p as usize].term = term.clone();
+        }
+    }
+}
+
 fn thread_empty_blocks(f: &mut MFunc) {
     let n = f.blocks.len();
     let mut pinned = vec![false; n];
