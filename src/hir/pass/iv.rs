@@ -1089,3 +1089,225 @@ fn apply_substitute(
         b.insts.retain(|i| i.dst() != Some(plan.step_val));
     }
 }
+
+// ── COUNT DOWN, so the branch reads the flags the step already set ─────────
+//
+// THE MEASUREMENT. `revbits`: `for (i=0;i<32;i++) { r=(r<<1)|(x&1); x>>=1; }`
+//
+//     zcc  and w3,w2,#1 ; orr w1,w3,w1,lsl 1 ; lsr w2,w2,#1 ; add w0,w0,#1 ; cmp w0,#32 ; b.lt
+//     gcc  and w3,w1,1  ; orr w0,w3,w0,lsl 1 ; lsr w1,w1,1  ; subs w2,w2,#1 ;             bne
+//
+// Six instructions against five, and 6/5 = 1.20 against a measured EXEC of
+// 1.194 — the whole gap is the separate `cmp`. gcc counts DOWN, so the step sets
+// the flags the branch needs. `cmp w0,#32` cannot be fused by `cmp_elim`: it
+// compares against a bound, not against zero.
+//
+// What the TIME model said about this loop is the instructive part: recurrence
+// 2, and gcc's is 2 as well. The gap was never latency. The model earned its
+// keep by ruling the recurrence OUT — this row is a count fix, not a chain fix.
+//
+// THE TRANSFORM. When a counted loop's index is read by NOTHING but its own step
+// and the exit test, its VALUES are unobservable; only the number of iterations
+// is. So run it from `trips` down to zero and test against zero.
+//
+// COMMUTING SQUARE. `scev::trips` is the number of times the BODY runs, claimed
+// only for a single-exit loop testing a literal-bounded induction variable from
+// a literal start. The body runs `trips` times before and after: the counter
+// takes `trips, trips-1, …, 1` and the step reaches 0 exactly once. Nothing else
+// can observe the difference, because the fence below establishes that no other
+// instruction reads the index — that IS the argument.
+//
+// IDEMPOTENCE IS PART OF THE PROOF, not a detail. The pass ladder is a FIXPOINT:
+// it re-runs until nothing changes, so a rewrite that does not recognize its own
+// output runs again on it. The first cut checked `step == -1 && off == trips`,
+// which looks sufficient and is not — on the second round `scev` re-derives a
+// trip count from the REWRITTEN `!= 0` test and returned 1, so the loop was
+// rebuilt to start at 1 and `revbits` ran a single iteration. That is a
+// MISCOMPILE (6442439334100992 became 1500000), caught by the batteries and by
+// comparing output against gcc before anything was banked. The guard is now the
+// SHAPE of the exit test — already testing `!= 0` means already done — which
+// cannot be re-derived into something else.
+//
+// WHAT IS REFUSED: a TOP-tested loop, where the test reads the index before the
+// step; an index with any other reader, a `sext` included (that is `widen`'s
+// row); a trip count the analysis will not state; a count that does not fit the
+// index's type.
+
+/// THEORY A7b  SQUARE a_counted_loop_counts_down_and_the_compare_disappears
+pub fn countdown(f: &mut Func) -> bool {
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    let lf = dom::loops(&c, &dt);
+    let mut order: Vec<usize> = (0..lf.loops.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    for li in order {
+        if countdown_loop(f, &c, &dt, &lf, li) {
+            refresh_defs(f);
+            return true;
+        }
+    }
+    false
+}
+
+fn countdown_loop(
+    f: &mut Func,
+    c: &dom::Cfg,
+    dt: &dom::DomTree,
+    lf: &dom::LoopForest,
+    li: usize,
+) -> bool {
+    let s = match scev::LoopScev::analyze(f, c, dt, lf, li) {
+        Some(s) => s,
+        None => return false,
+    };
+    let trips = match s.trips {
+        Some(t) if t >= 1 => t,
+        _ => return false,
+    };
+    let header = lf.loops[li].header;
+    let entries: Vec<BlockId> = c.preds[header as usize]
+        .iter()
+        .copied()
+        .filter(|&p| !dt.dominates(header, p))
+        .collect();
+    let latches: Vec<BlockId> = c.preds[header as usize]
+        .iter()
+        .copied()
+        .filter(|&p| dt.dominates(header, p))
+        .collect();
+    if entries.len() != 1 || latches.len() != 1 {
+        return false;
+    }
+    let mut ivs: Vec<(ValueId, scev::AddRec)> =
+        s.ivs.iter().filter(|(_, r)| r.base.is_none()).map(|(p, r)| (*p, *r)).collect();
+    ivs.sort_by_key(|(p, _)| *p);
+    for (p, rec) in ivs {
+        let ty = f.ty_of(p);
+        if ty.is_float() {
+            continue;
+        }
+        let limit: u64 = if ty.bits() == 32 { i32::MAX as u64 } else { i64::MAX as u64 };
+        if trips > limit {
+            continue;
+        }
+        let mut step_val = None;
+        let mut bad = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Bin { dst, op: BinOp::Add, a, b: rhs, .. } = inst {
+                    if *a == Operand::Val(p) && *rhs == Operand::Imm(rec.step) {
+                        if step_val.is_some() {
+                            bad = true;
+                        }
+                        step_val = Some(*dst);
+                    }
+                }
+            }
+        }
+        let sv = match step_val {
+            Some(v) if !bad => v,
+            _ => continue,
+        };
+        // The exit test, which must read the STEPPED value: that is the
+        // bottom-tested shape, the one whose arithmetic this proof is about.
+        let mut cmp = None;
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (i, inst) in b.insts.iter().enumerate() {
+                if let Inst::Cmp { dst, op, a, b: rhs, .. } = inst {
+                    if *a == Operand::Val(sv) || *a == Operand::Val(p) {
+                        if cmp.is_some() {
+                            bad = true;
+                        }
+                        cmp = Some((bi as BlockId, i, *dst, *a == Operand::Val(sv), *op, *rhs));
+                    }
+                }
+            }
+        }
+        let (cb, ci, cmp_dst, after_step, op, rhs) = match cmp {
+            Some(x) if !bad && x.3 => x,
+            _ => continue,
+        };
+        let _ = after_step;
+        // THE COMPARE MUST BE THE LOOP'S EXIT TEST, and asserting that is not a
+        // formality — it is the fence this pass shipped without and the torture
+        // corpus caught within the hour (`961017-2`). That program runs TWO
+        // induction variables: `z`, whose `while (z > 0)` is the real exit, and
+        // `i`, whose only compare is an overflow guard `if (i > 0x40000) abort()`
+        // in the middle of the body. A scan that takes the first compare it finds
+        // on an index rewrote the GUARD into `!= 0`, and the program aborted
+        // immediately. Being read only by a step and a compare is not enough; the
+        // compare has to be the one that ends the loop.
+        let leaves_loop = match &f.blocks[cb as usize].term {
+            Term::Br(Operand::Val(c), t, e) if *c == cmp_dst => {
+                let ins = |b: BlockId| b == header || lf.loops[li].body.contains(&b);
+                ins(t.block) != ins(e.block)
+            }
+            _ => false,
+        };
+        if !leaves_loop {
+            continue;
+        }
+        // ALREADY a countdown. The ladder is a fixpoint and re-runs this pass on
+        // its own output; see the note above for what happened when the guard
+        // was a property of the trip count instead of the shape of the test.
+        if op == CmpOp::Ne && rhs == Operand::Imm(0) {
+            continue;
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                inst.uses(|o| {
+                    if o == Operand::Val(p) || o == Operand::Val(sv) {
+                        let d = inst.dst();
+                        if d != Some(sv) && d != Some(cmp_dst) {
+                            bad = true;
+                        }
+                    }
+                });
+            }
+            for t in b.term.targets() {
+                if t.block != header
+                    && t.args.iter().any(|a| *a == Operand::Val(p) || *a == Operand::Val(sv))
+                {
+                    bad = true;
+                }
+            }
+            match &b.term {
+                Term::Br(x, ..) | Term::Switch(x, ..) | Term::GotoPtr(x, _) | Term::Ret(Some(x)) => {
+                    if *x == Operand::Val(p) || *x == Operand::Val(sv) {
+                        bad = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if bad {
+            continue;
+        }
+        let pi = match f.blocks[header as usize].params.iter().position(|&x| x == p) {
+            Some(i) => i,
+            None => continue,
+        };
+        for t in f.blocks[entries[0] as usize].term.targets_mut() {
+            if t.block == header {
+                t.args[pi] = Operand::Imm(trips as i64);
+            }
+        }
+        for b in f.blocks.iter_mut() {
+            for inst in b.insts.iter_mut() {
+                if inst.dst() == Some(sv) {
+                    *inst = Inst::Bin {
+                        dst: sv,
+                        op: BinOp::Sub,
+                        ty,
+                        a: Operand::Val(p),
+                        b: Operand::Imm(1),
+                    };
+                }
+            }
+        }
+        f.blocks[cb as usize].insts[ci] =
+            Inst::Cmp { dst: cmp_dst, op: CmpOp::Ne, ty, a: Operand::Val(sv), b: Operand::Imm(0) };
+        return true;
+    }
+    false
+}

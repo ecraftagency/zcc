@@ -1580,3 +1580,68 @@ fn a_masked_truncation_needs_no_widening() {
         (x, y) => panic!("a sign-bit-keeping mask must be refused: {:?} {:?}", x, y),
     }
 }
+
+#[test]
+fn a_counted_loop_counts_down_and_the_compare_disappears() {
+    // h2_revbits' shape: an index read by nothing but its own step and the exit
+    // test, so its VALUES are unobservable and only the trip count matters.
+    // Counting down lets the step set the flags the branch wants, and the
+    // separate `cmp` against the bound goes away — six instructions to five,
+    // 1.194 to 1.000 on the clock.
+    let src = "unsigned revbits(unsigned x){unsigned r=0;int i;\
+               for(i=0;i<32;i++){r=(r<<1)|(x&1);x>>=1;}return r;}\
+               int main(void){return (int)(revbits(1u)>>28);}";
+    let opt = module(src, true);
+    let g = func(&opt, "revbits");
+    // NON-VACUITY: the test is against ZERO now, not against the bound.
+    assert_eq!(
+        count(g, |i| matches!(
+            i,
+            Inst::Cmp { op: crate::hir::CmpOp::Ne, b: Operand::Imm(0), .. }
+        )),
+        1,
+        "the exit test counts down to zero"
+    );
+    // ⟦f⟧ = ⟦countdown f⟧. revbits(1) reverses bit 0 into bit 31, so the value
+    // is 0x80000000 and its top nibble is 8.
+    let ast = frontend(src);
+    let plain = module(src, false);
+    match (run(&plain, &ast), run(&opt, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == 8 => {}
+        (x, y) => panic!("⟦f⟧={:?} ⟦countdown f⟧={:?} want 8", x, y),
+    }
+}
+
+#[test]
+fn counting_down_is_idempotent_under_the_fixpoint() {
+    // THE REGRESSION THIS EXISTS FOR. The ladder re-runs every pass until
+    // nothing changes, so a rewrite that cannot recognize its OWN OUTPUT runs
+    // again on it. `countdown`'s first cut guarded on the trip count rather than
+    // on the shape of the test; on the second round `scev` re-derived a count of
+    // 1 from the rewritten `!= 0` test, the loop was rebuilt to start at 1, and
+    // `revbits` ran a single iteration — 6442439334100992 became 1500000.
+    //
+    // Running the whole ladder twice must therefore be the same as running it
+    // once, and the answer must still be the answer.
+    let src = "unsigned revbits(unsigned x){unsigned r=0;int i;\
+               for(i=0;i<32;i++){r=(r<<1)|(x&1);x>>=1;}return r;}\
+               int main(void){return (int)(revbits(1u)>>28);}";
+    let ast = frontend(src);
+    let mut once = build::build(&ast);
+    super::run_module_with(&mut once, &crate::compile::pinned_symbols(&ast));
+    let mut twice = build::build(&ast);
+    super::run_module_with(&mut twice, &crate::compile::pinned_symbols(&ast));
+    super::run_module_with(&mut twice, &crate::compile::pinned_symbols(&ast));
+    for f in &twice.funcs {
+        verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    }
+    assert_eq!(
+        ninsts(func(&once, "revbits")),
+        ninsts(func(&twice, "revbits")),
+        "a second run of the ladder must change nothing"
+    );
+    match (run(&once, &ast), run(&twice, &ast)) {
+        (Ok(a), Ok(b)) if a == b && a == 8 => {}
+        (a, b) => panic!("once={:?} twice={:?} want 8", a, b),
+    }
+}

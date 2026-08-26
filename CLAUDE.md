@@ -94,6 +94,31 @@ builds the model.
 trades chain length for instruction count. A residual measured on `cost = |MIR|`
 alone cannot see this class, so it does not discharge Law 4 for a codegen row.
 
+**WHAT MAY BE CLAIMED, and it is not what the number says** (user, 2026-08-26).
+THE ULTIMATUM names 1× against gcc -O1 as the stopping point. A measured 1× on
+the current surface does NOT establish it. The surface is 35 kernels that fit in
+L1i plus one real program, and it is narrow in nameable ways: no FP-heavy
+numerics, no large working sets, no deep call graphs or indirect dispatch, no
+varargs- or bitfield-heavy code, ONE microarchitecture, one input size per
+program, and `sqlite` is the only member with real register pressure. It is
+under a tenth of the spectrum, so a geomean over it is evidence about ITS
+members first.
+
+Therefore: **0.9× is the safe margin for claiming parity, and even then the
+claim is "matches gcc -O1 ON THIS SUITE, ON THIS CORE" — never "matches
+gcc -O1".** The margin is not padding; it is coverage insurance, the amount by
+which the sampled 10% must win before the unsampled 90% is unlikely to flip the
+sign. Compiler comparison is not a single number, and a compiler that announces
+parity from a narrow suite has mis-stated its own result, which is a Law-0
+failure (a claim bought at the cost of its provenance) rather than a small one.
+
+The surface is to be WIDENED — 100-200 programs — and the two instruments do
+different jobs: **csmith finds CLIFFS** (run many, report only the tail where
+zcc/gcc exceeds a threshold; it is a discovery engine pointed at time instead of
+correctness, and it is already in the gate), while **real programs carry the
+geomean** (csmith's control flow and global-memory traffic are nothing like real
+software, so a geomean over it would be a number about csmith).
+
 ---
 
 ## Article A — the two supreme requirements (every decision reduces to these)

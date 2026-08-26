@@ -143,6 +143,11 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         if on("subst") {
             changed |= iv::substitute(f);
         }
+        // LAST of the IV rows, because it DESTROYS the index: once the loop
+        // counts down, `widen` and `substitute` have nothing left to recognize.
+        if on("countdown") {
+            changed |= iv::countdown(f);
+        }
         if on("sink") {
             changed |= sink::run(f);
         }
