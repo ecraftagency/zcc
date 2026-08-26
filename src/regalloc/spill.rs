@@ -36,6 +36,15 @@
 //     is REMATERIALIZED instead of stored and reloaded — the recomputation is
 //     one instruction and the store disappears entirely.
 //
+// EVICTION IS A REGIONAL SPLIT (spec §4.3). "Memory-resident" is a property of a
+// REGION of a value's live range, never of the whole value: a value evicted at a
+// pressure peak is in memory from there to its next reload and in a register
+// everywhere else, under its own name. `Sim::More` therefore asks for a memory
+// HOME — a slot and a store after the definition — and not for banishment from
+// the register file; see the enum's own comment for why termination is untouched
+// by that. What is left whole-web memory-resident is the value that can hold a
+// register nowhere at all, which the `web-none` column of `ZCC_SPILLCEIL` counts.
+//
 // NO SSA RECONSTRUCTION IS NEEDED — still true after R4.1, and now for a
 // sharper reason than before. It used to hold because a reload's register never
 // left the block that made it. R4.1 lets a copy cross an edge, but only where
@@ -121,6 +130,26 @@ pub(super) const RECON_LOOPS: u8 = 2;
 #[cfg(test)]
 pub(super) fn set_reconstruct(level: u8) {
     RECONSTRUCT.with(|c| c.set(level));
+}
+
+/// THE A/B SEAM FOR SPEC §4.3 — is eviction a REGIONAL split, or does a value
+/// evicted at one pressure peak stay in memory for its whole web?
+///
+/// Same obligation as `RECONSTRUCT` above and same reason for being a
+/// thread-local: a commuting square proves nothing on an input where the pass
+/// never fires, and "fires" is the DIFFERENCE between the same program allocated
+/// with the split and without it. Off, the residency of a memory-resident value
+/// dies at every block boundary, which is the pre-§4.3 allocator exactly.
+thread_local! {
+    // THEORY A7 — the spiller's own theorem, instrument half. Not a value the
+    // compiler computes with.
+    static REGIONAL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Turn the regional split off, or back on, for the CURRENT THREAD.
+#[cfg(test)]
+pub(super) fn set_regional(on: bool) {
+    REGIONAL.with(|c| c.set(on));
 }
 
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
@@ -692,6 +721,24 @@ struct Phi {
     srcs: Vec<(MBlockId, Option<CopyId>)>,
 }
 
+/// The outcome of one simulated walk.
+///
+/// `More(vs)` used to be a life sentence and is not one since spec §4.3: it says
+/// each value in `vs` needs a MEMORY HOME — a slot, and a store right after the
+/// definition that dominates every later read — because the walk found a point
+/// where no register could hold it. It does NOT say the value is banished from
+/// the register file. On the next round the same value is register-resident from
+/// its definition until pressure evicts it, crosses an edge under its own name
+/// wherever every predecessor is still holding it, and is reloaded only in the
+/// regions in between: eviction is a SPLIT, and memory residency is regional.
+///
+/// TERMINATION IS UNCHANGED BY THAT, and this is the claim the whole fixpoint
+/// rests on. `spilled` is still what `More` grows, a value still never leaves it,
+/// so there are still at most |vregs| plan-less rounds. What §4.3 changed is what
+/// membership MEANS, not the lattice: a value that can hold a register nowhere —
+/// 179 of sqlite's 4,549, by the `web-none` column of `ZCC_SPILLCEIL` — still
+/// ends up memory-resident for its whole life, because every one of its regions
+/// is a region pressure forced it out of.
 enum Sim {
     Plan(Plan),
     More(Vec<VReg>),
@@ -744,6 +791,7 @@ fn simulate(
     depth: &[u32],
 ) -> Result<Sim, String> {
     let reconstruct = RECONSTRUCT.with(|c| c.get()) >= 1;
+    let regional = REGIONAL.with(|c| c.get());
     // WHICH VALUES STILL HAVE A DEFINITION — the fence that keeps SSA
     // reconstruction on SSA values.
     //
@@ -817,6 +865,13 @@ fn simulate(
     // binary search moved the sqlite compile not at all — so it is kept for the
     // asymptotics and named here so nobody re-measures it hoping for the 11%.
     let mut exit_keys: Vec<Vec<(VReg, CopyId)>> = vec![Vec::new(); nb];
+    // spec §4.3 — the same set restricted to residencies under the value's OWN
+    // name, sorted for lookup. A memory-resident value holding a register under
+    // its own name is what a REGIONAL split leaves behind: it is in memory in the
+    // regions pressure forced it out of and in a register in the regions it did
+    // not, and this is how the next block finds out which side of that line its
+    // entry is on.
+    let mut exit_orig: Vec<Vec<VReg>> = vec![Vec::new(); nb];
     let mut done: Vec<bool> = vec![false; nb];
     let mut lu = live::LastUse::new(lv.sp);
     let masks = [
@@ -903,6 +958,40 @@ fn simulate(
         //     and only under `BACKEDGE_CARRY`, because the two reaching
         //     definitions it joins need the block parameter of `reconstruct` to
         //     be sound — see the flag at the top of this file.
+        //     EVICTION IS A REGIONAL SPLIT, NOT A WHOLE-WEB SPILL (spec §4.3).
+        //     The carry above is written for a reload COPY, and that is not an
+        //     accident of spelling: before §4.3 a memory-resident value could
+        //     only be in a register as a copy, because `Sim::More` retired the
+        //     value's whole web to memory and the head candidate list drops a
+        //     memory-resident name on sight. §4.3 says memory residency is
+        //     REGIONAL — a value evicted at one pressure peak is in memory
+        //     between that peak and its next reload and in a register everywhere
+        //     else — and the register it is in over those other regions is its
+        //     OWN name, minted by its own definition ((2c) below already admits
+        //     it; nothing there filters on `spilled`).
+        //
+        //     So the carry has a second form: a memory-resident value that every
+        //     predecessor is still holding under its OWN name crosses the edge
+        //     with no copy, no parameter and no reload. It needs no dominance
+        //     argument at all, which is why it is stronger than the copy carry
+        //     rather than a special case of it: the name is the value's single
+        //     SSA definition, and a value LIVE-IN to this block is by definition
+        //     one whose definition dominates it. What every predecessor's exit
+        //     set establishes is only that a register really holds it here, which
+        //     is the pressure question and not the correctness one.
+        //
+        //     TWO FENCES. It must be memory-resident (a value that is not is
+        //     already in the head candidate list under its own name and needs
+        //     nothing), and it must still HAVE a definition — `evict_params`
+        //     turns a spilled block parameter into a name whose real definition
+        //     is the store each edge makes into its slot, and a register copy of
+        //     such a name goes stale the moment an edge writes it (see `has_def`
+        //     above; the battery caught that as a non-terminating loop). The
+        //     second fence is belt-and-braces here — an evicted parameter can
+        //     never enter `w` under its own name, since the head list filters
+        //     memory-resident names out and (2c) only admits real definitions —
+        //     and it is written down because the day that stops being true is not
+        //     the day to rediscover the defect.
         let mut w: Vec<Res> = Vec::new();
         let live_here = |v: VReg| lv.live_in[bi].contains(&lv.sp.idx(Reg::V(v)));
         let all_done = cfg.preds[bi].iter().all(|&p| done[p as usize]);
@@ -912,12 +1001,21 @@ fn simulate(
             let (first, rest) = cfg.preds[bi].split_first().unwrap();
             exits[*first as usize]
                 .iter()
-                .filter(|r| r.copy.is_some())
                 .filter(|r| live_here(r.v))
-                .filter(|r| {
-                    let key = (r.v, r.copy.unwrap());
-                    rest.iter()
-                        .all(|&p| exit_keys[p as usize].binary_search(&key).is_ok())
+                .filter(|r| match r.copy {
+                    Some(id) => {
+                        let key = (r.v, id);
+                        rest.iter()
+                            .all(|&p| exit_keys[p as usize].binary_search(&key).is_ok())
+                    }
+                    None => {
+                        regional
+                            && spilled[r.v as usize]
+                            && has_def[r.v as usize]
+                            && rest.iter().all(|&p| {
+                                exit_orig[p as usize].binary_search(&r.v).is_ok()
+                            })
+                    }
                 })
                 .copied()
                 .collect()
@@ -1103,7 +1201,15 @@ fn simulate(
             // turns out not to bind at block heads); it is here because the
             // asymmetry is real and the day it binds is not the day to discover
             // that a reload here was traded for a spill everywhere.
-            cand.sort_by_key(|r| (r.copy.is_some(), next_use(&uses, r.v as usize, head)));
+            // …and since §4.3 the test for "an original that does not fit
+            // becomes memory-resident" is not `copy.is_none()` but "its own name
+            // AND not already memory-resident": a value the regional carry
+            // brought in under its own name is ALREADY in memory, so losing it
+            // here costs one reload and not a whole-web spill. It must therefore
+            // sort with the copies, or it could displace a name whose loss is the
+            // expensive kind.
+            let droppable = |r: &Res| r.copy.is_some() || spilled[r.v as usize];
+            cand.sort_by_key(|r| (droppable(r), next_use(&uses, r.v as usize, head)));
             let hm = phys_mask(&physlive, c) & masks[ki(c)];
             let budget = isa::k(c).saturating_sub(hm.count_ones() as usize);
             let mut bcross = cs[ki(c)]
@@ -1116,10 +1222,11 @@ fn simulate(
                     *room -= 1;
                     taken += 1;
                     w.push(r);
-                } else if r.copy.is_none() {
+                } else if !droppable(&r) {
                     // an ORIGINAL name that does not fit has to become
-                    // memory-resident; a copy that does not fit is a duplicate of
-                    // what the slot already holds, so dropping it costs nothing.
+                    // memory-resident; a copy — or a name the regional carry
+                    // brought in, which the slot already holds — is a duplicate,
+                    // so dropping it costs nothing.
                     newsp.push(r.v);
                 }
             }
@@ -1158,7 +1265,13 @@ fn simulate(
                 match pick {
                     Some((j, v)) => {
                         w.remove(j);
-                        newsp.push(v);
+                        // already memory-resident ⟹ dropping the residency costs
+                        // a reload, not a whole-web spill (spec §4.3). Pushing it
+                        // anyway would report progress the fixpoint cannot make
+                        // and fail the round as "spilling made no progress".
+                        if !spilled[v as usize] {
+                            newsp.push(v);
+                        }
                     }
                     None => break,
                 }
@@ -1551,6 +1664,15 @@ fn simulate(
         exit_keys[bi] = {
             let mut k: Vec<(VReg, CopyId)> =
                 w.iter().filter_map(|r| r.copy.map(|c| (r.v, c))).collect();
+            k.sort_unstable();
+            k
+        };
+        exit_orig[bi] = {
+            let mut k: Vec<VReg> = w
+                .iter()
+                .filter(|r| r.copy.is_none() && spilled[r.v as usize])
+                .map(|r| r.v)
+                .collect();
             k.sort_unstable();
             k
         };

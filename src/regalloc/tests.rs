@@ -1006,3 +1006,117 @@ fn loop_header_carry_keeps_the_accumulator_in_a_register() {
         joins
     );
 }
+
+
+/// R4-capstone (spec §4.3) — EVICTION IS A REGIONAL SPLIT, not a whole-web spill.
+///
+/// `Sim::More` used to be a life sentence. One pressure peak anywhere in a
+/// function sent a value to memory for the whole of its live range, and every
+/// later read of it — in blocks with registers to spare, in loops it was merely
+/// passing through — paid a frame load. Braun & Hack's algorithm does not say
+/// that; it says a value leaves the register file WHERE pressure forces it out
+/// and comes back at its next use. The regions in between are register-resident,
+/// and the register they are resident in is the value's OWN name.
+///
+/// The measurement that sized this before a line of it was written is the
+/// `split` column of `ZCC_SPILLCEIL` (`spill.rs::ceiling_report`): on sqlite3.c,
+/// 2,084 of 11,520 reloads are of a value some predecessor was still holding in
+/// a register, in a block whose head had registers to spare — and 4,370 of the
+/// 4,549 values this allocator sends to memory hold a register SOMEWHERE in the
+/// function against 179 that hold one nowhere. The whole-web model is wrong for
+/// 96% of them, and those 179 are the ones it is right about: a value that can
+/// hold no register anywhere still becomes memory-resident for its whole life,
+/// which is what keeps the memory lattice growing and the fixpoint bounded.
+///
+/// THE MEANING half is the battery's ordinary obligation on the brief's own
+/// program — a value read either side of a long call chain — with `e` DEFINED,
+/// since an undefined callee traps both interpreters and `same` accepts a
+/// two-sided trap in silence.
+///
+/// THE EFFECT half needs a program with EDGES in it, and the brief's does not
+/// have any: the split of a straight-line value is what the eviction path
+/// already did before this step ((2c) in `simulate` never filtered on `spilled`),
+/// and what §4.3 adds is that the split SURVIVES A BLOCK BOUNDARY. So the
+/// differential is measured on eight arms reading twenty-four memory-resident
+/// values, `set_regional(false)` against `set_regional(true)`.
+///
+/// WHAT IS ASSERTED, and why it is the brief's assertion in the form this layer
+/// can see it. The brief asks that the value not be whole-web memory-resident —
+/// that it have a register-resident interval. `Plan.wexit` is gone by the time a
+/// test can look, and the allocated function has no virtual registers left in it
+/// to ask about; what survives is the pair (still spilled, fewer reloads). A
+/// value with a `Spill` is memory-resident somewhere by construction, and a
+/// strictly smaller reload count over the same program with the same spills is
+/// exactly a read served from a register that used to be served from the frame.
+/// The instruction count is asserted with it, because a reload traded for two
+/// copies is not a win and the cost square is the half a reload count cannot see.
+#[test]
+fn eviction_splits_regionally_not_whole_web() {
+    // Meaning: the brief's program, `e` defined so both interpreters run it.
+    same_all(&[
+        "int e(int x){return x*3+1;} int hot(int p){int a=e(p); int t=e(a)+e(a)+e(a)+e(a)+e(a)+e(a)+e(a)+e(a)+e(a)+e(a)+e(a)+e(a); int b=a+t+p; return b+a; } int main(void){return hot(2);}",
+    ]);
+
+    let n = 24;
+    let decls: String = (0..n)
+        .map(|i| format!("int v{}=g[{}]*{}+p;", i, i, i + 2))
+        .collect();
+    let sum: String = (0..n).map(|i| format!("+v{}", i)).collect();
+    let src = format!(
+        "int e(int x){{return x<=0?1:e(x-1)+3;}} int g[64];\n\
+         int hot(int p){{ int i,s=0; {d}\n\
+         s = 0{s};\n\
+         if(p>0){{ s += v0+v1+v2; }} else {{ s -= v3+v4+v5; }}\n\
+         if(p>1){{ s += v6+v7+v8; }} else {{ s -= v9+v10+v11; }}\n\
+         if(p>2){{ s += v12+v13+v14; }} else {{ s -= v15+v16+v17; }}\n\
+         if(p>3){{ s += v18+v19+v20; }} else {{ s -= v21+v22+v23; }}\n\
+         s += e(s);\n\
+         if(p>1){{ s += v0+v3+v6; }}\n\
+         for(i=0;i<20;i++){{ s += e(i)+v0+v1+v2+v3+v4; }}\n\
+         return s{s}; }}\n\
+         int main(void){{ return hot(3); }}\n",
+        d = decls,
+        s = sum
+    );
+    // the meaning obligation holds on the program the effect is measured on too
+    same(&src);
+
+    let count = |on: bool| -> (usize, usize, usize) {
+        super::spill::set_regional(on);
+        let ast = frontend(&src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let p = crate::compile::backend(&h).unwrap();
+        super::spill::set_regional(true);
+        let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
+        use crate::mir::MInst;
+        let it = || f.blocks.iter().flat_map(|b| b.insts.iter());
+        (
+            it().filter(|i| matches!(i, MInst::Reload { .. })).count(),
+            it().filter(|i| matches!(i, MInst::Spill { .. })).count(),
+            it().count(),
+        )
+    };
+    let whole = count(false);
+    let split = count(true);
+    assert!(
+        whole.0 > 0 && split.1 > 0,
+        "the fixture does not spill at all — the square above it would be vacuous: \
+         whole-web {:?}, regional {:?}",
+        whole,
+        split
+    );
+    assert!(
+        split.0 < whole.0,
+        "regional eviction served no read from a register: {} reloads split, {} whole-web",
+        split.0,
+        whole.0
+    );
+    assert!(
+        split.2 < whole.2,
+        "regional eviction removed reloads but not instructions — the reads it saved \
+         were paid for in copies: {} instructions split, {} whole-web",
+        split.2,
+        whole.2
+    );
+}
