@@ -560,6 +560,39 @@ fn a_reload_is_carried_into_the_blocks_it_dominates() {
 /// cannot be confused with each other or with allocator noise.
 const NEST: usize = 8;
 
+/// R4-capstone (spec §4.4) — the SEQUEL to the carry above, one edge kind
+/// further. R4.1 carries a residency across a FORWARD edge, where every
+/// predecessor has already been simulated. A loop header's latch has not: blocks
+/// are walked in reverse postorder, so when the header is simulated the latch
+/// "holds nothing" and residency restarts every iteration. Lifting that needs a
+/// second fixpoint — register-residency propagated backwards, read one round
+/// behind (`spill::backedge_entry_residency`).
+///
+/// This test is the MEANING GUARD for that fixpoint, written before it and kept
+/// after it: whatever the second lattice decides to keep in a register around a
+/// loop, ⟦mir_v⟧ = ⟦mir_p⟧ must not move. The EFFECT — the reload count at the
+/// header dropping — cannot be asserted yet: the carry it enables is unsound
+/// until the block-parameter that reconciles the two reaching definitions exists
+/// (Task 2's `reconstruct::insert_phi`), so it ships flag-OFF and the count is
+/// pinned by the task that turns the flag on.
+///
+/// The callee `e` is DEFINED rather than declared. An undefined callee traps the
+/// interpreter (`Trap::NoSuchFunction`) on both sides, and `same` passes a
+/// two-sided trap silently — the case would compile, execute nothing, and prove
+/// nothing. The definition also gives the loop a real call, which is what puts
+/// the accumulator under the callee-saved ceiling and makes the header residency
+/// worth anything at all.
+#[test]
+fn residency_carries_across_the_back_edge() {
+    // A value used every iteration, register-held at the latch, must be marked
+    // register-resident at the loop header once the fixpoint converges — not
+    // reloaded fresh each iteration. Meaning must be preserved regardless.
+    same_all(&[
+        "int e(int x){return x*3+1;} int hot(int p){int s=0,i;for(i=0;i<20;i++)s+=e(i)+p;return s+p;} int main(void){return hot(3);}",
+        "int e(int x){return x*3+1;} int hot(int p,int q){int s=0,i;for(i=0;i<15;i++)s+=e(i)*p+q;return s;} int main(void){return hot(2,5);}",
+    ]);
+}
+
 /// R4.2 — an ABI-boundary truncation is a no-op, and it is GONE.
 ///
 /// AAPCS64 §6.4.2/§6.8.2 leave the bits above an argument's or a result's
@@ -674,3 +707,4 @@ fn a_truncation_with_a_wide_reader_is_kept() {
     // two sides compute different values
     same(src);
 }
+

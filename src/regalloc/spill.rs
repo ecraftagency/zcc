@@ -61,6 +61,33 @@ use super::live;
 use crate::mir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// R4-capstone (REARCH allocator-splitting spec §4.2/§4.4) — is the back-edge
+/// carry ON?
+///
+/// THEORY A7: a residency crosses an edge only where the reaching definition
+/// DOMINATES the use. Across a forward edge "every predecessor holds this copy"
+/// establishes that on its own (see `carried` below). Across a BACK edge it does
+/// not: the latch's copy and the preheader's copy are two definitions of one
+/// value, and reconciling them needs the block parameter Braun 2013 calls a phi
+/// — `reconstruct::insert_phi`, which has no caller yet.
+///
+/// So the fixpoint that COMPUTES the back-edge residency ships first and ships
+/// dark. It is exercised, measured and proven terminating here; the day the
+/// reconstruction that makes it sound lands, this becomes `true` and the reload
+/// count at loop headers is what moves. A `const` rather than an environment
+/// variable on purpose: nothing about the emitted code may depend on it today,
+/// and a `const false` says that to the compiler as well as to the reader.
+///
+/// MEASURED, with the flag forced on: not one back-edge carry fires — not in the
+/// battery, not over the refactor-gate corpus, and the emitted bytes are
+/// identical either way. That is not a fixpoint that fails to work; it is §4.1
+/// restated as a measurement. A header's carry is an INTERSECTION over its
+/// predecessors, and the preheader holds no copy under the latch's name, so the
+/// intersection is empty until a block parameter gives the preheader a reaching
+/// definition to supply. The phi is not an optimization on top of this lattice;
+/// it is the thing that lets the lattice say anything at all.
+const BACKEDGE_CARRY: bool = false;
+
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
     spill_with(f, &BTreeSet::new(), usize::MAX)
 }
@@ -97,11 +124,28 @@ pub fn spill_with(
             nsp += 1;
         }
     }
-    // Termination: every round that does not produce a plan makes at least one
-    // more value memory-resident, and a value never leaves that set, so there
-    // are at most |vregs| rounds. Exceeding it means the argument is false —
-    // a Law-2 defect, not a budget to raise.
-    let bound = f.vregs.len() + 2;
+    // TERMINATION — a product of two bounded monotone lattices (spec §4.4).
+    //
+    // FIRST LATTICE, memory residency. Every round that does not produce a plan
+    // makes at least one more value memory-resident, and a value never leaves
+    // that set, so it can climb at most |vregs| times.
+    //
+    // SECOND LATTICE, register residency at a block ENTRY — the one this step
+    // adds. A round's plan says what each block is still holding when it ends
+    // (`Plan.wexit`); `backedge_entry_residency` turns that into what each block
+    // may assume on ENTRY, reading the PRIOR round's exit for a predecessor the
+    // current round has not reached yet (a latch, since blocks are walked in
+    // reverse postorder). Each element of that lattice is a subset of the
+    // (block, value) pairs, so it can climb at most |blocks| × |vregs| times.
+    //
+    // The two are not independent — spilling a value removes it from every entry
+    // set — so the pair is ordered lexicographically: a round either climbs the
+    // first lattice or, holding it fixed, climbs the second. The number of rounds
+    // is therefore at most the sum of the two heights, which is the cap below.
+    // Exceeding it means one of those two claims is FALSE: a Law-2 defect to be
+    // located, never a budget to raise, which is why the cap is asserted rather
+    // than silently retried.
+    let bound = f.vregs.len() * f.blocks.len() + f.vregs.len() + 2;
     let mut slot_of: BTreeMap<VReg, (SlotId, Width)> = BTreeMap::new();
     let mut web_slot: BTreeMap<VReg, (SlotId, Width)> = BTreeMap::new();
     for &v in forced.iter() {
@@ -118,14 +162,32 @@ pub fn spill_with(
     // live) so it is recomputed inside the loop; `simulate`'s `linear_positions`
     // likewise re-reads the (now longer) instruction lists off the same CFG.
     let cfg = crate::mir::verify::cfg(f);
+    // The second lattice's carrier: per block, what a predecessor the round has
+    // not yet simulated was holding LAST round. Empty on the first round, which
+    // is exactly today's "a back edge holds nothing".
+    let mut entry_resident: Vec<Vec<(VReg, Option<CopyId>)>> = vec![Vec::new(); f.blocks.len()];
     let plan = {
         let mut plan = None;
         for _ in 0..bound {
             let lv = live::compute(f, &cfg);
-            match simulate(f, &lv, &cfg, &spilled, cross_cap)? {
+            match simulate(f, &lv, &cfg, &spilled, cross_cap, &entry_resident)? {
                 Sim::Plan(p) => {
-                    plan = Some(p);
-                    break;
+                    // A plan is only ANSWER when the residency it produced is the
+                    // residency it consumed. Until then the plan describes a
+                    // program the next round would simulate differently — and,
+                    // concretely, its `CopyId`s are minted per round, so a plan
+                    // built on last round's numbering is not one to apply. At the
+                    // fixed point the two rounds agree on both.
+                    let converged = !BACKEDGE_CARRY || {
+                        let next = backedge_entry_residency(&cfg, &p.wexit);
+                        let same = next == entry_resident;
+                        entry_resident = next;
+                        same
+                    };
+                    if converged {
+                        plan = Some(p);
+                        break;
+                    }
                 }
                 Sim::More(vs) => {
                     let before = nsp;
@@ -158,6 +220,17 @@ pub fn spill_with(
                 }
             }
         }
+        // The cap is a DEFECT DETECTOR, not a budget: reaching it falsifies one
+        // of the two lattice-height claims above (spec §4.4), so a debug build
+        // says so at the layer that owns the argument rather than letting a
+        // half-spilled function walk down to the colourer.
+        debug_assert!(
+            plan.is_some(),
+            "{}: spilling ran {} rounds without a fixpoint — the lattice-height \
+             argument above is false, not the cap",
+            f.name,
+            bound
+        );
         match plan {
             Some(p) => p,
             None => return Err(format!("{}: spilling did not converge", f.name)),
@@ -452,12 +525,59 @@ struct Res {
     cross: bool,
 }
 
+/// THE SECOND LATTICE (spec §4.4) — what every block may assume is already in a
+/// register when it is ENTERED, derived from what the previous round's plan says
+/// each block was holding when it EXITED.
+///
+/// It is the same test `carried` makes below — a copy survives an edge only if
+/// EVERY predecessor is holding it, under the same name — with one difference,
+/// which is the whole of the step: it is applied to ALL predecessors, including
+/// the ones a reverse-postorder walk has not reached yet. A loop header's latch
+/// is exactly such a predecessor, so this is where "the value is still in a
+/// register at the bottom of the loop" first becomes something the top of the
+/// loop can read. One round behind, because that is the only place the answer
+/// exists before the loop is walked again.
+///
+/// Being an intersection over predecessors, the result at a block is bounded by
+/// its live-in set and cannot mention a value no predecessor holds — the
+/// bounded-height half of the termination argument in `spill_with`.
+fn backedge_entry_residency(
+    cfg: &crate::cfg::Cfg,
+    wexit: &[Vec<(VReg, Option<CopyId>)>],
+) -> Vec<Vec<(VReg, Option<CopyId>)>> {
+    // only a reload COPY can be carried; a value under its original name needs
+    // no carrying, the successor's live-in already names it.
+    let keys: Vec<Vec<(VReg, CopyId)>> = wexit
+        .iter()
+        .map(|w| {
+            let mut k: Vec<(VReg, CopyId)> = w.iter().filter_map(|&(v, c)| c.map(|c| (v, c))).collect();
+            k.sort_unstable();
+            k
+        })
+        .collect();
+    let mut out = vec![Vec::new(); wexit.len()];
+    for (bi, o) in out.iter_mut().enumerate() {
+        let Some((first, rest)) = cfg.preds[bi].split_first() else {
+            continue;
+        };
+        *o = keys[*first as usize]
+            .iter()
+            .filter(|k| rest.iter().all(|&p| keys[p as usize].binary_search(k).is_ok()))
+            .map(|&(v, c)| (v, Some(c)))
+            .collect();
+    }
+    out
+}
+
 fn simulate(
     f: &MFunc,
     lv: &live::Liveness,
     cfg: &crate::cfg::Cfg,
     spilled: &[bool],
     cross_cap: usize,
+    // what the PRIOR round left resident at each block's entry — read only for
+    // a predecessor this round has not simulated yet (spec §4.4)
+    entry_resident: &[Vec<(VReg, Option<CopyId>)>],
 ) -> Result<Sim, String> {
     let base = linear_positions(f, cfg);
     let uses = use_positions(f, lv, cfg, &base);
@@ -567,17 +687,34 @@ fn simulate(
         //     this paragraph.
         //
         //     A predecessor not yet simulated (a back edge, since blocks are
-        //     walked in reverse postorder) holds nothing as far as this test is
-        //     concerned, so nothing is carried into a loop header — the residency
-        //     starts afresh each iteration. That is a truncation, not a limit:
-        //     lifting it needs a fixpoint over the loop, and Law 4 asks for it
-        //     only once the acyclic case has been measured.
+        //     walked in reverse postorder) holds nothing as far as THIS round's
+        //     `exits` can tell, so nothing was ever carried into a loop header —
+        //     the residency started afresh each iteration. R4-capstone lifts that
+        //     with the second fixpoint (spec §4.4): the PRIOR round did simulate
+        //     the latch, and `entry_resident` is what its exit set says this
+        //     block may assume. It is read only when a predecessor is missing,
+        //     and only under `BACKEDGE_CARRY`, because the two reaching
+        //     definitions it joins need the block parameter of `reconstruct` to
+        //     be sound — see the flag at the top of this file.
         let mut w: Vec<Res> = Vec::new();
         let live_here = |v: VReg| lv.live_in[bi].contains(&lv.sp.idx(Reg::V(v)));
-        let carried: Vec<Res> = if cfg.preds[bi].is_empty()
-            || cfg.preds[bi].iter().any(|&p| !done[p as usize])
-        {
+        let carried: Vec<Res> = if cfg.preds[bi].is_empty() {
             Vec::new()
+        } else if cfg.preds[bi].iter().any(|&p| !done[p as usize]) {
+            if !BACKEDGE_CARRY {
+                Vec::new()
+            } else {
+                entry_resident[bi]
+                    .iter()
+                    .filter(|(v, c)| c.is_some() && !spilled[*v as usize] && live_here(*v))
+                    .map(|&(v, copy)| Res {
+                        v,
+                        copy,
+                        class: class_of(f, Reg::V(v)),
+                        cross: lv.crosses_call[v as usize],
+                    })
+                    .collect()
+            }
         } else {
             let (first, rest) = cfg.preds[bi].split_first().unwrap();
             exits[*first as usize]
