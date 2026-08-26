@@ -380,8 +380,27 @@ pub fn spill_with(
 /// a reload moved onto the cold edges rather than removed, so it is reported
 /// apart and never added into the prediction.
 ///
+/// THE REGIONAL-SPLIT COLUMN (spec §4.3, added before Task 5 was written).
+/// The columns above all ask the §4.1 question — "could a copy have been CARRIED
+/// here?". §4.3 asks a different one: "was this value memory-resident here only
+/// because `Sim::More` retired its WHOLE WEB on the strength of one pressure
+/// peak somewhere else?". A reload of `v` in block B counts against `split` when
+///   * some predecessor of B was still holding `v` in a register at its exit —
+///     a register copy existed immediately before B, so there is something for a
+///     regional residency to continue; and
+///   * B's HEAD had slack in `v`'s class (`Plan.headroom`) — B is not itself
+///     over-pressured, so nothing at B forced the value out.
+/// Such a reload is pure whole-web artefact: a regional model keeps the value in
+/// the register it was already in. `split-loop` is the part of it inside a loop,
+/// where the reload is paid every iteration. The `webs` pair counts the same
+/// thing over VALUES rather than reloads — `web-split` values are memory-resident
+/// yet hold a register somewhere in the function (a regional model splits them),
+/// `web-none` values hold a register nowhere at all (genuinely over-pressured
+/// for their whole live range, and the ones that must still go whole-web to
+/// memory so the memory lattice keeps growing and the fixpoint stays bounded).
+///
 /// Columns: `name total dom-ceiling same-block-repeat in-loop all-preds
-/// some-preds all-preds-in-loop remat`.
+/// some-preds all-preds-in-loop remat split split-loop web-split web-none`.
 fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -405,6 +424,7 @@ fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
         .collect();
     let (mut tot, mut ceil, mut rep, mut tot_l) = (0usize, 0usize, 0usize, 0usize);
     let (mut all_p, mut some_p, mut all_p_l) = (0usize, 0usize, 0usize);
+    let (mut split, mut split_l) = (0usize, 0usize);
     // how many of the reloads are REMATERIALIZATIONS (a `movz`/`adrp`/frame
     // address recomputed) rather than frame loads — the spiller's cost model
     // calls these free, and the histogram says they are 14,393 `movz`
@@ -423,6 +443,17 @@ fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
             let np = preds.iter().filter(|&&p| ex[p as usize].contains(&v)).count();
             let all = first && !preds.is_empty() && np == preds.len();
             let some = first && np > 0 && np < preds.len();
+            // spec §4.3: a register held it just before this block, and this
+            // block's head was not full — so nothing HERE forced it to memory
+            let cl = class_of(f, Reg::V(v));
+            let slack = match cl {
+                Class::Gpr => plan.headroom[bi][0] > 0,
+                Class::Fpr => plan.headroom[bi][1] > 0,
+                Class::Flags => false,
+            };
+            let sp = np > 0 && slack;
+            split += sp as usize;
+            split_l += (sp && inloop) as usize;
             tot += 1;
             rm += remat.contains_key(&v) as usize;
             ceil += dom as usize;
@@ -433,10 +464,32 @@ fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
             all_p_l += (all && inloop) as usize;
         }
     }
+    // The same question asked over VALUES: of the values this plan made
+    // memory-resident, how many hold a register SOMEWHERE (regional split has an
+    // interval to keep) and how many hold one nowhere at all (they must stay
+    // whole-web memory-resident — that is what keeps the memory lattice growing
+    // and the fixpoint bounded).
+    let mut held_somewhere: BTreeSet<VReg> = BTreeSet::new();
+    for w in plan.wexit.iter() {
+        for &(v, _) in w.iter() {
+            held_somewhere.insert(v);
+        }
+    }
+    let mut mem: BTreeSet<VReg> = BTreeSet::new();
+    for rs in plan.reloads.iter() {
+        for &(_, v, _) in rs {
+            if !remat.contains_key(&v) {
+                mem.insert(v);
+            }
+        }
+    }
+    let web_split = mem.iter().filter(|v| held_somewhere.contains(v)).count();
+    let web_none = mem.len() - web_split;
     if tot > 0 {
         eprintln!(
-            "SPILLCEIL {} {} {} {} {} {} {} {} {}",
-            f.name, tot, ceil, rep, tot_l, all_p, some_p, all_p_l, rm
+            "SPILLCEIL {} {} {} {} {} {} {} {} {} {} {} {} {}",
+            f.name, tot, ceil, rep, tot_l, all_p, some_p, all_p_l, rm, split, split_l,
+            web_split, web_none
         );
     }
 }
@@ -608,6 +661,12 @@ struct Plan {
     wexit: Vec<Vec<(VReg, Option<CopyId>)>>,
     /// per block: the block parameters this plan adds (spec §4.1)
     phis: Vec<Vec<Phi>>,
+    /// PER BLOCK, PER CLASS (`[Gpr, Fpr]`): how many more registers of that
+    /// class the block's HEAD could still have held once its working set was
+    /// built. Read by `ceiling_report` alone — it is the measurement of spec
+    /// §4.3's question ("was a register actually available where this value was
+    /// memory-resident?") and nothing in the plan's application consults it.
+    headroom: Vec<[usize; 2]>,
 }
 
 /// A block parameter the plan will add — Braun 2013's phi, spelled the way this
@@ -745,6 +804,7 @@ fn simulate(
         ncopies: 0,
         wexit: vec![Vec::new(); nb],
         phis: (0..nb).map(|_| Vec::new()).collect(),
+        headroom: vec![[0usize; 2]; nb],
     };
     let mut newsp: Vec<VReg> = Vec::new();
     // what each block is still holding when it ends, and whether it has been
@@ -1122,6 +1182,20 @@ fn simulate(
                 width: f.vregs[r.v as usize].width,
                 srcs: Vec::new(),
             });
+        }
+
+        // R4-capstone MEASUREMENT for spec §4.3 (`ZCC_SPILLCEIL=1`) — read-only.
+        // How many registers of each class the head could STILL have held. A
+        // reload of a memory-resident value in a block whose head had slack is a
+        // reload no pressure at this block ever asked for: it is there because
+        // `Sim::More` retired the value's WHOLE web to memory on the strength of
+        // one pressure peak somewhere else. That difference is what a REGIONAL
+        // split recovers, and this is the number that says how much of it there
+        // is before a line of it is written (Law 3 — predict on the model first).
+        for c in [Class::Gpr, Class::Fpr] {
+            let hm = phys_mask(&physlive, c) & masks[ki(c)];
+            let used = w.iter().filter(|r| r.class == c).count() + hm.count_ones() as usize;
+            plan.headroom[bi][ki(c)] = isa::k(c).saturating_sub(used);
         }
 
         // (2) walk the block
