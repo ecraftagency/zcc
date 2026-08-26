@@ -315,3 +315,59 @@ fn same_tail(a: &[MInst], b: &[MInst]) -> bool {
             _ => false,
         })
 }
+
+/// Drop a spill whose slot is never reloaded.
+///
+/// THE MEASUREMENT. sqlite holds **1,042 frame slots that are STORED AND NEVER
+/// LOADED — 1,090 dead stores, 0.63% of the whole program** and 5.4% of its size
+/// gap against gcc -O1. They exist because the spiller places a store at the
+/// value's DEFINITION whether or not any path later reloads it (REARCH §13o):
+/// the value stays in its register, the slot is written for nothing, and in
+/// `sqlite3VdbeExec` alone 102 slots are written exactly once and read never.
+///
+/// SQUARE. Removing a store to a location nothing ever reads cannot change what
+/// the program computes — the slot's contents are unobservable. The fence is
+/// what makes "nothing ever reads it" true: the slot must be touched ONLY by
+/// `Spill` and `Reload`, never by a `Load`/`Store` naming it as an address,
+/// because a local whose address escaped can be read through a pointer this pass
+/// cannot see. A slot with even one reload keeps all of its spills — this pass
+/// does no path reasoning, only whole-function counting.
+pub fn drop_dead_spills(f: &mut MFunc) -> usize {
+    use std::collections::HashSet;
+    let mut reloaded: HashSet<SlotId> = HashSet::new();
+    let mut addressed: HashSet<SlotId> = HashSet::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            match i {
+                MInst::Reload { slot, .. } => {
+                    reloaded.insert(*slot);
+                }
+                MInst::Load { mem, .. } | MInst::Store { mem, .. } => {
+                    if let AddrMode::Slot { slot, .. } = mem {
+                        addressed.insert(*slot);
+                    }
+                }
+                MInst::Pair { mem, .. } => {
+                    if let AddrMode::Slot { slot, .. } = mem {
+                        addressed.insert(*slot);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut n = 0usize;
+    for b in f.blocks.iter_mut() {
+        b.insts.retain(|i| match i {
+            MInst::Spill { slot, .. } => {
+                let dead = !reloaded.contains(slot) && !addressed.contains(slot);
+                if dead {
+                    n += 1;
+                }
+                !dead
+            }
+            _ => true,
+        });
+    }
+    n
+}

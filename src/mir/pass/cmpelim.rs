@@ -136,3 +136,60 @@ fn set_cc(f: &mut MFunc, b: usize, at: Option<usize>, cc: CC) {
         }
     }
 }
+
+/// Branch on the FLAGS, not on a boolean made from them.
+///
+/// `cmp` / `cset w, cc` / `cbnz w` is three instructions for what `cmp` /
+/// `b.cc` does in two. The middle one exists only because the value was
+/// materialized before anyone noticed its single use was a branch.
+///
+/// MEASURED on sqlite: **346 csets are consumed by a `cbz`/`cbnz`/`tbz`** and
+/// nothing else — 0.20% of the program. (Another 180 are stored to memory and
+/// 181 have other uses; those genuinely need the register.) zcc emits 796 csets
+/// against gcc's 411, and this is where the difference goes.
+///
+/// SQUARE. `cset dst, cc` writes 1 exactly when `cc` holds. So branching on
+/// `dst != 0` is branching on `cc`, and on `dst == 0` is branching on its
+/// inverse — the same edge is taken in both forms, from the same flags. The
+/// fences: the `cset` must be the LAST instruction of its block, so nothing
+/// between it and the terminator can disturb the flags it read, and its result
+/// must have no other reader, or the register still has to be produced.
+pub fn branch_on_flags(f: &mut MFunc) -> usize {
+    let mut n = 0usize;
+    for bi in 0..f.blocks.len() {
+        let Some(last) = f.blocks[bi].insts.last().cloned() else { continue };
+        let MInst::CSet { dst, cc, flags, .. } = last else { continue };
+        let Reg::V(dv) = dst else { continue };
+        // the terminator must be a zero-test on exactly that value
+        let (taken_when_true, t, e) = match &f.blocks[bi].term {
+            MTerm::Cbz { reg: Reg::V(v), zero, t, f: e, .. } if *v == dv => {
+                (!*zero, t.clone(), e.clone())
+            }
+            _ => continue,
+        };
+        // no other reader anywhere
+        let mut uses = 0usize;
+        for b in &f.blocks {
+            for i in &b.insts {
+                i.visit(&mut |r, c| {
+                    if r == dst && matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
+                        uses += 1;
+                    }
+                });
+            }
+            b.term.visit(&mut |r, _| {
+                if r == dst {
+                    uses += 1;
+                }
+            });
+        }
+        if uses != 1 {
+            continue; // the terminator's own use is the only one allowed
+        }
+        let cc = if taken_when_true { cc } else { cc.invert() };
+        f.blocks[bi].insts.pop();
+        f.blocks[bi].term = MTerm::Bcc(cc, flags, t, e);
+        n += 1;
+    }
+    n
+}

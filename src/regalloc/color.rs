@@ -507,13 +507,20 @@ fn color_of(color: &[Option<PReg>], sp: Space, i: usize) -> Option<PReg> {
     }
 }
 
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_WANTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_OCCUPIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_SPARE_SUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 thread_local! {
+    /// MEASURED M11 — the instrument, not a resource constant.
     /// (block, occupant value index, class) for each ABI refusal whose occupant
     /// dies inside the block — the set the full-range check replays.
     static REFUSALS: std::cell::RefCell<Vec<(usize, usize, Class)>> =
@@ -607,12 +614,18 @@ fn full_range_check(f: &MFunc, lv: &Liveness, color: &[Option<PReg>]) {
     });
 }
 
+/// MEASURED M11 — the instrument, not a resource constant
 pub static RANGE_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static RANGE_BLOCKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_OCC_LOCAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_OCC_GLOBAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_OCC_UNKNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_NO_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn hint_stats_wanted() -> bool {

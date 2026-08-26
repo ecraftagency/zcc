@@ -108,6 +108,7 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
         for f in m.funcs.iter_mut() {
             crate::mir::pass::ext::run(f);
             crate::mir::pass::cmpelim::run(f);
+            crate::mir::pass::cmpelim::branch_on_flags(f);
             crate::mir::pass::const_share::run(f);
             crate::mir::pass::autoinc::run(f);
         }
@@ -132,6 +133,7 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
 pub fn finish(m: &mut crate::mir::MModule) {
     phase("frame+layout", || {
         for f in m.funcs.iter_mut() {
+            crate::mir::pass::frame::drop_dead_spills(f);
             crate::mir::pass::frame::run(f);
             crate::mir::pass::shrink_wrap::run(f);
             crate::mir::pass::frame::merge_epilogues(f);
@@ -139,6 +141,7 @@ pub fn finish(m: &mut crate::mir::MModule) {
             crate::mir::pass::ldstp::run(f);
             crate::mir::pass::frame_fold::run(f);
             crate::mir::pass::layout::run(f);
+            crate::mir::pass::layout::drop_dead_copies(f);
         }
     });
 }
