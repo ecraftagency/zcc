@@ -15,7 +15,13 @@ export DIR="$C/c-testsuite/tests/single-exec"
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 
-ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 1 -P 8 sh -c '
+# A SEEK that matches NOTHING must be an ERROR, never a verdict on an empty set.
+# `fullsuite.sh all 300` puts "300" in SEEK — the second positional is SEEK, not
+# the fuzz count — and this suite then reported "0 pass, 1 fail" from a single
+# empty xargs argument, which read as a RED gate for three runs in a row.
+ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } > "$D/fed" || :
+[ -s "$D/fed" ] || { echo "cts: SEEK='${SEEK:-}' matched 0 of $(ls "$DIR"/*.c | wc -l | tr -d ' ') cases — nothing was tested"; exit 2; }
+xargs -n 1 -P 8 sh -c '
     f="$1"; b=$(basename "$f" .c)
     # CWD = $D (writable): some cases write files to CWD (00187 fopen "fred.txt","w")
     # — running at the repo root would litter it (mac) or fail on a read-only mount
@@ -27,15 +33,15 @@ ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } | xargs -n 
     else
         echo "FAIL $b"
     fi
-' sh > "$D/res"
+' sh < "$D/fed" > "$D/res"
 
 p=$(grep -c '^pass' "$D/res" || true)
 grep '^FAIL' "$D/res" | sort > "$D/fails"
 [ -n "${LIVE_FAILS_DIR:-}" ] && cp "$D/fails" "$LIVE_FAILS_DIR/cts.fails" 2>/dev/null; :
 sort "$(dirname "$0")/cts.known-fail" > "$D/known" 2>/dev/null || : > "$D/known"
 new=$(comm -23 "$D/fails" "$D/known" || true)
-echo "c-testsuite: $p pass, $(wc -l < "$D/fails" | tr -d ' ') fail"
+echo "c-testsuite: $(wc -l < "$D/fed" | tr -d ' ') cases, $p pass, $(wc -l < "$D/fails" | tr -d ' ') fail"
 if [ -n "$new" ]; then
     echo "CTS NEW FAIL (outside baseline):"; echo "$new" | head -20; exit 1
 fi
-echo "CTS PASS (every fail is in the triaged baseline)"
+echo "CTS PASS ($(wc -l < "$D/fed" | tr -d ' ') cases, every fail is in the triaged baseline)"

@@ -45,6 +45,9 @@ export OE="$(dirname "$0")/torture.oracle-ext"
 # meaningless if the measurement dropped anything — a reviewer verifies 1 equation,
 # without having to trust any narration.
 ls "$DIR"/*.c | { [ -n "${SEEK:-}" ] && grep -F -- "$SEEK" || cat; } > "$D/fed"
+# An empty feed is an ERROR, not a pass: a SEEK that matches nothing must never
+# be reported as a suite that found no failures. See the note in cts.sh.
+[ -s "$D/fed" ] || { echo "torture: SEEK='${SEEK:-}' matched 0 of $(ls "$DIR"/*.c | wc -l | tr -d ' ') cases — nothing was tested"; exit 2; }
 nfed=$(wc -l < "$D/fed" | tr -d ' ')
 # each worker prints 1 TSV line: <CLASS>\t<sub>\t<case>\t<reason>
 xargs -n 1 -P 8 sh -c '
@@ -149,6 +152,10 @@ echo "── NOT-IMPL manifest (torture.not-impl):"
 cat "$D/not-impl"
 echo "torture: $p pass, $ni not-impl ($oi oracle-invalid + $zr zcc-reject), $k FAIL"
 if [ "$k" -eq 0 ]; then
-    echo "TORTURE PASS (0 FAIL — every non-pass is a named NOT-IMPL)"; exit 0
+    # The COUNT is part of the verdict, not decoration. Guarding only against an
+    # EMPTY feed is not enough: `SEEK=300` matches a handful of torture names, so
+    # a three-case run printed the same "TORTURE PASS (0 FAIL)" as a 1471-case
+    # one. A verdict that does not say how much it examined cannot be audited.
+    echo "TORTURE PASS ($nfed cases, 0 FAIL — every non-pass is a named NOT-IMPL)"; exit 0
 fi
-echo "TORTURE RED ($k FAIL to triage → clean reject or fix)"; exit 1
+echo "TORTURE RED ($nfed cases, $k FAIL to triage → clean reject or fix)"; exit 1

@@ -34,7 +34,16 @@ for c in "$DIR"/*.c; do
     fail=$((fail + 1)); fails="$fails $n"; echo "FAIL $n (compile)"
   fi
 done
-echo "---- $pass pass, $fail fail"
+# ZERO CASES IS AN ERROR, NEVER A VERDICT. A SEEK that matches nothing printed
+# "---- 0 pass, 0 fail" and the gate scored it PASS — which is how `ext` reported
+# a clean run three times while testing not one case (`fullsuite.sh all 300`
+# passes "300" as SEEK, not as the fuzz count). A suite that was not run must not
+# be indistinguishable from a suite that found nothing wrong.
+if [ $((pass + fail)) -eq 0 ]; then
+  echo "$DIR: SEEK='$SEEK' matched 0 of $(ls "$DIR"/*.c 2>/dev/null | wc -l | tr -d ' ') cases — nothing was tested"
+  exit 2
+fi
+echo "---- $((pass + fail)) cases, $pass pass, $fail fail"
 # Gate: FAIL ⊆ known-fail (if <DIR>.known-fail exists); default requires 0 fail.
 kf="$DIR.known-fail"
 if [ -f "$kf" ]; then

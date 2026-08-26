@@ -9,7 +9,10 @@
 #     all                              — sci + corpus + fuzz + app (THE gate)
 #     sci | corpus | fuzz | app | base  — group (base = run.sh cases+ext, fast loop)
 #     provenance | determ | optpar | csmith | yarpgen — one stage
-#   FUZZ_N (default 300) sizes BOTH random generators; 1000 for a seal.
+#   FUZZ_N (default 300) sizes BOTH random generators; 1000 for a seal. It is an
+#     ENV VAR, not a positional — `fullsuite.sh all 300` does NOT set it, it sets
+#     SEEK=300, which filters every corpus suite down to case names containing
+#     "300" and silently shrinks the gate. Write `FUZZ_N=1000 fullsuite.sh all`.
 #     shape|cpp|decay|alg|abi          — 1 sci-gate (theorem verification)
 #     cases|ext                        — 1 base differential
 #     torture|cts                      — 1 corpus suite
