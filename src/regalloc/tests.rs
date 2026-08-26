@@ -708,3 +708,120 @@ fn a_truncation_with_a_wide_reader_is_kept() {
     same(src);
 }
 
+
+/// R4-capstone (spec §4.1) — SSA RECONSTRUCTION AT A JOIN, the Braun-2013 half
+/// of the restructure.
+///
+/// R4.1's carry crosses an edge only where EVERY predecessor holds the value
+/// under one name — the dominance special case, which needs no phi precisely
+/// because there is only one reaching definition. The general case has several:
+/// the value sits in a register on one arm of a diamond and has to be reloaded on
+/// the other, and the join cannot name either one. Braun 2013's answer is to give
+/// the join a BLOCK PARAMETER and let each predecessor pass its own reaching
+/// definition on its edge — which is what `reconstruct::insert_phi` builds.
+///
+/// The square it ships is structural, and that is not a weaker claim than the
+/// interpreted one: a block parameter defined at the head and fed by every
+/// predecessor IS an SSA phi, `destruct` already lowers it to parallel edge
+/// copies, and `mir::verify` already re-derives "every use dominated by its
+/// definition" from scratch. So the test asserts the shape — the join gained one
+/// parameter, each predecessor's edge INTO the join gained exactly the register
+/// it was asked to pass, and no other edge was touched — and the battery's
+/// `same_all` above it holds the meaning of the diamonds this will be pointed at.
+///
+/// `insert_phi` has no caller in the compiler yet (the wiring is the next task),
+/// so the meaning half cannot move: these two programs are the BEFORE reading,
+/// recorded here so the task that wires it in changes the count and not the
+/// answer.
+#[test]
+fn reconstruct_reconciles_a_join_with_a_phi() {
+    // Meaning-preserving on real programs whose join reconstructs a value.
+    // `e` is DEFINED: an undefined callee traps both interpreters and `same`
+    // passes a two-sided trap in silence, which would prove nothing.
+    same_all(&[
+        "int e(int x){return x*3+1;} int hot(int p){int a; if(p>0){a=e(p);}else{a=e(-p);} return a+p+e(p);} int main(void){return hot(4);}",
+        "int e(int x){return x*3+1;} int hot(int p){int a=e(p); if(p&1)a+=e(p+1); else a+=e(p+2); return a+e(p);} int main(void){return hot(7);}",
+    ]);
+
+    // EFFECT — a join whose two predecessors reach it with DIFFERENT registers:
+    // b0 falls into b2 holding the value in a register it computed, b1 reaches
+    // b2 with the same value reloaded out of a frame slot. No name spans both, so
+    // b2 needs the parameter. The two predecessors also end in different
+    // terminators (`cbz` and `b`), which is the part of `insert_phi` that has to
+    // know every `MTarget` a terminator carries.
+    use crate::mir::{Class, MFunc, MInst, MTarget, MTerm, Reg, RegSet, SlotKind, Width};
+    let mut f = MFunc {
+        name: "join".to_string(),
+        blocks: Vec::new(),
+        vregs: Vec::new(),
+        slots: Vec::new(),
+        entry: 0,
+        is_static: false,
+        is_weak: false,
+        order: Vec::new(),
+        laid_out: false,
+        frame_size: 0,
+        saved: RegSet::default(),
+        dyn_stack: false,
+        has_vla: false,
+        outgoing: 0,
+        fp_slot: 0,
+        cs_saves: Vec::new(),
+        physical: false,
+    };
+    let (b0, b1, b2) = (f.new_block(), f.new_block(), f.new_block());
+    let slot = f.new_slot(4, 4, SlotKind::Spill);
+    let in_reg = f.new_vreg(Width::W32);
+    let reloaded = f.new_vreg(Width::W32);
+    f.blocks[b0 as usize].insts.push(MInst::MovImm {
+        w: Width::W32,
+        dst: in_reg,
+        imm: 7,
+    });
+    f.blocks[b0 as usize].term = MTerm::Cbz {
+        w: Width::W32,
+        reg: in_reg,
+        zero: true,
+        t: MTarget { block: b1, args: Vec::new() },
+        f: MTarget { block: b2, args: Vec::new() },
+    };
+    f.blocks[b1 as usize].insts.push(MInst::Reload {
+        slot,
+        dst: reloaded,
+        w: Width::W32,
+    });
+    f.blocks[b1 as usize].term = MTerm::B(MTarget { block: b2, args: Vec::new() });
+    f.blocks[b2 as usize].term = MTerm::Ret;
+
+    let p = super::reconstruct::insert_phi(
+        &mut f,
+        b2,
+        Class::Gpr,
+        Width::W32,
+        &[(b0, in_reg), (b1, reloaded)],
+    );
+
+    assert_eq!(
+        f.blocks[b2 as usize].params,
+        vec![Reg::V(p)],
+        "the join did not gain the block parameter that is the phi"
+    );
+    assert_eq!(f.vregs[p as usize].class, Class::Gpr);
+    assert_eq!(f.vregs[p as usize].width, Width::W32);
+    // b0 reaches the join on the FALL-THROUGH arm of a `cbz`, so the argument
+    // must land on that target and on no other — an argument pushed onto the
+    // wrong edge is a wrong value on every path through b1.
+    match &f.blocks[b0 as usize].term {
+        MTerm::Cbz { t, f: fl, .. } => {
+            assert!(t.args.is_empty(), "the edge that does NOT reach the join gained an argument");
+            assert_eq!(fl.args, vec![in_reg], "the register-resident arm passes its register");
+        }
+        other => panic!("terminator rewritten: {:?}", other),
+    }
+    match &f.blocks[b1 as usize].term {
+        MTerm::B(t) => assert_eq!(t.args, vec![reloaded], "the reloaded arm passes its reload"),
+        other => panic!("terminator rewritten: {:?}", other),
+    }
+    // and the parameter is a FRESH name, not one of the two it reconciles
+    assert!(p != in_reg.vreg().unwrap() && p != reloaded.vreg().unwrap());
+}

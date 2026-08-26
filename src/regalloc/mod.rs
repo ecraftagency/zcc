@@ -17,6 +17,7 @@ pub mod color;
 pub mod destruct;
 pub mod live;
 pub mod promote;
+pub mod reconstruct;
 pub mod spill;
 #[cfg(test)]
 mod tests;
