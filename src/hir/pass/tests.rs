@@ -1521,3 +1521,62 @@ fn a_division_by_a_power_of_two_becomes_a_multiplication() {
     square("float f(float x){return x/8.0f;} int main(void){return (int)f(64.0f);}", 8);
     square("double f(double x){return x/-2.0;} int main(void){return (int)f(-8.0);}", 4);
 }
+
+#[test]
+fn an_invariant_plus_the_counter_becomes_the_counter() {
+    // §13q ii / Law 3c. `(m + k) & 31` inside a `k` loop rebuilds `m + k` on
+    // every iteration; gcc runs that value AS the counter and shifts the bound
+    // by `m`. Six instructions become five, and d2_nested_loops 1.400 → 1.000.
+    let src = "long f(int n,int m){long s=0;int k;for(k=0;k<n;k++)s+=(m+k)&31;return s;}\
+               int main(void){return (int)f(5,7);}";
+    let opt = module(src, true);
+    let g = func(&opt, "f");
+    // NON-VACUITY, and it is the whole point: the narrow counter is GONE. Both
+    // I32 adds — the step and the `m + k` — went with it, and the exit test is
+    // now made at 64 bits.
+    assert_eq!(count(g, |i| matches!(i, Inst::Bin { op: BinOp::Add, ty: crate::hir::Ty::I32, .. })), 0);
+    // The guard rotation left in the entry block is still an I32 compare and
+    // legitimately so — it is outside the loop. What matters is that the LOOP's
+    // test is now made at 64 bits.
+    assert_eq!(count(g, |i| matches!(i, Inst::Cmp { ty: crate::hir::Ty::I64, .. })), 1);
+    assert!(
+        g.blocks.iter().any(|b| b.params.iter().any(|&p| g.ty_of(p) == crate::hir::Ty::I64)),
+        "the substituted counter is a wide header parameter"
+    );
+    // ⟦f⟧ = ⟦subst f⟧, both equal C99: (7+k)&31 for k = 0..4 is 7+8+9+10+11 = 45.
+    let ast = frontend(src);
+    let plain = module(src, false);
+    match (run(&plain, &ast), run(&opt, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == 45 => {}
+        (x, y) => panic!("⟦f⟧={:?} ⟦subst f⟧={:?} want 45", x, y),
+    }
+}
+
+#[test]
+fn a_masked_truncation_needs_no_widening() {
+    // `fold::narrow_mask`'s square, on its own. A mask that clears the sign bit
+    // makes both the truncation and the widening around it no-ops, so the whole
+    // sandwich is one 64-bit `and`. Without it `iv::substitute` hands back the
+    // instruction it saved as a `mov w,w`.
+    let src = "long g(long x){return (long)(((int)x)&31);}\
+               int main(void){return (int)g(100);}";
+    let opt = module(src, true);
+    let g = func(&opt, "g");
+    assert_eq!(count(g, |i| matches!(i, Inst::Cvt { .. })), 0, "no trunc, no widening");
+    assert_eq!(count(g, |i| matches!(i, Inst::Bin { op: BinOp::And, ty: crate::hir::Ty::I64, .. })), 1);
+    let ast = frontend(src);
+    let plain = module(src, false);
+    match (run(&plain, &ast), run(&opt, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == 4 => {}
+        (x, y) => panic!("⟦g⟧={:?} ⟦narrow_mask g⟧={:?} want 4", x, y),
+    }
+    // The mask must clear the SIGN bit; 0xffffffff does not, and the rule must
+    // refuse it rather than turn a negative into a positive.
+    let neg = "long g(long x){return (long)(((int)x)&-1);}\
+               int main(void){return (int)g(-7);}";
+    let ast = frontend(neg);
+    match (run(&module(neg, false), &ast), run(&module(neg, true), &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == -7 => {}
+        (x, y) => panic!("a sign-bit-keeping mask must be refused: {:?} {:?}", x, y),
+    }
+}

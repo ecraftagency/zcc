@@ -755,3 +755,337 @@ fn append_cvt(f: &mut Func, b: BlockId, op: CvtOp, from: Ty, to: Ty, a: Operand)
     f.blocks[b as usize].insts.push(Inst::Cvt { dst: v, op, from, to, a });
     Operand::Val(v)
 }
+
+// ── INDUCTION-VARIABLE SUBSTITUTION (§13q ii; gcc's IV canonicalization, the
+//    half of `-ftree-slsr` that owns d2_nested_loops) ────────────────────────
+//
+// THE MEASUREMENT. `for (k=0;k<n;k++) s += (i*j+k) & 31;`
+//
+//     zcc  add w7,w5,w4 ; and w7,w7,#31 ; add x6,x6,x7 ; add w4,w4,#1 ; cmp w4,w0 ; b.lt
+//     gcc  and x2,x1,31 ; add x0,x0,x2  ; add w1,w1,1 ; cmp w1,w3    ; bne
+//
+// gcc runs `i*j + k` AS the induction variable: it starts at `i*j`, steps by
+// one, and the exit bound becomes `n + i*j`. The add that rebuilt the value on
+// every iteration is gone, and the mask reads its input a cycle earlier. Six
+// instructions against five, and 1.556 against 1.000 on the clock — Law 3c's
+// second kind of gap, where the count moves by ONE and the time by half.
+//
+// THE TRANSFORM. For a counted loop with an I32 counter `k` and one or more
+// values `t = inv + k` where `inv` is loop-invariant, introduce a 64-bit header
+// parameter `q` holding `sext(inv) + sext(k)`, rewrite the exit test onto it,
+// and let `k` die. Each `t` becomes `trunc(q)` in place.
+//
+// COMMUTING SQUARE, and it is why the parameter is WIDE. `SEMANTICS.md` defines
+// signed overflow as WRAPPING, so the C-level "signed overflow is undefined"
+// argument gcc uses is not available here and the rewrite has to be exact under
+// wrapping. In I32 it is not: shifting `k <s bound` by `inv` flips at the sign
+// boundary, and the corner is REACHABLE (`inv + bound - 1 == INT_MAX` exits on
+// the first test instead of the last). In I64 it is exact, unconditionally:
+//   * `sext(k_n) = sext(k_0) + step·n` — this is `no_wrap_signed(k)`, the fact
+//     `widen` already needs and `scev::find_nowrap` already proves;
+//   * `q_n = sext(inv) + sext(k_n)` cannot overflow — both terms are 32-bit
+//     ranged, so the sum needs 33 bits;
+//   * `t_n = trunc32(q_n)` holds with NO side condition, because truncating an
+//     exact sum yields the wrapping sum, which is what `t` meant;
+//   * `k <s bound ⟺ sext(k) <s sext(bound) ⟺ q <s sext(bound)+sext(inv)`,
+//     adding one constant to both sides of a comparison in ℤ, with no 64-bit
+//     wrap to spoil it. The bound is computed ONCE, in the entry block.
+//
+// WHAT IS REFUSED: a loop where the counter also feeds a `sext` — that is
+// `widen`'s row and running both would grow a second wide counter beside this
+// one; an unsigned exit test, whose `zext` twin is a fact this does not claim;
+// a bound that is not defined outside the loop; and any other use of the
+// counter, since a surviving `k` means the `add` this pass removes comes
+// straight back as the counter's own step.
+
+/// THEORY A7b  SQUARE an_invariant_plus_the_counter_becomes_the_counter — Law 3c
+pub fn substitute(f: &mut Func) -> bool {
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    let lf = dom::loops(&c, &dt);
+    let mut order: Vec<usize> = (0..lf.loops.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    for li in order {
+        if substitute_loop(f, &c, &dt, &lf, li) {
+            return true;
+        }
+    }
+    false
+}
+
+fn substitute_loop(
+    f: &mut Func,
+    c: &dom::Cfg,
+    dt: &dom::DomTree,
+    lf: &dom::LoopForest,
+    li: usize,
+) -> bool {
+    let s = match scev::LoopScev::analyze(f, c, dt, lf, li) {
+        Some(s) => s,
+        None => return false,
+    };
+    let header = lf.loops[li].header;
+    let entries: Vec<BlockId> = c.preds[header as usize]
+        .iter()
+        .copied()
+        .filter(|&p| !dt.dominates(header, p))
+        .collect();
+    let latches: Vec<BlockId> = c.preds[header as usize]
+        .iter()
+        .copied()
+        .filter(|&p| dt.dominates(header, p))
+        .collect();
+    if entries.len() != 1 || latches.is_empty() {
+        return false;
+    }
+    let entry = entries[0];
+    let mut ivs: Vec<(ValueId, scev::AddRec)> = s
+        .ivs
+        .iter()
+        .filter(|(p, r)| r.ty == Ty::I32 && r.base.is_none() && s.no_wrap_signed(**p))
+        .map(|(p, r)| (*p, *r))
+        .collect();
+    ivs.sort_by_key(|(p, _)| *p);
+    for (p, rec) in ivs {
+        if let Some((plan, shift)) = plan_substitute(f, &s, header, &latches, p, rec) {
+            apply_substitute(f, header, entry, &latches, p, rec, plan, shift);
+            refresh_defs(f);
+            return true;
+        }
+    }
+    false
+}
+
+/// The counter's uses, sorted into the ones this rewrite absorbs and the ones
+/// that refuse it. Returns the plan and the invariant term the new parameter
+/// carries.
+fn plan_substitute(
+    f: &Func,
+    s: &scev::LoopScev,
+    header: BlockId,
+    latches: &[BlockId],
+    p: ValueId,
+    rec: scev::AddRec,
+) -> Option<(Plan, ValueId)> {
+    let mut step_val = None;
+    let mut cmp: Option<(BlockId, usize, ValueId, CmpOp, Operand, bool)> = None;
+    // `inv` → the values `inv + p` computed in this loop. Deterministic order:
+    // identical IR must produce identical bytes.
+    let mut groups: std::collections::BTreeMap<ValueId, Vec<ValueId>> =
+        std::collections::BTreeMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (i, inst) in b.insts.iter().enumerate() {
+            match inst {
+                // The counter feeding a widening is `widen`'s row, not this one.
+                Inst::Cvt { op: CvtOp::Sext, a, .. } if *a == Operand::Val(p) => return None,
+                Inst::Bin { dst, op: BinOp::Add, ty: Ty::I32, a, b: rhs } => {
+                    if *a == Operand::Val(p) && *rhs == Operand::Imm(rec.step) {
+                        if step_val.is_some() {
+                            return None;
+                        }
+                        step_val = Some(*dst);
+                        continue;
+                    }
+                    let other = match (*a, *rhs) {
+                        (Operand::Val(x), o) if x == p => o,
+                        (o, Operand::Val(x)) if x == p => o,
+                        _ => continue,
+                    };
+                    if let Some(v) = other.val() {
+                        if s.is_loop_invariant(v) {
+                            groups.entry(v).or_default().push(*dst);
+                        }
+                    }
+                }
+                Inst::Cmp { dst, op, ty: Ty::I32, a, b: rhs } => {
+                    let after = match (*a, step_val) {
+                        (Operand::Val(v), Some(sv)) if v == sv => true,
+                        (Operand::Val(v), _) if v == p => false,
+                        _ => continue,
+                    };
+                    if cmp.is_some() {
+                        return None;
+                    }
+                    cmp = Some((bi as BlockId, i, *dst, *op, *rhs, after));
+                }
+                _ => {}
+            }
+        }
+    }
+    let step_val = step_val?;
+    let (cb, ci, cmp_dst, op, bound, cmp_after_step) = cmp?;
+    // The invariant term with the most sites; the smallest id breaks a tie so
+    // the choice does not depend on a hash walk.
+    let (shift, subs) = groups.into_iter().max_by_key(|(v, ss)| (ss.len(), std::cmp::Reverse(*v)))?;
+    if cmp_after_step && !latches.contains(&cb) {
+        return None;
+    }
+    if !matches!(op, CmpOp::Slt | CmpOp::Sle | CmpOp::Sgt | CmpOp::Sge | CmpOp::Eq | CmpOp::Ne) {
+        return None;
+    }
+    // Defined OUTSIDE the loop, not merely unchanging inside it — the shifted
+    // bound and the widened start are both materialized in the entry block.
+    match bound {
+        Operand::Imm(_) => {}
+        Operand::Val(v) if s.is_loop_invariant(v) => {}
+        _ => return None,
+    }
+    if !s.is_loop_invariant(shift) || f.ty_of(shift) != Ty::I32 {
+        return None;
+    }
+    // Every reader of the counter and of its step must be one this rewrite
+    // moves: a substituted add, the step, the test, or a header edge argument.
+    let ok_use = |user: &Inst| -> bool {
+        match user {
+            Inst::Bin { dst, .. } => *dst == step_val || subs.contains(dst),
+            Inst::Cmp { dst, .. } => *dst == cmp_dst,
+            _ => false,
+        }
+    };
+    for b in &f.blocks {
+        for inst in &b.insts {
+            let mut bad = false;
+            inst.uses(|o| {
+                if (o == Operand::Val(p) || o == Operand::Val(step_val)) && !ok_use(inst) {
+                    bad = true;
+                }
+            });
+            if bad {
+                return None;
+            }
+        }
+        for t in b.term.targets() {
+            if t.block == header {
+                continue;
+            }
+            if t.args.iter().any(|a| *a == Operand::Val(p) || *a == Operand::Val(step_val)) {
+                return None;
+            }
+        }
+        match &b.term {
+            Term::Br(x, ..) | Term::Switch(x, ..) | Term::GotoPtr(x, _) | Term::Ret(Some(x)) => {
+                if *x == Operand::Val(p) || *x == Operand::Val(step_val) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some((
+        Plan { sexts: subs, step_val, cmp_at: (cb, ci), cmp_after_step, bound, op, cmp_dst },
+        shift,
+    ))
+}
+
+fn apply_substitute(
+    f: &mut Func,
+    header: BlockId,
+    entry: BlockId,
+    latches: &[BlockId],
+    p: ValueId,
+    rec: scev::AddRec,
+    plan: Plan,
+    shift: ValueId,
+) {
+    let idx = f.blocks[header as usize].params.len() as u32;
+    let q = f.new_value(Ty::I64, Def::Param(header, idx));
+    f.blocks[header as usize].params.push(q);
+
+    // entry: `sext(inv)`, then the start `sext(inv) + k0` and the shifted bound.
+    // Both are loop-invariant and are computed exactly once.
+    let winv = append_cvt(f, entry, CvtOp::Sext, Ty::I32, Ty::I64, Operand::Val(shift));
+    let start = append(
+        f,
+        entry,
+        Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: winv, b: Operand::Imm(rec.off) },
+    );
+    for t in f.blocks[entry as usize].term.targets_mut() {
+        if t.block == header {
+            t.args.push(start);
+        }
+    }
+    let wide_bound = match plan.bound {
+        Operand::Imm(k) => append(
+            f,
+            entry,
+            Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: winv, b: Operand::Imm(k) },
+        ),
+        o => {
+            let wb = append_cvt(f, entry, CvtOp::Sext, Ty::I32, Ty::I64, o);
+            append(f, entry, Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: winv, b: wb })
+        }
+    };
+
+    // latches: the wide step, placed before the test in the block that holds it.
+    let (cb, mut ci) = plan.cmp_at;
+    let mut wstep = Vec::new();
+    for &l in latches {
+        let at = if l == cb { ci } else { f.blocks[l as usize].insts.len() };
+        let v = insert_bin(f, l, at, BinOp::Add, Ty::I64, Operand::Val(q), Operand::Imm(rec.step));
+        if l == cb {
+            ci += 1;
+        }
+        wstep.push((l, v));
+        for t in f.blocks[l as usize].term.targets_mut() {
+            if t.block == header {
+                t.args.push(Operand::Val(v));
+            }
+        }
+    }
+
+    // Each `inv + k` becomes a truncation of the wide parameter, IN PLACE: same
+    // value, same block, same index, so every reader keeps reading what it read.
+    // The truncation is what `mir/pass/ext.rs` then absorbs into a consumer that
+    // masks or re-widens (`and w,w,#31` + `sext` becomes one `and x,q,#31`).
+    for &t in &plan.sexts {
+        for b in f.blocks.iter_mut() {
+            for inst in b.insts.iter_mut() {
+                if inst.dst() == Some(t) {
+                    *inst = Inst::Cvt {
+                        dst: t,
+                        op: CvtOp::Trunc,
+                        from: Ty::I64,
+                        to: Ty::I32,
+                        a: Operand::Val(q),
+                    };
+                }
+            }
+        }
+    }
+
+    let lhs = if plan.cmp_after_step {
+        Operand::Val(
+            wstep
+                .iter()
+                .find(|(l, _)| *l == cb)
+                .expect("the after-step test is in a latch")
+                .1,
+        )
+    } else {
+        Operand::Val(q)
+    };
+    f.blocks[cb as usize].insts[ci] =
+        Inst::Cmp { dst: plan.cmp_dst, op: plan.op, ty: Ty::I64, a: lhs, b: wide_bound };
+
+    // The counter is dead by construction, and is deleted here for the same
+    // reason `apply_widen` deletes its own: what is left is a CYCLE the use-count
+    // sweep reads as live, and the loop would keep a second counter for nothing.
+    let pi = f.blocks[header as usize]
+        .params
+        .iter()
+        .position(|&x| x == p)
+        .expect("the counter is a header parameter");
+    f.blocks[header as usize].params.remove(pi);
+    let mut preds: Vec<BlockId> = latches.to_vec();
+    preds.push(entry);
+    for b in preds {
+        for t in f.blocks[b as usize].term.targets_mut() {
+            if t.block == header && pi < t.args.len() {
+                t.args.remove(pi);
+            }
+        }
+    }
+    for b in f.blocks.iter_mut() {
+        b.insts.retain(|i| i.dst() != Some(plan.step_val));
+    }
+}

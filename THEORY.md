@@ -159,11 +159,18 @@ target file (Side II); everything else is Side I.
 > torture/csmith300/yarpgen300. The R0 pipeline was `AST → HIR → isel → regalloc → frame →
 > layout → .s`; the passes below now sit between lowering and isel (HIR ladder) and between isel
 > and regalloc / after frame (MIR ladder). The MIR ladder is COMPLETE (`auto_inc` R3.2 and
-> `shrink_wrap` R3.3 shipped 2026-08-25). Still `⬜`, all in the HIR loop tail: iv /
-> pointer-iv / LFTR, and rotate / final-value. Scalar strength-reduction (`mul`→`add` on an
-> induction variable) is CLOSED as Law-4 category-(a) rather than pending — the rewrite is
-> 1:1 static and an out-of-order core pipelines `mul` at ≈`add` cost, so it is null on every
-> target (REARCH §13c). The general theorems in the first table are
+> `shrink_wrap` R3.3 shipped 2026-08-25). Still `⬜` in the HIR loop tail: rotate / final-value.
+> **CORRECTED 2026-08-26 (Law 3c, MEASURED M9).** Scalar strength-reduction was recorded here
+> as CLOSED, category-(a), on the premise that "an out-of-order core pipelines `mul` at ≈`add`
+> cost, so it is null on every target". **That premise is refuted by measurement.** A `mul`
+> that merely sits in a basic block does cost about an `add`; a `mul` at the HEAD OF A
+> DEPENDENCE CHAIN does not, because what it delays is everything downstream of it.
+> `tests/bench/matmul.c` moved **1.638× → 1.000×** by replacing one address `madd` with an
+> `add`, at IDENTICAL instruction count, and `d2_nested_loops` **1.400 → 1.000** by making
+> `inv + k` the counter. Both are now shipped — `iv::affine` (row-strided pointer walk, §13q)
+> and `iv::substitute` (IV substitution + LFTR, §13q ii) — with `fold::narrow_mask` as the
+> rule that keeps the second one's saving from returning as a `mov w,w`. The old entry is the
+> canonical example of a category-(a) verdict taken on a size model that cannot see time. The general theorems in the first table are
 > architecture-independent and survived the re-architecture unchanged — they are about how a
 > pass is PROVEN, not about what the IR is.
 

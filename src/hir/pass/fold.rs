@@ -171,6 +171,79 @@ fn exact_reciprocal(bits: u64, ty: Ty) -> Option<u64> {
     Some((sign << (ebits + mbits)) | (re << mbits))
 }
 
+/// `widen(narrow_mask(trunc(x)))` is a MASK OF `x`, at the wide width — the
+/// truncation and the widening are both no-ops once the mask has cleared every
+/// bit either of them could have touched.
+///
+/// SQUARE. Let `m` satisfy `0 ≤ m ≤ i32::MAX`, so bit 31 of `m` is clear.
+/// `trunc32(x) & m` keeps only bits of `x` that `m` keeps, all below bit 31, and
+/// so does `x & m` at 64 bits — the two agree bit for bit. The result lies in
+/// `[0, m] ⊆ [0, 2³¹−1]`, whose bit 31 is clear, so SIGN- and ZERO-extending it
+/// are the same map and both are the identity. Hence
+/// `ext(trunc(x) & m) = x & m` for every `x`, with no side condition.
+///
+/// WHY IT IS WORTH A RULE. `iv::substitute` leaves exactly this shape: the
+/// counter is 64 bits, the value the loop reads is `trunc` of it, and the
+/// program masks that value and widens the result. Without this the truncation
+/// survives as a `mov w,w` and the pass gives back the instruction it saved
+/// (d2_nested_loops stayed at six). It is not special to that pass — any
+/// `(int)(long_expr) & SMALL_MASK` promoted back to `long` has it.
+pub fn narrow_mask(f: &mut Func) -> bool {
+    let mut def: Vec<Option<Inst>> = vec![None; f.values.len()];
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Some(d) = inst.dst() {
+                def[d as usize] = Some(inst.clone());
+            }
+        }
+    }
+    // `v = u & m` with a mask that clears the sign bit, over a truncation.
+    let masked_trunc = |v: ValueId| -> Option<(ValueId, i64)> {
+        let (u, m) = match def.get(v as usize)?.as_ref()? {
+            Inst::Bin { op: BinOp::And, ty: Ty::I32, a: Operand::Val(u), b: Operand::Imm(m), .. }
+            | Inst::Bin { op: BinOp::And, ty: Ty::I32, a: Operand::Imm(m), b: Operand::Val(u), .. } => {
+                (*u, *m)
+            }
+            _ => return None,
+        };
+        if m < 0 || m > i32::MAX as i64 {
+            return None;
+        }
+        match def.get(u as usize)?.as_ref()? {
+            Inst::Cvt { op: CvtOp::Trunc, from: Ty::I64, to: Ty::I32, a: Operand::Val(x), .. } => {
+                Some((*x, m))
+            }
+            _ => None,
+        }
+    };
+    let mut changed = false;
+    for b in f.blocks.iter_mut() {
+        for inst in b.insts.iter_mut() {
+            let (dst, v) = match inst {
+                Inst::Cvt {
+                    dst,
+                    op: CvtOp::Sext | CvtOp::Zext,
+                    from: Ty::I32,
+                    to: Ty::I64,
+                    a: Operand::Val(v),
+                } => (*dst, *v),
+                _ => continue,
+            };
+            if let Some((x, m)) = masked_trunc(v) {
+                *inst = Inst::Bin {
+                    dst,
+                    op: BinOp::And,
+                    ty: Ty::I64,
+                    a: Operand::Val(x),
+                    b: Operand::Imm(m),
+                };
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 pub fn canon(f: &mut Func) -> bool {
     let mut changed = false;
     for b in f.blocks.iter_mut() {

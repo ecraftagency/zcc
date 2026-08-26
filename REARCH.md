@@ -2880,6 +2880,66 @@ It is also now **Law 3c** in `CLAUDE.md`.
 
 ---
 
+### §13q ii — IV SUBSTITUTION: d2_nested_loops, and the category-(a) verdict that was wrong (2026-08-26)
+
+**THE MEASUREMENT.** `for (k=0;k<n;k++) s += (i*j+k) & 31;` — zcc six instructions per iteration
+against gcc's five, and **1.400 on the clock** (14 ms against 10; geo40 reported 1.556 in its own
+session). Hand-validated before any pass was written, the §13q method: the k-loop was edited into
+gcc's shape in zcc's own `.s`, assembled and linked, and both print `418008592` — **11 ms**, so the
+one instruction was the whole gap.
+
+```
+zcc  add w7,w5,w4 ; and w7,w7,#31 ; add x6,x6,x7 ; add w4,w4,#1 ; cmp w4,w0 ; b.lt
+gcc  and x2,x1,31 ; add x0,x0,x2  ; add w1,w1,1 ; cmp w1,w3    ; bne
+```
+
+gcc runs `i*j + k` AS the induction variable: it starts at `i*j`, steps by one, and the exit bound
+becomes `n + i*j`, computed once in the preheader. The add that rebuilds the value on every
+iteration is gone and the mask reads its input a cycle earlier.
+
+**WHY THE PARAMETER IS 64 BITS, and it is not a style choice.** `SEMANTICS.md` §7 defines signed
+overflow as WRAPPING — a deliberate refinement of ⊥ — so gcc's "signed overflow is undefined"
+argument is NOT available here and the rewrite has to be exact under wrapping. In I32 it is not:
+shifting `k <s bound` by `inv` flips at the sign boundary, and the corner is reachable — when
+`inv + bound - 1 == INT_MAX` the shifted test exits on the FIRST evaluation instead of the last. In
+I64 it is exact with no side condition, because `sext(inv)` and `sext(k)` are both 32-bit ranged and
+their sum needs 33 bits. The four steps are in the pass's own header comment; the only external fact
+is `no_wrap_signed(k)`, which `widen` already needed and `scev::find_nowrap` already proves.
+
+**AND THE SAVING CAME STRAIGHT BACK, ONCE.** The first cut left `mov w7, w5` — the truncation of the
+wide parameter — and the loop stayed at six. `fold::narrow_mask` is the rule that closes it:
+`ext(trunc(x) & m) = x & m` for `0 ≤ m ≤ INT_MAX`, since the mask clears every bit either conversion
+could have touched. Not special to this pass: any `(int)(long_expr) & MASK` promoted back to `long`
+has the shape. With it, `and x7, x5, #31` — exactly what the model predicted when the same loop was
+written in 64-bit C and compiled, BEFORE the pass existed.
+
+**THE VERDICT THIS OVERTURNS, and it is the important part.** `THEORY.md` A7b recorded scalar
+strength-reduction as CLOSED, Law-4 **category (a)**, on this premise:
+
+> the rewrite is 1:1 static and an out-of-order core pipelines `mul` at ≈`add` cost, so it is null on
+> every target (REARCH §13c)
+
+That premise is **refuted by measurement**. It is true of a `mul` sitting in a basic block and false
+of a `mul` at the head of a dependence chain, because what such a `mul` delays is everything
+downstream of it. §13q's matmul moved **1.638× → 1.000× at identical instruction count**; this row
+moved d2 **1.400 → 1.000**. Both were closed by one sentence of plausible micro-architectural
+reasoning that no one had measured. `THEORY.md` now carries the correction, and this is the standing
+example for R4.18: **a category-(a) closure taken on the size model is not a closure at all.**
+
+**Gate:** cargo 176/0 (squares `an_invariant_plus_the_counter_becomes_the_counter` and
+`a_masked_truncation_needs_no_widening`), provenance PASS, shape/cpp/decay/alg/abi PASS, cases OK,
+ext PASS, torture 0 FAIL, determinism 88×8, opt-parity 1552/0, csmith300 254/0, yarpgen300 300/0,
+musl PASS — **14 PASS / 1 RED**, the RED being `cts`, which reports `0 pass, 0 fail`: a suite that
+was not found, on this run and on the two before it.
+
+**THE TARGET-KNOWLEDGE FILE.** Everything in §13q and §13q ii that is about the MACHINE rather than
+about a theorem now lives in **`src/arm64_elf.md`** — the shapes, what each costs, how to establish a
+codegen claim, and the big-win ledger (the standing rule: any change taking a program from 1.3–1.5×
+to parity or below gets a row). It is the successor to the pre-rearch `src/codegen/arm64_elf.md`,
+which catalogued algorithms; this one catalogues the target.
+
+---
+
 ## §14 Decision log (settled; reopen only with a stated reason)
 
 | decision | choice | why |

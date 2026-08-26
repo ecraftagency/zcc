@@ -105,6 +105,7 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         }
         if on("gvn") {
             changed |= fold::canon(f);
+            changed |= fold::narrow_mask(f);
             changed |= gvn::run(f);
         }
         if on("mem") {
@@ -133,6 +134,14 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // and gcc's (§13l).
         if on("widen") {
             changed |= iv::widen(f);
+        }
+        // IV SUBSTITUTION is a third row again (§13q ii): `widen` removes a
+        // `sxtw` from an `a[i]` loop, this removes the ADD that rebuilds
+        // `inv + k` every iteration by making that value the counter. After
+        // `widen`, because a loop whose counter already feeds a `sext` belongs
+        // to that row and this one refuses it.
+        if on("subst") {
+            changed |= iv::substitute(f);
         }
         if on("sink") {
             changed |= sink::run(f);
