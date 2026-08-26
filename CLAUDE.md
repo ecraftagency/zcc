@@ -1,6 +1,8 @@
 # zcc — Project Charter
 
-zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external crates. Terminology stays English. This file is the constitution: the three laws, then the supporting articles — each an amendment with detail offloaded to its own document. Only the first three carry the word **law**; the rest are mechanisms.
+zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external crates. Terminology stays English. This file is the constitution: the laws, then the supporting articles — each an amendment with detail offloaded to its own document. Only Laws 0–3 and **Law 3c** carry the word **law**; the rest are mechanisms.
+
+> **⚠️ AWS OPERATIONAL SAFETY (2026-08-26, after a real incident) — READ BEFORE ANY `aws` / terraform COMMAND.** `ap-southeast-1` (Singapore) is the user's **PRODUCTION** region — many live servers run there (`da09-*` and others). **NEVER create, modify, stop, terminate, cancel, or destroy ANY resource in `ap-southeast-1`.** All zcc fuzz-box work lives ONLY in **`us-east-2`** (the cheapest Graviton `c7g` spot region — the user's deliberate choice). The `aws` CLI default region on this machine is `ap-southeast-1`, so **ALWAYS pass `--region us-east-2` explicitly** on every AWS/terraform command, and **verify tags AND region before ANY destructive call.** (Root cause of the incident: an unqualified `aws ec2` audit defaulted to `ap-southeast-1`, a persistent spot request there was mistaken for a zcc leftover, and a production `da09-dev` instance was wrongly terminated. Data volume survived; the instance did not.)
 
 > **`[branch = `mir-rearch`]` BOOT OVERRIDE (2026-08-24, user re-plan) — READ THIS BEFORE THE PARAGRAPH BELOW.** On branch `mir-rearch` (the repository DEFAULT; `main` is frozen at tag `rc3` and is not to be touched), the plan of record is **`REARCH.md`**, not `OPT.md`. The whole layer below `src/ast.rs` was deleted and rewritten: `ir.rs`, `opt/`, `codegen/` no longer exist, and every reference to them in the paragraph below describes a DEAD architecture. **BOOT on this branch:** read `REARCH.md` §0, then resume at the first `⬜` in its §12 milestone ladder (R0–R5). The prompts "execute the plan" / "continue" / "resume" / "go R<n>" all mean THAT ladder; they do NOT mean `OPT.md §0`, whose spine row #25 `REARCH.md` supersedes. What still binds in full from the paragraph below and from the Laws and Articles above: Laws 1–3 (+ Law-4 exhaustion), Articles A–G, THE ULTIMATUM (1× vs gcc-O1 on BOTH size and speed, verification never traded for a number), the anti-fragmentation rule (edit the spine table IN PLACE; never author a new numbering), the NO-PIVOT contract, and the measurement method (paired INSN+EXEC, distribution not a single number, the gcc-zeroed bucket). What does NOT bind: the OPT.md lever spine, the #17→#24 grind, and "`main` **is** the optimizer".
 
@@ -51,6 +53,46 @@ Not a corollary of Law 1 but an *idea of the Correctness-by-Construction approac
 - **Correctness** — a pass `IR→IR'` ships with its commuting square `⟦IR⟧=⟦IR'⟧` (IR passes) or a machine translation-validation (backend passes). csmith/yarpgen only *confirm*, never *discover*.
 - **Optimization (cost-square)** — cost is proven the way correctness is: at the **theorem layer, in the theorem-programming-language**, not on the compiled artifact (Rust `.s`) via patch→build→suite. The instruction-count of a function is a *catamorphism over the IR*, `cost(f) = Σ_inst emit_len(inst, alloc)`, written **independently** from the lowering theorems (each `Inst` → its machine-insn expansion); the **cost-square** `cost(f) ≡ len(codegen(f))` — proven per-function over the whole corpus — certifies that the Rust in the backend *faithfully realizes* that cost-theorem. `[mir-rearch]`: this square is now EXACT BY CONSTRUCTION rather than a separate model — one `MInst` is one machine instruction after frame/layout, so `cost(f) = |MIR_final(f)|` and `emit.rs` expands nothing (the single exception, `MovImm`, reports its chain length via `isa::mov_chain().len()`). This is the exact dual of the correctness commuting square: there `⟦f⟧=⟦opt(f)⟧`, here `cost=len∘codegen`. A mismatch is a **Law-2 defect**, localized to the offending `Inst` — either code drifted from its lowering theorem (Side I) or the cost-theorem was mis-transcribed — *never* a mystery to be grepped out of `.s`. Once the square holds, a transform's Δinsn is computed **on the model, before any build** (predict → apply → the model confirms); patch-Rust-then-run-the-suite is the slow path of last resort, reserved for effects the cost-model provably cannot see. `.s` and the suite *confirm*, never *discover* (the LICM ship-then-regress trap).
 - **Exhaustion (vắt kiệt — Law-4 folded in, a corollary not a fourth law)** — a theorem is not "done" at its first positive result, however large; **cấm dừng ở green đầu tiên**. For each shipped theorem T, its **residual** — the multiset of sites where T *could* fire but did not — is measured on the cost-model, and every residual case classified: (a) a *fundamental limit* (a real ISA/ABI encoding boundary, proven — e.g. an offset genuinely beyond imm12 range), or (b) a *convenience truncation* (an incomplete or gated realization). T is **exhausted** only when residual = (a) entirely. This is the **coverage-dual** of Article E's constant-fidelity question: there it is *"the spec's number, or my convenience's number?"* (the value of a constant); here it is **"have I PROVEN this theorem exhausted, or did I stop at the first green?"** (the coverage of a transform). Stopping at a small positive while (b)-cases remain is a **Law-1 violation** — the algorithm does not *faithfully realize* its side over the full ultimate-fact — catchable as a Law-2 Side-I defect. Improvement therefore stays *inside* Law 1's "faithfully realizes" clause, now made mechanical and deterministic by the cost-model, with no separate "improvement law" needed.
+
+
+## Law 3c — COUNT IS NOT COST (the TIME dual; performance stands immediately behind correctness)
+
+A law, not a mechanism: correctness is first, and **performance is the thing
+directly behind it**. Law 3 certifies a pass at the middle on two axes — meaning
+(`⟦f⟧ = ⟦opt f⟧`) and SIZE (`cost(f) = |MIR(f)|`, exact by construction on this
+branch). That second square is exact for size **and blind to time by the same
+construction**, because one `MInst` is one machine instruction. So it needs its
+dual:
+
+```
+size:   cost(f)   = |MIR(f)|                    proven per function
+time:   cycles(L) = critical-recurrence(L)      proven per loop
+```
+
+> **Fewest instructions is not fastest code. A code-generation row is judged by
+> the longest dependence chain it leaves, not by how many instructions it emits.**
+> Where the two models disagree, TIME wins (Law 0: `exec > size`).
+
+**The operative rule.** Never leave a multi-cycle operation in front of an
+address or a loop-carried value when a one-cycle operation computes the same
+thing: `madd` on a strided address → `add`; `add …, w, sxtw` → `ldrsw` + `add`;
+`mul` by a constant → shift-and-add.
+
+**Measured, not asserted** — both halves of the claim, on this target:
+
+| case | instruction count | what actually differed | ratio vs gcc -O1 |
+|---|---|---|---|
+| `loops.c` | 24 → 22 | `mul`+`add` → `madd` on the master recurrence | 1.245 → **0.905** |
+| `matmul.c` | 7 → 7, **unchanged** | `madd` address → `add #1920` | 1.638 → **1.000** |
+
+matmul is the pure form: identical count, 64% slower, because a multiply stood
+at the head of a chain ending in a strided load. `MEASURED M1` and `MEASURED M9`
+are the facts; `REARCH.md` §13q is the derivation and R4.18 is the row that
+builds the model.
+
+**Law-4 dual (exhaustion).** A row is exhausted only when no remaining site
+trades chain length for instruction count. A residual measured on `cost = |MIR|`
+alone cannot see this class, so it does not discharge Law 4 for a codegen row.
 
 ---
 

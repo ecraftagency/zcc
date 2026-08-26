@@ -1280,7 +1280,8 @@ fn scev_refuses_a_value_outside_the_affine_fragment() {
     });
 }
 
-// ── pointer induction variables (§13h; shipped default-OFF, see §13i) ──────
+// ── pointer induction variables (§13h). The UNIT-STRIDE half ships OFF (§13i,
+// MEASURED M2); the row-strided half ships ON (§13q) ──────────────────────
 
 /// The optimized module, then this pass by hand — `module(src, true)` cannot
 /// reach it while it ships disabled, and a disabled theorem still owes its
@@ -1329,6 +1330,41 @@ fn a_strided_load_walks_a_pointer() {
     match (run(&plain, &ast), run(&after, &ast)) {
         (Ok(x), Ok(y)) if x == y && x == 42 => {}
         (x, y) => panic!("⟦f⟧={:?} ⟦iv f⟧={:?} want 42", x, y),
+    }
+}
+
+#[test]
+fn a_row_strided_load_walks_a_pointer_by_default() {
+    // The half of the pass that is ON, and the reason the two halves are told
+    // apart. `m[k][j]` walks a ROW: step 40 bytes for an 8-byte access. A64's
+    // scaled index scales by the ACCESS SIZE and by nothing else (DDI 0487
+    // C6.2.130), and 40 is not a power of two either, so no shift reaches it —
+    // the address is rebuilt with a MULTIPLY on every iteration. Replacing that
+    // multiply with an `add` is the same instruction count and one multiply less
+    // in front of a load, which is why it needs no post-index to pay and does
+    // not share MEASURED M2's verdict. FIVE columns deliberately: a row stride
+    // of 32 or 64 is a `lsl`, and a shift is not the multiply this removes.
+    //
+    // The address is also `&m + k*40 + j*8`: TWO loop-invariant symbolic terms
+    // around one recurrence, which `scev::AddRec` alone cannot hold — so this is
+    // the non-vacuity proof for `affine`'s split as well.
+    let src = "long m[8][5];\
+               long f(int j){long s=0;int k;for(k=0;k<8;k++)s+=m[k][j];return s;}\
+               int main(void){int i,j;for(i=0;i<8;i++)for(j=0;j<5;j++)m[i][j]=i*5+j;\
+               return (int)f(3);}";
+    let opt = module(src, true);
+    assert_eq!(
+        walked_loads(func(&opt, "f")),
+        1,
+        "a row-strided load must walk a pointer with the pass at its DEFAULT setting"
+    );
+    // ⟦f⟧ = ⟦iv f⟧, and both equal what C99 says: m[k][3] = k*5+3 for k = 0..7,
+    // so the sum is 5*(0+1+…+7) + 8*3 = 140 + 24 = 164.
+    let ast = frontend(src);
+    let plain = module(src, false);
+    match (run(&plain, &ast), run(&opt, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == 164 => {}
+        (x, y) => panic!("⟦f⟧={:?} ⟦iv f⟧={:?} want 164", x, y),
     }
 }
 

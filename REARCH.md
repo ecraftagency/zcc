@@ -1544,7 +1544,8 @@ every row, paired, in one session, as a distribution.
 | **R4.11** | **rotation residual + store motion** (j): `rotate.rs` tests `pin`, not `labels`; add the refusal-reason residual print; trace and lift the early-return shape; LICM store motion for a loop-invariant address with no aliasing access | `hir/pass/rotate.rs`, `hir/pass/licm.rs` | residual print first — the count of refused loops per reason IS the prediction | **d3, d4, i1 exec**; sqlite branch count | ⬜ |
 | **R4.12** | **`csel` re-judged** (k) after R4.5 | `hir/pass/ifconv.rs` | paired A/B with `ZCC_NOPASS=ifconv`, ≥30 ms subset | keep or narrow, on the number | ✅ **KEEP.** ON = EXEC 1.0576 / INSN 1.0677; OFF = 1.0732 / 1.0694 — ON wins both axes, identical distribution (median 1.000, worst d2 1.556). No program regresses; no narrowing warranted |
 | **R4.15** | **the frame adjust becomes an ordinary MIR instruction** (§13o), which `frame_fold` fuses into the first save pair (pre-index `stp …,[sp,#-N]!`) and the last restore (post-index `ldp …,[sp],#N`), DDI 0487 C6.2.130 | new `MInst::SpAdj` + `AddrMode::FrameWb`; `mir/pass/frame_fold.rs`; `frame` places callee-saves at offset 0; `emit` stops inventing the adjust for an ordinary frame | 1,588 `sub sp` + 1,726 `add sp` = ≈3,300 the pre/post-index forms fold for free | sqlite ≪ 186,705; the standalone adjust gone on every ordinary frame | ✅ **BANKED.** sqlite **183,253 = 1.1667×** (−3,452); geo40 INSN 1.0677 → **1.0272**, EXEC 1.0576 → **1.0513**, 0 DIVERGE. Guards: `!dyn_stack`, `outgoing=0`, pair N≤504 / single N≤255 (post-index end binds — the `ldr x30,[sp],#256` reject), offset-0 save at prologue head / epilogue tail. Square `frame_fold_folds_the_adjust_into_the_save_pair` + `_preserves_meaning`; full gate 15/15 |
-| **R4.13** | **the IV family — R2's exhaustion residual** (l, opened 2026-08-25 on the hot-loop inspection). Three shapes SCEV does not fire on, all one theorem over `scev.rs`/`iv.rs`: (1) a **pointer / 64-bit IV** where the source has a 32-bit counter — zcc recomputes `[xB, wI, sxtw #2]` every iteration, gcc walks a pointer with post-index writeback (`str w3, [x2], -4`; j5, d3); (2) a **count-down IV** whose decrement SETS THE FLAGS so the exit test is free (`subs w1,w1,#1; bpl` — j5, h2), where zcc keeps a separate `cmp`/`tbz`; (3) **strength reduction of `i*j+k` in a nested loop** to an add-IV (d2: `madd` every inner iteration vs gcc's `add`). Every one is `-O1` (`-fauto-inc-dec`, `-ftree-slsr`, IV canonicalization). NOT folded into R4.11 — that row owns rotation refusals and store motion, and Article G forbids blurring a theorem seam. §13n missed this family because it was decomposed from a STATIC sqlite histogram, where an IV shape costs zero instructions | `hir/pass/scev.rs`, `hir/pass/iv.rs`; the post-index fold is `isel/lower.rs` | **residual print FIRST**, as R4.11 requires of rotation: for every loop, is there an IV `scev` recognizes but `iv` refuses to widen/rewrite, and WHY — the count per refusal reason IS the prediction. Then per shape: (1) loops with an address `[base, w, sxtw]` on a recognized IV; (2) counted loops whose exit compare is against 0 or a hoistable bound; (3) inner-loop `mul`/`madd` on two IVs | **j5 exec** (11 → ~7 insns/iter), **d3, d2, h2 exec**; each shape's residual classified (a)/(b) | ⚠️ **RESIDUAL TAKEN → 2 of 3 shapes REFUTED on this target.** (1) pointer/64-bit IV: `ZCC_IV=1` re-measured post-R4.7 is still NEGATIVE (INSN 1.1493 → 1.1538, EXEC 1.2044 → 1.2140) — **category (a)**, the pass stays off. **RE-ENTRY TRIGGER: the time-dual cost model shipping** — that is §13k's own named gate ("re-opening needs a cost model that can say WHEN a writeback pays"), and R4.7's validated j3 cycle prediction is the argument that may open it. Re-entry is one command, no code. (2) count-down IV: zcc's `j>=0` is ALREADY one `tbz`, so `sub`+`tbz` = gcc's `subs`+`bpl` — **category (a)**, nothing to win; the general form shipped as R4.7's `cmp_elim` window. (3) `i*j+k`: the BUG half (cross-block `madd` undoing LICM) banked under R4.7, d2 **2.111 → 1.500**; the add-IV/exit-rewrite half is the ONE **category (b)** left, owning one program. **RE-ENTRY TRIGGER: after R4.5 → R4.9 → R4.11, re-measure d2** — it also carries R4.10's edge copies in the loop nest, so what is left of its gap by then may not be the add-IV at all. **The row is NOT ✅: a (b) residual means Law 4 is not satisfied, only that nothing downstream waits on it.** See "R4.13" below |
+| **R4.13** | **the IV family — R2's exhaustion residual** (l, opened 2026-08-25 on the hot-loop inspection). Three shapes SCEV does not fire on, all one theorem over `scev.rs`/`iv.rs`: (1) a **pointer / 64-bit IV** where the source has a 32-bit counter — zcc recomputes `[xB, wI, sxtw #2]` every iteration, gcc walks a pointer with post-index writeback (`str w3, [x2], -4`; j5, d3); (2) a **count-down IV** whose decrement SETS THE FLAGS so the exit test is free (`subs w1,w1,#1; bpl` — j5, h2), where zcc keeps a separate `cmp`/`tbz`; (3) **strength reduction of `i*j+k` in a nested loop** to an add-IV (d2: `madd` every inner iteration vs gcc's `add`). Every one is `-O1` (`-fauto-inc-dec`, `-ftree-slsr`, IV canonicalization). NOT folded into R4.11 — that row owns rotation refusals and store motion, and Article G forbids blurring a theorem seam. §13n missed this family because it was decomposed from a STATIC sqlite histogram, where an IV shape costs zero instructions | `hir/pass/scev.rs`, `hir/pass/iv.rs`; the post-index fold is `isel/lower.rs` | **residual print FIRST**, as R4.11 requires of rotation: for every loop, is there an IV `scev` recognizes but `iv` refuses to widen/rewrite, and WHY — the count per refusal reason IS the prediction. Then per shape: (1) loops with an address `[base, w, sxtw]` on a recognized IV; (2) counted loops whose exit compare is against 0 or a hoistable bound; (3) inner-loop `mul`/`madd` on two IVs | **j5 exec** (11 → ~7 insns/iter), **d3, d2, h2 exec**; each shape's residual classified (a)/(b) | ⚠️ **RESIDUAL TAKEN → 2 of 3 shapes REFUTED on this target.** (1) pointer/64-bit IV: `ZCC_IV=1` re-measured post-R4.7 is still NEGATIVE (INSN 1.1493 → 1.1538, EXEC 1.2044 → 1.2140) — **category (a)**, the pass stays off. **RE-ENTRY TRIGGER: the time-dual cost model shipping** — that is §13k's own named gate ("re-opening needs a cost model that can say WHEN a writeback pays"), and R4.7's validated j3 cycle prediction is the argument that may open it. Re-entry is one command, no code. (2) count-down IV: zcc's `j>=0` is ALREADY one `tbz`, so `sub`+`tbz` = gcc's `subs`+`bpl` — **category (a)**, nothing to win; the general form shipped as R4.7's `cmp_elim` window. (3) `i*j+k`: the BUG half (cross-block `madd` undoing LICM) banked under R4.7, d2 **2.111 → 1.500**; the add-IV/exit-rewrite half is the ONE **category (b)** left, owning one program. **RE-ENTRY TRIGGER: after R4.5 → R4.9 → R4.11, re-measure d2** — it also carries R4.10's edge copies in the loop nest, so what is left of its gap by then may not be the add-IV at all. **The row is NOT ✅: a (b) residual means Law 4 is not satisfied, only that nothing downstream waits on it.** **AMENDED 2026-08-26 (§13q) — shape (1) was RE-OPENED and half of it BANKED.** The category-(a) verdict was over-broad: it was taken on a UNIT-STRIDE address, the only case A64's scaled index reaches for free. A ROW-STRIDED address (`B[k][j]`, step 1920) has no addressing mode and is rebuilt with a MULTIPLY every iteration; walking a pointer replaces that with an `add` at the SAME instruction count. `matmul` **1.638× → 1.000×**, hand-validated before a line was written (MEASURED M9). Two defects fixed: the default-off gate moved down into `strengthen` so it covers the unit-stride half alone, and `iv::affine` now splits an address with TWO invariant symbolic terms around one recurrence, which `scev::AddRec`'s single base could not hold. The unit-stride half stays category (a) behind `ZCC_IV`, its re-entry trigger unchanged. Residual print shipped: `ZCC_IVDBG=1`. See "R4.13" below and §13q |
+| **R4.18** | **the TIME dual of the cost model** (§13q; the row "THE MISSING DUAL" reserved and gated). `cost = |MIR|` is exact for SIZE by construction and blind to TIME by the same construction — matmul moved 1.638× → 1.000× with the instruction count UNCHANGED at seven. Two independent validations now exist for the premise, which is the condition §13 set for opening this row: R4.7's j3 cycle prediction (2.0 → 1.0 predicted, 1.940 → 1.000 measured, 3% error) and §13q's matmul. Shape: a latency/pipe column in `mir/isa.rs` (Side II — MEASURED, no vendor guide exists for this core), a `mir/cost.rs` that scores a loop by its CRITICAL RECURRENCE rather than its length, and the square `time_model ≡ cycles(interp)` proven per loop over the corpus, exactly as `cost ≡ len∘codegen` is proven per function. Then a transform's Δcycles is predicted BEFORE any build, the way Δinsn already is | `mir/isa.rs`, new `mir/cost.rs`, `mir/interp.rs` | re-predict the two validated cases FIRST — the model must reproduce j3's 2.0 → 1.0 and matmul's `madd`-vs-`add` gap from the table alone, with no clock; a model that cannot re-derive what is already measured is not shipped | every remaining program above 1.1× EXEC that sits at INSN parity — the set the size model provably cannot see; and the RE-ENTRY of M2's unit-stride half, whose own gate is "a cost model that can say WHEN a writeback pays" | ⬜ |
 | **R4.14** | **three orphans, one row so they stay tracked** (m, opened 2026-08-25): (1) **`x / 2^k` → `x · 2^−k`** — exact under IEEE 754 since the reciprocal of a power of two is representable, so the commuting square is an identity on every input including ±0/∞/NaN (f2: `fdiv` 10+ cyc → `fmul` 3); (2) **small dense `switch` → compare tree, not a jump table** — R3.3's density constant ("≥4 cases, ≥½ span") is exactly Article E's "the spec's number or my convenience's number?": gcc-O1 builds a `cmp`/`tbnz`/`csel`/`csinc` tree for d1's 8 cases and wins 1.33× on it, so the constant is re-judged against a measured crossover, not cited; (3) **inline a called-once function that is not `static`** — `inline.rs` requires `is_static` for the called-once rule; gcc's `-finline-functions-called-once` does not, and keeps the out-of-line body (e2: `mix` marshals 10 arguments per call). Three sites, three proofs, each a few lines; grouped only so none is lost | `hir/pass/fold.rs`; `isel/lower.rs::jump_table` (the policy constant); `hir/pass/inline.rs` | (1) count `fdiv` by a constant power of two on sqlite and the suite; (2) measure the crossover: compare-tree vs table exec at 4, 6, 8, 12, 16 cases, on the clock; (3) count non-`static` functions with exactly one call site in the module | **f2, d1, e2 exec**; each with its own square | ⬜ |
 
 ### Order, and why — RE-PLANNED 2026-08-25 (user), on the hot-loop inspection
@@ -2790,6 +2791,92 @@ its value are downstream of the same R4 item. The revised order:
   4 pre-existing runtime FAIL.
 - Harnesses: `tests/bench/corpus25.sh` (excess histogram), `tests/bench/exectime.sh` (paired geo40),
   `tests/opt-parity.sh`, `tests/suites/{torture,csmith,yarpgen}.sh`, `tests/gate.sh all`.
+
+---
+
+### §13q — THE ROW-STRIDED POINTER IV, and the FIRST case where the cost model is provably blind (2026-08-26)
+
+**WHAT WAS MEASURED, and why it is worth a section.** `tests/bench/matmul.c` sat at **1.638×**
+gcc -O1 while `loops.c`, `fib.c` and `sieve.c` were at parity. Its inner loop was SEVEN instructions
+against gcc's six — a one-instruction gap that could not explain 64%.
+
+The localization was mechanical and did not touch the compiler. The k-loop was hand-edited into two
+variants, assembled and linked from otherwise IDENTICAL zcc output, and all four binaries print
+`414714994`:
+
+| k-loop form | insns | ms, best of 5 | vs gcc -O1 |
+|---|---|---|---|
+| gcc -O1 | 6 | 69 | 1.000 |
+| zcc, `madd x12,x11,x4,x1` then `ldr [x12,x9]` | 7 | 113 | **1.638** |
+| **E1** — B walked by `add x14,x14,#1920`, counter kept | 7 | **69** | **1.000** |
+| E2 — E1 plus post-index on A and a pointer-limit exit test | 6 | 69 | 1.000 |
+
+**E1 and E2 are the same number.** gcc's other two tricks — the post-index writeback and dropping the
+counter for a pointer compare — are worth nothing here. The entire gap is ONE multiply standing at
+the head of a dependence chain that ends in a strided load.
+
+**THIS IS THE COST MODEL'S BLIND SPOT, exactly as §10 predicts.** `cost = |MIR|` is exact by
+construction — one `MInst` is one machine instruction — so it scored the `madd` form and E1
+IDENTICALLY at seven, and always will. R4.7's j3 fact was the first instance (`add …,sxtw` at 2
+cycles against 1, MEASURED M1); this is the second, and it is starker: same count, 64%. Recorded as
+**MEASURED M9**.
+
+**WHY THE PASS THAT EXISTS DID NOT FIRE — two separate defects, both Law-4 residuals.**
+
+1. **The default-off verdict was over-broad.** `iv.rs` shipped OFF on MEASURED M2, whose A/B varied a
+   UNIT-STRIDE address — `p[i]`, where step == the access size. That is the only case A64's scaled
+   index reaches (`ldr Xt,[Xn,Xm,lsl #3]` scales by the access size and by nothing else, DDI 0487
+   C6.2.130), so there the address really is free and a pointer really is pure cost. A ROW stride of
+   1920 has no such mode: the address is rebuilt with a multiply. One verdict was covering two
+   theorems. The gate moved down into `strengthen` — `ENABLED`/`ZCC_IV` now gates the unit-stride
+   half alone, and M2's scope was narrowed in `MEASURED.md` to say so.
+
+2. **`scev::AddRec` holds ONE symbolic base.** `B[k][j]` is `&B + k*1920 + j*8`: two loop-invariant
+   symbolic terms around one recurrence, so `eval` refused the whole address and the load kept its
+   multiply even with the pass forced on (`ZCC_IV=1` still emitted the `madd`). `iv::affine` now
+   splits the top-level `add` and asks again — if one side carries the recurrence and the other is a
+   pure invariant, the address is affine and its base is the SUM of the invariant terms, which is
+   itself invariant and so computed once in the preheader. The commuting square is unchanged: the
+   parameter holds exactly what the old address computation produced on iteration `n`.
+
+**THE RESIDUAL PRINT SHIPPED FIRST**, as R4.13 requires. `ZCC_IVDBG=1` prints one line per declined
+in-loop load with the reason. On matmul, after the fix: **17 `scev-refused`, 3 `unit-stride-gated`,
+0 `no-symbolic-base`** — the count per reason is the prediction the next amendment is judged against.
+
+**THE RULE THAT SHIPPED, and why it is narrower than "non-unit stride".** The first cut fired on any
+step other than the access size. That was too broad and the A/B said so: sqlite **+1,245** static
+instructions, geo40 unmoved. Law 3c names what actually costs cycles — a MULTIPLY in front of a load —
+and a POWER-OF-TWO stride is not one: `fold::canon` has already turned `k*2^n` into `k<<n`, and isel
+folds `add(base, shl(k,n))` into a single shifted-register `add`. Narrowed to strides that need a real
+`mul`, the cost falls to **+951** and the win is untouched.
+
+**THE FINAL A/B, all in one box session.**
+
+| | baseline `8023b3c` | + `madd` literal | + this row |
+|---|---|---|---|
+| matmul | 1.638 | 1.638 | **1.000** |
+| loops.c | 1.245 | **0.905** | 0.905 |
+| geo40 INSN (35) | — | 1.0211 | **1.0211 — IDENTICAL** |
+| geo40 EXEC (18) | — | 1.0433 | 1.0464 (noise; INSN identical ⟹ same code) |
+| sqlite static insns | — | 172,393 | 173,344 (**+951**) |
+| sqlite run TOTAL | 1.715 | 1.737 | 1.693 (noise) |
+
+The taxonomy suite has **ZERO sites** for this row — INSN is identical to the digit with it on and off —
+so geo40 is neither helped nor harmed and the EXEC wobble is the harness's noise floor, measured. The
+row's whole effect is on matmul and on sqlite's 951 sites. Under Law 0 (`exec > size`) and Law 3c,
++951 static instructions buys a proven 1.638× → 1.000× where it fires: it ships.
+
+**A PRE-EXISTING DEFECT, FOUND HERE AND NOT INTRODUCED HERE.** `realprog.sh` reports **REALPROG RED**
+— `p04_point` and `p07_join` DIVERGE against gcc -O1. Both phases diverge identically on the baseline
+compiler `8023b3c`, built and run in the same session, so today's two rows are innocent. It is a real
+sqlite miscompile that no gate above catches (torture, cts, opt-parity, csmith300, yarpgen300 are all
+green) and it is recorded here as OPEN.
+
+**WHAT THIS OPENS.** §13's "THE MISSING DUAL" set an explicit condition for building a time-dual cost
+model: *open the row only if R4.7's latency table alone closes j3 from 1.94× to ≈1.0×.* It did, to
+the third decimal. This section is the second validation, on a case where instruction count moved by
+ZERO. The premise is proven twice and the row is authorized by the plan's own rule — see **R4.18**.
+It is also now **Law 3c** in `CLAUDE.md`.
 
 ---
 

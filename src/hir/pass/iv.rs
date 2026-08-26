@@ -37,14 +37,22 @@
 //     beside the first on every run of the ladder;
 //   * a recurrence with no symbolic base. `{0, +, 4}` is an integer sequence, not
 //     an address; rewriting it wins nothing and would fire on ordinary counters;
-//   * a STORE, and a step outside the post-index immediate — see the loads-only
-//     note below, which is a cost argument about A64's free scaled-index mode.
+//   * a STORE — see the loads-only note below, a cost argument about A64's free
+//     scaled-index mode;
+//   * a UNIT-STRIDE load (step == the access size) unless `ZCC_IV` forces it, and
+//     then only for a step inside the post-index immediate. That half is
+//     MEASURED M2, refuted on this target. A step the addressing mode cannot
+//     reach is a different theorem and ships ON — see `affine` and the two cost
+//     arguments in `strengthen`.
 use super::*;
 use std::collections::HashMap;
 
-/// MEASURED M2 — the pointer-IV rewrite is negative on this target
+/// MEASURED M2 — the UNIT-STRIDE pointer-IV rewrite is negative on this target
 /// SHIPPED DEFAULT-OFF, on the measurement rather than on a doubt about the
-/// theorem (§13i). Over the eight programs above the harness's noise floor this
+/// theorem (§13i). **Scope narrowed 2026-08-26**: this verdict is about a step
+/// EQUAL to the access size, the only case A64's scaled index reaches for free.
+/// A row-strided address (`B[k][j]`, step 1920) has no such mode and is rebuilt
+/// with a multiply; that half ships ON and is judged on the clock (§13q). Over the eight programs above the harness's noise floor this
 /// row is **1 win / 1 loss / 6 flat**: g1_memcpy 74 → 48 ms, j2_histogram
 /// 60 → 68 ms, everything else inside ±3%. Take the single winner out and the
 /// geomean goes the WRONG way — 1.4498 → 1.4840 — for +0.8% on sqlite.
@@ -70,6 +78,16 @@ use std::collections::HashMap;
 /// harness cannot answer. `ZCC_IV=1` forces it on for that day.
 const ENABLED: bool = false;
 
+/// The Law-4 residual print R4.13 asks for BEFORE a line is written: for every
+/// in-loop load this pass declines, WHY. `ZCC_IVDBG=1` turns it on; the count per
+/// reason is the prediction the next amendment is judged against.
+fn residual(reason: &str) {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *W.get_or_init(|| std::env::var("ZCC_IVDBG").is_ok()) {
+        eprintln!("[iv-residual] {}", reason);
+    }
+}
+
 fn enabled() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| ENABLED || std::env::var("ZCC_IV").is_ok())
@@ -77,15 +95,22 @@ fn enabled() -> bool {
 
 /// THEORY A7b  SQUARE a_strided_load_walks_a_pointer — the AddRec IS the address it replaces
 pub fn run(f: &mut Func) -> bool {
-    if !enabled() {
-        return false;
-    }
-    force(f)
+    walk(f, enabled())
 }
 
-/// The pass past the default-off gate. The batteries call this: a theorem that
-/// ships disabled still owes its square.
+/// The pass with BOTH halves live. `run` is now the same entry — the default-off
+/// gate moved DOWN into `strengthen`, where it belongs: `ENABLED`/`ZCC_IV` gates
+/// only the unit-stride half that MEASURED M2 refuted, while a stride the
+/// addressing mode cannot reach is always strength-reduced. The batteries call
+/// this directly because a theorem that ships half-disabled still owes its
+/// square on both halves.
 pub fn force(f: &mut Func) -> bool {
+    walk(f, true)
+}
+
+/// `unit` = also strength-reduce the unit-stride half MEASURED M2 refuted, the
+/// half that ships off. The batteries pass `true`; the ladder passes `enabled()`.
+fn walk(f: &mut Func, unit: bool) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);
     let lf = dom::loops(&c, &dt);
@@ -94,7 +119,7 @@ pub fn force(f: &mut Func) -> bool {
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     for li in order {
-        if strengthen(f, &c, &dt, &lf, li) {
+        if strengthen(f, &c, &dt, &lf, li, unit) {
             // The CFG is unchanged but every analysis over VALUES is stale.
             return true;
         }
@@ -102,8 +127,53 @@ pub fn force(f: &mut Func) -> bool {
     false
 }
 
-/// One recurrence, as the key that decides which accesses share a pointer.
-type Key = (ValueId, i64, i64);
+/// One recurrence, as the key that decides which accesses share a pointer. The
+/// base is a LIST of loop-invariant terms, not one value — see `affine`.
+type Key = (Vec<ValueId>, i64, i64);
+
+/// The affine form of an address, as this pass needs it: `Σ bases + off + step·n`.
+///
+/// `scev::AddRec` carries ONE symbolic base, which is enough for `p[i]` and not
+/// enough for `B[k][j]`. That address is `&B + k*1920 + j*8`: TWO loop-invariant
+/// symbolic terms (`&B` and `j*8`) around one recurrence, so `eval` refuses the
+/// whole expression and the strided load kept its multiply. Split the top-level
+/// `add` and ask again — if one side carries the recurrence and the other is a
+/// pure invariant, the address is still affine in `n`, and its base is the SUM of
+/// the invariant terms, which is itself invariant and so computable once in the
+/// preheader. Nothing about the commuting square changes: the parameter still
+/// holds exactly the value the old address computation produced on iteration `n`.
+fn affine(s: &scev::LoopScev, f: &Func, addr: Operand) -> Option<(Vec<ValueId>, i64, i64)> {
+    if let Some(a) = s.eval(f, addr) {
+        return Some((a.base.into_iter().collect(), a.off, a.step));
+    }
+    let v = addr.val()?;
+    let (p, q) = match def_inst(f, v)? {
+        Inst::Bin { op: BinOp::Add, a, b, .. } => (*a, *b),
+        _ => return None,
+    };
+    let (x, y) = (s.eval(f, p)?, s.eval(f, q)?);
+    // Exactly one side carries the recurrence; the other has to be a pure
+    // invariant term. Two recurrences added together are not this shape.
+    let (r, inv) = match (x.step, y.step) {
+        (0, t) if t != 0 => (y, x),
+        (t, 0) if t != 0 => (x, y),
+        _ => return None,
+    };
+    let mut bases: Vec<ValueId> = r.base.into_iter().chain(inv.base).collect();
+    if bases.len() != 2 || bases.iter().any(|&b| f.ty_of(b) != Ty::I64) {
+        return None;
+    }
+    bases.sort();
+    Some((bases, r.off.wrapping_add(inv.off), r.step))
+}
+
+/// The instruction that defines a value, when one does.
+fn def_inst(f: &Func, v: ValueId) -> Option<&Inst> {
+    match f.values[v as usize].def {
+        Def::Inst(b, i) => f.blocks[b as usize].insts.get(i as usize),
+        _ => None,
+    }
+}
 
 fn strengthen(
     f: &mut Func,
@@ -111,6 +181,7 @@ fn strengthen(
     dt: &dom::DomTree,
     lf: &dom::LoopForest,
     li: usize,
+    unit: bool,
 ) -> bool {
     let s = match scev::LoopScev::analyze(f, c, dt, lf, li) {
         Some(s) => s,
@@ -134,8 +205,8 @@ fn strengthen(
             // zeroing loop went from four instructions per iteration to five
             // (`str wzr,[x0,w1,sxtw #2]` became `str wzr,[x4]` plus an `add`)
             // and the program lost 60 ms → 69 ms. §13h.
-            let addr = match inst {
-                Inst::Load { addr, vol: false, .. } => *addr,
+            let (addr, acc) = match inst {
+                Inst::Load { addr, ty, vol: false, .. } => (*addr, (ty.bits() / 8) as i64),
                 _ => continue,
             };
             // Already a pointer walk: leave it alone, or the ladder would grow a
@@ -143,22 +214,61 @@ fn strengthen(
             if matches!(addr, Operand::Val(v) if s.ivs.contains_key(&v)) {
                 continue;
             }
-            let a = match s.eval(f, addr) {
-                Some(a) if a.step != 0 => a,
-                _ => continue,
+            let (bases, off, step) = match affine(&s, f, addr) {
+                Some(a) => a,
+                None => {
+                    residual("scev-refused");
+                    continue;
+                }
             };
-            let base = match a.base {
-                Some(b) => b,
-                // an integer recurrence, not an address
-                None => continue,
-            };
-            // The step must fit the post-index immediate, or `auto_inc` cannot
-            // fold and the pointer is pure cost (DDI 0487 C6.2: an unscaled
-            // signed 9-bit offset).
-            if a.step < -256 || a.step > 255 {
+            if step == 0 {
+                residual("invariant-address");
                 continue;
             }
-            groups.entry((base, a.off, a.step)).or_default().push((b, i));
+            // an integer recurrence, not an address
+            if bases.is_empty() {
+                residual("no-symbolic-base");
+                continue;
+            }
+            // TWO COST ARGUMENTS LIVE HERE, and only one of them is the one
+            // MEASURED M2 refuted. They are told apart by comparing the step to
+            // the ACCESS SIZE, because that is exactly what A64's scaled index
+            // can absorb (DDI 0487 C6.2.130: `ldr Xt,[Xn,Xm,lsl #3]` scales by
+            // the access size and by nothing else).
+            //
+            //   step == access size — `p[i]`. The address rides the scaled index
+            //     for free, so a walking pointer only pays if `auto_inc` then
+            //     folds the add into a post-index, which needs the unscaled
+            //     signed 9-bit offset. MEASURED M2 says that trade is NEGATIVE
+            //     on this target (j2_histogram: identical instruction count,
+            //     13% slower), so this half stays behind `ENABLED`/`ZCC_IV`.
+            //
+            //   step != access size — `B[k][j]` walking a 240×8-byte ROW, step
+            //     1920. No addressing mode reaches it: the address is rebuilt
+            //     with a MULTIPLY every iteration (`madd x12,x11,x4,x1`), and
+            //     the scaled index cannot absorb a scale it does not have. The
+            //     pointer replaces that multiply with an `add` — the SAME
+            //     instruction count, one multiply fewer standing in front of a
+            //     load. `cost = |MIR|` is blind to this by construction, so it
+            //     is judged on the clock, exactly as R4.7's j3 cycle fact was:
+            //     `tests/bench/matmul.c` 1.638× → 1.000× gcc -O1 (§13q).
+            // LAW 3c — the thing that costs cycles is a MULTIPLY standing in
+            // front of a load, not a non-unit stride as such. Two strides are
+            // free on A64 and neither is worth a pointer:
+            //   * step == the access size — the scaled index reaches it whole
+            //     (`ldr Xt,[Xn,Xm,lsl #3]`, DDI 0487 C6.2.130). MEASURED M2.
+            //   * step a POWER OF TWO — `fold::canon` has already turned
+            //     `k*2^n` into `k<<n`, and isel folds `add(base, shl(k,n))` into
+            //     one shifted-register `add`. Still no multiply.
+            // What is left is a stride like `B[k][j]`'s 1920: no shift, no mode,
+            // an honest `mul` on the address every iteration. MEASURED M9.
+            let free = step.unsigned_abs() == acc.unsigned_abs()
+                || step.unsigned_abs().is_power_of_two();
+            if free && (!unit || step < -256 || step > 255) {
+                residual("no-multiply-to-remove");
+                continue;
+            }
+            groups.entry((bases, off, step)).or_default().push((b, i));
         }
     }
     if groups.is_empty() {
@@ -166,7 +276,7 @@ fn strengthen(
     }
     // Deterministic order: identical IR must produce identical bytes
     // (`tests/determinism.sh`), and a HashMap walk does not.
-    let mut keys: Vec<Key> = groups.keys().copied().collect();
+    let mut keys: Vec<Key> = groups.keys().cloned().collect();
     keys.sort();
     for k in keys {
         let sites = groups.remove(&k).unwrap();
@@ -186,7 +296,7 @@ fn introduce(
     k: Key,
     sites: &[(BlockId, usize)],
 ) {
-    let (base, off, step) = k;
+    let (bases, off, step) = k;
     let idx = f.blocks[header as usize].params.len() as u32;
     let q = f.new_value(Ty::I64, Def::Param(header, idx));
     f.blocks[header as usize].params.push(q);
@@ -197,11 +307,19 @@ fn introduce(
         // entry supplies the start value, a latch supplies the step.
         let arg = if dt.dominates(header, p) {
             append(f, p, Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: Operand::Val(q), b: Operand::Imm(step) })
-        } else if off == 0 {
-            // Nothing to compute: the start IS the base.
-            Operand::Val(base)
         } else {
-            append(f, p, Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: Operand::Val(base), b: Operand::Imm(off) })
+            // The start value. Every term is loop-invariant, so summing them on
+            // the entry edge computes ONCE what the old address recomputed on
+            // every iteration; when there is a single term and no offset there
+            // is nothing to compute and the start IS the base.
+            let mut acc = Operand::Val(bases[0]);
+            for &t in &bases[1..] {
+                acc = append(f, p, Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: acc, b: Operand::Val(t) });
+            }
+            if off != 0 {
+                acc = append(f, p, Inst::Bin { dst: 0, op: BinOp::Add, ty: Ty::I64, a: acc, b: Operand::Imm(off) });
+            }
+            acc
         };
         for t in f.blocks[p as usize].term.targets_mut() {
             if t.block == header {

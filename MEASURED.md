@@ -54,11 +54,20 @@ The transform is never WRONG there, only unmotivated.
 
 ---
 
-## M2. The pointer / 64-bit induction variable is NEGATIVE on this target
+## M2. The UNIT-STRIDE pointer / 64-bit induction variable is NEGATIVE on this target
 
 **VALUE.** Rewriting a recomputed `[base, w, sxtw #k]` address into a pointer
 walked by a post-index writeback makes zcc measurably WORSE. `hir/pass/iv.rs`
-ships default-OFF because of this entry.
+ships that half default-OFF because of this entry.
+
+**SCOPE, narrowed 2026-08-26.** This entry is about a step EQUAL to the access
+size, and only that. It is what the A/B below varied, and it is the only case
+A64's scaled index reaches: `ldr Xt,[Xn,Xm,lsl #3]` scales by the access size
+and by nothing else (DDI 0487 C6.2.130). An address whose step the mode cannot
+express — `B[k][j]` walking a 240 x 8-byte ROW, step 1920 — is rebuilt with a
+MULTIPLY on every iteration, so replacing it with an `add` costs the same
+instruction count and removes a multiply from in front of a load. That half
+ships ON and has its own fact, M9; nothing here measured it.
 
 **METHOD.** `ZCC_IV=1` A/B over the 35-program suite, twice, on two different
 compilers. §13k (pre-R4.7): EXEC ≥30 ms 1.3789 → 1.4087, INSN 1.2419 → 1.2454,
@@ -73,7 +82,8 @@ worse than the first.
 
 **WHEN / WHERE.** 2026-08-25, M1 Pro under Docker.
 
-**WHAT USES IT.** `hir/pass/iv.rs::ENABLED = false`.
+**WHAT USES IT.** `hir/pass/iv.rs::ENABLED = false` — which now gates the
+unit-stride half alone (`strengthen`'s `unit` parameter), not the whole pass.
 
 **RE-ENTRY TRIGGER.** §13k's own gate: a cost model that can say WHEN a
 writeback pays. Until one exists this stays off. j5_insertion_sort is the one
@@ -210,3 +220,40 @@ Side-II citation would be inventing provenance. Labelled honestly instead.
 **OPEN.** Never swept. A sweep over the suite would move it from "the
 conservative reading" to a measured entry — and `csel` sits at 599 against gcc's
 542, so the bound is not currently costing much either way.
+
+## M9. A ROW-STRIDED pointer IV is POSITIVE on this target
+
+**VALUE.** When a loop's load address advances by a step the addressing mode
+cannot express, walking a pointer removes a MULTIPLY from in front of the load
+at the same instruction count. `hir/pass/iv.rs` ships this half ON.
+
+**METHOD.** `tests/bench/matmul.c` — `s += A[i][k] * B[k][j]`, where `B[k][j]`
+walks a 240 x 8-byte row, step 1920. The k-loop is seven instructions either
+way; the difference is one `madd x12,x11,x4,x1` computing the address against
+one `add x14,x14,#1920` advancing a pointer. Both forms were HAND-ASSEMBLED from
+the same zcc output and linked and run side by side, so nothing but that one
+instruction differs, and both print `414714994`:
+
+| k-loop form | ms, best of 5 | vs gcc -O1 |
+|---|---|---|
+| gcc -O1 (same shape as the pointer walk) | 69 | 1.000 |
+| zcc, address rebuilt with `madd` | 113 | 1.638 |
+| zcc, pointer walked by `add #1920` | 69 | **1.000** |
+
+Adding gcc's other two tricks on top — post-index writeback for the `A` load and
+a pointer-limit exit test instead of a counter, six instructions — changed
+nothing: also 69 ms. The whole gap is the multiply.
+
+**WHY.** The multiply sits at the head of a dependence chain that ends in a
+strided load, and a strided load is where the machine most needs its address
+early. `cost = |MIR|` cannot see this: the instruction COUNT is identical. It is
+the same kind of fact as M1, and it is judged the same way — on the clock.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, `zcc-box:latest`, gcc 14.2.0.
+
+**WHAT USES IT.** `hir/pass/iv.rs::strengthen` — the `scaled` test that separates
+this half from M2's.
+
+**OPEN.** Stores are still refused (M2's j2_histogram argument, which is about
+the unit-stride case). `ZCC_IVDBG=1` prints the residual per refusal reason;
+matmul still reports 17 `scev-refused` and 3 `unit-stride-gated`.
