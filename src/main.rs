@@ -123,7 +123,17 @@ fn drive() -> ExitCode {
             // flags with a separate argument: swallow the whole pair
             "-arch" | "-isysroot" | "-framework" | "-include" | "-x" | "-MT" | "-MQ"
             | "-Xlinker" => i += 1,
-            s if s.starts_with('-') => {} // -O -g -W… -std=… : swallowed for cc compatibility
+            // drop-in gcc: honor the optimization level. `-O0` turns our optimizer
+            // OFF (a debug build must get unoptimized code); `-O`, `-O1`, `-O2`,
+            // `-O3`, `-Os`, `-Ofast`, `-Og` all map to our single optimizer tier —
+            // the charter's stopping point is gcc-O1 parity, so there is nothing
+            // above -O1 to give, and gcc never rejects a level, so neither do we.
+            // The last -O on the line wins, exactly as gcc resolves it.
+            // SAFETY: argument parsing runs on the main thread before any pass
+            // thread is spawned, so this process-global write races nothing.
+            "-O0" => unsafe { std::env::set_var("ZCC_O0", "1") },
+            s if s.starts_with("-O") => unsafe { std::env::remove_var("ZCC_O0") },
+            s if s.starts_with('-') => {} // -g -W… -std=… : swallowed for cc compatibility
             s => inputs.push(s),
         }
         i += 1;
