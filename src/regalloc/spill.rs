@@ -152,6 +152,36 @@ pub(super) fn set_regional(on: bool) {
     REGIONAL.with(|c| c.set(on));
 }
 
+/// THE A/B SEAM FOR THE PRUNING (spec §6, "block-param explosion"), and the
+/// TALLY that says how many parameters a plan actually built.
+///
+/// A pruning pass is the one kind of pass whose absence is invisible in a
+/// correctness square: prune nothing and the code is still right, only bigger.
+/// So the obligation is the same as every other pass's — measure the difference
+/// — and this is the switch that lets a test measure it. The tally is the same
+/// argument one level up: a reconstruction that fires zero times is
+/// byte-indistinguishable from one that is on and neutral, so the count is read
+/// rather than inferred. `ZCC_PHICOUNT=1` prints the same two numbers per
+/// function for a corpus-scale run.
+thread_local! {
+    // THEORY A7 — instrument half, as `RECONSTRUCT` and `REGIONAL` above.
+    static PRUNE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static PHI_TALLY: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Turn the trivial/dead-parameter pruning off, or back on, for this thread.
+#[cfg(test)]
+pub(super) fn set_prune(on: bool) {
+    PRUNE.with(|c| c.set(on));
+}
+
+/// `(join parameters, loop-header parameters)` built since the last call, and
+/// reset it — the non-vacuity instrument for §4.1/§4.2 inside the battery.
+#[cfg(test)]
+pub(super) fn take_phi_tally() -> (usize, usize) {
+    PHI_TALLY.with(|c| c.replace((0, 0)))
+}
+
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
     spill_with(f, &BTreeSet::new(), usize::MAX)
 }
@@ -365,6 +395,28 @@ pub fn spill_with(
         }
     };
     let n = nsp;
+    // R4-capstone MEASUREMENT — read-only, changes nothing. Counted on the
+    // ACCEPTED plan and nowhere else: a rejected round's parameters are not in
+    // the emitted function, and tallying them would report a reconstruction the
+    // reader cannot find. `header` is a parameter at a block one of whose
+    // predecessors comes after it in reverse postorder — §4.2's loop headers;
+    // the rest are §4.1's ordinary joins.
+    {
+        let (mut fwd, mut back) = (0usize, 0usize);
+        for (bi, ps) in plan.phis.iter().enumerate() {
+            let bk = cfg.preds[bi].iter().any(|&p| cfg.rpo_num[p as usize] >= cfg.rpo_num[bi]);
+            for _ in ps {
+                if bk { back += 1 } else { fwd += 1 }
+            }
+        }
+        PHI_TALLY.with(|c| {
+            let (a, b) = c.get();
+            c.set((a + fwd, b + back));
+        });
+        if (fwd + back) > 0 && std::env::var_os("ZCC_PHICOUNT").is_some() {
+            eprintln!("PHICOUNT {} join {} header {}", f.name, fwd, back);
+        }
+    }
     ceiling_report(f, &plan, &remat);
     apply(f, plan, &spilled, &remat, &web, web_slot, slot_of);
     drop_redundant_spills(f);
@@ -1701,6 +1753,110 @@ fn simulate(
         //     reload on its edge like any other cold one. The two rounds
         //     disagreeing is precisely what the convergence test in `spill_with`
         //     refuses to accept a plan on.
+        // (c) TRIVIAL PHIS — Braun 2013 §2.3, `removeTrivialPhi`, which this
+        //     allocator could not run until §4.2 gave a header a parameter whose
+        //     arguments only the finished walk knows. A phi whose every incoming
+        //     edge reaches it with the SAME reaching definition (its own
+        //     parameter not counted, which is how a loop header's self-reference
+        //     is discounted) is not a phi at all: it IS that definition. Keeping
+        //     it costs one parallel edge copy per predecessor — `destruct` emits
+        //     one on every edge and only biased colouring removes any of them —
+        //     and buys nothing, so the parameter is replaced by what it stands
+        //     for everywhere it is mentioned.
+        //
+        //     The self-reference clause is what makes this a fixpoint rather than
+        //     a sweep: aliasing one phi can make a second one trivial, and around
+        //     a loop the two point at each other. It runs BEFORE the cold-edge
+        //     reloads are minted, so a phi removed here never mints one.
+        let prune = PRUNE.with(|c| c.get());
+        let mut alias: BTreeMap<CopyId, Option<CopyId>> = BTreeMap::new();
+        let chase = |alias: &BTreeMap<CopyId, Option<CopyId>>, mut c: Option<CopyId>| {
+            let mut n = 0;
+            while let Some(id) = c {
+                match alias.get(&id) {
+                    Some(&t) => c = t,
+                    None => break,
+                }
+                n += 1;
+                debug_assert!(n <= alias.len() + 1, "alias chain cycles");
+            }
+            c
+        };
+        while prune {
+            let mut changed = false;
+            for (bi, ps) in plan.phis.iter().enumerate() {
+                for ph in ps.iter() {
+                    if alias.contains_key(&ph.id) {
+                        continue;
+                    }
+                    let mut uniq: Option<Option<CopyId>> = None;
+                    let mut trivial = true;
+                    for &p in cfg.preds[bi].iter() {
+                        let held = plan.wexit[p as usize]
+                            .iter()
+                            .find(|&&(x, _)| x == ph.v)
+                            .map(|&(_, c)| chase(&alias, c));
+                        // a predecessor holding nothing takes a reload on its
+                        // edge — a name of its own, so the phi is reconciling two
+                        // definitions and is not trivial
+                        let src = match held {
+                            Some(c) => c,
+                            None => {
+                                trivial = false;
+                                break;
+                            }
+                        };
+                        if src == Some(ph.id) {
+                            continue;
+                        }
+                        match uniq {
+                            None => uniq = Some(src),
+                            Some(u) if u == src => {}
+                            _ => {
+                                trivial = false;
+                                break;
+                            }
+                        }
+                    }
+                    if trivial {
+                        if let Some(u) = uniq {
+                            alias.insert(ph.id, u);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if !alias.is_empty() {
+            for ps in plan.phis.iter_mut() {
+                ps.retain(|ph| !alias.contains_key(&ph.id));
+            }
+            for w in plan.wexit.iter_mut() {
+                for e in w.iter_mut() {
+                    e.1 = chase(&alias, e.1);
+                }
+            }
+            // A use substituted to a removed parameter reads what the parameter
+            // stood for; where that is the value's own name there is nothing to
+            // substitute at all, so the entry goes.
+            for ss in plan.subs.iter_mut() {
+                for e in ss.iter_mut() {
+                    if let Some(t) = alias.get(&e.2) {
+                        match chase(&alias, Some(e.2)) {
+                            Some(c) => e.2 = c,
+                            None => {
+                                let _ = t;
+                                e.2 = u32::MAX;
+                            }
+                        }
+                    }
+                }
+                ss.retain(|e| e.2 != u32::MAX);
+            }
+        }
         let mut used: BTreeSet<CopyId> = plan
             .subs
             .iter()
@@ -1712,26 +1868,32 @@ fn simulate(
             .enumerate()
             .flat_map(|(bi, ps)| ps.iter().enumerate().map(move |(k, ph)| (ph.id, (bi, k))))
             .collect();
-        loop {
-            let mut grew = false;
-            for (bi, ps) in plan.phis.iter().enumerate() {
-                for ph in ps.iter() {
-                    if !used.contains(&ph.id) {
-                        continue;
-                    }
-                    for &p in cfg.preds[bi].iter() {
-                        if let Some(&(_, Some(c))) =
-                            plan.wexit[p as usize].iter().find(|&&(x, _)| x == ph.v)
-                        {
-                            if owner.contains_key(&c) && used.insert(c) {
-                                grew = true;
-                            }
-                        }
+        // A WORKLIST, not a re-sweep. The reachability is a graph search over the
+        // phi graph, and re-scanning every phi until nothing grows makes it
+        // quadratic in the phi count for no reason — the O(stores × reloads)
+        // mistake in a smaller shape. Each phi is expanded at most once, so the
+        // whole prune is O(phis × preds).
+        let mut work: Vec<CopyId> = plan
+            .phis
+            .iter()
+            .flatten()
+            .filter(|ph| used.contains(&ph.id))
+            .map(|ph| ph.id)
+            .collect();
+        while let Some(id) = work.pop() {
+            let (bi, k) = match owner.get(&id) {
+                Some(&x) => x,
+                None => continue,
+            };
+            let v = plan.phis[bi][k].v;
+            for &p in cfg.preds[bi].iter() {
+                if let Some(&(_, Some(c))) =
+                    plan.wexit[p as usize].iter().find(|&&(x, _)| x == v)
+                {
+                    if owner.contains_key(&c) && used.insert(c) {
+                        work.push(c);
                     }
                 }
-            }
-            if !grew {
-                break;
             }
         }
         for ps in plan.phis.iter_mut() {
@@ -1741,24 +1903,6 @@ fn simulate(
         // register for it and the next round would offer it as an edge argument.
         for w in plan.wexit.iter_mut() {
             w.retain(|&(_, c)| c.is_none_or(|c| !owner.contains_key(&c) || used.contains(&c)));
-        }
-        // R4-capstone MEASUREMENT (`ZCC_PHICOUNT=1`) — read-only, changes nothing.
-        // A pass that fires zero times is byte-indistinguishable from a pass that
-        // is on and neutral, so the count is instrumented rather than inferred
-        // from the KPI. `back` counts the phis whose decision needed a
-        // predecessor this round had not simulated — §4.2's loop headers; the
-        // rest are §4.1's ordinary joins.
-        if std::env::var_os("ZCC_PHICOUNT").is_some() {
-            let (mut fwd, mut back) = (0usize, 0usize);
-            for (bi, ps) in plan.phis.iter().enumerate() {
-                let bk = cfg.preds[bi].iter().any(|&p| cfg.rpo_num[p as usize] >= cfg.rpo_num[bi]);
-                for _ in ps {
-                    if bk { back += 1 } else { fwd += 1 }
-                }
-            }
-            if fwd + back > 0 {
-                eprintln!("PHICOUNT {} join {} header {}", f.name, fwd, back);
-            }
         }
         for bi in 0..nb {
             for k in 0..plan.phis[bi].len() {

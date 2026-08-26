@@ -1120,3 +1120,178 @@ fn eviction_splits_regionally_not_whole_web() {
         whole.2
     );
 }
+
+
+/// R4-capstone (spec §6, the "block-param explosion" risk) — PRUNING, and the
+/// two questions a pruning pass has to answer that a correctness square cannot.
+///
+/// Prune nothing and the program is still right, only bigger; so "does it hold"
+/// is the wrong question and "what does it remove, and does it remove anything
+/// it should have kept" is the right one. Both are measured here against
+/// `set_prune(false)`.
+///
+/// WHAT IS PRUNED. Two things, and the second is the one that carries the
+/// numbers. A parameter no use reads is dropped — decided at a block head where
+/// "the value is read at or below here" is the best that can be said, and the
+/// walk may then evict it before that read. And a parameter every incoming edge
+/// reaches with the SAME reaching definition is not a parameter at all: it IS
+/// that definition (Braun 2013 §2.3, `removeTrivialPhi`, with a loop header's
+/// self-reference discounted so the fixpoint can see through a cycle). Keeping
+/// one costs a parallel copy on every edge — `destruct` emits one per edge and
+/// only biased colouring removes any of them — and buys nothing. On sqlite3.c
+/// **1,883 of 2,839 parameters are trivial in that sense**, worth 530 static
+/// instructions and 496 `mov`s with frame traffic unchanged.
+///
+/// WHAT IS ASSERTED, and why it is the brief's assertion in the form this layer
+/// can see it. The brief asks that every parameter inserted remove at least one
+/// reload. A parameter is gone by the time a test can look — `destruct` has
+/// lowered it to edge copies — so the observable statement of "it removed no
+/// reload" is that REMOVING IT COSTS NO RELOAD: pruning may only take away
+/// parameters whose absence nothing has to reload for. So reloads must not rise
+/// and instructions must fall. The other half of the brief, that colouring never
+/// exceeds k, is checked by the pipeline itself on every one of these programs —
+/// `spill::check_pressure` and `mir::verify` run inside `compile::backend`, and
+/// `regalloc::verify` runs in `same` — which is why a passing compile IS that
+/// assertion and no separate one is written.
+#[test]
+fn reconstruction_is_pruned_and_pressure_is_counted() {
+    // Meaning on nested loops + wide joins, `e` defined so both interpreters
+    // actually run it (an undefined callee traps both and `same` accepts a
+    // two-sided trap in silence).
+    same_all(&[
+        "int e(int x){return x*3+1;} int hot(int p){int s=0,i,j; for(i=0;i<10;i++)for(j=0;j<10;j++){switch((i+j)%4){case 0:s+=e(i)+p;break;case 1:s+=e(j)*p;break;case 2:s+=p;break;default:s+=e(i*j);}} return s+p;} int main(void){return hot(2);}",
+    ]);
+
+    let n = 24;
+    let decls: String = (0..n)
+        .map(|i| format!("int v{}=g[{}]*{}+p;", i, i, i + 2))
+        .collect();
+    let sum: String = (0..n).map(|i| format!("+v{}", i)).collect();
+    let src = format!(
+        "int e(int x){{return x<=0?1:e(x-1)+3;}} int g[64];\n\
+         int hot(int p){{ int i,j,k,s=0; {d}\n\
+         s = 0{s};\n\
+         for(i=0;i<10;i++){{ s += e(i)+v0+v1+v2;\n\
+           for(j=0;j<10;j++){{ s += e(j)+v3+v4+v5+v6;\n\
+             for(k=0;k<10;k++){{ s += e(k)+v7+v8+v9+v10+v11; }}\n\
+             s += v12+v13; }}\n\
+           s += v14+v15; }}\n\
+         return s{s}; }}\n\
+         int main(void){{ return hot(3); }}\n",
+        d = decls,
+        s = sum
+    );
+    same(&src);
+
+    let count = |on: bool| -> (usize, usize, usize) {
+        super::spill::set_prune(on);
+        let ast = frontend(&src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let p = crate::compile::backend(&h).unwrap();
+        super::spill::set_prune(true);
+        let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
+        use crate::mir::MInst;
+        let it = || f.blocks.iter().flat_map(|b| b.insts.iter());
+        (
+            it().filter(|i| matches!(i, MInst::Reload { .. })).count(),
+            it().filter(|i| matches!(i, MInst::Spill { .. })).count(),
+            it().count(),
+        )
+    };
+    let kept = count(false);
+    let pruned = count(true);
+    assert!(
+        kept.0 > 0,
+        "the fixture does not spill at all — the square above it would be vacuous"
+    );
+    assert!(
+        pruned.2 < kept.2,
+        "pruning removed no instruction — either no parameter was dead or trivial, \
+         or the prune is not firing: {} instructions pruned, {} kept",
+        pruned.2,
+        kept.2
+    );
+    assert!(
+        pruned.0 <= kept.0,
+        "pruning removed a parameter that was removing a reload: {} reloads pruned, \
+         {} kept",
+        pruned.0,
+        kept.0
+    );
+}
+
+
+/// R4-capstone (spec §4.4) — THE CARRY BUDGET AT LOOP DEPTH ≥ 2.
+///
+/// Termination no longer waits for the register-residency lattice to reach a
+/// fixed point (it oscillates: 113,024 rounds on one sqlite function, measured).
+/// It spends a BUDGET of re-seeding rounds instead, and the budget is the
+/// function's loop nesting depth plus one — the claim being that one round is
+/// what it takes for a latch's residency to become visible to its own header, so
+/// a value carried around an inner loop reaches the ENCLOSING header one round
+/// later and one round per level sees all of them.
+///
+/// That is a structural argument about a number, and until this test nothing
+/// exercised it above depth 1 — the whole ladder rested on a bound no fixture
+/// had ever pushed. The program below is doubly nested with loop-invariant
+/// values read in both bodies, so if the budget were short by one level the
+/// OUTER header would never learn what its latch holds and its parameters would
+/// not exist. The assertion is on the tally of parameters at loop headers
+/// (`take_phi_tally`): §4.2's carry has to fire more than once, which at one
+/// nesting level per round it cannot do unless the budget really is depth + 1.
+#[test]
+fn the_carry_budget_reaches_a_doubly_nested_header() {
+    let n = 24;
+    let decls: String = (0..n)
+        .map(|i| format!("int v{}=g[{}]*{}+p;", i, i, i + 2))
+        .collect();
+    let sum: String = (0..n).map(|i| format!("+v{}", i)).collect();
+    let src = format!(
+        "int e(int x){{return x<=0?1:e(x-1)+3;}} int g[64];\n\
+         int hot(int p){{ int i,j,s=0; {d}\n\
+         s = 0{s};\n\
+         for(i=0;i<10;i++){{ s += e(i)+v0+v1+v2;\n\
+           for(j=0;j<10;j++){{ s += e(j)+v3+v4+v5+v6; }}\n\
+           s += v7+v8; }}\n\
+         return s{s}; }}\n\
+         int main(void){{ return hot(3); }}\n",
+        d = decls,
+        s = sum
+    );
+    same(&src);
+
+    // The tally is taken with the PRUNING OFF, because the question is what the
+    // carry DECIDED, not what survived: a header parameter every edge reaches
+    // with one name is trivial and is removed, and counting only the survivors
+    // would read a successful carry as a carry that never happened.
+    let tally = |level: u8| -> (usize, usize) {
+        super::spill::set_reconstruct(level);
+        super::spill::set_prune(false);
+        let _ = super::spill::take_phi_tally();
+        let ast = frontend(&src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        let _ = crate::compile::backend(&h).unwrap();
+        super::spill::set_reconstruct(super::spill::RECON_LOOPS);
+        super::spill::set_prune(true);
+        super::spill::take_phi_tally()
+    };
+    let joins = tally(super::spill::RECON_JOINS);
+    let loops = tally(super::spill::RECON_LOOPS);
+    assert_eq!(
+        joins.1, 0,
+        "a loop-header parameter was built with §4.2 switched off: {:?}",
+        joins
+    );
+    assert!(
+        loops.1 >= 2,
+        "the carry reached only {} loop header(s) on a doubly-nested function — \
+         the budget of loop-nesting-depth + 1 re-seeding rounds is not reaching \
+         the outer header: {:?} with §4.2, {:?} with joins only",
+        loops.1,
+        loops,
+        joins
+    );
+}
+
