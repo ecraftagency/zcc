@@ -251,6 +251,7 @@ pub fn color(f: &MFunc, lv: &Liveness, dt: &DomTree) -> Result<Coloring, ColorEr
             }
         }
     }
+    full_range_check(f, lv, &color);
     Ok(Coloring { color, used })
 }
 
@@ -512,6 +513,103 @@ pub static HINT_OCCUPIED: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 pub static HINT_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_SPARE_SUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// (block, occupant value index, class) for each ABI refusal whose occupant
+    /// dies inside the block — the set the full-range check replays.
+    static REFUSALS: std::cell::RefCell<Vec<(usize, usize, Class)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// THE FULL-RANGE CHECK — the precondition eviction actually needs.
+///
+/// A register free at the refusal POINT proves nothing: re-colouring the
+/// occupant retroactively rewrites the instructions already emitted earlier in
+/// its range, because `color[]` is a table applied at the end. A register busy
+/// anywhere in that range is a MISCOMPILE, not a missed optimization. So the
+/// question is not "is something free now" but "is some register free across the
+/// occupant's WHOLE range".
+///
+/// Runs after the function is coloured, because during colouring the later half
+/// of the range does not have colours yet.
+fn full_range_check(f: &MFunc, lv: &Liveness, color: &[Option<PReg>]) {
+    if !hint_stats_wanted() {
+        return;
+    }
+    let sp = lv.sp;
+    REFUSALS.with(|r| {
+        for (bi, occ_v, class) in r.borrow_mut().drain(..) {
+            let blk = &f.blocks[bi];
+            let n = blk.insts.len();
+            // Occupancy timeline: which colours are held at each index.
+            let mut live: BTreeSet<usize> = lv.live_in[bi].clone();
+            for &p in &blk.params {
+                live.insert(sp.idx(p));
+            }
+            let mut lu = super::live::LastUse::new(sp);
+            super::live::last_use_into(f, sp, lv, bi, &mut lu);
+            let mut timeline: Vec<Occupancy> = Vec::with_capacity(n + 1);
+            let mut start = 0usize;
+            let mut end = n;
+            let mut seen_def = false;
+            for i in 0..=n {
+                let mut held = Occupancy::new();
+                for &x in &live {
+                    if x != occ_v {
+                        if let Some(p) = color_of(color, sp, x) {
+                            held.add(p);
+                        }
+                    }
+                }
+                timeline.push(held);
+                if i == n {
+                    break;
+                }
+                // advance: kills then defs
+                blk.insts[i].visit(&mut |rg, c| {
+                    if matches!(c, Constraint::Use | Constraint::UseFixed(_))
+                        && lu.at[sp.idx(rg)] == Some(i)
+                    {
+                        live.remove(&sp.idx(rg));
+                    }
+                });
+                blk.insts[i].visit(&mut |rg, c| {
+                    if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
+                        let ix = sp.idx(rg);
+                        live.insert(ix);
+                        if ix == occ_v && !seen_def {
+                            seen_def = true;
+                            start = i;
+                        }
+                    }
+                });
+            }
+            if let Some(l) = lu.at[occ_v] {
+                end = l;
+            }
+            // Is any register of the class free at EVERY point of [start, end]?
+            //
+            // An UPPER BOUND: this tests allocability and occupancy, not the
+            // caller-saved partition or the per-value physical conflicts that
+            // `assign`'s own `free` also enforces. So a register counted here may
+            // still be refused for another reason — the true evictable set is no
+            // larger than this.
+            let ok = isa::alloc_order(class).iter().any(|&num| {
+                let p = PReg { class, num };
+                isa::alloc_mask(class) & (1u32 << num) != 0
+                    && (start..=end.min(n)).all(|i| !timeline[i].taken(p))
+            });
+            if ok {
+                RANGE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                RANGE_BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+pub static RANGE_OK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static RANGE_BLOCKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub static HINT_OCC_LOCAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_OCC_GLOBAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static HINT_OCC_UNKNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -561,6 +659,14 @@ pub fn hint_report() {
         if o > 0 { 100.0 * lo as f64 / o as f64 } else { 0.0 },
         gl,
         un
+    );
+    let (ok, bad) = (RANGE_OK.load(Relaxed), RANGE_BLOCKED.load(Relaxed));
+    eprintln!(
+        "[hint] FULL-RANGE: {} of {} block-local refusals have a register free across the occupant's WHOLE range ({:.1}%), {} blocked",
+        ok,
+        ok + bad,
+        if ok + bad > 0 { 100.0 * ok as f64 / (ok + bad) as f64 } else { 0.0 },
+        bad
     );
 }
 
@@ -744,8 +850,13 @@ fn assign(
                         Some(i) if lv.live_out[bi].contains(&i) => {
                             HINT_OCC_GLOBAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Some(_) => {
+                        Some(i) => {
                             HINT_OCC_LOCAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Recorded for the FULL-RANGE check, which cannot run
+                            // here: colouring walks forward, so the rest of the
+                            // occupant's range is not coloured yet. Replayed once
+                            // the function is complete.
+                            REFUSALS.with(|r| r.borrow_mut().push((bi, i, class)));
                         }
                     }
                 }
