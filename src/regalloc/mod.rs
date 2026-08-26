@@ -317,5 +317,6 @@ pub fn allocate_module(m: &mut MModule) -> Result<(), String> {
     for f in m.funcs.iter_mut() {
         allocate(f)?;
     }
+    color::hint_report();
     Ok(())
 }

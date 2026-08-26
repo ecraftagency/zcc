@@ -505,6 +505,49 @@ fn color_of(color: &[Option<PReg>], sp: Space, i: usize) -> Option<PReg> {
     }
 }
 
+pub static HINT_WANTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_OCCUPIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_SPARE_SUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static HINT_NO_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn hint_stats_wanted() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_HINT").is_ok())
+}
+
+/// The ABI-hint hit rate, and whether a refusal had anywhere to evict TO.
+pub fn hint_report() {
+    if !hint_stats_wanted() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let (w, t, o, x) = (
+        HINT_WANTED.load(Relaxed),
+        HINT_TAKEN.load(Relaxed),
+        HINT_OCCUPIED.load(Relaxed),
+        HINT_OTHER.load(Relaxed),
+    );
+    let (sp, ss, ns) = (
+        HINT_SPARE.load(Relaxed),
+        HINT_SPARE_SUM.load(Relaxed),
+        HINT_NO_SPARE.load(Relaxed),
+    );
+    eprintln!(
+        "[hint] wanted={} taken={} ({:.1}%) refused-occupied={} refused-other={}",
+        w, t, if w > 0 { 100.0 * t as f64 / w as f64 } else { 0.0 }, o, x
+    );
+    eprintln!(
+        "[hint] of the refusals: {} had a SPARE register (avg {:.1} free), {} had NONE ({:.1}% evictable at all)",
+        sp,
+        if sp > 0 { ss as f64 / sp as f64 } else { 0.0 },
+        ns,
+        if o > 0 { 100.0 * sp as f64 / o as f64 } else { 0.0 }
+    );
+}
+
 fn phys_of(color: &[Option<PReg>], sp: Space, r: Reg) -> Option<PReg> {
     match r {
         Reg::P(p) => Some(p),
@@ -632,6 +675,40 @@ fn assign(
             }
         }
         wave = next;
+    }
+    // ZCC_HINT=1 — is there a CARD TO PLAY? Before building eviction machinery,
+    // measure whether eviction is even possible: at each refusal, how many
+    // registers of the right class are FREE. A refusal with zero free registers
+    // cannot be fixed by any priority scheme — the occupant has nowhere to go
+    // and the copy is forced. This is an UPPER bound on evictability (a register
+    // free HERE may still be busy elsewhere in the occupant's range), so if even
+    // this is usually zero, the 8,187-instruction ceiling is a mirage.
+    if hint_stats_wanted() {
+        let want: Option<PReg> = partners[v as usize].iter().find_map(|q| match q {
+            Reg::P(p) if p.class == class => Some(*p),
+            _ => None,
+        });
+        if let Some(w) = want {
+            HINT_WANTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if hint == Some(w) {
+                HINT_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if !free(w, occ) {
+                HINT_OCCUPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let spare = isa::alloc_order(class)
+                    .iter()
+                    .map(|&n| PReg { class, num: n })
+                    .filter(|p| *p != w && free(*p, occ))
+                    .count();
+                if spare == 0 {
+                    HINT_NO_SPARE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    HINT_SPARE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    HINT_SPARE_SUM.fetch_add(spare, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                HINT_OTHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     let pick = hint
         .or_else(|| {
