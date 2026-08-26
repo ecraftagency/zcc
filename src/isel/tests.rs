@@ -597,3 +597,27 @@ fn a_shift_folds_into_a_commutative_operation_from_either_side() {
     equiv("unsigned f(unsigned x,unsigned y){return (x<<2)-y;} int main(void){return (int)f(3,4);}");
     equiv("unsigned f(unsigned x,unsigned y){return y-(x<<2);} int main(void){return (int)f(3,40);}");
 }
+
+#[test]
+fn multiply_accumulate_takes_a_literal_multiplier() {
+    use crate::mir::{Alu3Op, AluOp, MInst};
+    // §17 row 23's category-(b) residual. A LITERAL multiplier is not a reason
+    // to leave the `add` standing: the literal has to reach a register before
+    // `mul` can read it either way, so `madd` costs the same register and one
+    // instruction less — and it shortens the loop-carried chain of
+    // `a = a*K + C`, which is what the hot loop of `tests/bench/loops.c` is.
+    let src = "unsigned long f(unsigned long a){return a*1103515245UL+12345UL;}\n\
+               int main(void){return (int)f(1);}";
+    let f = mir_of(src, "f");
+    assert_eq!(count(&f, |i| matches!(i, MInst::Alu3 { op: Alu3Op::Madd, .. })), 1);
+    assert_eq!(count(&f, |i| matches!(i, MInst::Alu { op: AluOp::Mul, .. })), 0);
+    equiv(src);
+    // `c − a*K` is the same row through `msub`
+    let g = "unsigned long f(unsigned long a,unsigned long c){return c-a*3141592653UL;}\n\
+             int main(void){return (int)f(7,9);}";
+    assert_eq!(count(&mir_of(g, "f"), |i| matches!(i, MInst::Alu3 { op: Alu3Op::Msub, .. })), 1);
+    equiv(g);
+    // the value-operand form the row already had, unchanged
+    equiv("long f(long a,long b,long c){return a*b+c;} int main(void){return (int)f(3,4,5);}");
+    equiv("int f(int a,int c){return a*7+c;} int main(void){return f(3,4);}");
+}

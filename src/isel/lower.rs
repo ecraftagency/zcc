@@ -144,8 +144,11 @@ enum AluFold {
     Shifted(Operand, ValueId, ShiftKind, u8),
     /// `a op (b <ext>)`
     Extended(Operand, ValueId, ExtKind),
-    /// `a*b + c` / `c − a*b`
-    Mul3(Alu3Op, ValueId, ValueId, Operand),
+    /// `a*b + c` / `c − a*b`. The multiply's operands are OPERANDS, not values:
+    /// a multiply by a literal has to materialize that literal into a register
+    /// before `mul` can read it, so the register exists either way and `madd`
+    /// absorbs the `add` for free.
+    Mul3(Alu3Op, Operand, Operand, Operand),
 }
 
 /// A compare whose single use is a branch or a select: `(op, compared type,
@@ -680,16 +683,19 @@ fn munch(h: &hir::Func) -> Munch {
             }
             // `a*b + c` and `c − a*b`: one instruction instead of two, and the
             // product's register disappears with it.
-            let mul_of = |v: Operand| -> Option<(ValueId, ValueId)> {
-                let v = v.val()?;
-                if !foldable(v, &m2) || blk[v as usize] != bi as u32 {
+            // The multiply's operands are read as OPERANDS. Refusing the row when
+            // the multiplier is a literal was a category-(b) truncation of §17
+            // row 23: `a = a*1103515245 + 12345` had to materialize the literal
+            // for the `mul` regardless, so the register was already there and the
+            // `add` left behind was one the ISA never asked for (loops.c, where
+            // `a` is the loop-carried recurrence every other value hangs off).
+            let mul_of = |v: Operand| -> Option<(ValueId, Operand, Operand)> {
+                let p = v.val()?;
+                if !foldable(p, &m2) || blk[p as usize] != bi as u32 {
                     return None;
                 }
-                match bin(v)? {
-                    (hir::BinOp::Mul, t, x, y) if t == ty => Some((v, x.val()?)).map(|(p, _)| {
-                        let _ = p;
-                        (x.val().unwrap(), y.val().unwrap_or(u32::MAX))
-                    }),
+                match bin(p)? {
+                    (hir::BinOp::Mul, t, x, y) if t == ty => Some((p, x, y)),
                     _ => None,
                 }
             };
@@ -700,21 +706,11 @@ fn munch(h: &hir::Func) -> Munch {
                 hir::BinOp::Sub => mul_of(bb).map(|p| (p, a)),
                 _ => None,
             };
-            if let Some(((x, y), c)) = mul3 {
-                if y != u32::MAX {
-                    let k = if op == hir::BinOp::Add { Alu3Op::Madd } else { Alu3Op::Msub };
-                    let prod = if op == hir::BinOp::Add {
-                        bb.val().filter(|v| bin(*v).is_some_and(|t| t.0 == hir::BinOp::Mul))
-                            .or_else(|| a.val())
-                    } else {
-                        bb.val()
-                    };
-                    if let Some(p) = prod {
-                        m2.dead.insert(p);
-                        m2.alu.insert(dst, AluFold::Mul3(k, x, y, c));
-                        continue;
-                    }
-                }
+            if let Some(((p, x, y), c)) = mul3 {
+                let k = if op == hir::BinOp::Add { Alu3Op::Madd } else { Alu3Op::Msub };
+                m2.dead.insert(p);
+                m2.alu.insert(dst, AluFold::Mul3(k, x, y, c));
+                continue;
             }
             if !matches!(
                 op,
@@ -1290,7 +1286,7 @@ impl<'a> L<'a> {
                     return;
                 }
                 AluFold::Mul3(k, x, y, c) => {
-                    let (xr, yr) = (self.reg(Operand::Val(x), ty), self.reg(Operand::Val(y), ty));
+                    let (xr, yr) = (self.reg(x, ty), self.reg(y, ty));
                     let cr = self.reg(c, ty);
                     self.push(MInst::Alu3 { op: k, w, dst: d, a: xr, b: yr, c: cr });
                     return;
