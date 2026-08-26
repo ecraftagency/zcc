@@ -185,14 +185,34 @@ gcc   ldrsw x1,[x2] ; add x0,x0,x1          the add is 1
 Same instruction count. When the value feeds a loop-carried chain the difference
 is the whole recurrence bound. j3_prefix_sum **1.940 → 1.000**. Row R4.7.
 
-### 3.7 Switch: predictability decides, not case count
+### 3.7 Switch: the table crossover is ~24 arms, and a balanced tree never wins
 
-zcc emits `adrp`/`ldr`/`br x16` for 8 cases; gcc emits a compare chain of direct
-conditional branches. zcc's is 4% SHORTER and 50% slower, because an indirect
-branch on a data-dependent index mispredicts and a compare chain on a repeating
-pattern does not. `MEASURED M4` recorded the symptom and left it unsettled
-because the case COUNT is not the variable. Law 3c names the variable:
-**branch predictability**, which `cost = |MIR|` cannot see.
+zcc emitted `adrp`/`ldr`/`br x16` from FOUR cases up — 4% shorter than gcc's
+compare chain and 50% slower. `MIN_CASES = 4` was taste, not measurement.
+
+Swept properly (4…64 arms, pseudorandom index and repeating index, both agree):
+the **chain** wins to ~20 arms, the **table** from ~24. `MIN_CASES` is 24 now,
+and d1_switch went **1.500 → 1.200**.
+
+**The balanced search TREE was built and refuted — it loses at every size from 4
+to 64.** At 16 arms: chain 62 ms, table 65, tree 84. It asks strictly fewer
+questions (four against the chain's seven on d1) and takes more time. The
+chain's tests FALL THROUGH; the tree spends a taken branch per level and
+scatters the arms across the function. This is Law 3c pointing the other way,
+and it is the reason the law says "longest dependence chain" and not "fewest
+questions" — a not-taken branch is nearly free and a taken one is not.
+
+Removed rather than kept behind a flag: no measured size wants it.
+
+What is LEFT of d1's gap is not the dispatch at all. gcc flattens the tiny arms:
+
+```
+gcc   tbnz x1, 2, .L4                              range split in one instruction
+      sub x3,x0,#2 ; cmp w2,2 ; csinc x0,x3,x0,eq  case 2 + default, NO branch
+      add x0,x0,7  ; cmp w2,4 ; csel  x0,x0,x3,eq  case 4 + default, NO branch
+```
+
+That is if-conversion of the ARMS. `MEASURED M4`.
 
 ### 3.8 Down-count when the bound needs a register
 
@@ -261,6 +281,15 @@ the pointer-IV row is loads-only.
 
 ## §5 — Traps
 
+* **Fewer questions, more time.** The balanced switch tree asked four questions
+  where the chain asked seven and lost at every size measured. "Shorter" and
+  "fewer decisions" are both proxies; only the clock is the arbiter. A not-taken
+  branch is nearly free, a taken one is not, and no instruction-count model of
+  any kind can see that difference.
+* **A constant nobody measured.** `MIN_CASES = 4` sat in `isel/lower.rs` from
+  R3.3 and cost d1_switch 50%. Article E asks of every resource constant: "is
+  this the spec's number, or my convenience's number?" — this one was neither, it
+  was a guess. Sweeping it took under an hour.
 * **A number that looked free.** A `mul` "costs about an `add` on an
   out-of-order core" was written into `THEORY.md` as a category-(a) closure, and
   it stood for weeks. It is true of a `mul` in a basic block and false of a `mul`

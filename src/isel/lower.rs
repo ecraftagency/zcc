@@ -23,7 +23,22 @@ use crate::mir::*;
 /// MEASURED M4 — the jump-table/compare-tree crossover, UNSETTLED
 /// The jump-table density threshold (REARCH §13n R4.14 (2)) — the case count at
 /// which a table beats a compare tree on THIS machine, taken on the clock.
-const MIN_CASES: usize = 4;
+/// The arm count at which a JUMP TABLE beats a linear chain of equality tests.
+///
+/// MEASURED, not chosen (`MEASURED M4`, re-taken 2026-08-26). R3.3 used 4 by
+/// taste and d1_switch paid for it: eight arms went through an indirect branch
+/// at 1.500x gcc -O1 where the chain it replaced runs at 1.20-1.30x. A sweep at
+/// 16/20/24/28/32 arms, with a pseudorandom index AND with a repeating one, puts
+/// the crossover between 20 and 24 — the chain is better or equal to 20 on both,
+/// the table wins from 24 on both. 24 is the first measured size where the table
+/// actually wins; 21..23 were not measured and the constant does not pretend
+/// otherwise.
+///
+/// A BALANCED SEARCH TREE was built and REFUTED here: it lost at every size from
+/// 4 to 64 (at 16 arms: chain 62 ms, table 65, tree 84). It asks fewer questions
+/// and takes more time, because the chain's tests FALL THROUGH while the tree
+/// spends a taken branch per level and scatters the arms. See `arm64_elf.md`.
+const MIN_CASES: usize = 24;
 
 pub fn lower(m: &hir::Module) -> MModule {
     MModule {

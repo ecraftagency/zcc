@@ -114,7 +114,73 @@ with longer copy chains would move it.
 
 ---
 
-## M4. A jump table and a compare tree are indistinguishable by case count
+## M4. The jump-table crossover is ~24 arms, and a BALANCED TREE never wins
+
+**RE-TAKEN 2026-08-26, and the earlier entry is superseded below.** The first
+attempt could not separate the forms because it swept a synthetic whose arms did
+too little work. This one sweeps 4…64 arms with a pseudorandom index AND with a
+repeating one, and the two agree.
+
+**VALUE.** `isel/lower.rs::MIN_CASES = 24`, was 4 (chosen by taste at R3.3).
+
+**METHOD.** Three dispatch forms, same program, ms best-of-7, outputs compared
+first. Unpredictable index:
+
+| arms | gcc | chain | tree | table |
+|---|---|---|---|---|
+| 4 | 21 | **46** | 53 | 54 |
+| 8 | 36 | **54** | 69 | 62 |
+| 16 | 49 | **62** | 84 | 65 |
+| 32 | 50 | 71 | 98 | **67** |
+| 64 | 53 | 87 | 111 | **68** |
+
+Crossover, both index kinds (chain / table): 16 → 62/65 and 11/12 · 20 → 66/67
+and 12/12 · 24 → 68/**67** and 14/**12** · 28 → 70/**67** and 15/**12**. The
+chain is better or equal to 20 arms and the table wins from 24, whether the
+index repeats or not. 21…23 were not measured and the constant does not pretend
+otherwise — 24 is the first size where the table actually wins.
+
+**THE BALANCED SEARCH TREE IS REFUTED.** It was built, proven and measured, and
+it loses at EVERY size from 4 to 64 — at 16 arms, chain 62 ms, table 65, tree 84.
+It asks strictly fewer questions (4 against 7 on d1_switch) and takes more time,
+because the chain's tests FALL THROUGH while the tree spends a taken branch per
+level and scatters the arms. Law 3c pointing the other way: fewer questions is
+not less time either. The code was removed rather than kept behind a flag,
+because no measured size wants it.
+
+**RESULT.** d1_switch **1.500 → 1.200**; geo40 EXEC 1.0240 → **1.0180**; sqlite
+173,344 → 173,519 (+175, +0.1%), which is the Law 0 ordering — `exec > size`.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, gcc 14.2.0.
+
+**WHAT USES IT.** `isel/lower.rs::MIN_CASES`, and `jump_table`'s density test.
+
+**OPEN, and FOUR HYPOTHESES REFUTED.** d1 sits at 1.200, and none of the obvious
+explanations survives a controlled hand-edit (same file, one change, outputs
+compared, best-of-11):
+
+| d1 variant | ms |
+|---|---|
+| gcc -O1 | 10 |
+| **zcc, compare chain (what ships)** | **12** |
+| gcc's dispatch shape transcribed verbatim into zcc | 13 |
+| `csel` on the last arm (if-converted arm body) | 12 |
+| `tbnz` range split | 15 |
+| counter widened to 64 bits, arms read `x1` (no `sxtw`) | 13 |
+
+Transcribing gcc's own shape makes zcc SLOWER. The branchless arms buy nothing.
+The range split hurts. Widening the counter — which removes three
+extended-register operands (`MEASURED M1`) from the loop-carried accumulator —
+also loses. Whatever the last 2 ms is, it is not the switch and not the arms, and
+four experiments did not find it.
+
+QUARANTINED at 1.200 rather than guessed at further. The re-entry is **R4.18**,
+the time-dual cost model: this is precisely the case it exists for — a program at
+INSN 1.077 whose remaining time gap no instruction-level reasoning has located.
+
+---
+
+## M4-superseded. A jump table and a compare tree are indistinguishable by case count
 
 **VALUE.** `isel/lower.rs::MIN_CASES = 4` is UNSETTLED. The measurement does not
 support any constant derived from the case count, so the R3.3 value stands
