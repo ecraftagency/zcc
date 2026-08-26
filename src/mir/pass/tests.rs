@@ -726,3 +726,80 @@ fn an_arithmetic_result_needs_no_second_compare() {
     );
     same(src2);
 }
+
+// ── the TIME model (R4.18, Law 3c) ─────────────────────────────────────────
+
+/// The loops of `name`, deepest first, with the bound the model gives each.
+fn bounds(src: &str, name: &str) -> Vec<crate::mir::cost::Bound> {
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module_with(&mut h, &crate::compile::pinned_symbols(&ast));
+    let m = crate::isel::lower(&h);
+    let f = m.funcs.iter().find(|f| f.name == name).expect("no such function");
+    let cfg = crate::mir::verify::cfg(f);
+    let dt = crate::cfg::DomTree::new(&cfg, f.entry);
+    let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+    let mut out: Vec<(u32, crate::mir::cost::Bound)> = (0..lf.loops.len())
+        .filter_map(|li| {
+            crate::mir::cost::recurrence(f, &cfg, &lf, li).map(|b| (lf.loops[li].depth, b))
+        })
+        .collect();
+    out.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+    out.into_iter().map(|(_, b)| b).collect()
+}
+
+#[test]
+fn the_time_model_separates_shapes_the_size_model_cannot() {
+    // THE SQUARE FOR A COST MODEL IS THAT IT RE-DERIVES WHAT IS ALREADY MEASURED.
+    // R4.18 ships only if the latency table alone reproduces the two gaps that
+    // were taken on the clock, so these are not invented expectations — each one
+    // has a wall-time measurement behind it in MEASURED.md.
+
+    // (1) An ACCUMULATOR recurrence is one cycle, and it stays one cycle when a
+    // multiply feeds it: `madd`'s accumulator operand forwards late (measured
+    // 1.00 against the multiplicand's 3.02, MEASURED M10). This is why
+    // `s += a*b` loops are not multiply-bound, and why matmul needed a SECOND
+    // axis before the model could see its gap at all.
+    let acc = "long f(long *p,long *q,int n){long s=0;int i;for(i=0;i<n;i++)s+=p[i]*q[i];return s;}\
+               int main(void){long a[2]={2,3},b[2]={4,5};return (int)f(a,b,2);}";
+    let b = bounds(acc, "f");
+    assert_eq!(b[0].recurrence, 1, "an accumulator cycle is one cycle, madd or not");
+
+    // (2) A recurrence THROUGH A MULTIPLICAND is three. `a = a*3 + 1` carries the
+    // value through the multiply itself, so the loop cannot run faster than the
+    // multiplier. Measured on tests/bench/loops.c: `mul`+`add` (3+1) became one
+    // `madd` (3), predicting 4/3 = 1.333 against a measured 1.365.
+    let mul = "long f(long a,int n){int i;for(i=0;i<n;i++)a=a*3+1;return a;}\
+               int main(void){return (int)f(1,3);}";
+    let b = bounds(mul, "f");
+    assert_eq!(b[0].recurrence, 3, "a cycle through a multiplicand costs the multiply");
+
+    // (3) THE TWO ARE THE SAME INSTRUCTION COUNT. That is the whole point: the
+    // size model scores these loops identically and the time model does not.
+    // Without this the test would pass on a model that had simply counted.
+    assert_ne!(
+        bounds(acc, "f")[0].recurrence,
+        bounds(mul, "f")[0].recurrence,
+        "the model must separate two loops the size model cannot"
+    );
+}
+
+#[test]
+fn an_address_rebuilt_with_a_multiply_is_seen_as_a_delay() {
+    // matmul's shape, and the reason `Bound` has a second field. The accumulator
+    // cycle is ONE cycle whichever way the address is built, so a
+    // recurrence-only model reproduces `cost = |MIR|`'s exact blindness — it
+    // scored the two seven-instruction loops the same while one took 64% longer.
+    // Walking a pointer puts the address in a header parameter, ready at zero;
+    // rebuilding it with `madd` makes every load wait the multiplier out.
+    let src = "long m[8][5];\
+               long f(int j,int n){long s=0;int k;for(k=0;k<n;k++)s+=m[k][j];return s;}\
+               int main(void){int i,j;for(i=0;i<8;i++)for(j=0;j<5;j++)m[i][j]=i*5+j;\
+               return (int)f(3,8);}";
+    let walked = bounds(src, "f");
+    assert_eq!(walked[0].recurrence, 1, "the accumulator cycle is one cycle");
+    assert_eq!(
+        walked[0].addr, 0,
+        "iv::substitute walks the pointer, so the address is a header parameter"
+    );
+}

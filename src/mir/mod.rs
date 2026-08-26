@@ -15,6 +15,7 @@
 // The allocator, liveness, the verifier and the interpreter reach an
 // instruction's registers ONLY through `visit`/`visit_mut` and its memory effect
 // through `effect`. No component outside `isa.rs` matches on an opcode.
+pub mod cost;
 pub mod interp;
 pub mod isa;
 pub mod pass;

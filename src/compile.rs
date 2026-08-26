@@ -112,6 +112,12 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             crate::mir::pass::autoinc::run(f);
         }
     });
+    // R4.18's instrument: the TIME model, read beside the size model. Placed
+    // here because the recurrence is a property of SSA MIR — the loop-carried
+    // edges are the header parameters, and `regalloc` is about to destroy them.
+    for f in m.funcs.iter() {
+        crate::mir::cost::report(f);
+    }
     phase("mir::verify", || {
         for f in &m.funcs {
             crate::mir::verify::verify(f)?;

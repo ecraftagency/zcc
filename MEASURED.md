@@ -323,3 +323,49 @@ this half from M2's.
 **OPEN.** Stores are still refused (M2's j2_histogram argument, which is about
 the unit-stride case). `ZCC_IVDBG=1` prints the residual per refusal reason;
 matmul still reports 17 `scev-refused` and 3 `unit-stride-gated`.
+
+---
+
+## M10. Instruction latency on this core, in units of a dependent `add`
+
+**VALUE.** The Side-II table the time model reads (`mir/cost.rs::latency`).
+
+| latency | forms |
+|---|---|
+| **1** | `add`/`sub`/`and`/`orr`/`eor` (reg or imm), `lsl` (imm or reg), `csel`, `sxtw`, `uxtb`, `ubfx`, `mvn`, `rev`, and **`madd` reached through its ACCUMULATOR** |
+| **2** | `add x,x,x,lsl #n` and `add x,x,w,sxtw` — a shifted or extended register operand |
+| **3** | `mul`, `madd` reached through a MULTIPLICAND, `ldr` L1 hit (plain or register-offset) |
+| **7** | `sdiv`, `udiv` |
+
+**METHOD.** `tests/bench/latency.sh`. Time a loop whose body is 32 copies of one
+instruction, each reading the register the previous wrote. The chain cannot
+overlap, so wall time is `K x latency x iterations` whatever the core does about
+width or reordering — and dividing by the same measurement for `add x0,x0,#1`
+cancels the clock, which is why no frequency is needed and the answer is a ratio.
+Measured ratios: 1.00 / 2.02 / 3.02 / 7.05, with a `nop` control at **0.12**
+confirming the harness is not measuring itself.
+
+**THE ONE THAT CHANGES DESIGN DECISIONS.** `madd` is TWO latencies in one
+instruction: 3.02 through a multiplicand, **1.00 through the accumulator**. So
+`s += a*b` accumulation is not multiply-bound, and a loop that looks
+multiply-heavy may have a one-cycle recurrence. matmul is exactly that, which is
+why a recurrence-only model could not see its gap and `Bound` grew a second axis.
+
+**IT RE-DERIVES WHAT WAS ALREADY MEASURED**, which is R4.18's ship condition:
+
+| case | from the table alone | measured on the clock | error |
+|---|---|---|---|
+| `loops.c`, `mul`+`add` (3+1) becomes `madd` (3) | 4/3 = **1.333x** | 771/565 = **1.365x** | 2.3% |
+| j3, extended operand (2) becomes `ldrsw`+`add` (1) | **2.00x** | **1.940x** | 3% |
+| matmul, `madd` address vs pointer walk | addr **3 -> 0** | 113/69 = 1.638x | direction |
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, `zcc-box`, gcc 14.2.0.
+
+**WHAT USES IT.** `src/mir/cost.rs`. `ZCC_CYCLES=1` prints the per-loop bounds.
+
+**OPEN.** The FP forms, `Call`, and the `ldp`/`stp` pair are unmeasured and take
+the ALU default of 1; a loop containing a call is reported UNSCORED rather than
+guessed at. Issue width, ports, the reorder window, cache misses and branch
+misprediction are not modelled at all — the recurrence is a LOWER bound, and
+programs it scores at 1 while they run slower (j5, g1, d1) are bounded by
+something else, which is itself a useful verdict.
