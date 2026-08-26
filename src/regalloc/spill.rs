@@ -183,7 +183,9 @@ pub(super) fn take_phi_tally() -> (usize, usize) {
 }
 
 pub fn spill(f: &mut MFunc) -> Result<usize, String> {
-    spill_with(f, &BTreeSet::new(), usize::MAX)
+    let n = spill_with(f, &BTreeSet::new(), usize::MAX)?;
+    check_pressure(f).map_err(PressureErr::into_string)?;
+    Ok(n)
 }
 
 /// `forced` names values the caller has already decided must live in memory —
@@ -420,7 +422,10 @@ pub fn spill_with(
     ceiling_report(f, &plan, &remat);
     apply(f, plan, &spilled, &remat, &web, web_slot, slot_of);
     drop_redundant_spills(f);
-    check_pressure(f)?;
+    // The pressure post-condition (`check_pressure`) is enforced by the CALLER
+    // now, not here: `spill_and_color` distinguishes its two failure kinds and
+    // dissolves the recoverable one (`OverCross`) by lowering `cross_cap` and
+    // retrying — a reaction `spill_with` cannot take from inside one round.
     // A reload copy is no longer confined to the block that made it, so "the
     // copy's definition dominates every use of it" stopped being true BY
     // INSPECTION and became a property to check. It is checked here, at the
@@ -575,6 +580,26 @@ fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
     }
 }
 
+/// The two ways the post-condition can be unmet — distinguished because the
+/// caller reacts to them differently. `OverK` is a genuine over-k pressure defect
+/// with nowhere to spill to. `OverCross` is the ABI-asymmetry case: more values
+/// are live across a call than there are callee-saved registers to hold them. The
+/// R4.1 carry and the R4.3 regional split can re-admit a crossing value at a point
+/// already at that ceiling — not an over-k bug, but exactly the demand
+/// `spill_and_color` dissolves by lowering `cross_cap` (driving it to zero reloads
+/// every crossing value after its call, so the crossing count falls to zero).
+pub enum PressureErr {
+    OverK(String),
+    OverCross(String),
+}
+impl PressureErr {
+    pub fn into_string(self) -> String {
+        match self {
+            Self::OverK(s) | Self::OverCross(s) => s,
+        }
+    }
+}
+
 /// The spiller's POST-CONDITION, checked rather than trusted (REARCH §7.6a):
 /// at every program point the virtual values of a class that are live, plus the
 /// allocatable physical registers spoken for there, are at most `isa::k(class)`;
@@ -582,7 +607,7 @@ fn ceiling_report(f: &MFunc, plan: &Plan, remat: &BTreeMap<VReg, MInst>) {
 /// theorem is "this cannot fail once pressure ≤ k", so a colouring failure means
 /// the PRECONDITION was false — and without this check that shows up as an
 /// unlocalized "no colour for v161" instead of naming the point and the count.
-pub fn check_pressure(f: &MFunc) -> Result<(), String> {
+pub fn check_pressure(f: &MFunc) -> Result<(), PressureErr> {
     let cfg = crate::mir::verify::cfg(f);
     let lv = live::compute(f, &cfg);
     let sp = lv.sp;
@@ -600,7 +625,7 @@ pub fn check_pressure(f: &MFunc) -> Result<(), String> {
         for &p in &f.blocks[bi].params {
             live.insert(sp.idx(p));
         }
-        let mut probe = |live: &BTreeSet<usize>, at: &str, extra: Option<RegSet>| -> Result<(), String> {
+        let mut probe = |live: &BTreeSet<usize>, at: &str, extra: Option<RegSet>| -> Result<(), PressureErr> {
             for (ci, c) in [Class::Gpr, Class::Fpr].into_iter().enumerate() {
                 let mut phys = 0u32;
                 let (mut n, mut ncross) = (0usize, 0usize);
@@ -629,16 +654,16 @@ pub fn check_pressure(f: &MFunc) -> Result<(), String> {
                         })
                         .collect();
                     who.sort();
-                    return Err(format!(
+                    return Err(PressureErr::OverK(format!(
                         "{}: {:?} pressure {} + {} held > k={} at {} [{}]",
                         f.name, c, n, held, isa::k(c), at, who.join(" ")
-                    ));
+                    )));
                 }
                 if ncross > cs[ci] {
-                    return Err(format!(
+                    return Err(PressureErr::OverCross(format!(
                         "{}: {} call-crossing {:?} values live at {} but only {} callee-saved",
                         f.name, ncross, c, at, cs[ci]
-                    ));
+                    )));
                 }
             }
             Ok(())

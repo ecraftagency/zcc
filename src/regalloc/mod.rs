@@ -139,11 +139,32 @@ fn spill_and_color(f: &mut MFunc) -> Result<(color::Coloring, live::Liveness), S
     let mut forced: std::collections::BTreeSet<VReg> = std::collections::BTreeSet::new();
     let mut cross_cap = usize::MAX;
     let snapshot = f.clone();
-    // one round per value that can be forced, plus the first attempt
-    let bound = f.vregs.len() + 1;
+    let cs_gpr = isa::callee_saved_mask(Class::Gpr).count_ones() as usize;
+    // The well-founded measure is the pair (cross_cap, |forced|): cross_cap falls
+    // at most cs_gpr+1 times, and between two falls `forced` grows at most vregs
+    // times before it must either colour or fall again. This product is a hard
+    // ceiling the common case (which colours on the first pass) never approaches.
+    let bound = (f.vregs.len() + 1) * (cs_gpr + 2);
     for round in 0..bound {
         let _ = round;
         phase("  spill", || spill::spill_with(f, &forced, cross_cap))?;
+        // POST-CONDITION (§7.6a), enforced here so the two failure kinds can be
+        // told apart. `OverCross` — more values live across a call than there are
+        // callee-saved registers — is the ABI asymmetry this loop already dissolves
+        // for the colourer: lower the crossing ceiling and retry. Driving cross_cap
+        // to 0 reloads every crossing value after its call (ncross → 0), so the
+        // check must eventually pass; the convergence is the None branch's below.
+        match spill::check_pressure(f) {
+            Ok(()) => {}
+            Err(spill::PressureErr::OverCross(_)) if cross_cap > 0 => {
+                let cur = if cross_cap == usize::MAX { cs_gpr } else { cross_cap };
+                cross_cap = cur.saturating_sub(1);
+                forced.clear();
+                *f = snapshot.clone();
+                continue;
+            }
+            Err(e) => return Err(e.into_string()),
+        }
         let cfg = phase("  cfg", || crate::mir::verify::cfg(f));
         let lv = phase("  liveness", || live::compute(f, &cfg));
         let dt = phase("  domtree", || DomTree::new(&cfg, f.entry));
