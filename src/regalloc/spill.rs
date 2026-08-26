@@ -290,6 +290,9 @@ pub fn spill_with(
         }
     }
     evict_params(f, &slot_of);
+    // evict_params mints a value for each read it materializes before an edge
+    // store; every per-value vector has to grow with it.
+    spilled.resize(f.vregs.len(), false);
     // The second lattice's carrier: per block, what it was still holding in a
     // register when it ENDED last round. Read only for a predecessor the current
     // round has not simulated yet. Empty on the first round, which is exactly
@@ -367,6 +370,10 @@ pub fn spill_with(
                         }
                     }
                     evict_params(f, &slot_of);
+                    // evict_params mints a value for each read it has to
+                    // materialize before an edge store; every per-value vector
+                    // has to grow with it.
+                    spilled.resize(f.vregs.len(), false);
                 }
             }
         }
@@ -2167,12 +2174,58 @@ fn evict_params(f: &mut MFunc, slot_of: &BTreeMap<VReg, (SlotId, Width)>) {
         for p in 0..f.blocks.len() {
             let mut term = f.blocks[p].term.clone();
             let mut stores: Vec<MInst> = Vec::new();
+            let mut pre: Vec<MInst> = Vec::new();
             let mut edited = false;
             for t in term.targets_mut() {
                 if t.block as usize != b {
                     continue;
                 }
                 edited = true;
+                // THE EDGE IS A PARALLEL COPY, AND A SLOT IS ONE OF ITS
+                // LOCATIONS. The stores below all write slots at the END of this
+                // edge; any argument that is ITSELF resident in one of those
+                // slots must be read BEFORE they run, or it reads the value the
+                // edge has just overwritten. Read-before-write is the defining
+                // property of a parallel copy, and it is not something the
+                // ordering of two separately-scheduled phases provides on its
+                // own — so the read is materialized here, into a fresh value the
+                // spiller will never send back to memory, and the argument is
+                // rewritten to name it. This is the same move `seq_copy` makes
+                // for a register cycle, with a slot as the location.
+                //
+                // Measured: `int *pt[3]` rotated across a loop back edge
+                // (`t=pt[0]; pt[0]=pt[1]; pt[1]=pt[2]; pt[2]=t;`) emitted
+                // `str x13,[sp,#88]` and then `ldr x13,[sp,#88]`, so the reload
+                // returned the value just stored and the rotation lost a
+                // pointer. sqlite's `wherePathSolver` picks its join order with
+                // exactly that rotation, which is how a two-cursor query came to
+                // dereference a NULL cursor and SIGSEGV.
+                let written: Vec<SlotId> = dropped
+                    .iter()
+                    .filter(|&&(k, slot, _)| {
+                        !t.args[k]
+                            .vreg()
+                            .and_then(|v| slot_of.get(&v))
+                            .is_some_and(|&(s2, _)| s2 == slot)
+                    })
+                    .map(|&(_, slot, _)| slot)
+                    .collect();
+                for j in 0..t.args.len() {
+                    let Some(v) = t.args[j].vreg() else { continue };
+                    let Some(&(s2, w2)) = slot_of.get(&v) else {
+                        continue;
+                    };
+                    if !written.contains(&s2) {
+                        continue;
+                    }
+                    let fresh = f.new_vreg(w2);
+                    pre.push(MInst::Reload {
+                        slot: s2,
+                        dst: fresh,
+                        w: w2,
+                    });
+                    t.args[j] = fresh;
+                }
                 for &(k, slot, w) in &dropped {
                     // If the argument is itself memory-resident IN THIS SLOT, the
                     // value is already where the parameter's uses will look for
@@ -2204,6 +2257,7 @@ fn evict_params(f: &mut MFunc, slot_of: &BTreeMap<VReg, (SlotId, Width)>) {
             // occasional extra. Writing it back conditionally left the edge
             // carrying arguments for parameters that no longer existed.
             if edited {
+                f.blocks[p].insts.extend(pre);
                 f.blocks[p].insts.extend(stores);
                 f.blocks[p].term = term;
             }

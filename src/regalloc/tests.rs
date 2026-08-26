@@ -1295,3 +1295,56 @@ fn the_carry_budget_reaches_a_doubly_nested_header() {
     );
 }
 
+
+/// AN EDGE IS A PARALLEL COPY, AND A SPILL SLOT IS ONE OF ITS LOCATIONS.
+///
+/// `evict_params` removes a spilled block parameter and makes each predecessor
+/// store the value it would have passed straight into the parameter's slot. When
+/// ANOTHER argument on that same edge is itself resident in that slot, the edge
+/// both reads and writes one location, and read-before-write — the defining
+/// property of a parallel copy — has to hold across the register/slot boundary,
+/// not just between registers.
+///
+/// It did not. A rotation of three pointers across a loop back edge
+/// (`t=pt[0]; pt[0]=pt[1]; pt[1]=pt[2]; pt[2]=t;`) under enough register
+/// pressure to spill emitted
+///
+///     str x13, [sp, #88]        // pt[2]' = pt[0]   — writes the slot
+///     ldr x13, [sp, #88]        // pt[1]' = pt[2]   — reads what it just wrote
+///
+/// so the rotation lost a pointer. sqlite's `wherePathSolver` chooses its join
+/// order with exactly that rotation, so a two-table query built a plan naming a
+/// cursor that was never opened and `sqlite3VdbeExec` dereferenced NULL: the
+/// zcc-built sqlite CLI SIGSEGV'd on any join. The fix materializes the read
+/// into a fresh value before the stores run, which is the move `seq_copy`
+/// already makes for a register cycle, with a slot as the location.
+///
+/// The pressure matters — with few enough live values nothing spills, no
+/// parameter is evicted, and the hazard cannot arise — so the fixture carries
+/// twelve loop-carried accumulators alongside the rotation.
+#[test]
+fn an_edge_reads_a_slot_before_the_edge_overwrites_it() {
+    same(
+        "int main(void){\n\
+           static int M[4][32];\n\
+           int *pt[3];\n\
+           pt[0]=M[0]; pt[1]=M[1]; pt[2]=M[2];\n\
+           long v0=5,v1=4,v2=2,v3=2,v6=6,v7=5,v8=6,v9=7;\n\
+           long v12=4,v13=8,v14=2,v15=2,v16=7,v17=7;\n\
+           int i, j; long s = 0;\n\
+           for(i=0;i<17;i++){\n\
+             int *t;\n\
+             v1=(v1^(i+1))&0xffff; v2=(v2*(i+4))&0xffff; v3=(v3^(i+2))&0xffff;\n\
+             v8=(v8^(i+3))&0xffff; v15=(v15*(i+1))&0xffff;\n\
+             v16=(v16^(i+2))&0xffff; v17=(v17^(i+5))&0xffff;\n\
+             for(j=0;j<32;j++){ pt[0][j] = (int)(v13 + j); }\n\
+             t=pt[0]; pt[0]=pt[1]; pt[1]=pt[2]; pt[2]=t;\n\
+             s += v0 + pt[0][i%32]; s += v1 + pt[1][i%32];\n\
+             s += v6 + pt[0][i%32]; s += v7 + pt[1][i%32];\n\
+             s += v9 + pt[0][i%32]; s += v12 + pt[0][i%32];\n\
+             s += v13 + pt[1][i%32]; s += v14 + pt[2][i%32];\n\
+           }\n\
+           return (int)(s & 0x7fffffff);\n\
+         }",
+    );
+}
