@@ -126,6 +126,21 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
         Ok::<(), String>(())
     })?;
     phase("regalloc", || crate::regalloc::allocate_module(&mut m))?;
+    // THE ALLOCATOR'S OWN OBLIGATIONS, ON EVERY COMPILE (REARCH §7.6). These are
+    // decidable on the physical MIR alone — no virtual register survives, every
+    // `Reload` reads a slot some `Spill` wrote on EVERY path to it, no
+    // `ParallelCopy` is left unsequentialized — and until now they were checked
+    // only on unit-test fixtures. A theorem the shipping pipeline never asks is
+    // not a theorem the compiler HAS: `reload of unstored slot` is a reload of
+    // whatever the frame happened to hold, and the first symptom is a wrong
+    // answer in a program nobody reduced. Law 3 says certify at the middle; this
+    // is the middle.
+    phase("regalloc::verify", || {
+        for f in &m.funcs {
+            crate::regalloc::verify::verify(f)?;
+        }
+        Ok::<(), String>(())
+    })?;
     Ok(m)
 }
 

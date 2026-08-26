@@ -39,10 +39,17 @@ fn same_side(src: &str, opt: bool) {
         let mut mach = mi::new_machine(&v, &ast);
         mach.call("main", &[], &[])
     };
+    // The allocator's obligations are checked INSIDE `allocated`, which is where
+    // they are expressible: obligation (b) — every `Reload` reads a slot some
+    // `Spill` wrote on every path — is stated in the Spill/Reload vocabulary, and
+    // frame lowering spends that vocabulary. `ldstp` folds two spills into one
+    // `stp`, which carries an address rather than a slot number, so a store-set
+    // gathered after `finish` is missing them and reports `reload of unstored
+    // slot` on a function whose answer is right (measured: the nine rotation
+    // shapes below all agree with gcc -O1 at -O0 and -O1). Law 3 says certify at
+    // the EARLIEST layer where the question is decidable; for this obligation
+    // that layer is post-allocation, pre-frame-lowering.
     let p = crate::compile::backend(&h).unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    for f in &p.funcs {
-        super::verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
-    }
     let after = {
         let mut mach = mi::new_machine(&p, &ast);
         mach.call("main", &[], &[])
@@ -1347,4 +1354,53 @@ fn an_edge_reads_a_slot_before_the_edge_overwrites_it() {
            return (int)(s & 0x7fffffff);\n\
          }",
     );
+}
+
+/// LAW-4 EXHAUSTION FOR THE EDGE-AS-PARALLEL-COPY THEOREM.
+///
+/// `an_edge_reads_a_slot_before_the_edge_overwrites_it` pins ONE shape, and one
+/// shape is where a proof stops being a proof and becomes an anecdote — the
+/// defect it names shipped through a 20,000-program generated seal, a 1,694-case
+/// torture suite and a 1,552-case opt-parity run, because none of them held a
+/// rotation under enough register pressure to evict a parameter.
+///
+/// The family is generated instead of hand-picked: a permutation of K pointers
+/// carried around a loop, under P loop-carried accumulators. K decides how many
+/// locations the edge's parallel copy has to move at once, P decides whether the
+/// allocator runs out of registers and starts evicting parameters into slots —
+/// and the defect needs BOTH, which is why every fixture written by hand at one
+/// pressure level missed it. Each member is checked by the allocator's commuting
+/// square `⟦mir_v⟧ = ⟦mir_p⟧`, so a failure names the shape rather than a
+/// checksum.
+#[test]
+fn every_pointer_rotation_under_pressure_keeps_its_permutation() {
+    for k in 2..=4usize {
+        for p in [6usize, 10, 14] {
+            let mut s = String::from("int main(void){\n static int M[5][32];\n int *pt[");
+            s.push_str(&format!("{}];\n", k));
+            for i in 0..k {
+                s.push_str(&format!(" pt[{}]=M[{}];\n", i, i));
+            }
+            for i in 0..p {
+                s.push_str(&format!(" long v{}={};\n", i, i % 7 + 2));
+            }
+            s.push_str(" int i,j; long acc=0;\n for(i=0;i<13;i++){\n  int *t;\n");
+            for i in 0..p {
+                let op = ["^", "*", "+"][i % 3];
+                s.push_str(&format!("  v{}=(v{} {} (i+{}))&0xffff;\n", i, i, op, i % 5 + 1));
+            }
+            s.push_str("  for(j=0;j<32;j++){ pt[0][j]=(int)(v0+j); }\n");
+            // the rotation: t = pt[0]; pt[0] = pt[1]; ... ; pt[k-1] = t
+            s.push_str("  t=pt[0];\n");
+            for i in 0..k - 1 {
+                s.push_str(&format!("  pt[{}]=pt[{}];\n", i, i + 1));
+            }
+            s.push_str(&format!("  pt[{}]=t;\n", k - 1));
+            for i in 0..p {
+                s.push_str(&format!("  acc+=v{}+pt[{}][i%32];\n", i, i % k));
+            }
+            s.push_str(" }\n return (int)(acc & 0x7fffffff);\n}");
+            same(&s);
+        }
+    }
 }
