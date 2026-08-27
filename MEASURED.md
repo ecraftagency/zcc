@@ -785,3 +785,50 @@ parameters (2.2× on one program), `ifconv` requiring exactly two join
 predecessors (12.5%), and the jump table refusing arms with edge arguments (30%
 of sqlite). None was a missing optimization. The audit exists to find the next
 one by measurement instead of by accident.
+
+
+---
+
+## M18. The peer landscape — zcc against cproc+qbe, and what cproc cannot build
+
+**VALUE.** Over the 42 programs of `tests/bench/suite`, exec geomean against
+`gcc -O1` on the same machine, all three compilers producing byte-identical
+program output:
+
+| compiler | exec geomean |
+|---|---|
+| **zcc** | **1.0229** |
+| cproc + qbe | **1.5555** |
+| | worst: `i1_global_acc` **4.13×** |
+
+zcc is ~1.52× faster than cproc+qbe on this surface. cproc compiled all 42 with
+zero failures, so the comparison is over the whole set rather than a subset.
+
+**AND THE PART THAT IS NOT A RATIO.** The comparison could not be run on sqlite,
+because **cproc cannot compile the amalgamation.** Two separate walls:
+
+* the GCC atomic builtins sqlite selects when the preprocessor advertises
+  `__GNUC__` (`__atomic_load_n`/`__atomic_store_n`). This one is fair to patch —
+  sqlite's OWN non-GCC branch is `*(PTR)`, which is what any non-GCC compiler
+  takes — and past it lies the second;
+* `volatile store is not yet supported`, an unimplemented C feature. Patching
+  around THAT would change the program's semantics, so the run stops there
+  honestly rather than reporting a number for different code.
+
+zcc compiles the amalgamation unmodified, which is Article C's whole premise.
+
+**WHAT THIS ENTRY IS FOR, AND WHAT IT IS NOT.** THE ULTIMATUM names `gcc -O1` as
+the finish line, and nothing here changes that. cproc+qbe is a PEER — the
+nearest comparable project, a small C compiler with a real SSA backend — so this
+answers "is zcc actually good, or only good against a toy?" It must never become
+a gate: beating a weaker reference is flattering, and a number quoted against it
+would be exactly the Law 3c failure of announcing parity from a favourable
+surface.
+
+**METHOD.** qbe and cproc built in-box with gcc (clang is not installed there;
+the compiler used to BUILD a compiler does not affect the code it GENERATES).
+Each program compiled by all three, outputs compared before any timing, then
+best-of-5 wall time through `tests/bench/timeit.c`.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, qbe and cproc at their
+repository tips.
