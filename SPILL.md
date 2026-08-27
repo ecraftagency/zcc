@@ -353,7 +353,48 @@ spends itself without moving the ladder. The facts:
 | geo40 worst exec | `d1_switch` 1.111× | 2026-08-27 |
 | realprog total | 1.410× Apple / 2.03× Graviton | report |
 
-### THE HEADLINE, taken at session end 2026-08-27 — sqlite exec is UNMOVED
+### ⭐ THE HEADLINE — sqlite exec 1.651 → 1.159, and what actually did it
+
+Three interleaved runs of each binary, `realprog.sh` at microsecond resolution,
+session start (`d85aac9`) against `5ed5648`:
+
+| | session start | after the jump-table row |
+|---|---|---|
+| **SQL geomean, 11 phases** | 1.6282 / 1.6743 → **1.651** | 1.1524 / 1.1646 → **1.159** |
+| TOTAL (sum-weighted) | 1.490 | **1.164** |
+| worst phase `p01_insert` | 2.818 / 2.593 | **1.313 / 1.301** |
+| median phase | 1.551 / 1.578 | **1.154 / 1.147** |
+| phases above 1.1× | 10 of 11 | 9 of 11 |
+
+**65% slower than gcc -O1 became 16% slower, from one condition in `isel`.**
+`sqlite3VdbeExec` dispatches 196 opcodes and every arm carries edge arguments,
+so the jump-table row refused it and the hottest dispatch in the program was a
+183-deep linear compare chain, walked ~1.4 million times per 100,000-row INSERT.
+
+**AND HERE IS THE LESSON, which cost a day to learn.** The seven rows shipped
+before it — trace-distance eviction, the phi gate, argument registers last,
+inline of composite parameters, the parameter-copy elision, if-conversion —
+were all real, all gated, all measured on their own programs, and together they
+moved sqlite **by nothing** (1.679 → 1.649, ranges overlapping). Every one had
+been aimed at a KERNEL, because kernels are the only programs small enough to
+diff by hand. The row that moved sqlite was aimed at sqlite.
+
+The chain that found it, in order, and none of the steps is skippable:
+
+1. `localize.sh` — attribution by linker: **85% of the gap in one function**
+   (`MEASURED M16`). Static instruction counts had said `VdbeExec` was 25% of
+   the *size* excess; they could not say it was 85% of the *time*.
+2. `xray.sh` — that function's mnemonic histogram against gcc. **Necessary but
+   not sufficient**: a histogram names CLASSES, not sites. Three hypotheses
+   drawn from it (`madd`→shifts, `cset`/`cmp` folding, dispatch reordering) were
+   built or hand-edited and each refuted at ~1%.
+3. **Narrowing the window.** `EXPLAIN` gave the opcodes the workload actually
+   runs; counting `br` in the two assemblies gave the answer in one line —
+   gcc 1, zcc 0.
+
+Step 3 is the one that mattered, and it is the cheapest of the three.
+
+### The pre-jump-table state, kept because it is what the lesson is about
 
 Three interleaved runs of each binary, `realprog.sh` at microsecond resolution,
 session start (`d85aac9`) against HEAD (`47f8e77`) — seven shipped rows apart:

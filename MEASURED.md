@@ -709,7 +709,16 @@ never against `realprog.sh`'s.
 
 **WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
 
-**WHAT USES IT.** Nothing in the compiler — it is an instrument. What it directs
-is every future row: `sqlite3VdbeExec` is 10,763 instructions against gcc's
-6,041 and holds **199 distinct frame slots against gcc's 43**, so the shape to
-attack is already named.
+**WHAT USES IT.** Nothing in the compiler — it is an instrument. What it
+DIRECTED, within the hour it was built: `sqlite3VdbeExec`'s 196-case dispatch
+was found to be a 183-deep linear compare chain (gcc: one indirect branch),
+because the jump-table row refused any switch whose arms carry edge arguments.
+Fixing that took **sqlite's SQL geomean from 1.651 to 1.159** and this workload
+from 1.988× to 1.279×. The instrument paid for itself the same day.
+
+**A CAUTION FOR THE NEXT READER.** Attribution to a function is not attribution
+to a defect. The histogram of that function (`xray.sh`) named classes — `mov`
++1148, `mov #imm` +485, `str` +353 — and three rows built from those classes
+were each refuted at ~1%. What worked was narrowing the window to what the
+workload actually executes (`EXPLAIN`) and then counting ONE mnemonic (`br`) in
+both assemblies.
