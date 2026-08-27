@@ -62,10 +62,38 @@ fn sym_name(n: &str) -> String {
     n.strip_prefix('\u{1}').unwrap_or(n).to_string()
 }
 
+/// THEORY II-4 — ELF section names
+///
+/// `-ffunction-sections`: each function goes in a section of its own,
+/// `.text.<name>`, instead of all of them sharing `.text`. The linker can then
+/// drop the ones nothing references (`--gc-sections`), which is why real
+/// size-conscious builds pass this pair; the section name is the convention
+/// every ELF toolchain already agrees on, so `ld` needs no help to place them.
+///
+/// It also makes a function individually REPLACEABLE at link time, which is
+/// what turns "sqlite is 1.65x and we do not know which code carries it" into
+/// a measurement: remove one `.text.<f>` from zcc's object, link it ahead of a
+/// gcc-compiled object of the same source, and `f` — and only `f` — comes from
+/// gcc. Attribution by linker rather than by profiler, on a box whose kernel
+/// exposes no PMU.
+pub fn function_sections() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var_os("ZCC_FUNCTION_SECTIONS").is_some())
+}
+
+/// The section a function's code belongs in.
+fn text_section(name: &str) -> String {
+    if function_sections() {
+        format!("\t.section .text.{},\"ax\",@progbits\n\t.p2align 2\n", name)
+    } else {
+        "\t.text\n\t.p2align 2\n".to_string()
+    }
+}
+
 // ── functions ──────────────────────────────────────────────────────────────
 fn func(s: &mut String, ast: &Ast, f: &MFunc) {
     let name = sym_name(&f.name);
-    s.push_str("\t.text\n\t.p2align 2\n");
+    s.push_str(&text_section(&name));
     if f.is_weak {
         let _ = writeln!(s, "\t.weak {}", name);
     } else if !f.is_static {
@@ -130,7 +158,7 @@ fn func(s: &mut String, ast: &Ast, f: &MFunc) {
         for b in blocks {
             let _ = writeln!(s, "\t.word .L{}_{} - {}", name, b, label);
         }
-        s.push_str("\t.text\n");
+        s.push_str(&text_section(&name));
     }
 }
 

@@ -661,3 +661,55 @@ is out of scope against an `-O1` reference.
 `ZCC_LDSTP`. The entry exists so the next reader of the 3,020 knows it was
 tried, and so the row is not attempted again on the strength of the number
 alone.
+
+
+---
+
+## M16. `sqlite3VdbeExec` IS the sqlite gap — 85% of it, in one function
+
+**VALUE.** On sqlite's worst workload (`p01_insert`, 100,000 rows through a
+recursive CTE, in-memory), compiling **one function** with gcc and the other
+1,259 with zcc takes the program from **1.98× to 1.15×**. That one function is
+`sqlite3VdbeExec`, the VDBE interpreter loop every statement runs.
+
+| function taken from gcc | ratio | closes |
+|---|---|---|
+| **`sqlite3VdbeExec`** | 1.145–1.165 | **83.2 / 83.9 / 85.2 / 88.5%** (four runs) |
+| `sqlite3BtreeInsert` | 1.87–1.95 | 1.8–2.1% |
+| `balance_nonroot` | 1.96 | 1.7% |
+| `sqlite3VdbeRecordCompare` | 1.91 | 0.4% |
+| `sqlite3VdbeMemGrow` | 2.00 | −0.5% |
+| `sqlite3BtreeMovetoUnpacked` | 2.04 | −4.4% |
+
+Everything that is not the interpreter is at or below the noise floor.
+
+**METHOD.** `tests/bench/localize.sh` — attribution by LINKER, because this box
+exposes no PMU (`/sys/bus/event_source/devices` carries software events only, and
+forcing gcc's own scheduler on at -O1 moves nothing, so there is no profiler to
+borrow). The same source is compiled by both compilers; every global in the gcc
+object is weakened except the chosen names; those names are weakened in the zcc
+object; the zcc object is linked first. A strong definition beats a weak one, so
+the chosen functions come from gcc and every other name from zcc. The output is
+compared against the pure-gcc build before any time is reported.
+
+**WHAT IT COST TO LEARN, and why it is worth an entry.** Seven optimization rows
+shipped on 2026-08-27 moved the 42-program taxonomy suite from 1.0400 to 1.0190
+and moved real sqlite execution by **nothing** (1.679 → 1.649, ranges
+overlapping). Every one of those rows was aimed at a shape found in a KERNEL,
+because kernels are the only programs small enough to diff by hand. This entry
+is the first fact about WHERE sqlite's time actually goes, and it says the
+kernels were never going to reach it.
+
+**⚠️ WHAT THE NUMBER IS NOT.** `-DSQLITE_PRIVATE=` externalizes sqlite's 1,260
+internal functions so they have symbols to select by, and that costs BOTH
+compilers their static-function inlining. The hybrid is therefore a slightly
+different program from the shipping build — read these ratios against the
+baselines the script prints under the same flag (gcc 43,070 µs / zcc 85,634 µs),
+never against `realprog.sh`'s.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** Nothing in the compiler — it is an instrument. What it directs
+is every future row: `sqlite3VdbeExec` is 10,763 instructions against gcc's
+6,041 and holds **199 distinct frame slots against gcc's 43**, so the shape to
+attack is already named.
