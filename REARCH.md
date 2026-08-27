@@ -731,12 +731,42 @@ R5 goal. **The R5 goal is broad sub-1× margin across the spectrum, ranked by br
   widening, guards inherited down the dominator tree from single-predecessor edges, folding a decided
   comparison and reducing `x / 2^k` / `x % 2^k` on a proven non-negative dividend. Toggle `ZCC_VRP`.
 
-**WHAT TIER 1 STILL OWES, and it is the half that decides whether any of it stays.** Every row is
-proven and inert by default; none has a NUMBER. The box gate must run per toggle (`fullsuite.sh`
-forwards every `ZCC_*` since `4d5af69` — before that it passed only `ZCC_IN_BOX`, so a toggled run was
-testing the untoggled compiler and reporting green), then a paired INSN+EXEC re-measure per toggle,
-distribution not geomean (Law 3c). A row that cannot clear the noise floor is quarantined, not shipped
-on by default.
+**TIER 1 IS MEASURED, AND IT DOES NOT PAY (2026-08-28).** Paired INSN+EXEC over the 42-program
+taxonomy suite, one toggle at a time, same session, same machine. Seal gate green first (15 PASS / 0
+RED at FUZZ_N=1000 with all five on), so these are numbers about speed and not about correctness.
+
+| toggle | EXEC | INSN | verdict |
+|---|---|---|---|
+| baseline | 1.0206 | 1.0719 | — |
+| `ZCC_WEIGHTS` (R5.1) | 1.0873 | 1.0880 | **QUARANTINED** — the whole batch regression is this row |
+| ⤷ `ZCC_WEIGHTS_LAYOUT` | 1.0925 → 1.0712 after two fixes | 1.0774 | still worse than baseline; stays OFF |
+| ⤷ `ZCC_WEIGHTS_SPILL` | 1.0199 | 1.0818 | EXEC-neutral, costs instructions (`k2_live_pressure` 1.468 → 1.621); stays OFF |
+| `ZCC_TBAA` (R5.2) | 1.0276 | 1.0718 | flat on this suite — measure on sqlite before judging |
+| `ZCC_VRP` (R5.5) | 1.0204 | **1.0673** | INSN −0.46%, the only positive; at the noise floor |
+| `ZCC_SCHED` (R5.4) | **1.0152** | 1.0718 | EXEC −0.5%, at the noise floor |
+| `ZCC_SLP` (R5.3) | 1.0213 | 1.0719 | no pack fires on this suite at all |
+
+⚠️ **The absolute geomean here is NOT the rc5 instrument.** `rc5` recorded geo40 EXEC 0.9494 on the
+box; this baseline reads 1.0206 on a laptop under Docker. Only the A/B deltas within the session are
+trustworthy — which is exactly what Law 3c says about reading one number.
+
+**THE ROWS ARE ADDITIVE, NOT CLASHING.** Sum of the individual INSN deltas predicts 1.0832; measured
+all-on is 1.0839. Phase-ordering interference is not what is wrong here — one row is.
+
+**WHAT R5.1 TAUGHT, and it is worth more than the row.** Two defects were found by reading the emitted
+code rather than the pass: `freq` scored a loop's EXIT edge at even odds (a loop that runs `TRIPS`
+times leaves ONCE), and `chain_by_weight` broke ties toward the block reverse postorder visits first,
+making a character-dispatch chain pay a taken branch per comparison. Both are fixed in `b878483`;
+neither made the row pay. The weights themselves are now trustworthy — which matters, because the use
+they were originally justified by is still unbuilt: **gating `rotate`/`licm`/`iv`, which add 7,728
+instructions to sqlite for no measurable speed (`MEASURED M17`) because they fire on cold loops.** That
+is the R5.1 consumer worth building, and it is not layout.
+
+**WHAT TIER 1 STILL OWES.** A measurement on sqlite and the real-program set, where TBAA and the
+spiller have something to bite on that 42 kernels do not. Until then every row stays default-OFF, which
+is the only honest state for a row whose whole claim is speed. The gate itself was nearly a liar here:
+`fullsuite.sh` forwarded only `ZCC_IN_BOX` before `4d5af69`, so a toggled run tested the untoggled
+compiler and reported green.
 
 **Tier 2 — medium, broad.**
 - **R5.6 = #15** remat + live-range-splitting refinements (**the residency lever — now one broad row for
