@@ -705,19 +705,38 @@ in dominance order cannot revisit, so true global recoloring is a DIFFERENT allo
 not a row. A hand-edit proved residency is real and correct; it is banked as a Tier-2 row below, NOT the
 R5 goal. **The R5 goal is broad sub-1× margin across the spectrum, ranked by broad-speed ÷ effort:**
 
-**Tier 1 — cheap, broad, ship early (the R5 opening hand, in order).**
-- **R5.1 = ★4** static branch prediction → block weights → **layout + spill-weighting** (`Block.weight`
-  hook exists). The universal enabler: every program gets hot/cold layout and a spiller that keeps hot
-  values resident. Also feeds R5's Tier-2 residency row and #9's priorities.
-- **R5.2 = ★1** TBAA → **load-elim / DSE / LICM** (`aclass` hook exists). The biggest generic
-  across-the-board win; radius = alias-oracle soundness vs C99 6.5p7.
-- **R5.3 = #13** **SLP-SIMD** — the SIMPLE half (local straight-line pack, no cross-iteration analysis;
-  user 2026-08-27). Infra = `Ty::V128` in HIR + NEON ops in MIR, FPR class already holds v-regs. This is
-  where the headroom MARGIN lives: kernels are already 0.95×, NEON pushes them well below 1×.
-- **R5.4 = #9** **BB list-scheduling** — simple algo (user 2026-08-27); needs a MEASURED arm64 latency
-  table (no vendor guide → `MEASURED`). Broad on exposed critical paths (Law 3c).
-- **R5.5 = ★2** VRP + branch-folding + `udiv`/shift narrowing — cheap lattice pass, folds branches
-  everywhere.
+**Tier 1 — cheap, broad, ship early (the R5 opening hand, in order). ALL FIVE ROWS ARE IMPLEMENTED
+(2026-08-27), each behind its own default-OFF toggle, each squared, none measured on a machine yet.**
+- ✅ **R5.1 = ★4** static branch prediction → block weights → **layout + spill-weighting**. Three
+  commits: `acc572c` computes the weights (`freq::annotate` — the field had nine writers and no
+  readers), `f576f57` lays the heavy successor out as the fall-through (and deletes the dead
+  `(rpo_num, depth)` sort that could never affect the order), `d5e0b49` scales the spiller's Belady
+  distance by the frequency of the block where the reload would be paid. Toggle `ZCC_WEIGHTS`.
+- ✅ **R5.2 = ★1** TBAA → **load-elim / DSE**. `8d08396` stamps the C99 6.5p7 class at the access and
+  teaches `mem.rs::disjoint` to answer on types before addresses; `713e6d3` honours the GNU opt-outs
+  the BOX found (`may_alias`, `optimize("-fno-strict-aliasing")`, and the driver flag). LICM does not
+  hoist loads, so the row's reach is `mem.rs`, not the three passes the plan named. Toggle `ZCC_TBAA`.
+- ✅ **R5.3 = #13** **SLP-SIMD**, the straight-line half. `f08aa3a`, and NOT where the plan put it:
+  built as a MIR pass with one new instruction (`MInst::VAlu`) rather than a HIR pass with `Ty::V128`,
+  because `Width::Q`/`MemOp::Q`/the FPR class already carry the whole vector data path (§14 decision
+  ㉚). One shape — two adjacent `double` pairs, one op, two adjacent stores → four instructions — with
+  an alias oracle over `Adrp`/`SlotAddr` origins, because the merge moves a store past loads. Toggle
+  `ZCC_SLP`.
+- ✅ **R5.4 = #9** **BB list-scheduling**, `4d5af69` + the fix in `f08aa3a`. Dependence DAG (RAW/WAR/WAW
+  + memory + barriers from `MInst::effect()`), list-scheduled by longest latency-weighted path from
+  `MEASURED M10`. Runs BEFORE frame lowering: the first cut ran after it and the box answered with
+  corpus-wide segmentation faults, because an epilogue's sp-restoring load is a memory READ and two
+  reads are unordered. Toggle `ZCC_SCHED`.
+- ✅ **R5.5 = ★2** VRP + branch-folding + division narrowing, `6e1e862`. Intervals with Cousot
+  widening, guards inherited down the dominator tree from single-predecessor edges, folding a decided
+  comparison and reducing `x / 2^k` / `x % 2^k` on a proven non-negative dividend. Toggle `ZCC_VRP`.
+
+**WHAT TIER 1 STILL OWES, and it is the half that decides whether any of it stays.** Every row is
+proven and inert by default; none has a NUMBER. The box gate must run per toggle (`fullsuite.sh`
+forwards every `ZCC_*` since `4d5af69` — before that it passed only `ZCC_IN_BOX`, so a toggled run was
+testing the untoggled compiler and reporting green), then a paired INSN+EXEC re-measure per toggle,
+distribution not geomean (Law 3c). A row that cannot clear the noise floor is quarantined, not shipped
+on by default.
 
 **Tier 2 — medium, broad.**
 - **R5.6 = #15** remat + live-range-splitting refinements (**the residency lever — now one broad row for
@@ -2985,6 +3004,9 @@ which catalogued algorithms; this one catalogues the target.
 | decision | choice | why |
 |---|---|---|
 | frontend | keep as input | failure is entirely below AST; parser is an independent proven artifact |
+| SLP layer (R5.3) | a MIR pass, NOT a HIR pass with `Ty::V128` | the vector data path already exists one layer down — `Width::Q`, `MemOp::Q`, the FPR class, 16-byte slots, all carried since `long double` — so what was actually missing was arithmetic. HIR would have needed a new type in every exhaustive `match Ty` in the frontend half plus a lane semantics in `hir::interp`, for a type the frontend can never produce |
+| scheduler position (R5.4) | post-allocation but PRE-frame-lowering | post-RA so no schedule can create a live range; pre-frame so it never sees a prologue, an epilogue, or an sp-writeback address. Learned the hard way: the first cut ran after `frame_fold` and the box returned corpus-wide SIGSEGV, because two memory READS are unordered and one of them was the epilogue's sp-restoring load |
+| TBAA opt-out granularity (R5.2) | whole translation unit | `may_alias` and `optimize("-fno-strict-aliasing")` set one flag for the unit. The finer answer is a bit per `TypeId` beside `vol`; both gcc torture cases put the pun in `main`, where per-type buys nothing. Conservative direction: costs an optimization, never an answer |
 | SSA representation | block parameters (HIR and MIR) | explicit edges, trivial destruction, one model |
 | HIR types | closed `Ty` enum, signedness in opcodes | passes independent of TyTab; closed semantics |
 | allocation | on SSA, Braun-Hack spill first, chordal greedy color | polynomial + optimal for the spill set; splitting free |
