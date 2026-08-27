@@ -71,6 +71,41 @@ pub const TRIPS: u64 = 10;
 /// real distinguishes that from "as hot as it gets".
 const CEIL: u64 = ENTRY.saturating_mul(1_000_000_000);
 
+/// Whether the frequency estimate is written into `Block.weight` at all
+/// (`ZCC_WEIGHTS=1`). R5.1's A/B seam: off, `weight` keeps the `1` it has always
+/// held and every consumer sees today's behaviour.
+pub fn weights_wanted() -> bool {
+    std::env::var_os("ZCC_WEIGHTS").is_some()
+}
+
+/// Stamp every block with its estimated frequency, so the layers BELOW HIR can
+/// read a real number instead of re-deriving loop depth.
+///
+/// `Block.weight` has existed since the HIR was written and `isel` already
+/// copies it into `MBlock.weight`, but nothing ever COMPUTED it: it defaults to
+/// `1` and the nine sites that touch it only propagate a neighbour's value. The
+/// field was plumbed and dead. This is the missing line.
+///
+/// Run AFTER the pass ladder and before `isel`: the passes reshape the CFG, and
+/// a frequency computed before them describes a program that no longer exists.
+///
+/// Saturating to `u32` is not a truncation of the model. `CEIL` is `10^13`,
+/// reached only by a nest ten levels deep, and everything above `u32::MAX` is
+/// already "as hot as it gets" — the consumers compare weights, they do not do
+/// arithmetic that the clamp could bias.
+pub fn annotate(f: &mut Func) {
+    if !weights_wanted() {
+        return;
+    }
+    let c = dom::cfg(f);
+    let dt = dom::domtree(f, &c);
+    let lf = dom::loops(&c, &dt);
+    let fq = estimate(f, &c, &lf);
+    for (b, &w) in fq.iter().enumerate() {
+        f.blocks[b].weight = w.min(u32::MAX as u64) as u32;
+    }
+}
+
 /// Relative execution frequency of every block, `ENTRY` for the entry block.
 ///
 /// Unreachable blocks get 0, which is the honest answer and lets a caller use

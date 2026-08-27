@@ -17,6 +17,14 @@ pub fn compile(ast: &Ast) -> String {
     if optimize() {
         let pinned = pinned_symbols(ast);
         phase("hir::pass", || crate::hir::pass::run_module_with(&mut h, &pinned));
+        // R5.1 — the block frequencies the layers below read. Between the ladder
+        // and `isel` because the ladder reshapes the CFG and `isel` is the first
+        // consumer's supplier: it copies `Block.weight` into `MBlock.weight`.
+        phase("hir::weight", || {
+            for f in h.funcs.iter_mut() {
+                crate::hir::freq::annotate(f);
+            }
+        });
     }
     // Law 3 at the cheapest layer: the HIR verifier decides dominance, edge
     // arity and type agreement on the IR alone, so a pass that breaks one of
