@@ -622,10 +622,38 @@ pairs where creation order had three. The allocator mints spill slots in an
 order already correlated with the order they are accessed in, which is why the
 inherited order is hard to beat.
 
-**WHAT THAT LEAVES.** The reachable classes are the small ones: 886 blocked by
-the motion rule and 123 beyond the ten-instruction window. gcc's remaining lead
-is not a layout zcc could adopt — it is that gcc SCHEDULES, placing accesses
-next to each other before any pairing pass runs, and zcc has no scheduler.
+**THE PREMISE OF THE WHOLE ROW WAS WRONG, and here is the arithmetic.** "gcc
+emits 12,637 pairs to zcc's 7,616, so 5,130 instructions are being left on the
+table" counts gcc's PAIRS as if each one zcc lacks were an instruction zcc could
+delete. A pair only saves an instruction when the two accesses exist. Counted
+properly, on sqlite:
+
+| frame traffic | zcc | gcc -O1 |
+|---|---|---|
+| paired instructions (`ldp`/`stp` on sp/x29) | 7,097 | 11,456 |
+| single `ldr` | 8,862 | 7,976 |
+| single `str` | 6,111 | 5,288 |
+| **total frame instructions** | **22,070** | **24,720** |
+| accesses those instructions cover | 29,167 | 36,176 |
+
+**zcc emits 2,650 FEWER frame instructions than gcc -O1.** gcc has more pairs
+because it has 7,009 more frame accesses to pair — it spills more file-wide,
+which is a fact already on the record. There was never a 5,130-instruction
+opportunity here.
+
+What is real is pairing EFFICIENCY: 0.757 instructions per frame access against
+gcc's 0.683. Matching that on zcc's own accesses would be ~2,100 instructions,
+and the census above says ~1,009 of those are reachable (886 motion-blocked, 123
+out of window).
+
+**AND IT IS NOT SCHEDULING.** An earlier version of this entry blamed gcc's lead
+on instruction scheduling. Measured instead of asserted: at `-O1` gcc reports
+`-fschedule-insns [disabled]` and `-fschedule-insns2 [disabled]`, and forcing
+`-fschedule-insns2` on at `-O1` moves sqlite's pair count by **2 instructions**
+and its instruction count by **zero** (157,074 either way). 91% of gcc's pairs
+are sp/x29-based — prologue, epilogue and spill runs, emitted adjacent by the
+frame expander, with no scheduler involved. Scheduling is an `-O2` transform and
+is out of scope against an `-O1` reference.
 
 **WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
 
