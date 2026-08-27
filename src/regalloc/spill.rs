@@ -1605,18 +1605,36 @@ fn simulate(
                         // has. No A64 instruction reads more than four, so this
                         // is a Law-2 defect in isel.
                         None => {
+                            // THE DIAGNOSTIC IS AN INSTRUMENT, AND AN INSTRUMENT
+                            // THAT LIES COSTS MORE THAN THE DEFECT IT REPORTS.
+                            // The previous form printed six values under six
+                            // labels rotated by one — the mnemonic appeared as
+                            // "resident", the resident count as "held", and
+                            // `pinned.len()` as "k". Two sessions read `k 4` on a
+                            // machine whose k is 26 and diagnosed a register
+                            // shortage that was not there. Each value is now
+                            // named where it is computed, and the headline says
+                            // WHICH ceiling was hit, because "exceeds k" was
+                            // printed for a crossing overflow.
+                            let ceiling = if over_k { "k" } else { "callee-saved crossing" };
                             return Err(format!(
-                                "{}: {:?} pressure exceeds k at bb{}[{}] with nothing evictable                                  (resident {}, held {}, need {}, pinned {}, k {}, inst {})",
+                                "{}: {:?} pressure exceeds the {} ceiling at bb{}[{}] {} with \
+                                 nothing evictable (resident {}, cross {}, held {}, need {}, \
+                                 need_cross {}, pinned {}, k {}, cs {})",
                                 f.name,
                                 c,
+                                ceiling,
                                 bi,
                                 i,
                                 if i < n { mnemonic(&blk.insts[i]) } else { "term" },
                                 cnt,
+                                ncross,
                                 held(physlive, c),
                                 need,
+                                need_cross,
                                 pinned.len(),
-                                isa::k(c)
+                                isa::k(c),
+                                cs[ki(c)]
                             ));
                         }
                     }
