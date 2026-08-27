@@ -119,6 +119,12 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             crate::mir::pass::cmpelim::branch_on_flags(f);
             crate::mir::pass::const_share::run(f);
             crate::mir::pass::autoinc::run(f);
+            // R5.3, LAST of the SSA-MIR rows: it consumes the shape the rows
+            // above leave — plain `BaseImm` addresses and scalar FP ops — and
+            // `autoinc` running first means an address it rewrote into a
+            // post-index form is simply not a pack candidate, which is the
+            // conservative order rather than a fight over the same addresses.
+            crate::mir::pass::slp::run(f);
         }
     });
     // R4.18's instrument: the TIME model, read beside the size model. Placed
@@ -156,6 +162,14 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
 pub fn finish(m: &mut crate::mir::MModule) {
     phase("frame+layout", || {
         for f in m.funcs.iter_mut() {
+            // R5.4 FIRST, and the position is the whole of its risk budget.
+            // Post-allocation, so no schedule can create a live range — but
+            // BEFORE frame lowering, so it never sees a prologue, an epilogue,
+            // or an address that writes back to the stack pointer. The first
+            // cut ran after `frame_fold` and the box answered with segmentation
+            // faults across the corpus: two memory READS are unordered, and one
+            // of them was the epilogue's sp-restoring load.
+            crate::mir::pass::sched::run(f);
             crate::mir::pass::frame::drop_dead_spills(f);
             crate::mir::pass::slotmerge::run(f);
             crate::mir::pass::frame::run(f);
@@ -164,11 +178,6 @@ pub fn finish(m: &mut crate::mir::MModule) {
             crate::mir::pass::legalize::run(f);
             crate::mir::pass::ldstp::run(f);
             crate::mir::pass::frame_fold::run(f);
-            // R5.4, and the position is the whole of its risk budget: AFTER
-            // `ldstp`, so a pair it formed is scheduled as the one instruction
-            // it now is rather than being pulled apart; BEFORE `layout`, which
-            // reads the final terminators and inserts trampolines by size.
-            crate::mir::pass::sched::run(f);
             crate::mir::pass::layout::run(f);
             crate::mir::pass::layout::drop_dead_copies(f);
         }

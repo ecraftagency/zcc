@@ -965,3 +965,94 @@ fn sched_is_a_topological_order_of_the_dependence_dag() {
     });
     assert!(moved, "the scheduler moved nothing: the fixtures have no slack to schedule");
 }
+
+// ── R5.3 SLP ───────────────────────────────────────────────────────────────
+
+/// THEORY A6b  SQUARE slp_packs_two_scalar_lanes_into_one_vector
+///
+/// Two neighbouring `double` operations on adjacent memory are one `2d` vector
+/// instruction. The square is lane independence (DDI 0487 C7.2): no lane sees
+/// another's rounding, NaN or exception state, so the vector form means exactly
+/// the two scalar forms taken lanewise — which is what `mir::interp` states.
+///
+/// Both halves are asserted, and the refusals matter as much as the pack: a
+/// non-adjacent pair, a value read twice, a store between the two, and a
+/// volatile access must all leave the scalars alone.
+#[test]
+fn slp_packs_two_scalar_lanes_into_one_vector() {
+    use crate::mir::pass::slp;
+    // The SHIPPING pipeline, not the bare one `same` uses: `slp` consumes the
+    // shape the HIR ladder leaves — one address materialization per object,
+    // each intermediate read exactly once — and a fixture built without the
+    // ladder is a different program that happens to have the same source.
+    let same_opt = |src: &str| {
+        let ast = frontend(src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module_with(&mut h, &crate::compile::pinned_symbols(&ast));
+        let p = allocated(&h).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+        let before = mi::new_machine(&p, &ast).call("main", &[], &[]);
+        let mut fin = allocated(&h).unwrap();
+        finish(&mut fin);
+        let after = mi::new_machine(&fin, &ast).call("main", &[], &[]);
+        match (before, after) {
+            (Ok(x), Ok(y)) => assert_eq!(
+                x as i32, y as i32,
+                "⟦mir_p⟧ = {} but ⟦mir_final⟧ = {}\n{}",
+                x as i32, y as i32, src
+            ),
+            (Err(_), _) => {}
+            (Ok(x), Err(e)) => {
+                panic!("⟦mir_final⟧ trapped ({:?}), ⟦mir_p⟧ = {}\n{}", e, x as i32, src)
+            }
+        }
+    };
+    // the shape: two adjacent loads from each of two arrays, one op each, two
+    // adjacent stores
+    let packable = "double a[2],b[2],c[2];\
+        void k(void){c[0]=a[0]*b[0];c[1]=a[1]*b[1];}\
+        int main(void){a[0]=2;a[1]=3;b[0]=5;b[1]=7;k();return (int)(c[0]+c[1]);}";
+    slp::set_slp(Some(true));
+    let _ = slp::take_tally();
+    same_opt(packable);
+    let built = slp::take_tally();
+    slp::set_slp(None);
+    assert!(built > 0, "nothing packed: the fixture stopped exercising the pass");
+
+    // …and the refusals. Each of these must build NO pack, and each must still
+    // compute the right answer.
+    let refused: &[&str] = &[
+        // not adjacent: c[0] and c[2] are 16 bytes apart
+        "double a[4],b[4],c[4];\
+         void k(void){c[0]=a[0]*b[0];c[2]=a[1]*b[1];}\
+         int main(void){a[0]=2;a[1]=3;b[0]=5;b[1]=7;k();return (int)(c[0]+c[2]);}",
+        // an intervening CALL, which may write any object the pack moves an
+        // access past
+        "double a[2],b[2],c[2];void t(void);\
+         void k(void){c[0]=a[0]*b[0];t();c[1]=a[1]*b[1];}\
+         void t(void){a[1]=11;}\
+         int main(void){a[0]=2;a[1]=3;b[0]=5;b[1]=7;k();return (int)(c[0]+c[1]);}",
+        // a volatile store between the two: C99 6.7.3 forbids the reorder
+        "double a[2],b[2],c[2];volatile int v;\
+         void k(void){c[0]=a[0]*b[0];v=1;c[1]=a[1]*b[1];}\
+         int main(void){a[0]=2;a[1]=3;b[0]=5;b[1]=7;k();return (int)(c[0]+c[1])+v;}",
+        // different operations: not isomorphic
+        "double a[2],b[2],c[2];\
+         void k(void){c[0]=a[0]*b[0];c[1]=a[1]+b[1];}\
+         int main(void){a[0]=2;a[1]=3;b[0]=5;b[1]=7;k();return (int)(c[0]+c[1]);}",
+    ];
+    // THE SINGLE-USE FENCE HAS NO FIXTURE HERE, and saying so is the honest
+    // form of Law 4's residual. It is a real guard — deleting the definition of
+    // a value someone else reads loses it — but no C program reaches this pass
+    // with one: a second reader of a stored value arrives as its own load, and a
+    // second reader of a loaded one as a second load. The fence guards against
+    // an IR shape a future row could produce, and the battery cannot construct
+    // it from source.
+    for src in refused {
+        slp::set_slp(Some(true));
+        let _ = slp::take_tally();
+        same_opt(src);
+        let n = slp::take_tally();
+        slp::set_slp(None);
+        assert_eq!(n, 0, "packed a shape it may not pack:\n{}", src);
+    }
+}

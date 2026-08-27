@@ -101,28 +101,36 @@ pub fn run(f: &mut MFunc) -> bool {
 
 /// Does this instruction order every memory access around it, and every other
 /// barrier?
+///
+/// `MInst::effect()` is the codebase's own oracle — its doc comment already
+/// names a list scheduler as a consumer — and it is used rather than a second
+/// copy written here, which is how the first cut of this pass missed
+/// `StackAlloc` and `Asm`. The one thing added on top is an address that WRITES
+/// BACK to the stack pointer: `FrameWb` restores sp as a side effect of the
+/// load, so every sp-relative access around it means a different address
+/// depending on which side it lands, and `visit_addr!` reports no register for
+/// it to depend on. Two memory READS are otherwise unordered, which is exactly
+/// how a reload could have crossed the epilogue.
 fn is_barrier(i: &MInst) -> bool {
-    matches!(
-        i,
-        MInst::Call { .. }
-            | MInst::SpAdj { .. }
-            | MInst::Dmb
-            | MInst::LdAxr { .. }
-            | MInst::StlXr { .. }
-            | MInst::Stlr { .. }
-            | MInst::ParallelCopy(_)
-            | MInst::Load { vol: true, .. }
-            | MInst::Store { vol: true, .. }
-    )
+    if i.effect() == MemEffect::Barrier {
+        return true;
+    }
+    let wb = |m: &AddrMode| {
+        matches!(m, AddrMode::FrameWb { .. } | AddrMode::PreIdx { .. } | AddrMode::PostIdx { .. })
+    };
+    match i {
+        MInst::Load { mem, .. } | MInst::Store { mem, .. } | MInst::Pair { mem, .. } => wb(mem),
+        _ => false,
+    }
 }
 
 /// `(reads memory, writes memory)`.
 fn mem_effect(i: &MInst) -> (bool, bool) {
-    match i {
-        MInst::Load { .. } | MInst::Reload { .. } => (true, false),
-        MInst::Store { .. } | MInst::Spill { .. } => (false, true),
-        MInst::Pair { load, .. } => (*load, !*load),
-        _ => (false, false),
+    match i.effect() {
+        MemEffect::Read => (true, false),
+        MemEffect::Write => (false, true),
+        MemEffect::Barrier => (true, true),
+        MemEffect::None => (false, false),
     }
 }
 

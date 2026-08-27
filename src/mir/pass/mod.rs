@@ -16,5 +16,6 @@ pub mod ext;
 pub mod layout;
 pub mod ldstp;
 pub mod sched;
+pub mod slp;
 pub mod shrink_wrap;
 pub mod slotmerge;
