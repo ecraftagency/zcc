@@ -1645,3 +1645,30 @@ fn counting_down_is_idempotent_under_the_fixpoint() {
         (a, b) => panic!("once={:?} twice={:?} want 8", a, b),
     }
 }
+
+#[test]
+fn countdown_refuses_an_index_shared_with_a_sibling_header_phi() {
+    // THE REGRESSION THIS EXISTS FOR (`c9330`, found by the 20k csmith seal and
+    // reduced to fifteen lines). Taking `&i` keeps the index in memory, so the
+    // promoter rebuilds it as TWO header parameters fed by the SAME latch value:
+    // one slot read by the exit test, the other by `&a[i]`. `countdown` rewrites
+    // the step instruction in place, which turns both slots into countdowns, but
+    // restamps the entry argument of only its own slot. The address phi
+    // therefore ran 0, 4, 3, 2, 1 and the loop stored into `a[1]` where the
+    // source says `a[4]`.
+    //
+    // The fence is that the step must flow into no header slot but its own, so
+    // the pass must simply decline this loop.
+    let src = "int a[5];int *p;int **pp;\
+               int main(void){int i;pp=&p;\
+               for(i=0;i<=4;i+=1) *pp=&a[i];\
+               **pp=42;{int *q=&i;(void)q;}\
+               return a[4]*10+a[1];}";
+    let ast = frontend(src);
+    let plain = module(src, false);
+    let opt = module(src, true);
+    match (run(&plain, &ast), run(&opt, &ast)) {
+        (Ok(x), Ok(y)) if x == y && x == 420 => {}
+        (x, y) => panic!("⟦f⟧={:?} ⟦countdown f⟧={:?} want 420", x, y),
+    }
+}

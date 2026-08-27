@@ -1253,6 +1253,10 @@ fn countdown_loop(
         if op == CmpOp::Ne && rhs == Operand::Imm(0) {
             continue;
         }
+        let pi = match f.blocks[header as usize].params.iter().position(|&x| x == p) {
+            Some(i) => i,
+            None => continue,
+        };
         for b in &f.blocks {
             for inst in &b.insts {
                 inst.uses(|o| {
@@ -1265,9 +1269,24 @@ fn countdown_loop(
                 });
             }
             for t in b.term.targets() {
-                if t.block != header
-                    && t.args.iter().any(|a| *a == Operand::Val(p) || *a == Operand::Val(sv))
-                {
+                // A SIBLING HEADER PHI FED BY THE SAME LATCH VALUE is the hole
+                // this fence closes (`c9330`, 2026-08-27). The rewrite below is
+                // done in place on the step instruction, so every header param
+                // whose latch argument is that value starts counting down —
+                // but only slot `pi` gets its entry argument restamped to the
+                // trip count. A duplicate index phi (one slot read by the exit
+                // test, the other by `&a[i][j]`) therefore kept its 0 start and
+                // then followed the descending step: the loop wrote `a[1][7]`
+                // where the source says `a[4][7]`. Being read only by a step and
+                // a compare is not enough; the step must flow into NO header
+                // slot but our own.
+                if t.block == header {
+                    if t.args.iter().enumerate().any(|(k, a)| {
+                        k != pi && (*a == Operand::Val(p) || *a == Operand::Val(sv))
+                    }) {
+                        bad = true;
+                    }
+                } else if t.args.iter().any(|a| *a == Operand::Val(p) || *a == Operand::Val(sv)) {
                     bad = true;
                 }
             }
@@ -1283,10 +1302,6 @@ fn countdown_loop(
         if bad {
             continue;
         }
-        let pi = match f.blocks[header as usize].params.iter().position(|&x| x == p) {
-            Some(i) => i,
-            None => continue,
-        };
         for t in f.blocks[entries[0] as usize].term.targets_mut() {
             if t.block == header {
                 t.args[pi] = Operand::Imm(trips as i64);
