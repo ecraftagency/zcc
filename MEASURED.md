@@ -463,3 +463,44 @@ instructions outweigh a factor of ten across a level — deep nests over long
 bodies. Nothing in the current corpus is that shape; a program that is would
 show up as a sqlite-scale gap between TRIPS=10 and TRIPS=100, which today is
 14 instructions.
+
+---
+
+## M13. The argument registers go LAST in the caller-saved half
+
+**VALUE.** `GPR_ORDER` offers x8–x15 before x0–x7. The allocatable SET is
+AAPCS64 §6.1.1 and does not change; only the order `assign` walks when a value
+has no coalescing hint.
+
+**WHY IT COULD MATTER.** x0–x7 are the only registers a call can demand by
+name. `assign` picks `hint.or_else(|| alloc_order.find(free))`, so with x0
+first every unhinted value in the function takes an argument register before
+anything else — and the argument that later wants x0 finds it occupied, which
+is one `mov` per refusal. The instrument (`ZCC_HINT=1`) had already measured
+the refusals: **34,569 hints wanted, 55.4% taken, 15,348 refused because the
+register was OCCUPIED**, never for want of a free register (0 refusals had no
+spare).
+
+**METHOD.** sqlite compiled with both orders, same binary otherwise:
+
+| | x0-first | x8-first |
+|---|---|---|
+| reg-reg `mov` | 31,352 | **30,669** |
+| of those, writing x0–x7 | 22,829 | **19,985** |
+| file instructions | 175,407 | **174,677** |
+| hint hit rate | 55.4% | 56.7% |
+
+−730 instructions, 1.1167× → 1.1120× against gcc -O1.
+
+**WHAT IT DOES NOT FIX, and the number that says so.** The hit rate moves by
+1.3 points. 14,879 hints are still refused because the wanted register is
+occupied, and for **8,784** of them the occupant dies inside the same block
+with a register free across its WHOLE range — the colourer computes that in
+its statistics replay and acts on none of it. Reordering cannot reach those:
+they need the occupant RE-COLOURED, which greedy colouring in dominance order
+does not do. That is the open lever, and it is larger than this one.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `regalloc/color.rs::assign`'s fallback scan — and nothing
+else: masks, `k`, and the callee-saved set are all order-independent.

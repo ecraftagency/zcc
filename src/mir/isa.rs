@@ -36,12 +36,26 @@ pub const SCRATCH_GPR2: PReg = PReg::gpr(17);
 pub const SCRATCH_FPR: PReg = PReg::fpr(31);
 
 /// THEORY II-3 — AAPCS64 §6.1.1, the full allocatable table
-/// Allocation order for the GPR class: caller-saved first, so a value that does
-/// not live across a call never forces a prologue save; callee-saved last, so a
-/// value that does live across one lands there without any "crossing" rule.
+/// MEASURED M13 — the ORDER within the caller-saved half
+///
+/// Allocation order for the GPR class. The SET is AAPCS64's; the ORDER is a
+/// policy, and each half of it answers a different question.
+///
+/// Caller-saved first, callee-saved last: a value that does not live across a
+/// call never forces a prologue save, and one that does lands in the preserved
+/// half without any "crossing" rule.
+///
+/// Within the caller-saved half, x8–x15 BEFORE x0–x7. The argument registers
+/// are the only ones a call can demand by name, so a value that could sit
+/// anywhere should not be holding one: `assign` offers this order to every
+/// value that has no coalescing hint, and an unhinted value taking x0 is a
+/// register an argument then cannot have, paid for with a `mov` at the call.
+/// Measured on sqlite (`MEASURED M13`): 2,844 fewer moves into x0–x7 and 730
+/// fewer instructions in the file, for a reordering that changes no set, no
+/// mask and no ABI.
 pub const GPR_ORDER: [u8; 26] = [
-    // caller-saved (x0–x7 are also the argument registers)
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, //
+    // caller-saved, ARGUMENT REGISTERS LAST within the half
+    8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, //
     // callee-saved
     19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 ];
