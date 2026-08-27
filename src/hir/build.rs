@@ -233,7 +233,10 @@ impl<'a> B<'a> {
     /// would reorder the two accesses that punning depends on. So an access
     /// reached through ANY union member on its path is `ACLASS_ANY`.
     fn aclass(&self, n: NodeId, ty: TypeId) -> AClass {
-        if !crate::hir::tbaa_wanted() {
+        // EXT(gcc): the unit opted out — `may_alias`, a function-level
+        // `optimize("-fno-strict-aliasing")`, or the driver's flag. Then every
+        // access is ANY and the oracle is the address-only one again.
+        if !crate::hir::tbaa_wanted() || self.ast.no_tbaa {
             return ACLASS_ANY;
         }
         let mut cur = n;

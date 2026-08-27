@@ -156,6 +156,7 @@ fn run1(f: MFunc, args: &[u64]) -> u64 {
         aliases: vec![],
         pic: false,
         weak_decls: vec![],
+        no_tbaa: false,
     };
     let mut mach = interp::new_machine(&m, &ast);
     mach.call("f", args, &[]).expect("⟦mir⟧ trapped")

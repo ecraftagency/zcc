@@ -574,6 +574,49 @@ impl<'a> Machine<'a> {
                 let v = cond_true(*cc, n) as u64;
                 self.set(fr, *dst, trunc(v, *w));
             }
+            // R5.3 — ONE OPERATION PER LANE, and the lanes are independent by
+            // DDI 0487 C7.2: no lane sees another's carry, rounding or NaN, so
+            // the meaning of a vector op is exactly the meaning of the scalar
+            // ops it replaces, taken lanewise. That is the whole of the pack's
+            // commuting square, and it is why the pass may only build one where
+            // the scalars were independent.
+            MInst::VAlu { op, arr, dst, a, b } => {
+                let (xl, xh) = (self.get(fr, *a), self.get_hi(fr, *a));
+                let (yl, yh) = (self.get(fr, *b), self.get_hi(fr, *b));
+                let f64op = |p: f64, q: f64| -> f64 {
+                    match op {
+                        FpOp::Fadd => p + q,
+                        FpOp::Fsub => p - q,
+                        FpOp::Fmul => p * q,
+                        FpOp::Fdiv => p / q,
+                    }
+                };
+                let (lo, hi) = match arr {
+                    Arr::V2D => (
+                        f64op(f64::from_bits(xl), f64::from_bits(yl)).to_bits(),
+                        f64op(f64::from_bits(xh), f64::from_bits(yh)).to_bits(),
+                    ),
+                    Arr::V4S => {
+                        let lane = |v: u64, i: u32| f32::from_bits((v >> (32 * i)) as u32);
+                        let f32op = |p: f32, q: f32| -> u64 {
+                            (match op {
+                                FpOp::Fadd => p + q,
+                                FpOp::Fsub => p - q,
+                                FpOp::Fmul => p * q,
+                                FpOp::Fdiv => p / q,
+                            })
+                            .to_bits() as u64
+                        };
+                        let pack = |x: u64, y: u64| -> u64 {
+                            f32op(lane(x, 0), lane(y, 0))
+                                | (f32op(lane(x, 1), lane(y, 1)) << 32)
+                        };
+                        (pack(xl, yl), pack(xh, yh))
+                    }
+                };
+                self.set(fr, *dst, lo);
+                self.set_hi(fr, *dst, hi);
+            }
             MInst::FpAlu { op, w, dst, a, b } => {
                 let (x, y) = (self.get(fr, *a), self.get(fr, *b));
                 let v = if *w == Width::S {

@@ -182,6 +182,16 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
         }
     };
     match inst {
+        // R5.3: every operand of a vector op is a full `q` register in the FP
+        // file. The arrangement decides how those 128 bits are READ; it cannot
+        // change which file they live in, so the check is the class and nothing
+        // else — an arrangement mismatch is not expressible here, since both
+        // sources and the destination carry the same one by construction.
+        MInst::VAlu { dst, a, b, .. } => {
+            want(*dst, Class::Fpr, "dst")?;
+            want(*a, Class::Fpr, "lhs")?;
+            want(*b, Class::Fpr, "rhs")?;
+        }
         MInst::Alu { dst, a, b, flags, w, .. } => {
             want(*dst, Class::Gpr, "dst")?;
             want(*a, Class::Gpr, "lhs")?;

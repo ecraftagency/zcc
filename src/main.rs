@@ -65,6 +65,7 @@ fn drive() -> ExitCode {
     let (mut libs, mut depgen, mut depfile) = (Vec::<String>::new(), false, None::<String>);
     let mut shared = false; // -shared → ld -dylib (redis's xxhash builds a dylib)
     let mut pic = false; // -fPIC → the ELF backend goes through the GOT for non-static globals
+    let mut no_tbaa = false; // EXT(gcc): -fno-strict-aliasing → R5.2's oracle answers may-alias
     let (mut nostdinc, mut bundle) = (false, false);
     let mut export_dyn = false; // -rdynamic → ld --export-dynamic (backtrace_symbols resolves function names)
     // IR→ops→asm is the ONLY path (it fully covers suite/csmith/musl); the
@@ -103,6 +104,13 @@ fn drive() -> ExitCode {
             // GOT (ld rejects a direct adrp under -shared); redis modules build .xo
             // with -fPIC
             "-fPIC" | "-fpic" => pic = true,
+            // EXT(gcc): the flag real software reaches for when it punns types
+            // on purpose (the Linux kernel, Python, older glibc consumers). It
+            // turns R5.2's type-based alias oracle off for the unit; the
+            // address-based one, which needs no promise from the program, keeps
+            // running. `-fstrict-aliasing` is the default and so is a no-op.
+            "-fno-strict-aliasing" => no_tbaa = true,
+            "-fstrict-aliasing" => {}
             "-bundle" => bundle = true, // a dlopen module → .so (redis test modules)
             "-rdynamic" | "-export-dynamic" | "--export-dynamic" => export_dyn = true,
             // Darwin flags with a separate argument (unused on ELF) — swallow the
@@ -173,6 +181,7 @@ fn drive() -> ExitCode {
             |(t, locs, files)| {
                 parser::parse(&t, &locs, &files).map(|mut ast| {
                     ast.pic = pic;
+                    ast.no_tbaa |= no_tbaa;
                     (ast, files)
                 })
             },

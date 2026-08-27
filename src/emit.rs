@@ -670,6 +670,21 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
         MInst::CSet { w, dst, cc, .. } => {
             let _ = writeln!(s, "\tcset {}, {}", reg(*dst, *w), cc_name(*cc));
         }
+        MInst::VAlu { op, arr, dst, a, b } => {
+            let m = match op {
+                FpOp::Fadd => "fadd",
+                FpOp::Fsub => "fsub",
+                FpOp::Fmul => "fmul",
+                FpOp::Fdiv => "fdiv",
+            };
+            // the vector spelling of the same register the scalar forms print
+            // as `d`/`s`/`q`: `v<n>.<arrangement>`
+            let v = |r: Reg| match r {
+                Reg::P(p) => format!("v{}.{}", p.num, arr.suffix()),
+                Reg::V(x) => format!("<v{}>", x),
+            };
+            let _ = writeln!(s, "\t{} {}, {}, {}", m, v(*dst), v(*a), v(*b));
+        }
         MInst::FpAlu { op, w, dst, a, b } => {
             let m = match op {
                 FpOp::Fadd => "fadd",

@@ -130,6 +130,10 @@ struct P<'a> {
     asm_label: Option<String>, // EXT(gcc): __asm("_sym") just consumed in skip_attrs
     renames: HashMap<String, String>, // EXT(gcc): C name → __asm symbol (SDK versioning)
     attr_weak: bool,            // EXT(gcc): __attribute__((weak)) (musl)
+    // EXT(gcc): this unit punned types on purpose — `may_alias` on a type, or a
+    // function-level `optimize("-fno-strict-aliasing")`. Sticky for the whole
+    // parse: it disables R5.2's type-based alias oracle for the unit.
+    no_tbaa: bool,
     attr_transp: bool,          // EXT(gcc): transparent_union (glibc sockaddr arg)
     attr_alias: Option<String>, // EXT(gcc): __attribute__((alias("sym"))) (musl weak_alias)
     attr_mode: Option<(u32, bool)>, // EXT(gcc): mode(M) → (width-in-bytes, is_float); remap type
@@ -1080,6 +1084,15 @@ impl P<'_> {
                         }
                         // EXT(gcc): weak/alias — the skeleton of musl's weak_alias()
                         "weak" | "__weak__" => self.attr_weak = true,
+                        // EXT(gcc): may_alias — a type declared to alias every
+                        // other one, which is the exact opposite of what C99
+                        // 6.5p7 lets R5.2's oracle assume. gcc's own
+                        // `mayalias-1` is the case: a `short __may_alias__ *`
+                        // aimed at an `int`, whose store the oracle would
+                        // otherwise call disjoint. Swallowing it silently was
+                        // harmless until the classes were stamped and is a
+                        // miscompile now.
+                        "may_alias" | "__may_alias__" => self.no_tbaa = true,
                         // EXT(gcc): glibc enables this union under _GNU_SOURCE
                         // (__CONST_SOCKADDR_ARG of bind/connect/sendto…)
                         "transparent_union" | "__transparent_union__" => self.attr_transp = true,
@@ -1098,6 +1111,35 @@ impl P<'_> {
                                 aligned = Some(aligned.unwrap_or(0).max(v));
                             } else {
                                 aligned = Some(16); // GCC: bare aligned = 16
+                            }
+                        }
+                        // EXT(gcc): optimize("...") turns flags on or off for one
+                        // function. zcc has no per-function flag surface, and
+                        // only ONE of those flags changes an answer rather than
+                        // a number: `-fno-strict-aliasing`. gcc's `pr79043`
+                        // puts an always_inline function carrying it next to a
+                        // `main` that reads the punned object, so the opt-out
+                        // has to reach the caller — which whole-unit does and a
+                        // per-function flag would not.
+                        "optimize" | "__optimize__" => {
+                            let mut txt = String::new();
+                            if self.eat(&Tok::Punct("(")) {
+                                let mut depth = 1u32;
+                                while depth > 0 {
+                                    match self.toks.get(self.pos) {
+                                        Some(Tok::Punct("(")) => depth += 1,
+                                        Some(Tok::Punct(")")) => depth -= 1,
+                                        Some(Tok::Str(b, _)) => {
+                                            txt.push_str(&String::from_utf8_lossy(b))
+                                        }
+                                        None => return Err("unterminated __attribute__".into()),
+                                        _ => {}
+                                    }
+                                    self.pos += 1;
+                                }
+                            }
+                            if txt.contains("no-strict-aliasing") {
+                                self.no_tbaa = true;
                             }
                         }
                         _ => {
@@ -4227,6 +4269,7 @@ pub fn parse(
         renames: HashMap::new(),
         fname: String::new(),
         attr_weak: false,
+        no_tbaa: false,
         attr_mode: None,
         attr_transp: false,
         attr_alias: None,
@@ -4343,6 +4386,7 @@ pub fn parse(
         aliases: p.aliases,
         pic: false,
         weak_decls: p.weak_decls,
+        no_tbaa: p.no_tbaa,
     })
 }
 

@@ -461,4 +461,17 @@ pub struct Ast {
     // EXT(gcc): a weak prototype/extern — the TU emits .weak so the undefined
     // reference is weak
     pub weak_decls: Vec<String>,
+    // EXT(gcc): this translation unit OPTED OUT of type-based aliasing — it uses
+    // `__attribute__((may_alias))`, a function-level
+    // `optimize("-fno-strict-aliasing")`, or the driver was given
+    // `-fno-strict-aliasing`. R5.2's oracle must then answer may-alias
+    // everywhere, exactly as it did before the classes were stamped.
+    //
+    // WHOLE-UNIT, and deliberately so: the finer answer is a bit per TypeId
+    // beside `vol`, so that only the punning type loses its class. That is the
+    // residual (category (b), Law 4). This is the conservative direction, which
+    // costs an optimization and never an answer — and the two gcc torture cases
+    // that named it, `mayalias-1` and `pr79043`, both put the pun in `main`,
+    // where a per-type answer would have bought nothing anyway.
+    pub no_tbaa: bool,
 }

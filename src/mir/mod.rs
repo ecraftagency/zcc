@@ -102,6 +102,39 @@ pub enum Width {
     Q,
 }
 
+/// A NEON lane ARRANGEMENT — how the 128 bits of a `q` register are read.
+/// Only the two floating-point forms exist here, because they are the two R5.3
+/// builds; an integer arrangement is a separate row with its own square.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arr {
+    /// two doubles
+    V2D,
+    /// four singles
+    V4S,
+}
+
+impl Arr {
+    pub fn lanes(self) -> u32 {
+        match self {
+            Arr::V2D => 2,
+            Arr::V4S => 4,
+        }
+    }
+    /// The scalar width of one lane — the `Width` the unpacked form used.
+    pub fn lane(self) -> Width {
+        match self {
+            Arr::V2D => Width::D,
+            Arr::V4S => Width::S,
+        }
+    }
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Arr::V2D => "2d",
+            Arr::V4S => "4s",
+        }
+    }
+}
+
 impl Width {
     pub fn class(self) -> Class {
         match self {
@@ -504,6 +537,19 @@ pub enum MInst {
         a: Reg,
         b: Reg,
     },
+    /// `fadd/fsub/fmul/fdiv v.<arr>, v.<arr>, v.<arr>` — the same arithmetic as
+    /// `FpAlu`, done on every lane of a `q` register at once (DDI 0487
+    /// C7.2.10/C7.2.131). R5.3 is the only thing that builds one: a pair of
+    /// isomorphic scalar operations on adjacent memory IS this instruction, and
+    /// the register file it needs already exists — `Width::Q` has been carried
+    /// since `long double`.
+    VAlu {
+        op: FpOp,
+        arr: Arr,
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     FpUn {
         op: FpUnOp,
         w: Width,
@@ -896,7 +942,7 @@ impl MInst {
                 g(flags, Constraint::Use);
                 g(dst, Constraint::Def);
             }
-            MInst::FpAlu { dst, a, b, .. } => {
+            MInst::FpAlu { dst, a, b, .. } | MInst::VAlu { dst, a, b, .. } => {
                 g(a, Constraint::Use);
                 g(b, Constraint::Use);
                 g(dst, Constraint::Def);
@@ -1041,7 +1087,7 @@ impl MInst {
                 f(flags, Constraint::Use);
                 f(dst, Constraint::Def);
             }
-            MInst::FpAlu { dst, a, b, .. } => {
+            MInst::FpAlu { dst, a, b, .. } | MInst::VAlu { dst, a, b, .. } => {
                 f(a, Constraint::Use);
                 f(b, Constraint::Use);
                 f(dst, Constraint::Def);

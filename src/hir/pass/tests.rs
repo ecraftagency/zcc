@@ -1855,3 +1855,30 @@ fn vrp_replaces_an_expression_by_one_equal_on_its_range() {
         "the proven-non-negative division survived"
     );
 }
+
+/// SOUNDNESS (1) — THE GNU OPT-OUTS, and the gate is what found them. R5.2
+/// shipped its own battery green and the ELF box then failed three gcc torture
+/// cases by name: `mayalias-1`, `mayalias-2`, `pr79043`. Both are programs that
+/// pun types ON PURPOSE and say so — `__attribute__((may_alias))` on the type,
+/// `__attribute__((optimize("-fno-strict-aliasing")))` on the function — and
+/// C99 6.5p7 is exactly the assumption they are revoking. Swallowing those
+/// attributes silently was harmless until the classes were stamped.
+#[test]
+fn tbaa_obeys_the_gnu_opt_outs() {
+    let punned = "typedef short __attribute__((__may_alias__)) short_a;\
+                  int g(int *p){*p=0x12345678;{short_a*b=(short_a*)p;b[1]=0;}return *p;}\
+                  int main(void){int a;return g(&a)!=0x12345678;}";
+    assert_eq!(
+        loads(func(&tbaa_module(punned, true), "g")),
+        loads(func(&tbaa_module(punned, false), "g")),
+        "may_alias did not turn the type oracle off"
+    );
+    let optout = "static void __attribute__((optimize(\"-fno-strict-aliasing\"))) pun(float*q){*q=0;}\
+                  int v;int *ptr=&v;float *ptr2;\
+                  int main(void){ptr2=(float*)&v;*ptr=1;pun(ptr2);return *ptr;}";
+    assert_eq!(
+        loads(func(&tbaa_module(optout, true), "main")),
+        loads(func(&tbaa_module(optout, false), "main")),
+        "optimize(\"-fno-strict-aliasing\") did not turn the type oracle off"
+    );
+}
