@@ -811,9 +811,18 @@ because **cproc cannot compile the amalgamation.** Two separate walls:
   `__GNUC__` (`__atomic_load_n`/`__atomic_store_n`). This one is fair to patch —
   sqlite's OWN non-GCC branch is `*(PTR)`, which is what any non-GCC compiler
   takes — and past it lies the second;
-* `volatile store is not yet supported`, an unimplemented C feature. Patching
-  around THAT would change the program's semantics, so the run stops there
-  honestly rather than reporting a number for different code.
+* `volatile store is not yet supported`. Patching around THAT would change the
+  program's semantics, so the run stops there rather than reporting a number for
+  different code.
+
+**AND IT IS UPSTREAM-DOCUMENTED, not a quirk of this setup.** cproc's own
+`README.md`, under *What's missing*: "`volatile`-qualified types ([#7], requires
+qbe support)" and "`long double` type ([#3], requires qbe support)". Its
+`doc/software.md` records that building binutils required patching out "subtle
+`volatile` usage" — the same wall. And `grep -ri sqlite` over the whole cproc
+repository returns nothing: it does not claim sqlite among the software it
+builds. (The small compilers known for compiling sqlite are chibicc and tcc,
+both of which implement `volatile`.)
 
 zcc compiles the amalgamation unmodified, which is Article C's whole premise.
 
