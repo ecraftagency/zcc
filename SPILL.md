@@ -184,12 +184,35 @@ anything positive, and advance. A blocker never authorizes a new direction.
 
 ---
 
-## §6 THE FIRST HOUR OF THE NEXT SESSION
+## §6 THE NUMBERS ARE ALREADY TAKEN — DO NOT RE-TAKE THEM
 
-1. Re-run `scratchpad/nestjoin.c` and confirm 8 ms / 1 ms / 1 ms still holds.
-2. Read `spill.rs` around `next_use`, `linear_positions`, and the `cand.sort_by_key`
-   at ~line 1317. That is the whole surface of S1.
-3. Decide the weighting form on the model *before* editing: what does `10^depth`
-   do to a position scale that is also used for `partition_point` binary search?
-   The ordering must stay monotone or `next_use` breaks.
-4. Then, and only then, write code.
+Everything in §1 was measured on 2026-08-27 against `2d6461a`. **A later session
+must not re-measure any of it to "confirm".** Re-measuring a recorded fact costs
+an hour, produces the same number, and is the single most common way a session
+spends itself without moving the ladder. The facts:
+
+| fact | value | source |
+|---|---|---|
+| `nestjoin.c` gcc -O1 | 1 ms | §1 |
+| `nestjoin.c` zcc -O1 | 8 ms | §1 |
+| `nestjoin.c` zcc, hand-edited loop | 1 ms | §1 — **the ceiling** |
+| `VdbeExec` distinct frame slots | zcc 235 / gcc 43 | §1 |
+| `VdbeExec` instructions | zcc 10,766 / gcc 6,040 | §1 |
+| sqlite file ratio | 1.1238× (173,176 / 154,097) | §1 |
+| functions in both compilers | 1.045× | §1 |
+| `ldp`/`stp` file-wide | zcc 7,266 / gcc 12,305 | S5 |
+| geo40 exec | 0.9494× (tag `rc5`) | rc5 |
+| realprog total | 1.410× Apple / 2.03× Graviton | report |
+
+**Re-measure only when the tree has changed in a way that could move the number**
+— i.e. AFTER shipping a row, as that row's gate. Never before, and never "to be
+sure".
+
+### The first hour
+
+1. Read `spill.rs` around `next_use`, `linear_positions`, and the
+   `cand.sort_by_key` at ~line 1317. That is the whole surface of S1.
+2. Decide the weighting form on the model *before* editing: what does `10^depth`
+   do to a position scale that `next_use` binary-searches with
+   `partition_point`? The ordering must stay monotone or the search breaks.
+3. Then, and only then, write code — and measure once, at the gate.
