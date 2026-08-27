@@ -185,7 +185,7 @@ Status lives HERE, edited in place. Do not open a new numbering elsewhere.
 
 | # | row | gate | status |
 |---|---|---|---|
-| S0 | **A shape-matched kernel in the exec suite** (§4a). geo40 cannot currently SEE this defect — that is why it reads 0.9494× while the same compiler reads 1.4–2.0× on real sqlite. Build one kernel with `sqlite3VdbeExec`'s shape and admit it to the suite, so the standard metric gates S1 instead of hiding it. | the kernel reproduces zcc/gcc ≈ **1.7–1.8×**, matching the real function | ⬜ |
+| S0 | **A shape-matched kernel in the exec suite** — and, it turned out, an INSTRUMENT that could see it. Two things were hiding this defect from geo40, not one: no kernel in the suite spills, AND the harness timed with `date +%s%N` and then divided by 1,000,000, throwing the nanoseconds away before declaring everything under 5 ms unmeasurable. See §4a. | kernel `k1_vdbe_dispatch` reads **exec 1.939× / insn 1.561×**; timed programs 18 → 25 | ✅ |
 | S1 | **The trace-distance model.** ~~Loop-weighted eviction~~ — the measurement (§1) refuted that framing: the defect was the `usize::MAX` a back edge produces, not a missing weight. Shipped `spill.rs::Trace`: Belady's distance measured along the execution trace (a use behind, inside this loop, is one wrap away; a use outside costs the remaining trips) and over the SSA WEB (the granularity at which eviction is paid, since `Sim::More` retires a whole web). | `nestjoin.c` **8 ms → 1 ms = gcc**; inner loop 11 insns → 8, frame ops 6 → 2 | ✅ |
 | S2a | **The invariant reload.** ✅ The mechanism that carries a memory-resident value through a loop in a register — the cold-edge phi — was already built and was being REFUSED by its own pruning gate, which asked for a read strictly AFTER the block head when the read is AT the head, and answered `usize::MAX` for a value read only across the back edge. The same trace query S1 installed fixes it. | `nestjoin` inner loop 8 insns → **7**, zero reloads; at 36M iterations **12 ms → 11 ms = gcc's 11** | ✅ |
 | S2b | **The accumulator's store.** The one frame op left: every definition of a memory-resident value emits a `Spill` immediately after it (`apply`, ~line 2138), so an accumulator that never leaves its register still writes its slot every iteration. It is off the dependence chain, so measure the ceiling by hand before building anything — sinking a store to the loop's exit edges is a dataflow pass, not a peephole. | no `str` to a slot inside a loop whose slot no instruction in that loop reads | ⬜ |
@@ -195,39 +195,69 @@ Status lives HERE, edited in place. Do not open a new numbering elsewhere.
 | S4 | **The copy residual.** +1,252 reg-reg mov in that function. Only after S1–S3, because eviction pressure changes once hot values stop moving. | reg-reg mov in `VdbeExec` < 800 | ⬜ |
 | S5 | **`ldp`/`stp` pairing.** File-wide gcc 12,305 pairs vs zcc 7,266 — **−5,039 instructions**, the cheapest untouched size win, and it touches no allocator theorem. | file ratio ≤ 1.09× | ⬜ |
 
-### §4a S0 — the shape-matched kernel
+### §4a S0 — what was actually wrong with the instrument
 
-**Why it comes first.** Every existing geo40 kernel fits in L1i and stays under
-register pressure, so none of them can express the defect. Gating S1 on a suite
-that is blind to it would let a real regression pass and a real win go unseen.
-`tests/bench/nestjoin.c` proves the mechanism but is a nested loop, not the
-interpreter shape that carries sqlite's cost.
+**The suite could not see the defect for two reasons, and only one was planned
+for.** The first is the one this row was written about: every geo40 kernel fits
+in the register file and spills nothing. That is now proven rather than assumed —
+the whole 35-program corpus is byte-identical across a 1000× sweep of the
+spiller's one cost constant (`MEASURED M12`), which is only possible if no
+allocation decision in any of them is pressure-bound.
 
-**Step 1 — extract the true shape.** `sqlite3VdbeExec` starts at line 93917 of
-the cached amalgamation. A naive `awk '/^}/{exit}'` stops after 267 lines on a
-nested brace; extract it properly and record: number of locals live across the
-dispatch, opcode-case count, loop nest depth inside the cases, and how many
-values are live ACROSS the switch. Those four numbers are the spec.
+**The second was the harness.** `exectime.sh` timed with `date +%s%N` — a
+nanosecond clock — and then wrote `(t1-t0)/1000000`, truncating to whole
+milliseconds, with a shell `fork` for `date` sitting between the two readings.
+On the strength of that truncation it declared everything under 5 ms
+"startup-dominated" and skipped it. **Fifteen of the thirty-five programs never
+produced an exec number at all.** The resolution was never missing from the
+machine: `clock_gettime(CLOCK_MONOTONIC)` is a vDSO read here, the counter
+behind it runs at 24 MHz (41.7 ns/tick, 0.5% run-to-run over ten million
+iterations), and the real floor — `fork`+`execve` of `/bin/true`, best of 20 —
+is **189 µs**, reproducible to the microsecond. `tests/bench/timeit.c` measures
+that floor on every run and prints it, so the cutoff is a measured number times
+a margin rather than a constant someone chose.
 
-**Step 2 — write the kernel to that spec.** A switch-dispatch interpreter: a
-`while` loop over a synthetic bytecode program, a switch with the measured number
-of cases, the measured number of VM-state locals held live across every case, and
-an inner loop in the cases that carry one. Drive it with enough bytecode to time
-cleanly at kernel scale (target ~5–50 ms under gcc, so the suite stays fast).
+What that changed, at the SAME tree:
 
-**Step 3 — ADMISSION IS CONDITIONAL.** The kernel joins the suite only if it
-reproduces the real function's ratio, **1.7–1.8× zcc/gcc**. A kernel that
-compiles to 1.0× is decorative: it proves the shape was not captured, and
-admitting it would dilute the geomean with a program that tests nothing. Iterate
-on the spec until the ratio matches, or report that the shape could not be
-reproduced and say why.
+| | old instrument | µs instrument |
+|---|---|---|
+| programs timed | 18 | **25** |
+| EXEC geomean | 0.9500 | **1.0165** |
+| worst exec | `d2_nested_loops` 1.111 | `e3_struct_byval` **2.642** |
 
-**Step 4 — re-baseline.** geo40 becomes geo41 and the headline number MOVES,
-because a program that was previously absent is now included. State the new
-baseline explicitly and never compare a post-S0 geomean against 0.9494×; they
-are different suites. This is the honest version of "widen the surface" from
-Law 3c — one program chosen because it carries a known defect, rather than 100
-chosen at random.
+⚠️ **The sub-1× reading was substantially an artifact of the skipping.**
+`e3_struct_byval` was reported as `fast` and dropped; it is 2.6× slower than
+gcc. `a2_udiv_mod`, `a3_sdiv_mod` and `a4_shift_mask` were dropped; they are
+1.11–1.14×. A geomean over the 18 programs that survived a 5 ms floor was not a
+statement about the suite. This is Law 3c's own warning arriving from an
+unexpected direction: the narrow surface was narrower than anyone had counted.
+
+**The kernel.** `tests/bench/suite/k1_vdbe_dispatch.c`, generated to the spec
+measured from `sqlite3VdbeExec` itself (8,363 lines at amalgamation line 93,917;
+**196 arms in one switch**; **42 for/while loops inside them**; brace depth 9;
+a VM-state set live across every arm; per-arm locals with mutually exclusive
+live ranges). Arms are heterogeneous by construction — integer chain,
+struct-field chasing, byte/short work, double arithmetic, compare-and-select —
+because a uniform body measures one lowering row 196 times instead of a
+dispatch.
+
+**Admission, and the honest shortfall.** Step 3 asked for 1.7–1.8×. On the
+arbiter axis it exceeds that: **exec 1.939×**. On instructions it reaches
+**1.561×** against the real function's 1.794×, with 86 zcc frame slots to gcc's
+37 (the real pair is 199/43). Seven parameter settings were swept; the
+instruction ratio plateaus at 1.5–1.6, and adding calls to the arms — VdbeExec
+is the most call-dense function in sqlite — LOWERED it, because argument
+marshalling costs gcc as much as zcc per call. The residual is heterogeneous
+hand-written code over a large frame, which a generator does not reproduce. The
+program carries the shape and the exec ratio; the last 0.23× of the instruction
+ratio lives in sqlite, where `realprog.sh` measures it.
+
+**Step 4 — the suite is re-baselined and the old numbers do not compare.**
+geo40 becomes geo41. At HEAD, 36 programs: **EXEC 1.0403 over 25 timed** (median
+1.004, worst `e3_struct_byval` 2.630, 6 above 1.1×) and **INSN 1.0421 over all
+36** (median 0.991, worst 1.724, 12 above 1.1×). Never compare either against
+0.9494×, 0.9565× or 0.9500×: those are a different program set read through a
+different instrument.
 
 ---
 
@@ -268,7 +298,9 @@ spends itself without moving the ladder. The facts:
 | sqlite file ratio | 1.1238× (173,176 / 154,097) | §1 |
 | functions in both compilers | 1.045× | §1 |
 | `ldp`/`stp` file-wide | zcc 7,266 / gcc 12,305 | S5 |
-| geo40 EXEC geomean | **0.9565×** at HEAD (18 timed, median 1.000, 0 DIVERGE) | 2026-08-27 |
+| geo40 EXEC geomean | **0.9565×** — SUPERSEDED, see §4a: 18 timed under a 5 ms floor | 2026-08-27 |
+| **geo41 EXEC geomean** | **1.0403×** (25 timed at a 189 µs floor, median 1.004, worst `e3_struct_byval` 2.630, 6 above 1.1×) | 2026-08-27 |
+| **geo41 INSN geomean** | **1.0421×** (all 36, median 0.991, worst `e3_struct_byval` 1.724, 12 above 1.1×) | 2026-08-27 |
 | geo40 INSN geomean | **1.0432×** (deterministic, all 35, worst `e3_struct_byval` 1.759×) | 2026-08-27 |
 | geo40 worst exec | `d1_switch` 1.111× | 2026-08-27 |
 | realprog total | 1.410× Apple / 2.03× Graviton | report |

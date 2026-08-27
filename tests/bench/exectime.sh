@@ -40,8 +40,24 @@ SUITE="${SUITE:-/work/tests/bench/suite}"
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 GCC="${GCC:-gcc}"
 N="${N:-5}"
-GCC_FAST=5    # gcc <this ms ⟹ wall-time unmeasurable (startup-dominated)
-ZCC_SLOW=15   # zcc >=this ms while gcc is fast ⟹ gcc-zeroed (real asymptotic gap)
+# MICROSECONDS, and the floor is MEASURED rather than assumed (2026-08-27).
+# This harness used to time with `date +%s%N` and then write `(t1-t0)/1000000`,
+# throwing the nanoseconds away, with a shell `fork` for `date` sitting between
+# the two readings; on the strength of that truncation it called everything
+# under 5 ms unmeasurable and skipped 15 of the 35 programs. `timeit` reads
+# CLOCK_MONOTONIC through the vDSO around its own fork+exec, and the floor it
+# reports for /bin/true on this box is 167 us, reproducible to the microsecond.
+# So the cutoff below is that floor times a margin, not a round number, and both
+# sides pay the same fork+exec cost — which is why the ratio is taken on the
+# time ABOVE the floor.
+TIMEIT=/tmp/geo40_timeit
+GCC_FAST_US="${GCC_FAST_US:-500}"   # gcc time ABOVE the floor, below which a ratio is not claimed
+ZCC_SLOW_US="${ZCC_SLOW_US:-15000}" # zcc >=this while gcc is at the floor ⟹ gcc-zeroed
+"$GCC" -O2 -w -o "$TIMEIT" "$(dirname "$0")/timeit.c" 2>/dev/null || {
+  echo "exectime: cannot build timeit.c"; exit 1; }
+FLOOR=$("$TIMEIT" 20 /bin/true | awk '{print $2}')
+echo "timing floor (fork+exec of /bin/true, best of 20): ${FLOOR}us"
+tmin() { "$TIMEIT" "$N" "$1" | awk -v f="$FLOOR" '{ d=$2-f; print (d>0?d:0) }'; }
 
 rows=/tmp/geo40_rows.$$; zeroed=/tmp/geo40_zeroed.$$; allinsn=/tmp/geo40_insn.$$
 zzero=/tmp/geo40_zzero.$$
@@ -50,7 +66,7 @@ skip=0; diverge=0
 
 insns() { grep -cE '^[[:space:]]+[a-z]' "$1" 2>/dev/null || echo 0; }
 
-printf "%-22s %8s %8s %8s %8s\n" program insn_r gcc_ms zcc_ms exec_r
+printf "%-22s %8s %8s %8s %8s\n" program insn_r gcc_us zcc_us exec_r
 for c in "$SUITE"/*.c; do
   b=$(basename "$c" .c)
   "$GCC" -O1 -w -o /tmp/g "$c" 2>/dev/null || { skip=$((skip+1)); continue; }
@@ -65,17 +81,10 @@ for c in "$SUITE"/*.c; do
   ir=$(awk "BEGIN{ if($gi>0) printf \"%.3f\", $zi/$gi; else print \"-\" }")
   [ "$gi" -gt 0 ] && echo "$b $ir" >> "$allinsn"
   # NOISY wall-clock ratio.
-  gmin=; zmin=
-  i=0; while [ "$i" -lt "$N" ]; do
-    t0=$(date +%s%N); /tmp/g >/dev/null 2>&1; t1=$(date +%s%N); d=$(( (t1-t0)/1000000 ))
-    { [ -z "$gmin" ] || [ "$d" -lt "$gmin" ]; } && gmin=$d
-    t0=$(date +%s%N); /tmp/z >/dev/null 2>&1; t1=$(date +%s%N); d=$(( (t1-t0)/1000000 ))
-    { [ -z "$zmin" ] || [ "$d" -lt "$zmin" ]; } && zmin=$d
-    i=$((i+1))
-  done
+  gmin=$(tmin /tmp/g); zmin=$(tmin /tmp/z)
 
-  if [ "$gmin" -lt "$GCC_FAST" ]; then
-    if [ "$zmin" -ge "$ZCC_SLOW" ]; then
+  if [ "$gmin" -lt "$GCC_FAST_US" ]; then
+    if [ "$zmin" -ge "$ZCC_SLOW_US" ]; then
       printf "%-22s %8s %8s %8d %8s\n" "$b" "$ir" "~0" "$zmin" "ZEROED"
       echo "$b $zmin $ir" >> "$zeroed"
     else
@@ -84,13 +93,25 @@ for c in "$SUITE"/*.c; do
     fi
     continue
   fi
-  if [ "$zmin" -lt "$GCC_FAST" ]; then
+  if [ "$zmin" -lt "$GCC_FAST_US" ]; then
     # The mirror of the gcc-ZEROED case: zcc killed work gcc still performs.
     printf "%-22s %8s %8d %8s %8s\n" "$b" "$ir" "$gmin" "~0" "ZCC-ZEROED"
     echo "$b $gmin $ir" >> "$zzero"
     continue
   fi
   er=$(awk "BEGIN{printf \"%.3f\", $zmin/$gmin}")
+  # ASYMPTOTIC, not constant-factor. Clause (c) of the honest-measurement patch
+  # put a zcc that killed a loop gcc keeps into its own bucket, and tested that
+  # by "zcc is under the floor". At microsecond resolution zcc is no longer
+  # UNDER the floor — `e1_recursion` reads 338,156us against 1,812us, a ratio of
+  # 0.005 — so the test has to be the RATIO, or one asymptotic win drags a
+  # geomean of two dozen constant-factor programs with it (it moved 0.95 to
+  # 0.82 the first time this ran).
+  if awk "BEGIN{exit !($er < 0.1)}"; then
+    printf "%-22s %8s %8d %8s %8s\n" "$b" "$ir" "$gmin" "$zmin" "ZCC-ZEROED"
+    echo "$b $gmin $ir" >> "$zzero"
+    continue
+  fi
   printf "%-22s %8s %8d %8d %8s\n" "$b" "$ir" "$gmin" "$zmin" "$er"
   echo "$b $er" >> "$rows"
 done
@@ -119,7 +140,7 @@ fi
 zz=$(wc -l < "$zzero" | tr -d ' ')
 if [ "$zz" -gt 0 ]; then
   echo "zcc-ZEROED (zcc killed the loop gcc-O1 keeps; asymptotic WIN, kept out of the geomean):"
-  while read -r nm ms ir; do printf "  %-20s gcc=%sms vs zcc≈0  (insn %s)\n" "$nm" "$ms" "$ir"; done < "$zzero"
+  while read -r nm ms ir; do printf "  %-20s gcc=%sus vs zcc≈0  (insn %s)\n" "$nm" "$ms" "$ir"; done < "$zzero"
 fi
 echo "(skipped $skip trivial, $diverge DIVERGE)"
 echo "PARITY = exec≈1.0 AND insn≈1.0 AND flat distribution AND gcc-zeroed bucket EMPTY."
