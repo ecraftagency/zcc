@@ -202,6 +202,23 @@ fn args_match(caller: &Func, g: &Func, args: &[Operand]) -> bool {
     args.iter().zip(&g.sig.params).all(|(a, p)| match (a, p) {
         (Operand::Val(v), PTy::S(t)) => caller.ty_of(*v) == *t,
         (Operand::Val(_), PTy::LDouble) => true,
+        // A COMPOSITE PARAMETER IS AN ADDRESS, and refusing it here refused
+        // every by-value struct in the language. C 6.9.1p9 makes a parameter a
+        // local object initialized from the argument, and HIR realizes that the
+        // way the ABI does: the caller passes the address of its copy and the
+        // callee's entry copies from it into a slot of its own. Both halves
+        // survive splicing unchanged - the callee's slots are APPENDED to the
+        // caller (`*slot += slot0`) rather than merged, so the copy still lands
+        // somewhere only the inlined body can see, and the argument is an
+        // ordinary pointer value renamed like any other.
+        //
+        // Measured on `e3_struct_byval`, which is what this refusal cost: the
+        // call could not be inlined, so a four-int struct was built in memory
+        // and reloaded to pass in x0/x1 four million times. Hand-inlining the
+        // call in the .s took it from 7,321us to 3,332us - 2.20x, and 14%
+        // FASTER than gcc -O1 - while leaving the memory round-trip in place.
+        // The round-trip is worth nothing; the call was worth everything.
+        (Operand::Val(v), PTy::Agg { .. }) => caller.ty_of(*v) == Ty::I64,
         (Operand::Imm(_), PTy::S(t)) => !t.is_float(),
         (Operand::Fimm(_), PTy::S(t)) => t.is_float(),
         _ => false,

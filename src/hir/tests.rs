@@ -478,3 +478,62 @@ fn an_alloca_size_is_extended_to_the_full_register() {
     );
     check("int main(void){char*a=(char*)__builtin_alloca(0);return a!=0;}", 1);
 }
+
+/// A BY-VALUE STRUCT ARGUMENT DOES NOT BLOCK INLINING.
+///
+/// `args_match` accepted only scalar parameters, so every function taking a
+/// composite by value was refused — the one shape where the call is most
+/// expensive, because the caller has to build the object in memory and reload
+/// it into the argument registers at every call.
+///
+/// What that cost, measured on `tests/bench/suite/e3_struct_byval.c` before any
+/// of this was written: the call could not be inlined and the program ran
+/// 7,399us against gcc -O1's 3,824us. Hand-inlining the call in the emitted `.s`
+/// — leaving the memory round-trip exactly where it was — gave 3,332us, faster
+/// than gcc. The call was the whole of the 1.93x; the memory traffic was worth
+/// nothing while the call stood.
+///
+/// C 6.9.1p9 is why splicing is sound here: a parameter is a local object
+/// initialized from the argument, HIR realizes that by passing the address of
+/// the caller's copy and having the callee copy it into a slot of its own, and
+/// `splice` appends the callee's slots to the caller rather than merging them —
+/// so the copy still lands where only the inlined body can see it.
+///
+/// NON-VACUOUS: with the `PTy::Agg` arm removed from `args_match` the call
+/// survives and the first assertion fails.
+#[test]
+fn a_by_value_struct_argument_does_not_block_inlining() {
+    let src = "struct V{ int a,b,c,d; };\n\
+               long sum(struct V v){ return (long)v.a + v.b - v.c + v.d; }\n\
+               int main(void){ long s=0; int k;\n\
+               for(k=0;k<8;k++){ struct V v; v.a=k; v.b=k&7; v.c=k%5; v.d=k&255;\n\
+               s += sum(v); }\n\
+               return (int)s; }";
+    let mut m = super::build::build(&frontend(src));
+    super::pass::run_module(&mut m);
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    let calls = main
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, super::Inst::Call { .. }))
+        .count();
+    assert_eq!(calls, 0, "the by-value struct call was not inlined");
+
+    // ⟦f⟧ = ⟦inline f⟧ over the shape, both sides of the square
+    check(src, 71);
+    // and the fences still hold: a RECURSIVE callee taking a composite is
+    // refused, because beta-reduction on a recursive term does not terminate
+    let rec = "struct V{ int a,b; };\n\
+               long go(struct V v){ if(v.a<=0) return v.b; { struct V w; w.a=v.a-1; w.b=v.b+v.a;\n\
+               return go(w); } }\n\
+               int main(void){ struct V v; v.a=5; v.b=0; return (int)go(v); }";
+    let mut r = super::build::build(&frontend(rec));
+    super::pass::run_module(&mut r);
+    let go = r.funcs.iter().find(|f| f.name == "go").unwrap();
+    assert!(
+        go.blocks.iter().flat_map(|b| b.insts.iter()).any(|i| matches!(i, super::Inst::Call { .. })),
+        "a recursive composite-argument callee was inlined into itself"
+    );
+    check(rec, 15);
+}
