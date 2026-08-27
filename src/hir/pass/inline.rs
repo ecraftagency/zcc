@@ -322,6 +322,57 @@ fn inlinable(g: &Func) -> bool {
     true
 }
 
+/// Does `g` write memory at all, ignoring the entry copies that materialize its
+/// own composite parameters?
+///
+/// This is the fence for `param_rebase` below, and it is deliberately blunt: a
+/// callee that writes nothing cannot disturb the caller's object between the
+/// copy and the reads, so no alias question arises and none is answered.
+fn writes_no_memory(g: &Func) -> bool {
+    for (bi, blk) in g.blocks.iter().enumerate() {
+        for (ii, inst) in blk.insts.iter().enumerate() {
+            match inst {
+                Inst::Store { .. } | Inst::MemSet { .. } | Inst::Call { .. } => return false,
+                Inst::MemCpy { .. } => {
+                    // the entry copies are the ones this transform is about;
+                    // any other copy is a write
+                    if !(bi == 0 && entry_param_copy(g, ii).is_some()) {
+                        return false;
+                    }
+                }
+                Inst::Intrinsic { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// If `g.blocks[0].insts[ii]` is the copy that gives composite parameter `k` its
+/// own object, return `(k, dst_slot, dst_off, len)`.
+fn entry_param_copy(g: &Func, ii: usize) -> Option<(u32, u32, i64, u64)> {
+    let Inst::MemCpy { dst: Operand::Val(d), src: Operand::Val(sv), len } = &g.blocks[0].insts[ii]
+    else {
+        return None;
+    };
+    let k = match g.values.get(*sv as usize).map(|v| v.def) {
+        Some(Def::FuncParam(k)) => k,
+        _ => return None,
+    };
+    if !matches!(g.sig.params.get(k as usize), Some(PTy::Agg { .. })) {
+        return None;
+    }
+    // its destination is a frame address of this callee
+    for inst in g.blocks[0].insts.iter() {
+        if let Inst::SlotAddr { dst, slot, off } = inst {
+            if dst == d {
+                return Some((k, *slot, *off, *len));
+            }
+        }
+    }
+    None
+}
+
 /// Replace `f.blocks[b].insts[i]` — a call to `g` — by `g`'s body.
 fn splice(f: &mut Func, b: usize, i: usize, g: &Func) {
     let (args, dst) = match &f.blocks[b].insts[i] {
@@ -343,6 +394,48 @@ fn splice(f: &mut Func, b: usize, i: usize, g: &Func) {
         f.blocks[cont as usize].params.insert(0, p);
         (d, p)
     });
+
+    // (2a) THE PARAMETER COPY, ELIDED WHERE IT IS PROVABLY POINTLESS.
+    //
+    // C 6.9.1p9 gives a composite parameter its own object, so the callee's
+    // entry copies the caller's argument into a slot of its own and reads that.
+    // Inlined, the copy survives — and in a loop it is paid every iteration.
+    // Measured on `e3_struct_byval` once the call itself was gone: 5,094us with
+    // the copy against 3,332us for a hand-edit without it, a third of the
+    // remaining time for a copy nothing can observe.
+    //
+    // It is unobservable exactly when the callee WRITES NO MEMORY: then nothing
+    // between the copy and the reads can disturb the caller's object, so the
+    // callee's own object is a duplicate that is read and discarded, and its
+    // reads can be rebased onto the caller's. No alias question is asked because
+    // the fence removes the only way one could arise.
+    //
+    // Both sides are frame addresses, so the rebase is arithmetic on offsets and
+    // needs no new instruction: a read at `off` inside the callee's object
+    // becomes a read at `src_off + (off - dst_off)` of the caller's slot.
+    let mut rebase: Vec<(u32, i64, u64, u32, i64)> = Vec::new();
+    let mut skip: Vec<usize> = Vec::new();
+    if writes_no_memory(g) {
+        for ii in 0..g.blocks[0].insts.len() {
+            let Some((k, dslot, doff, len)) = entry_param_copy(g, ii) else { continue };
+            // the caller's argument must itself be a frame address, or there is
+            // nothing to rebase onto
+            let Operand::Val(av) = args[k as usize] else { continue };
+            let mut src = None;
+            for blk in f.blocks.iter() {
+                for inst in blk.insts.iter() {
+                    if let Inst::SlotAddr { dst, slot, off } = inst {
+                        if *dst == av {
+                            src = Some((*slot, *off));
+                        }
+                    }
+                }
+            }
+            let Some((sslot, soff)) = src else { continue };
+            rebase.push((dslot, doff, len, sslot, soff));
+            skip.push(ii);
+        }
+    }
 
     // (2) clone the callee's slots and values
     let slot0 = f.slots.len() as u32;
@@ -373,11 +466,14 @@ fn splice(f: &mut Func, b: usize, i: usize, g: &Func) {
     };
 
     // (3) clone the blocks
-    for gb in &g.blocks {
+    for (gbi, gb) in g.blocks.iter().enumerate() {
         let nb = f.new_block();
         f.blocks[nb as usize].weight = gb.weight;
         let mut insts = Vec::with_capacity(gb.insts.len());
-        for inst in &gb.insts {
+        for (gii, inst) in gb.insts.iter().enumerate() {
+            if gbi == 0 && skip.contains(&gii) {
+                continue;
+            }
             let mut c = inst.clone();
             c.uses_mut(|o| *o = sub(*o));
             match &mut c {
@@ -397,8 +493,18 @@ fn splice(f: &mut Func, b: usize, i: usize, g: &Func) {
                 }
                 Inst::Store { .. } | Inst::MemCpy { .. } | Inst::MemSet { .. } => {}
             }
-            if let Inst::SlotAddr { slot, .. } = &mut c {
-                *slot += slot0;
+            if let Inst::SlotAddr { slot, off, .. } = &mut c {
+                match rebase
+                    .iter()
+                    .find(|(ds, dof, len, ..)| *slot == *ds && *off >= *dof && *off < *dof + *len as i64)
+                {
+                    Some((_, dof, _, ss, sof)) => {
+                        let d = *off - *dof;
+                        *slot = *ss;
+                        *off = *sof + d;
+                    }
+                    None => *slot += slot0,
+                }
             }
             insts.push(c);
         }
