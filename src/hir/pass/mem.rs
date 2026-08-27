@@ -65,7 +65,22 @@ enum Loc {
     Ptr(ValueId, i64),
 }
 
-fn disjoint(a: &(Loc, u32), b: &(Loc, u32)) -> bool {
+/// R5.2 — TYPE FIRST, THEN ADDRESS. C99 6.5p7 says an object's value may be
+/// accessed only through an lvalue of a compatible type, an aggregate containing
+/// one, or a character type (`hir::aclass_of` is that paragraph read as a
+/// partition). Two accesses carrying different classes, neither of them ANY,
+/// therefore cannot name one object however their addresses are computed —
+/// including the case this oracle is otherwise blind to, two unrelated pointers.
+///
+/// The soundness obligation runs one way only: declaring DISJOINT what is not is
+/// a miscompile, while declaring may-alias what is not merely costs a transform.
+/// So ANY on either side answers "may alias" without looking, and every access
+/// the frontend cannot type — a character access, a union member, an aggregate,
+/// `va_arg`'s bookkeeping, an `asm` operand — carries ANY.
+fn disjoint(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
+    if a.2 != ACLASS_ANY && b.2 != ACLASS_ANY && a.2 != b.2 {
+        return true;
+    }
     match (&a.0, &b.0) {
         (Loc::Slot(s1, o1), Loc::Slot(s2, o2)) => {
             s1 != s2 || o1 + a.1 as i64 <= *o2 || o2 + b.1 as i64 <= *o1
@@ -81,14 +96,14 @@ fn disjoint(a: &(Loc, u32), b: &(Loc, u32)) -> bool {
     }
 }
 
-fn same(a: &(Loc, u32), b: &(Loc, u32)) -> bool {
+fn same(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
     a.1 == b.1 && a.0 == b.0
 }
 
 /// What memory is known to hold: the location, the type it was accessed at, the
 /// value, and — for a store — its instruction index, so a later store that makes
 /// it invisible can delete it.
-type Avail = Vec<((Loc, u32), Ty, Operand, Option<usize>)>;
+type Avail = Vec<((Loc, u32, AClass), Ty, Operand, Option<usize>)>;
 
 /// THEORY A7b  SQUARE a_second_read_of_the_same_place_is_the_first — the alias oracle
 pub fn run(f: &mut Func) -> bool {
@@ -103,11 +118,12 @@ pub fn run(f: &mut Func) -> bool {
             }
         }
     }
-    let loc_of = |o: Operand, ty: Ty| -> Option<(Loc, u32)> {
+    let loc_of = |o: Operand, ty: Ty, ac: AClass| -> Option<(Loc, u32, AClass)> {
         match o {
             Operand::Val(v) => Some((
                 addr[v as usize].clone().unwrap_or(Loc::Ptr(v, 0)),
                 ty.bytes(),
+                ac,
             )),
             _ => None,
         }
@@ -138,8 +154,8 @@ pub fn run(f: &mut Func) -> bool {
         };
         for i in 0..f.blocks[b].insts.len() {
             match f.blocks[b].insts[i].clone() {
-                Inst::Load { dst, ty, addr: a, vol: false, .. } => {
-                    let key = match loc_of(a, ty) {
+                Inst::Load { dst, ty, addr: a, aclass, vol: false } => {
+                    let key = match loc_of(a, ty, aclass) {
                         Some(k) => k,
                         // an address the oracle cannot name may be anything
                         None => {
@@ -169,8 +185,8 @@ pub fn run(f: &mut Func) -> bool {
                         None => avail.push((key, ty, Operand::Val(dst), None)),
                     }
                 }
-                Inst::Store { ty, addr: a, val, vol: false, .. } => {
-                    let key = match loc_of(a, ty) {
+                Inst::Store { ty, addr: a, val, aclass, vol: false } => {
+                    let key = match loc_of(a, ty, aclass) {
                         Some(k) => k,
                         None => {
                             avail.clear();

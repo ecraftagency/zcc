@@ -194,22 +194,66 @@ impl<'a> B<'a> {
         self.bin(BinOp::Add, Ty::I64, a, Operand::Imm(k))
     }
     fn load(&mut self, ty: Ty, addr: Operand, vol: bool) -> Operand {
+        self.load_ac(ty, addr, vol, ACLASS_ANY)
+    }
+    fn store(&mut self, ty: Ty, addr: Operand, val: Operand, vol: bool) {
+        self.store_ac(ty, addr, val, vol, ACLASS_ANY)
+    }
+    /// The same access, carrying the C99 6.5p7 class of the lvalue it came from.
+    /// `load`/`store` above are the callers that have no lvalue to ask — a
+    /// struct copy's element walk, `va_arg`'s own bookkeeping, an `asm` operand —
+    /// and they say so by stamping ANY.
+    fn load_ac(&mut self, ty: Ty, addr: Operand, vol: bool, aclass: AClass) -> Operand {
         self.def(ty, |dst| Inst::Load {
             dst,
             ty,
             addr,
-            aclass: ACLASS_ANY,
+            aclass,
             vol,
         })
     }
-    fn store(&mut self, ty: Ty, addr: Operand, val: Operand, vol: bool) {
+    fn store_ac(&mut self, ty: Ty, addr: Operand, val: Operand, vol: bool, aclass: AClass) {
         self.push(Inst::Store {
             ty,
             addr,
             val,
-            aclass: ACLASS_ANY,
+            aclass,
             vol,
         });
+    }
+
+    /// The alias class of an access to the lvalue `n`, typed `ty`.
+    ///
+    /// UNIONS ARE THE EXCEPTION, and they are the reason this takes a node and
+    /// not only a type. C99 6.5p7 permits an access through "an aggregate or
+    /// union type that includes one of the aforementioned types among its
+    /// members", and reading a union member other than the one last stored is
+    /// the idiom the committee softened rather than outlawed (6.5.2.3 and TC3's
+    /// footnote 82). A compiler that gave `u.i` and `u.f` different classes
+    /// would reorder the two accesses that punning depends on. So an access
+    /// reached through ANY union member on its path is `ACLASS_ANY`.
+    fn aclass(&self, n: NodeId, ty: TypeId) -> AClass {
+        if !crate::hir::tbaa_wanted() {
+            return ACLASS_ANY;
+        }
+        let mut cur = n;
+        loop {
+            match self.node(cur) {
+                Node::Member(base, _) => {
+                    let bt = self.ty(*base);
+                    if let crate::ast::Ty::Struct(s) = self.tt().tys[bt as usize] {
+                        if self.tt().structs[s as usize].is_union {
+                            return ACLASS_ANY;
+                        }
+                    }
+                    cur = *base;
+                }
+                // A `Deref` ends the walk: what the pointer points into is not
+                // knowable here, and the class of the access is the class of the
+                // type it is made at, which is what 6.5p7 speaks about.
+                _ => return crate::hir::aclass_of(self.tt(), ty),
+            }
+        }
     }
 
     // ── bit-fields (C99 6.7.2.1) ───────────────────────────────────────────
@@ -846,7 +890,8 @@ impl<'a> B<'a> {
                 if scalar(self.tt(), nty) {
                     let t = self.hty(n);
                     let vol = self.tt().is_volatile(nty);
-                    self.load(t, a, vol)
+                    let ac = self.aclass(n, nty);
+                    self.load_ac(t, a, vol, ac)
                 } else {
                     a
                 }
@@ -1067,7 +1112,8 @@ impl<'a> B<'a> {
             self.ld_store(a, v);
             return v;
         }
-        self.store(t, a, v, vol);
+        let ac = self.aclass(l, lty);
+        self.store_ac(t, a, v, vol, ac);
         v
     }
 
@@ -1294,10 +1340,11 @@ impl<'a> B<'a> {
         let a = self.addr(lv);
         let bf = self.bf_of(lty);
         let ld = self.is_ld(lty);
+        let ac = self.aclass(lv, lty);
         let old = match bf {
             Some(bf) => self.bf_load(a, bf, vol),
             None if ld => self.ld_load(a),
-            None => self.load(t, a, vol),
+            None => self.load_ac(t, a, vol, ac),
         };
         // C99 6.5.2.4: x++ is x = x + 1 with the usual promotion, then the
         // conversion back — which keeps the HIR "no narrow arithmetic" invariant.
@@ -1326,7 +1373,7 @@ impl<'a> B<'a> {
                 self.bf_store(a, bf, new, vol);
             }
             None if ld => self.ld_store(a, new),
-            None => self.store(t, a, new, vol),
+            None => self.store_ac(t, a, new, vol, ac),
         }
         old
     }

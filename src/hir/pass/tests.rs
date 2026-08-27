@@ -1672,3 +1672,63 @@ fn countdown_refuses_an_index_shared_with_a_sibling_header_phi() {
         (x, y) => panic!("⟦f⟧={:?} ⟦countdown f⟧={:?} want 420", x, y),
     }
 }
+
+// ── R5.2 TBAA ──────────────────────────────────────────────────────────────
+
+/// The same program built with the alias classes stamped, and without.
+fn tbaa_module(src: &str, on: bool) -> Module {
+    crate::hir::set_tbaa(Some(on));
+    let m = module(src, true);
+    crate::hir::set_tbaa(None);
+    m
+}
+
+fn loads(f: &Func) -> usize {
+    count(f, |i| matches!(i, Inst::Load { .. }))
+}
+
+/// EFFECT (2). Two pointers of incompatible type cannot name one object (C99
+/// 6.5p7), so the store through the `float *` cannot be what the `int *` reads —
+/// and the reload after it is redundant. The address oracle alone cannot see
+/// this: both locations are `Loc::Ptr` of unrelated values, which is the one
+/// case it answers "may alias" to.
+#[test]
+fn tbaa_disambiguates_two_incompatible_pointers() {
+    let src = "int tb(int *p,float *q,int v){*p=v;*q=1.0f;return *p;}\
+               int main(void){int a;float b;return tb(&a,&b,7);}";
+    let off = loads(func(&tbaa_module(src, false), "tb"));
+    let on = loads(func(&tbaa_module(src, true), "tb"));
+    assert!(on < off, "the class was stamped but nothing read it: {} -> {}", off, on);
+}
+
+/// SOUNDNESS (1), the direction that matters. A CHARACTER type may access any
+/// object (6.5p7's last bullet), so a `char *` store must keep killing the
+/// available `int` — and `main` here passes the SAME object under both names, so
+/// a wrong answer is a wrong answer and not a technicality.
+#[test]
+fn tbaa_keeps_a_character_access_aliasing_everything() {
+    let src = "int cb(int *p,char *q){*p=258;*q=0;return *p;}\
+               int main(void){int a=0;return cb(&a,(char*)&a);}";
+    let off = loads(func(&tbaa_module(src, false), "cb"));
+    let on = loads(func(&tbaa_module(src, true), "cb"));
+    assert_eq!(on, off, "a char access stopped aliasing: {} -> {}", off, on);
+    crate::hir::set_tbaa(Some(true));
+    square(src, 256);
+    crate::hir::set_tbaa(None);
+}
+
+/// SOUNDNESS (1) — THE UNION. Reading a member other than the one last stored is
+/// the idiom C99 softened rather than outlawed (6.5.2.3, TC3 footnote 82), so an
+/// access reached through a union member carries ANY however well-typed it looks.
+/// Here `u->i` is read after `u->f` overwrote it: disambiguating the two would
+/// forward the dead `5` and return it.
+#[test]
+fn tbaa_refuses_to_disambiguate_through_a_union() {
+    let src = "union U{int i;float f;};\
+               int pun(union U *u){u->i=5;u->f=2.0f;return u->i;}\
+               int main(void){union U u;return pun(&u);}";
+    crate::hir::set_tbaa(Some(true));
+    // 2.0f is 0x40000000 read back as an int
+    square(src, 1073741824);
+    crate::hir::set_tbaa(None);
+}

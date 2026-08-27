@@ -183,13 +183,79 @@ pub enum CvtOp {
     Bitcast,
 }
 
-/// C99 6.5p7 effective-type alias class. 0 = "may alias anything" (the only class
-/// R0/R1 produce). The field is carried from day one because retrofitting an
-/// alias tag through every load/store later is expensive; TBAA (REARCH §16 ★1)
-/// is the pass that will finally read it.
+/// C99 6.5p7 effective-type alias class. 0 = "may alias anything". The field was
+/// carried from day one because retrofitting an alias tag through every
+/// load/store later is expensive; R5.2 is what finally stamps and reads it.
 pub type AClass = u32;
 /// THEORY A6 — HIR's alias-class sentinel
 pub const ACLASS_ANY: AClass = 0;
+
+/// THE ALIAS LATTICE, and it is C99 6.5p7 read as a partition rather than as a
+/// list of permissions. The paragraph says an object's stored value may be
+/// accessed only through an lvalue of: the object's own effective type, a
+/// signed/unsigned or qualified variant of it, an aggregate or union containing
+/// it, or a CHARACTER type. Everything it does not permit is undefined, which is
+/// exactly the licence an alias oracle needs: two accesses whose types the
+/// paragraph never lets name one object cannot name one object.
+///
+/// So the classes are the equivalence classes of "compatible up to signedness",
+/// and the two escape hatches from the paragraph are what keeps this sound:
+///
+///   * A CHARACTER TYPE aliases everything, so `char`, `signed char`,
+///     `unsigned char` — and, conservatively, `_Bool` and every non-scalar — are
+///     `ACLASS_ANY`, which the oracle treats as may-alias against every class
+///     including itself.
+///   * AN AGGREGATE CONTAINING THE TYPE aliases its members, so a struct or
+///     union access is `ACLASS_ANY` as well. `build` additionally stamps ANY on
+///     any access reached THROUGH a union member, because the union case is the
+///     one where real C99 programs read a member other than the one last stored
+///     (6.5.2.3, and TC3's footnote), and a compiler that disambiguated there
+///     would break working code to enforce a rule the committee itself softened.
+///
+/// Pointers share one class rather than splitting by pointee: `int *` and
+/// `char *` are incompatible types, so splitting would be legal, but one class
+/// for all of them is the conservative direction and costs only precision.
+///
+/// The numbers are labels, not measurements: what matters is that two types get
+/// the same number exactly when 6.5p7 lets one name the other's object.
+pub fn aclass_of(tt: &crate::ast::TyTab, t: crate::ast::TypeId) -> AClass {
+    use crate::ast::Ty as T;
+    match tt.tys[t as usize] {
+        T::Short | T::UShort => 1,
+        T::Int | T::UInt => 2,
+        T::Long | T::ULong => 3,
+        T::Float => 4,
+        T::Double => 5,
+        T::LDouble => 6,
+        T::Ptr(_) => 7,
+        // char family (aliases anything), _Bool, and every aggregate
+        _ => ACLASS_ANY,
+    }
+}
+
+/// R5.2's A/B SEAM (`ZCC_TBAA`). Off, every access is stamped `ACLASS_ANY` and
+/// the oracle is exactly the pre-R5.2 one — which the byte-identical gate checks.
+/// A thread-local overlay over the environment, for the reason `spill.rs`'s seams
+/// are thread-locals: the battery runs its tests in parallel threads.
+pub fn tbaa_wanted() -> bool {
+    TBAA.with(|c| c.get()).unwrap_or_else(|| {
+        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENV.get_or_init(|| std::env::var_os("ZCC_TBAA").is_some())
+    })
+}
+
+thread_local! {
+    // THEORY A7b — instrument half: the switch a test flips to measure that the
+    // oracle actually disambiguated something (the non-vacuity obligation).
+    static TBAA: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force TBAA on or off for the CURRENT THREAD, or hand it back to the
+/// environment with `None`.
+#[cfg(test)]
+pub fn set_tbaa(on: Option<bool>) {
+    TBAA.with(|c| c.set(on));
+}
 
 // ── instructions ───────────────────────────────────────────────────────────
 #[derive(Clone, Debug)]
