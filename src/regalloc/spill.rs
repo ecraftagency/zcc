@@ -1241,8 +1241,14 @@ fn simulate(
                 if cl == Class::Flags {
                     continue;
                 }
-                // pruning: it must remove a read
-                if next_use(&uses, lv.sp.idx(Reg::V(v)), head) == usize::MAX {
+                // pruning: it must remove a read — asked of the TRACE, for the
+                // two reasons S1 records. A read AT the head is the read this
+                // phi removes, and the static query looks strictly after it; and
+                // a value read only across the back edge answers `usize::MAX` in
+                // reverse postorder, which is how the loop-invariant pointer of
+                // `nestjoin.c` was refused a register and reloaded four million
+                // times while its phi was available and free.
+                if trace.next_use(v, bi, head) == usize::MAX {
                     continue;
                 }
                 // A predecessor the round has not simulated can only be believed

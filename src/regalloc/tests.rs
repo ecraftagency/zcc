@@ -1460,18 +1460,27 @@ fn eviction_ranks_by_dynamic_distance_not_text_order() {
     let deepest = *lf.depth.iter().max().unwrap();
     assert!(deepest >= 2, "the fixture lost its inner loop; nothing is being tested");
     use crate::mir::MInst;
-    let traffic: usize = (0..f.blocks.len())
-        .filter(|&b| lf.depth[b] == deepest)
-        .map(|b| {
-            f.blocks[b]
-                .insts
-                .iter()
-                .filter(|i| matches!(i, MInst::Spill { .. } | MInst::Reload { .. }))
-                .count()
-        })
-        .sum();
+    let count = |f: &crate::mir::MFunc, pred: fn(&MInst) -> bool| -> usize {
+        (0..f.blocks.len())
+            .filter(|&b| lf.depth[b] == deepest)
+            .map(|b| f.blocks[b].insts.iter().filter(|i| pred(i)).count())
+            .sum()
+    };
+    let reloads = count(f, |i| matches!(i, MInst::Reload { .. }));
+    let traffic = reloads + count(f, |i| matches!(i, MInst::Spill { .. }));
+    // A RELOAD in the innermost loop is the expensive kind: it stands in front of
+    // the use, so it lengthens the dependence chain the loop runs four million
+    // times (Law 3c). The loop's pointer is invariant — one reload before the
+    // loop serves every iteration — and refusing it a register cost `nestjoin.c`
+    // its whole remaining gap: 12 ms against gcc's 11 on the 36-million-iteration
+    // form, 11 ms once the phi that carries it was allowed to exist.
+    assert_eq!(
+        reloads, 0,
+        "the innermost loop reloads {} value(s) every iteration",
+        reloads
+    );
     assert!(
-        traffic <= 2,
+        traffic <= 1,
         "the innermost loop carries {} frame instructions: the hot values lost to the cold ones again",
         traffic
     );
