@@ -2040,17 +2040,46 @@ impl<'a> L<'a> {
         }
         let lo = arms.iter().map(|(k, _)| *k).min()?;
         let hi = arms.iter().map(|(k, _)| *k).max()?;
+        let span_check = hi.checked_sub(lo)?.checked_add(1)?;
+        if span_check > (arms.len() as i64).checked_mul(2)? || span_check > 4096 {
+            return None;
+        }
         let span = hi.checked_sub(lo)?.checked_add(1)?;
         if span > (arms.len() as i64).checked_mul(2)? || span > 4096 {
             return None;
         }
-        // An arm that carries edge ARGUMENTS cannot be reached through a table:
-        // there is nowhere to put the copies. `destruct::split_critical_edges`
-        // would give each one its own block, but it runs later — so for now such
-        // a switch keeps its compare chain.
-        if arms.iter().any(|(_, t)| !t.args.is_empty()) || !dflt.args.is_empty() {
+        // AN ARM THAT CARRIES EDGE ARGUMENTS GETS A TRAMPOLINE.
+        //
+        // A table entry is an address, so it has nowhere to put an edge's
+        // copies, and this used to refuse the whole switch on that ground. What
+        // it refused, measured: sqlite's `sqlite3VdbeExec` dispatches 196
+        // opcodes, EVERY arm carries edge arguments because values are live
+        // across the switch, so the table never fired and the dispatch became a
+        // LINEAR COMPARE CHAIN — 183 `cmp`/`b.eq` pairs over 187 distinct
+        // opcode constants, walked about ninety deep on average, roughly 1.4
+        // million times in a 100,000-row INSERT. gcc spends one indirect branch.
+        // That function carries 85% of sqlite's runtime gap (`MEASURED M16`).
+        //
+        // The fix is the block the comment already named: give the arm its own
+        // block, put the edge there, and let the table point at THAT. The
+        // trampoline is one `b` on the taken path — against ninety compares —
+        // and the copies it carries are the ones the edge always had.
+        if !dflt.args.is_empty() {
             return None;
         }
+        let arms: Vec<(i64, MTarget)> = arms
+            .iter()
+            .map(|(k, t)| {
+                let mt = self.target(t);
+                if mt.args.is_empty() {
+                    (*k, mt)
+                } else {
+                    let tb = self.f.new_block();
+                    self.f.blocks[tb as usize].term = MTerm::B(mt);
+                    (*k, MTarget { block: tb, args: vec![] })
+                }
+            })
+            .collect();
         let w = wid(ty);
         // `v - lo`, then the unsigned range test against the span. A 32-bit `sub`
         // zeroes bits 63:32 (DDI 0487 B1.2.1), so its result is already the
@@ -2090,8 +2119,8 @@ impl<'a> L<'a> {
             MTarget { block: body, args: vec![] },
         );
         let mut table: Vec<MTarget> = vec![dflt.clone(); span as usize];
-        for (k, t) in arms {
-            table[(k - lo) as usize] = self.target(t);
+        for (k, t) in &arms {
+            table[(k - lo) as usize] = t.clone();
         }
         self.f.blocks[body as usize].term = MTerm::Switch {
             idx,
