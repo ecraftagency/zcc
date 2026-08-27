@@ -722,3 +722,66 @@ to a defect. The histogram of that function (`xray.sh`) named classes — `mov`
 were each refuted at ~1%. What worked was narrowing the window to what the
 workload actually executes (`EXPLAIN`) and then counting ONE mnemonic (`br`) in
 both assemblies.
+
+
+---
+
+## M17. The pass audit — which passes pay, which refuse, which are dead weight
+
+**METHOD.** `ZCC_NOPASS=<name>` disables one pass. Compile sqlite with each
+disabled in turn and compare: a pass whose removal costs nothing is a pass that
+is refusing everything, and a pass whose removal SHRINKS the program is buying
+its size with something else — or with nothing. No instrumentation is needed;
+the bisection tool already in the tree answers it.
+
+**SIZE, sqlite (baseline 173,611 instructions):**
+
+| pass | instructions if removed |
+|---|---|
+| `sroa` | **+18,635** |
+| `gvn` | +9,728 |
+| `cfg` | +6,706 |
+| `mem` | +3,122 |
+| `ifconv` | +1,424 |
+| `sccp` | +645 |
+| `purecall` | **0 — inert on this program** |
+| `iv` | −944 |
+| `inline` | −1,980 |
+| `licm` | −1,998 |
+| `rotate` | **−4,786** |
+
+**SPEED, `p01_insert`.** Four passes cost size, so the question is what they buy:
+
+| disabled | speed |
+|---|---|
+| `inline` | **+7.7% slower** — it earns its size |
+| `rotate`, `licm`, `iv` together | **−0.2% to −1.1%** — noise |
+
+**THE FINDING.** `rotate`, `licm` and `iv` add **7,728 instructions to sqlite —
+4.5% of it — for no measurable speed.** And they are not optional: disabling them
+on the 42-program taxonomy suite takes EXEC from **1.0206 to 1.4236**, with
+`l2_nested_join` at **10.889×** and 26 of 42 programs above 1.1×. They are worth
+40% of execution on loop code.
+
+So this is not a deletion, it is a **missing profitability gate**: three loop
+passes that pay enormously on loops and inflate everything else. The row is to
+make them decline a transform that cannot pay, not to switch them off.
+
+**A SECOND FINDING, smaller.** `purecall` changes sqlite by zero instructions —
+it fires nowhere in 173,611 instructions of real C. Either its precondition is
+too narrow or the shape does not occur outside the suite; it should be measured
+before it is trusted.
+
+**⚠️ WHAT THIS ENTRY IS NOT.** Removal cost is not the same as value: a pass can
+be worth nothing on its own and load-bearing in combination (its output feeding
+another's precondition). These numbers rank suspicion, not merit.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation,
+`p01_insert` in memory, best-of-7.
+
+**WHY IT WAS RUN.** Three of the four rows shipped on 2026-08-27 were an
+EXISTING pass refusing a common shape — `args_match` refusing composite
+parameters (2.2× on one program), `ifconv` requiring exactly two join
+predecessors (12.5%), and the jump table refusing arms with edge arguments (30%
+of sqlite). None was a missing optimization. The audit exists to find the next
+one by measurement instead of by accident.
