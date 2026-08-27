@@ -320,7 +320,7 @@ pub fn spill_with(
                 prev_exit = vec![Vec::new(); f.blocks.len()];
             }
             let lv = live::compute(f, &cfg);
-            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web)? {
+            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat)? {
                 Sim::Plan(p) => {
                     // SPEND A ROUND ONLY IF IT CAN BUY SOMETHING. The seeding is
                     // worth another walk while it is still finding NEW block
@@ -900,6 +900,10 @@ fn simulate(
     // that is the granularity at which it is PAID (`Sim::More` retires a whole
     // web to memory, § below)
     web: &[VReg],
+    // values whose producer reads no register: restoring one costs a single
+    // instruction and no memory traffic, which is what the eviction ranking
+    // below weighs against Belady's distance
+    remat: &BTreeMap<VReg, MInst>,
 ) -> Result<Sim, String> {
     let depth = &lf.depth;
     let reconstruct = RECONSTRUCT.with(|c| c.get()) >= 1;
@@ -1588,7 +1592,30 @@ fn simulate(
                         .filter(|(_, r)| r.class == c && !pinned.contains(&r.v))
                         .filter(|(_, r)| !over_cross || r.cross)
                         .filter(|(_, r)| !(over_plain && !over_cross && !over_k) || !r.cross)
-                        .max_by_key(|(_, r)| trace.next_use(r.v, bi, at))
+                        // DISTANCE IS NOT COST. Belady's rule — evict the value
+                        // whose next read is furthest away — is exactly right when
+                        // every victim costs the same to bring back. A
+                        // rematerializable value does not: its producer reads no
+                        // register, so restoring it is ONE instruction, no slot and
+                        // no memory traffic, while every other victim pays a store
+                        // and a load. Ranking the two by distance alone spends a
+                        // register on the cheap value and evicts the dear one.
+                        //
+                        // csmith c6837 is the case that names it. `v1106` is a
+                        // `SlotAddr` (`add xN, sp, #imm`) read twenty-odd times
+                        // across a 600-instruction block, so its next read is always
+                        // near and it never loses a distance contest — while holding
+                        // one of the ten callee-saved registers, because it is live
+                        // across a call. The colourer then cannot colour it, the
+                        // caller forces values to memory and retries, and 168 rounds
+                        // later the compile fails outright. The value that could
+                        // have been rebuilt for one `add` is the one that was kept.
+                        //
+                        // So the key is (rematerializable, distance): a free victim
+                        // outranks every paying one, and among equals Belady still
+                        // decides. This is Law 3c's dual for the allocator — a
+                        // decision is judged by what it COSTS, not by a count.
+                        .max_by_key(|(_, r)| (remat.contains_key(&r.v), trace.next_use(r.v, bi, at)))
                         .map(|(j, r)| (j, *r));
                     match pick {
                         Some((j, r)) => {
