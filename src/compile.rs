@@ -158,5 +158,6 @@ pub fn finish(m: &mut crate::mir::MModule) {
             crate::mir::pass::layout::run(f);
             crate::mir::pass::layout::drop_dead_copies(f);
         }
+        crate::mir::pass::ldstp::residual_report();
     });
 }

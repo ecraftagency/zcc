@@ -55,12 +55,131 @@ pub fn run(f: &mut MFunc) {
                 Some((j, p)) => {
                     taken[j] = true;
                     out.push(p);
+                    PAIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                None => out.push(insts[i].clone()),
+                None => {
+                    residual(&offs, &insts, &taken, i);
+                    out.push(insts[i].clone());
+                }
             }
         }
         b.insts = out;
     }
+}
+
+/// LAW 4 — the residual of this theorem, measured rather than assumed.
+///
+/// An access left unpaired is one of two things: a FUNDAMENTAL limit (no
+/// partner exists, or the paired form cannot encode the displacement) or a
+/// CONVENIENCE truncation (a partner exists and something about how this pass
+/// looks refused it). The row is exhausted only when the second set is empty,
+/// so it is counted rather than argued about. `ZCC_LDSTP=1` prints the split.
+/// MEASURED M15 — the instrument, not a resource constant
+static PAIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M15 — the instrument, not a resource constant
+static NO_PARTNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M15 — the instrument, not a resource constant
+static OUT_OF_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M15 — the instrument, not a resource constant
+static BLOCKED_MOTION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M15 — the instrument, not a resource constant
+static BACKWARD_ONLY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M15 — the instrument, not a resource constant
+static LAYOUT_COULD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Same direction and same transfer width — the two things a paired form needs
+/// beyond adjacency, so "a layout could have paired these" is not claimed for a
+/// load next to a store.
+fn same_shape(a: &MInst, b: &MInst) -> bool {
+    let shape = |m: &MInst| match m {
+        MInst::Load { op, .. } => Some((true, op.bytes())),
+        MInst::Store { op, .. } => Some((false, op.bytes())),
+        MInst::Reload { w, .. } => Some((true, w.bytes())),
+        MInst::Spill { w, .. } => Some((false, w.bytes())),
+        _ => None,
+    };
+    match (shape(a), shape(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn wanted() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var_os("ZCC_LDSTP").is_some())
+}
+
+/// Why did `insts[i]` not pair? Looks far past `WINDOW` on purpose: the point is
+/// to separate "no partner exists" from "a partner exists and this pass did not
+/// reach it".
+fn residual(offs: &[i32], insts: &[MInst], taken: &[bool], i: usize) {
+    if !wanted() || !matches!(insts[i], MInst::Load { .. } | MInst::Store { .. } | MInst::Reload { .. } | MInst::Spill { .. }) {
+        return;
+    }
+    let far = 200usize;
+    // forward: a partner AFTER i, beyond the window
+    let mut fwd = None;
+    let hi = (i + far).min(insts.len().saturating_sub(1));
+    for j in (i + 1)..=hi {
+        if !taken[j] && fuse(offs, &insts[i], &insts[j]).is_some() {
+            fwd = Some(j);
+            break;
+        }
+    }
+    // backward: a partner BEFORE i and FARTHER than the window, so it is out of
+    // reach by construction rather than by encoding — this pass only ever moves
+    // the SECOND access back to the first. A nearer backward partner is the SAME
+    // event already counted at that partner's own turn, so it is not counted
+    // twice.
+    let mut back = false;
+    let lo = i.saturating_sub(far);
+    for j in lo..i.saturating_sub(WINDOW) {
+        if !taken[j] && fuse(offs, &insts[j], &insts[i]).is_some() {
+            back = true;
+            break;
+        }
+    }
+    // ADJACENT IN TIME, NOT IN ADDRESS. The pairable-ness of two accesses is a
+    // property of the FRAME LAYOUT, not only of the schedule: two frame accesses
+    // standing next to each other that name different, non-adjacent slots could
+    // have been paired if the slots had been laid out together. This counts the
+    // opportunity a layout row would have; it is an upper bound, since making
+    // one pair adjacent may break another.
+    let near_frame = frame_range(offs, &insts[i]).is_some()
+        && ((i + 1)..=(i + WINDOW).min(insts.len().saturating_sub(1))).any(|j| {
+            !taken[j]
+                && frame_range(offs, &insts[j]).is_some()
+                && fuse(offs, &insts[i], &insts[j]).is_none()
+                && same_shape(&insts[i], &insts[j])
+        });
+    use std::sync::atomic::Ordering::Relaxed;
+    match fwd {
+        None if back => { BACKWARD_ONLY.fetch_add(1, Relaxed); }
+        None => {
+            NO_PARTNER.fetch_add(1, Relaxed);
+            if near_frame {
+                LAYOUT_COULD.fetch_add(1, Relaxed);
+            }
+        }
+        Some(j) if j > i + WINDOW => { OUT_OF_WINDOW.fetch_add(1, Relaxed); }
+        Some(_) => { BLOCKED_MOTION.fetch_add(1, Relaxed); }
+    }
+}
+
+pub fn residual_report() {
+    if !wanted() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!(
+        "[ldstp] paired={} | unpaired: no-partner={} (of which {} sit NEXT TO another frame access of the same shape — a LAYOUT could pair them) out-of-window={} motion-blocked={} partner-is-BEHIND={}",
+        PAIRED.load(Relaxed),
+        NO_PARTNER.load(Relaxed),
+        LAYOUT_COULD.load(Relaxed),
+        OUT_OF_WINDOW.load(Relaxed),
+        BLOCKED_MOTION.load(Relaxed),
+        BACKWARD_ONLY.load(Relaxed),
+    );
 }
 
 /// May `y` be moved back across everything in `between`?

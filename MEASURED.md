@@ -586,3 +586,50 @@ and small aggregates to live in registers (SROA) — neither is this row.
 **WHAT USES IT.** `isel/lower.rs::copy_inline`, reached from `Inst::MemCpy`.
 The expansion emits two loads then two stores per sixteen bytes so that
 `mir/pass/ldstp.rs` sees adjacent same-kind accesses and fuses them.
+
+---
+
+## M15. The `ldp`/`stp` residual, and why the layout cannot collect it
+
+**VALUE.** On sqlite, `ZCC_LDSTP=1`:
+
+```
+paired=7616 | unpaired: no-partner=44137 (of which 3020 sit NEXT TO another
+frame access of the same shape — a LAYOUT could pair them)
+out-of-window=123  motion-blocked=886  partner-is-BEHIND=126
+```
+
+gcc -O1 emits 12,637 pairs to zcc's 7,616. This is the Law-4 residual of the
+pairing theorem, classified: 41,117 accesses have no partner at any distance and
+are a FUNDAMENTAL limit; 1,135 are convenience truncations of how this pass
+looks (window, motion rule, direction); and 3,020 are refused only because the
+two slots are not neighbours in the frame.
+
+**THE 3,020 IS AN UPPER BOUND ON AN UPPER BOUND, and it was tested.** Two
+orderings of the spill group were built and measured against the creation order
+that §13o leaves in place:
+
+| spill-slot order | pairs | sqlite instructions |
+|---|---|---|
+| creation order (shipped) | **7,616** | **174,572** |
+| heaviest disjoint affinity pairs | 7,516 | 174,730 |
+| first-access position | 7,435 | 174,882 |
+
+Both alternatives are WORSE. The count says "these two could be adjacent" one
+pair at a time and cannot say that making them adjacent separates two others —
+`ldp`/`stp` consume RUNS, and a disjoint matching cuts a four-slot run into two
+pairs where creation order had three. The allocator mints spill slots in an
+order already correlated with the order they are accessed in, which is why the
+inherited order is hard to beat.
+
+**WHAT THAT LEAVES.** The reachable classes are the small ones: 886 blocked by
+the motion rule and 123 beyond the ten-instruction window. gcc's remaining lead
+is not a layout zcc could adopt — it is that gcc SCHEDULES, placing accesses
+next to each other before any pairing pass runs, and zcc has no scheduler.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** Nothing in the compiler: these are counters behind
+`ZCC_LDSTP`. The entry exists so the next reader of the 3,020 knows it was
+tried, and so the row is not attempted again on the strength of the number
+alone.
