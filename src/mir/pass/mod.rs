@@ -14,3 +14,4 @@ pub mod ext;
 pub mod layout;
 pub mod ldstp;
 pub mod shrink_wrap;
+pub mod slotmerge;

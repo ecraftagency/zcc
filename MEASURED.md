@@ -923,3 +923,40 @@ iteration, no floating point. `tests/determinism.sh` checks it end to end.
 
 **WHAT USES IT.** `hir/pass/rotate.rs`. The gates for `licm` and `iv`, and the
 spiller's `TRIPS`, are the obvious next consumers and are NOT yet wired.
+
+
+---
+
+## M20. The copies that are NOT the ABI's fault — 325 against gcc's 8
+
+**VALUE.** `sqlite3VdbeExec`, register-to-register `mov`, zcc against gcc -O1:
+
+| kind | zcc | gcc | reading |
+|---|---|---|---|
+| total reg-reg `mov` | 1,757 | 482 | +1,275 |
+| writing x0–x7 (argument marshalling) | 645 | 379 | +266 |
+| into a callee-saved reg from x0–x7, right after a call | 38 | 26 | **near-equal — ABI-FORCED** |
+| **callee-saved ← callee-saved** | **325** | **8** | **the gap** |
+| into a caller-saved temp x8–x15 | 25 | 0 | 25 |
+
+**WHAT IT SETTLES.** The copy excess is not argument marshalling and not the
+call-result convention. A result that is live across a later call MUST move to a
+callee-saved register — gcc obeys that rule too, and does it 26 times to zcc's
+38. What zcc does 325 times and gcc 8 is move a value from one callee-saved
+register to ANOTHER: pure allocator shuffling, forced by nothing.
+
+**WHY IT MATTERS MORE THAN THE COUNT SUGGESTS.** These execute. Unlike the
+frame-size rows measured the same day — slot coalescing (203 → 116 slots,
+−6,832 bytes of stack) and the cold-loop rotation gate (−662 instructions) —
+both of which moved the clock by nothing, a copy in the dispatch path is
+retired on every pass through it.
+
+**WHAT IT DOES NOT SAY.** That 325 is an upper bound on what coalescing can
+remove, in the same sense `M11-correction` and `M15` were upper bounds: it counts
+copies that the ABI does not force, not copies that a colouring could avoid. Two
+callee-saved values that genuinely interfere still need a move between them at a
+join. The number to beat is 8; the number reachable is unmeasured, and the first
+job of the campaign is to measure it — by hand-editing the copies out of one hot
+arm and timing it, before any allocator code is written.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.

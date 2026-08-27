@@ -309,6 +309,74 @@ number in the report is not the number of removable copies.
 
 ---
 
+## §4c THE NEXT SESSION STARTS HERE — the copy-coalescing campaign
+
+**State at hand-off.** sqlite exec **1.159×** gcc -O1 (was 1.651 at the start of
+2026-08-27). Size 1.1052×. The 42-program suite 1.0206. Everything in `§6` is
+measured; do not re-take it.
+
+**BEFORE ANYTHING ELSE.** `mir/pass/slotmerge.rs` is committed but the FULL GATE
+WAS NOT RUN on it — the session ended first. It has: cargo 186/0, provenance
+PASS, `localize.sh`'s output check green on sqlite (which is what caught its
+predecessor's miscompile), and `determinism` NOT run. **Run
+`FUZZ_N=300 sh tests/fullsuite.sh all` first, before adding anything.**
+
+**THE TARGET, measured (`MEASURED M20`).** In `sqlite3VdbeExec`:
+
+```
+mov <callee-saved>, <callee-saved>      zcc 325   gcc 8     <- the gap
+mov <callee-saved>, x0..x7 after a call zcc  38   gcc 26    <- ABI-forced, near-equal
+mov -> x0..x7 (argument marshalling)    zcc 645   gcc 379
+```
+
+The excess is NOT the ABI. A result live across a later call must move to a
+callee-saved register and gcc does that too. What zcc does 325 times and gcc 8 is
+shuffle a value from one callee-saved register to another — coalescing failure,
+and unlike the frame rows these copies EXECUTE.
+
+**THE ORDER OF WORK, and step 1 is not code.**
+
+1. **MEASURE THE CEILING BY HAND.** Take one hot arm of the dispatch, delete its
+   callee-saved shuffles in the `.s` by renaming registers, link, check the
+   output, time it. That number decides whether the campaign is worth 7 points or
+   1. Everything on 2026-08-27 that skipped this step was refuted; everything
+   that did it shipped. `MEASURED M20` says 325 is an upper bound on what the ABI
+   does not force, NOT on what a colouring could avoid.
+2. **Diagnose ONE shuffle.** Why did the colourer put the value somewhere its
+   copy partner is not? `ZCC_HINT=1` already reports the refusals; the answer for
+   the block-local case is in `§4b` and it is that recolouring the occupant needs
+   interference the allocator does not carry.
+3. **The mechanism, if the ceiling justifies it.** Post-colouring recolouring
+   with WHOLE-FUNCTION occupancy, which is what `§4b`'s attempt lacked: build,
+   per physical register, the set of program points where it is held, then for a
+   copy `D = S` recolour `D` to `S`'s register when that register is free across
+   `D`'s entire live range and the caller/callee partition allows it. The copy
+   becomes a self-move and `destruct::sequentialize` already deletes those.
+4. **Verify with `localize.sh` before timing anything.** It compares program
+   output against the gcc build and refuses to report a number otherwise. It is
+   the only instrument in the tree that caught the slot-merge miscompile — 185
+   unit tests and all 42 suite programs passed it.
+
+**WHAT IS NOT THE PATH TO 1×, measured on 2026-08-27 so nobody re-tries it:**
+
+* frame-size work. Slot coalescing took `VdbeExec` from 203 slots to 116 and cut
+  6,832 bytes of stack; the clock moved 1.279 → 1.276. Fewer ADDRESSES is not
+  fewer ACCESSES, and the access count (1,629 against gcc's 598) is what costs.
+* cold-path work. The rotation gate removed 662 instructions from loops that by
+  definition do not execute.
+* `madd`→shifts, `cset`/`cmp` folding, dispatch reordering, dispatch trees,
+  small-struct SROA, invariant-constant hoisting — each priced by hand-edit and
+  each worth ~1% or less. `arm64_elf.md` §6.1 records why.
+
+**THE HONEST SIZING.** `VdbeExec` is ~47% of the remaining 15.9 points ≈ 7.5.
+The tail (`MemShallowCopy` ~8%) is ~1.3. The rest is below the attribution
+instrument's noise floor, which is what a systemic allocation problem looks like
+from a distance. **1× is not reachable without this campaign**, and it may end at
+"chordal colouring in dominance order cannot revisit, so this needs a different
+allocator" — which is a REARCH decision, not a row.
+
+---
+
 ## §5 HOW TO JUDGE
 
 * **Speed on real programs, not instruction count** (Law 3c). `realprog.sh` per

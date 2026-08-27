@@ -803,3 +803,115 @@ fn an_address_rebuilt_with_a_multiply_is_seen_as_a_delay() {
         "iv::substitute walks the pointer, so the address is a header parameter"
     );
 }
+
+/// THEORY A7b — slot merging: two values never live at once share one address.
+///
+/// The spiller gives one slot per SSA WEB, which decides WHERE a value lives and
+/// says nothing about whether two DIFFERENT variables need two addresses. In a
+/// `switch`, at most one arm runs per dispatch, so every arm's spilled locals
+/// are mutually exclusive by construction — and sqlite's `sqlite3VdbeExec`, 196
+/// arms of exactly that shape, held **199 frame slots against gcc's 43**.
+///
+/// NON-VACUOUS both ways, which is what the assertions below are for: the
+/// fixture must actually merge (or the square proves nothing), and a fixture
+/// whose values ARE simultaneously live must NOT merge (or the pass is unsound
+/// and the first assertion would pass for the wrong reason).
+///
+/// The unsound version is not hypothetical. The first cut of this pass marked
+/// interference at the `Reload` — a use — instead of at the `Spill` — a def, so
+/// two slots live across a stretch with neither reloaded inside it were never
+/// compared. It merged them, and they overwrote each other. **The 42-program
+/// taxonomy suite and all 185 unit tests passed; sqlite's output diverged.**
+#[test]
+fn slots_that_never_overlap_share_one() {
+    // The shape needs BOTH halves: values live ACROSS the switch to use up the
+    // register file, and per-arm locals that therefore have to spill. Without
+    // the first half nothing spills and the square is vacuous; without the
+    // second there is nothing to merge.
+    let cross: String = (0..8).map(|k| format!("long g{}=v*{}+{};\n", k, k + 1, k)).collect();
+    let sum: String = (0..8).map(|k| format!("+g{}", k)).collect();
+    // Each arm holds MANY locals across a call, so the arm's own values are what
+    // spills. That is the shape sqlite's dispatch has, and the one where merging
+    // is possible at all: two arms never run in the same iteration.
+    let arms: String = (0..6)
+        .map(|k| {
+            let decl: String = (0..18)
+                .map(|j| format!("long a{k}_{j}=v*{m}+{j};\n", k = k, j = j, m = j + 2))
+                .collect();
+            let across: String = (0..18)
+                .map(|j| format!("+a{k}_{j}*{m}", k = k, j = j, m = j + 1))
+                .collect();
+            format!(
+                "case {k}: {{\n{decl}\
+                 s += f(v+{k});\n\
+                 s += 0{across};\n\
+                 s += f(v-{k});\n\
+                 s += 0{across}; break; }}\n",
+                k = k,
+                decl = decl,
+                across = across
+            )
+        })
+        .collect();
+    let src = format!(
+        "long f(long x){{ return x*3+1; }}\n\
+         long run(int n, long v){{ long s=0; int i;\n{cross}\
+         for(i=0;i<n;i++){{ switch(i%6){{\n{arms}\n }} }}\n return s{sum}; }}\n\
+         int main(void){{ return (int)(run(24, 5) & 0x7fffffff); }}\n",
+        cross = cross,
+        arms = arms,
+        sum = sum
+    );
+    let count_slots = |m: &crate::mir::MModule| -> usize {
+        let f = m.funcs.iter().find(|f| f.name == "run").unwrap();
+        f.slots
+            .iter()
+            .filter(|s| s.kind == crate::mir::SlotKind::Spill && s.size > 0)
+            .count()
+    };
+    let ast = frontend(&src);
+    let h = hir::build::build(&ast);
+    let mut merged = allocated(&h).unwrap();
+    for f in merged.funcs.iter_mut() {
+        crate::mir::pass::slotmerge::run(f);
+    }
+    let plain = allocated(&h).unwrap();
+    let (before, after) = (count_slots(&plain), count_slots(&merged));
+    assert!(before > 0, "the fixture does not spill — the square would be vacuous");
+    assert!(
+        after < before,
+        "no slot was merged: {} before, {} after — mutually exclusive arms must share",
+        before,
+        after
+    );
+
+    // ⟦mir_p⟧ = ⟦mir_final⟧ over the shape, with the pass in the pipeline
+    same(&src);
+
+    // AND THE FENCE: values live at the same time must NOT merge. Every local
+    // here is read AFTER the switch, so no two of them are ever dead together.
+    let live: String = (0..12).map(|k| format!("long d{}=v+{};\n", k, k)).collect();
+    let use_all: String = (0..12).map(|k| format!("+d{}*f(d{})", k, k)).collect();
+    let src2 = format!(
+        "long f(long x){{ return x*3+1; }}\n\
+         long run(int n, long v){{ long s=0; int i;\n{live}\
+         for(i=0;i<n;i++){{ s += f(v+i); }}\n\
+         return s{use_all}; }}\n\
+         int main(void){{ return (int)(run(20, 3) & 0x7fffffff); }}\n",
+        live = live,
+        use_all = use_all
+    );
+    let ast2 = frontend(&src2);
+    let h2 = hir::build::build(&ast2);
+    let mut m2 = allocated(&h2).unwrap();
+    let plain2 = count_slots(&allocated(&h2).unwrap());
+    for f in m2.funcs.iter_mut() {
+        crate::mir::pass::slotmerge::run(f);
+    }
+    assert_eq!(
+        count_slots(&m2),
+        plain2,
+        "slots live at the same time were merged — the interference test is wrong"
+    );
+    same(&src2);
+}
