@@ -1108,3 +1108,59 @@ fn the_same_compare_twice_sets_the_same_flags() {
         n
     );
 }
+
+/// THEORY A6b  SQUARE a_constant_is_the_same_constant_every_iteration
+///
+/// A `movz` inside a loop body dominates nothing outside it, so `const_share`'s
+/// dominator-scoped numbering cannot reach it and the loop rebuilds the same
+/// bits every iteration — twelve of them in `m2_http_parse`'s byte loop against
+/// gcc's zero. Hoisting is sound because `MovImm` and `Adrp` are pure and
+/// constant and the preheader dominates the whole body.
+///
+/// MEASURED AND NOT SHIPPED (2026-08-28). Over the 42-program taxonomy suite the
+/// hoist moved EXEC 1.0178 -> 1.0152 and INSN 1.0710 -> 1.0941: a gain inside
+/// the harness's own noise band bought with a 2.3% instruction cost that is
+/// deterministic. A constant hoisted out of a loop is live across it, and a
+/// program one value short of spilling now spills — `m2` itself went from 299 to
+/// 340 instructions. So the row stays OFF and keeps its number, which is what
+/// this test guards: that it still WORKS, for the day the allocator makes the
+/// pressure affordable.
+#[test]
+fn a_constant_is_the_same_constant_every_iteration() {
+    use crate::mir::pass::const_share;
+    use crate::mir::MInst;
+    let src = "int f(int n){int i,s=0;for(i=0;i<n;i++){s+=(i&1)?70000:90000;}return s;}\
+               int main(void){return f(4);}";
+    let consts_in_loops = |on: bool| -> usize {
+        const_share::set_hoist(Some(on));
+        let ast = frontend(src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module_with(&mut h, &crate::compile::pinned_symbols(&ast));
+        let m = allocated(&h).unwrap();
+        let f = m.funcs.iter().find(|f| f.name == "f").expect("no f");
+        let cfg = crate::mir::verify::cfg(f);
+        let dt = crate::cfg::DomTree::new(&cfg, f.entry);
+        let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+        let n = (0..f.blocks.len())
+            .filter(|&b| lf.depth[b] > 0)
+            .map(|b| {
+                f.blocks[b]
+                    .insts
+                    .iter()
+                    .filter(|i| matches!(i, MInst::MovImm { .. } | MInst::Adrp { .. }))
+                    .count()
+            })
+            .sum();
+        const_share::set_hoist(None);
+        n
+    };
+    let off = consts_in_loops(false);
+    let on = consts_in_loops(true);
+    assert!(off > 0, "the fixture materializes no constant inside its loop");
+    assert!(on < off, "the hoist left {} constants in the loop (was {})", on, off);
+    // …and the meaning is unchanged in both states
+    const_share::set_hoist(Some(true));
+    same(src);
+    const_share::set_hoist(None);
+    same(src);
+}

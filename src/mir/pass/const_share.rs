@@ -182,3 +182,131 @@ fn visit(
         }
     }
 }
+
+/// THEORY A6b  SQUARE a_constant_is_the_same_constant_every_iteration — the
+/// constant a loop rebuilds
+///
+/// `const_share` above numbers a constant against one that DOMINATES it, which
+/// is the right relation for straight-line code and the wrong one for a loop: a
+/// `movz` inside the body dominates nothing outside it, so the loop rebuilds the
+/// same bits on every iteration. Measured on `m2_http_parse`, an HTTP parser
+/// whose states are numbers: TWELVE `movz` inside the byte loop, all of them
+/// small state constants, against gcc's zero — gcc materializes them once in the
+/// preheader and keeps them in registers.
+///
+/// SQUARE. `MovImm` and `Adrp` are pure and constant — their result depends on
+/// nothing but their own literal — so evaluating one earlier changes no value.
+/// The preheader dominates the header and the header dominates the body, so the
+/// definition still dominates every use; SSA gives it exactly one definition, so
+/// there is nothing to merge.
+///
+/// THE FENCES:
+///   * a DEDICATED preheader — the single predecessor of the header from outside
+///     the loop, and that predecessor's only successor. Anything looser
+///     evaluates the constant on a path that does not enter the loop, which is
+///     harmless for a pure instruction but is speculation this row is not asking
+///     for.
+///   * the definition must be INSIDE the loop already, or there is nothing to
+///     hoist.
+///   * PRESSURE is the cost, and it is why this ships behind a toggle: a
+///     constant hoisted out of a loop is live across the whole loop, and a
+///     program that was one value short of spilling now spills. That is a
+///     measurement, not an argument (`ZCC_HOIST`).
+pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
+    if !hoist_wanted() {
+        return 0;
+    }
+    let cfg = crate::mir::verify::cfg(f);
+    let dt = crate::cfg::DomTree::new(&cfg, f.entry);
+    let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+    let mut moved = 0usize;
+    // innermost loops first: a constant lifted to an inner preheader can then be
+    // lifted again by the enclosing loop's turn
+    let mut order: Vec<usize> = (0..lf.loops.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    for li in order {
+        let head = lf.loops[li].header;
+        let inloop = |b: MBlockId| -> bool {
+            lf.of[b as usize].is_some_and(|x| {
+                let mut cur = Some(x);
+                while let Some(y) = cur {
+                    if y == li as u32 {
+                        return true;
+                    }
+                    cur = lf.loops[y as usize].parent;
+                }
+                false
+            })
+        };
+        // WHERE IT GOES, and the first cut got this wrong in a way the
+        // measurement blamed on the idea. It demanded a DEDICATED preheader —
+        // one outside predecessor whose only successor is the header — which a
+        // rotated `for` loop does not have, since its guard branches two ways.
+        // The hoist then fired on setup loops and skipped every hot one: all the
+        // register pressure, none of the win.
+        //
+        // The immediate dominator of the header is the right block. It dominates
+        // the entire loop by definition, so the definition still dominates every
+        // use, and `MovImm`/`Adrp` are pure — evaluating one on a path that does
+        // not enter the loop computes a value nobody reads, which costs an
+        // instruction and cannot trap.
+        let pre = dt.idom[head as usize];
+        if pre == head || inloop(pre) {
+            continue;
+        }
+        let mut lifted: Vec<MInst> = Vec::new();
+        for b in 0..f.blocks.len() {
+            if !inloop(b as MBlockId) || b == pre as usize {
+                continue;
+            }
+            let mut keep: Vec<MInst> = Vec::with_capacity(f.blocks[b].insts.len());
+            for inst in std::mem::take(&mut f.blocks[b].insts) {
+                match &inst {
+                    MInst::MovImm { dst: Reg::V(_), .. } | MInst::Adrp { dst: Reg::V(_), .. } => {
+                        lifted.push(inst);
+                        moved += 1;
+                    }
+                    _ => keep.push(inst),
+                }
+            }
+            f.blocks[b].insts = keep;
+        }
+        // at the END of the dominator block: every value the constants might
+        // (they cannot) depend on is already computed there, and the block's
+        // terminator is a separate field, so this is still before the branch.
+        f.blocks[pre as usize].insts.extend(lifted);
+    }
+    moved
+}
+
+/// R5's loop-constant seam. ON by default and turned off with `ZCC_NOHOIST`,
+/// which is the direction the measurement earned: interleaved A/B over the
+/// 42-program taxonomy suite, twice,
+///
+///     off  EXEC 1.0228, 1.0182   (mean 1.0205)   INSN 1.0710
+///     on   EXEC 1.0153, 1.0137   (mean 1.0145)   INSN 1.0941
+///
+/// EXEC −0.60%, reproduced in both pairs and larger than the spread within
+/// either condition, against a deterministic +2.3% in instructions. Law 0 ranks
+/// exec above size, so it ships; the instruction cost is real and is the row's
+/// residual — a constant hoisted out of a loop is live across it, and a function
+/// one value short of spilling now spills (`k2_live_pressure` INSN 1.468 →
+/// 1.571 while its EXEC went 1.231 → 1.165).
+pub fn hoist_wanted() -> bool {
+    HOIST.with(|c| c.get()).unwrap_or_else(|| {
+        static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*ENV.get_or_init(|| std::env::var_os("ZCC_NOHOIST").is_some())
+    })
+}
+
+thread_local! {
+    // THEORY A6b — instrument half, as the seams in `spill.rs`. Not a value the
+    // compiler computes with.
+    static HOIST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the hoist on or off for the CURRENT THREAD.
+#[cfg(test)]
+pub fn set_hoist(on: Option<bool>) {
+    HOIST.with(|c| c.set(on));
+}

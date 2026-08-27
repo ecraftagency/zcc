@@ -122,6 +122,7 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             // compare that a later one may now duplicate exactly.
             crate::mir::pass::cmpelim::drop_redundant_cmps(f);
             crate::mir::pass::const_share::run(f);
+            crate::mir::pass::const_share::hoist_invariant_consts(f);
             crate::mir::pass::autoinc::run(f);
             // R5.3, LAST of the SSA-MIR rows: it consumes the shape the rows
             // above leave — plain `BaseImm` addresses and scalar FP ops — and
