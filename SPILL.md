@@ -309,7 +309,25 @@ number in the report is not the number of removable copies.
 
 ---
 
-## §4c THE NEXT SESSION STARTS HERE — the copy-coalescing campaign
+## §4c THE NEXT SESSION STARTS HERE — pointer-residency, NOT copy-coalescing
+
+> **VERDICT 2026-08-27 (supersedes the copy-coalescing framing below; full
+> derivation `MEASURED M21`).**
+> 1. **Full gate GREEN on `slotmerge.rs`** — `FUZZ_N=300 fullsuite.sh all` =
+>    15 PASS / 0 RED (determinism ✅, csmith 254/0, yarpgen 300/0, musl ✅).
+>    §4c item 1 discharged.
+> 2. **The copy-coalescing campaign is CANCELLED.** The 283 cs←cs `mov`s are
+>    COLD (100% branch to `abort_due_to_error`/`no_mem`) — a size cost, ~0
+>    speed. M20's "these execute" was the Law-2 measurement exception.
+>    libFIRM co-heur would buy SIZE only; not built (toggle-off if ever authored).
+> 3. **The hot lever is pointer RESIDENCY.** gcc keeps p/pOp/pC register-
+>    resident across the dispatch; zcc reloads them, and pOp's reload gates the
+>    mispredicting jump-table branch. Proven: keeping pOp resident moves the
+>    canonical `realprog.sh` geomean **1.1661× → 1.1553×** (+0.9%), size-neutral.
+> 4. **No smash-and-grab remains.** `OP_Column`/`OP_Next` carry no structural
+>    defect — only systemic spilling. Path to lower = a gated residency pass
+>    (keep p+pOp+pC resident at the dispatch join), est. +2–4% → sqlite ~1.12×.
+>    1× is not reachable by one trick on this surface.
 
 **State at hand-off.** sqlite exec **1.159×** gcc -O1 (was 1.651 at the start of
 2026-08-27). Size 1.1052×. The 42-program suite 1.0206. Everything in `§6` is

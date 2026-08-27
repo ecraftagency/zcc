@@ -960,3 +960,57 @@ job of the campaign is to measure it — by hand-editing the copies out of one h
 arm and timing it, before any allocator code is written.
 
 **WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+## M21. M20 CORRECTED — the 283 copies are COLD; the hot lever is pointer residency
+
+**M20 CLAIMED** the 325 callee-saved←callee-saved `mov`s "execute, unlike the
+frame rows" and named a copy-coalescing campaign. **THAT HOTNESS CLAIM IS THE
+LAW-2 MEASUREMENT EXCEPTION** — it counted static `mov`s and never checked their
+branch targets.
+
+**WHAT THE BRANCH TARGETS SAY.** Of the 138 `mov x22, x19` (the dominant pair,
+90% of the 283 with `mov x21, x20`), **107 branch to `_220` (`abort_due_to_error`)
+and 32 to `_8` (`no_mem`)** — 100% land on error/OOM/return handlers. They are
+SSA phi-args for the error-state join, retired ~never in any workload. The count
+is real (a SIZE cost, ~283 insns); the "these execute" is false. A copy-coalescer
+(libFIRM co-heur, the §4c-planned recolour) would remove SIZE only, ~0 speed.
+Per Law 0 (`exec > size`) and the 1× *speed* goal, it is not built (keep any such
+pass behind a default-off toggle if authored, per user 2026-08-27).
+
+**WHERE THE HOT COST ACTUALLY IS — pointer RESIDENCY, proven.** The hot dispatch
+reloads the interpreter's core pointers that gcc keeps register-resident:
+`p`(Vdbe*, slot #96, 114 loads), `pOp`(#456/#472, ~68), `aOp`(#104, 67),
+`pC`(per-Column spill+reload). Only `pOp`'s reload is on the *branch-resolution
+critical path* (reload pOp → read opcode → jump-table `br`).
+
+**THE MICROBENCH (isolates one reload+respill of a loop-carried dispatch index
+on this core):**
+* perfectly-predicted dispatch: ratio mem/reg = **0.966** — the reload is FREE
+  (store-forwarding + spare LSU bandwidth; the Law-3c load-analogue of move
+  elimination).
+* mispredicted dispatch (random opcode stream, like real VdbeExec): ratio
+  **1.129** — the L1 load lands on the misprediction-recovery critical path.
+  The cost is not the instruction; it is that the reload GATES the mispredicting
+  branch.
+
+**THE HAND-EDIT (actual sqlite `.s`, keep pOp resident across the dispatch:
+carry it in x20 from both preds of `_15`, drop the reload — a store-to-load of
+the pOp slot, provably equivalent; verified byte-for-byte identical output):**
+on the CANONICAL `realprog.sh` 11-phase geomean, box-exclusive best-of-5,
+**base 1.1661× → patch 1.1553× gcc -O1** — **+0.9%, ~6.5% of the remaining gap,
+from removing ONE reload/opcode.** Size-neutral (entry +1 `mov`, `_15` −1 `ldr`).
+Gains concentrate in the dispatch-bound phases (p03 index 1.214→1.143, p05 scan
+1.222→1.185, p08 subquery 1.192→1.178); no regression.
+
+**SMASH-AND-GRAB VERDICT.** Hunted the two hottest arms (`OP_Column` _81 run
+2×/row, `OP_Next` _132 1×/row) for a jump-table-class structural defect: none.
+No bad `madd`, no redundant `sxtw`, no wrong addressing — every arm just reloads
+p/pOp/pC. The jump-table row was the last big grab; what remains is systemic
+spilling worth single-digit % (full p+pOp+pC residency est. +2–4%, sqlite
+~1.15×→~1.12×), a gated allocator campaign, not one trick. The stopping point
+is honest: 1× is not reachable by a grab on this surface.
+
+**REPRODUCE.** microbench `scratchpad/disp*.s` + `bench*.c`; hand-edit
+`scratchpad/patch.pl` against a fresh `zcc -S sqlite3.c` (slot number is
+build-specific — the pass will not be). **WHEN / WHERE.** 2026-08-27, M1 Pro
+under Docker, sqlite 3 amalgamation, gcc -O1 referee.
