@@ -1732,3 +1732,126 @@ fn tbaa_refuses_to_disambiguate_through_a_union() {
     square(src, 1073741824);
     crate::hir::set_tbaa(None);
 }
+
+// ── R5.5 VRP ───────────────────────────────────────────────────────────────
+
+fn vrp_module(src: &str, on: bool) -> Module {
+    super::vrp::set_vrp(Some(on));
+    let m = module(src, true);
+    super::vrp::set_vrp(None);
+    m
+}
+
+fn cmps(f: &Func) -> usize {
+    count(f, |i| matches!(i, Inst::Cmp { .. }))
+}
+
+/// EFFECT (2) — THE GUARD. Inside `if (n < 16)` the test `n < 100` is not a
+/// branch: every value the first test admits passes the second. Nothing in the
+/// definition of `n` says so — the fact is on the EDGE, which is what the
+/// dominator-inherited constraint map carries.
+#[test]
+fn vrp_folds_a_comparison_the_guard_above_it_decides() {
+    let src = "int g(int n){if(n<16){if(n<100)return 1;return 2;}return 3;}\
+               int main(void){return g(4)+g(40);}";
+    let off = cmps(func(&vrp_module(src, false), "g"));
+    let on = cmps(func(&vrp_module(src, true), "g"));
+    assert!(on < off, "the guarded comparison survived: {} -> {}", off, on);
+    super::vrp::set_vrp(Some(true));
+    square(src, 4); // g(4) = 1, g(40) = 3
+    super::vrp::set_vrp(None);
+}
+
+/// EFFECT (2) — THE MASK. `x & 0xff` is in `[0, 255]` whatever `x` was, so a
+/// comparison against a larger bound is decided. This is the arm that needs no
+/// control flow at all: the fact comes from the operation.
+#[test]
+fn vrp_bounds_a_masked_value() {
+    let src = "int g(int x){int m=x&255;if(m>300)return 7;return m;}\
+               int main(void){return g(1000);}";
+    let off = cmps(func(&vrp_module(src, false), "g"));
+    let on = cmps(func(&vrp_module(src, true), "g"));
+    assert!(on < off, "the mask bound nothing: {} -> {}", off, on);
+    super::vrp::set_vrp(Some(true));
+    square(src, 232); // 1000 & 255
+    super::vrp::set_vrp(None);
+}
+
+/// EFFECT (2) — THE DIVISION. `x / 4` on a dividend proven non-negative is a
+/// shift; on one that is not, it is the three-instruction rounding dance, and
+/// the pass must leave it alone. Both halves are asserted, because a rewrite
+/// that fired on the second would be a miscompile and one that fired on neither
+/// would be a vacuous green.
+#[test]
+fn vrp_reduces_a_signed_division_only_where_the_dividend_is_proven_non_negative() {
+    let sdiv = |f: &Func| {
+        count(f, |i| matches!(i, Inst::Bin { op: BinOp::SDiv, .. } | Inst::Bin { op: BinOp::SRem, .. }))
+    };
+    let proven = "int g(int x){int m=x&255;return m/4+m%8;}int main(void){return g(1000);}";
+    let unproven = "int g(int x){return x/4+x%8;}int main(void){return g(-1000);}";
+    assert!(sdiv(func(&vrp_module(proven, false), "g")) > 0, "the fixture has no division");
+    assert_eq!(
+        sdiv(func(&vrp_module(proven, true), "g")),
+        0,
+        "a non-negative dividend still divides"
+    );
+    assert_eq!(
+        sdiv(func(&vrp_module(unproven, true), "g")),
+        sdiv(func(&vrp_module(unproven, false), "g")),
+        "a dividend that may be negative was rewritten: the rounding is not the same"
+    );
+    super::vrp::set_vrp(Some(true));
+    square(proven, 58); // 232/4 = 58, 232%8 = 0
+    square(unproven, -250); // -1000/4 = -250, -1000%8 = 0
+    super::vrp::set_vrp(None);
+}
+
+/// THEORY A7b  SQUARE vrp_replaces_an_expression_by_one_equal_on_its_range
+///
+/// The obligation itself, on the shapes the pass rewrites and on the shapes it
+/// must refuse: a guard that decides a comparison, a mask that bounds one, a
+/// division whose dividend is proven non-negative, a division whose dividend is
+/// not, a loop whose counter the widening sends to the full width, and the
+/// boundary values where an interval argument is easiest to get wrong.
+#[test]
+fn vrp_replaces_an_expression_by_one_equal_on_its_range() {
+    super::vrp::set_vrp(Some(true));
+    let cases: &[(&str, i64)] = &[
+        ("int g(int n){if(n<16){if(n<100)return 1;return 2;}return 3;}\
+          int main(void){return g(4)*10+g(40);}", 13),
+        ("int g(int x){int m=x&255;return m/4+m%8;}int main(void){return g(1000);}", 58),
+        ("int g(int x){return x/4+x%8;}int main(void){return g(-1000);}", -250),
+        // the boundary the interval arithmetic must not round through
+        ("int g(int x){int m=x&255;if(m>255)return 1;if(m<0)return 2;return 3;}\
+          int main(void){return g(-1);}", 3),
+        // INT_MIN / -1 is the one signed division the hardware cannot do; the
+        // pass must not claim a range that would let anything rewrite it
+        ("int g(int x){return x/2;}int main(void){return g(-2147483647-1)==-1073741824;}", 1),
+        // a loop counter: the widening sends it to the full width, so nothing
+        // below may assume a bound the program does not prove
+        ("int main(void){int i,s=0;for(i=0;i<10;i++){if(i>=0)s+=i;else s-=i;}return s;}", 45),
+        // an unsigned comparison against a value that straddles zero stays open
+        ("int g(int x){unsigned u=(unsigned)x;if(u<10u)return 1;return 2;}\
+          int main(void){return g(-1);}", 2),
+    ];
+    for (src, want) in cases {
+        square(src, *want);
+    }
+    super::vrp::set_vrp(None);
+    // …and the square is not vacuous: on the first case the pass removes a
+    // comparison, and on the second it removes the division. A square that only
+    // said "still correct" would stay green for a pass that never fired.
+    assert!(
+        cmps(func(&vrp_module(cases[0].0, true), "g")) < cmps(func(&vrp_module(cases[0].0, false), "g")),
+        "the guarded comparison survived"
+    );
+    let sdiv = |m: &Module| {
+        count(func(m, "g"), |i| {
+            matches!(i, Inst::Bin { op: BinOp::SDiv, .. } | Inst::Bin { op: BinOp::SRem, .. })
+        })
+    };
+    assert!(
+        sdiv(&vrp_module(cases[1].0, true)) < sdiv(&vrp_module(cases[1].0, false)),
+        "the proven-non-negative division survived"
+    );
+}

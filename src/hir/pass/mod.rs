@@ -28,6 +28,7 @@ mod tests;
 pub mod sccp;
 pub mod sink;
 pub mod sroa;
+pub mod vrp;
 
 use super::*;
 
@@ -102,6 +103,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         }
         if on("sccp") {
             changed |= sccp::run(f);
+        }
+        // AFTER sccp: a value the point lattice settles is an interval of one,
+        // so the cheaper analysis goes first and this one reasons about what is
+        // left. BEFORE gvn, which is what removes the comparisons this decides.
+        if on("vrp") {
+            changed |= vrp::run(f);
         }
         if on("gvn") {
             changed |= fold::canon(f);
