@@ -193,3 +193,169 @@ pub fn branch_on_flags(f: &mut MFunc) -> usize {
     }
     n
 }
+
+/// THEORY A6b  SQUARE the_same_compare_twice_sets_the_same_flags — a compare
+/// whose flags are already live
+///
+/// THE SHAPE, measured before it was written (`m2_http_parse`, 2026-08-28). One
+/// C condition consumed by several selects lowers to a compare, a `cset` that
+/// turns the flags into a boolean, and then — before EVERY consumer — a fresh
+/// `cmp w3, #0` that turns that boolean back into flags:
+///
+///     cmp w3, #0 ; csel w12, w4, w12, ne
+///     cmp w3, #0 ; csel x13, x13, x2, ne      <- both of these
+///     cmp w3, #0 ; csinc x15, x15, x15, eq    <- are already true
+///
+/// `csel`, `csinc`, `movz` and a non-`S` `add` do not write NZCV, so the second
+/// and third compares are dead BY CONSTRUCTION rather than by analysis. Deleting
+/// the two of them in the two hot states of that parser: 68.4 ms to 65.4 ms,
+/// **4.4%**, on three instructions.
+///
+/// THE FENCES, and each is a way the deletion could be wrong:
+///   * IDENTICAL — same kind, same width, same operands. A `Rhs::Reg` compare is
+///     only the same compare while neither register has been redefined.
+///   * NZCV UNTOUCHED between the two, which is what makes the flags still the
+///     ones the first compare set.
+///   * NO SECOND FLAGS VALUE between the survivor and the last reader of the
+///     deleted one. MIR before allocation lets two flag values coexist as
+///     virtual registers, but the machine has one NZCV: extending a range across
+///     another flags definition is exactly the "two NZCV values live at once"
+///     the spiller refuses, and a pass must not hand it that.
+pub fn drop_redundant_cmps(f: &mut MFunc) -> usize {
+    let mut n = 0;
+    for b in 0..f.blocks.len() {
+        // (the compare, the flags register it defined, its index)
+        let mut live: Option<(MInst, Reg, usize)> = None;
+        let mut rewrite: Vec<(Reg, Reg)> = Vec::new();
+        let mut drop_at: Vec<usize> = Vec::new();
+        for i in 0..f.blocks[b].insts.len() {
+            let inst = f.blocks[b].insts[i].clone();
+            // does this instruction redefine anything the live compare reads?
+            if let Some((c, _, _)) = &live {
+                let mut kills = false;
+                let (mut ra, mut rb) = (None, None);
+                if let MInst::Cmp { a, b: rhs, .. } = c {
+                    ra = Some(*a);
+                    if let Rhs::Reg(r) | Rhs::Shifted(r, ..) | Rhs::Extended(r, ..) = rhs {
+                        rb = Some(*r);
+                    }
+                }
+                inst.visit(&mut |r, cons| {
+                    if matches!(cons, Constraint::Def | Constraint::DefFixed(_))
+                        && (Some(r) == ra || Some(r) == rb)
+                    {
+                        kills = true;
+                    }
+                });
+                if kills {
+                    live = None;
+                }
+            }
+            match &inst {
+                MInst::Cmp { flags, .. } => {
+                    let same = match &live {
+                        Some((c, _, _)) => same_compare(c, &inst),
+                        None => false,
+                    };
+                    if same {
+                        let keep = live.as_ref().map(|(_, r, _)| *r).expect("live is Some");
+                        rewrite.push((*flags, keep));
+                        drop_at.push(i);
+                        n += 1;
+                    } else {
+                        live = Some((inst.clone(), *flags, i));
+                    }
+                }
+                // anything not KNOWN to preserve NZCV ends the range
+                _ if !preserves_flags(&inst) => live = None,
+                _ => {}
+            }
+        }
+        if drop_at.is_empty() {
+            continue;
+        }
+        // every reader of a deleted flags value now reads the survivor
+        for (from, to) in &rewrite {
+            for i in 0..f.blocks[b].insts.len() {
+                f.blocks[b].insts[i].visit_mut(&mut |r, cons| {
+                    if *r == *from && matches!(cons, Constraint::Use | Constraint::UseFixed(_)) {
+                        *r = *to;
+                    }
+                });
+            }
+            f.blocks[b].term.visit_mut(&mut |r, _| {
+                if *r == *from {
+                    *r = *to;
+                }
+            });
+        }
+        for &i in drop_at.iter().rev() {
+            f.blocks[b].insts.remove(i);
+        }
+    }
+    n
+}
+
+/// Do these two compares set NZCV to the same thing?
+fn same_compare(a: &MInst, b: &MInst) -> bool {
+    match (a, b) {
+        (
+            MInst::Cmp { kind: k1, w: w1, a: a1, b: b1, .. },
+            MInst::Cmp { kind: k2, w: w2, a: a2, b: b2, .. },
+        ) => k1 == k2 && w1 == w2 && a1 == a2 && same_rhs(b1, b2),
+        _ => false,
+    }
+}
+
+fn same_rhs(a: &Rhs, b: &Rhs) -> bool {
+    match (a, b) {
+        (Rhs::Imm(x), Rhs::Imm(y)) => x == y,
+        (Rhs::Reg(x), Rhs::Reg(y)) => x == y,
+        (Rhs::Shifted(x, k1, n1), Rhs::Shifted(y, k2, n2)) => x == y && k1 == k2 && n1 == n2,
+        (Rhs::Extended(x, k1, n1), Rhs::Extended(y, k2, n2)) => x == y && k1 == k2 && n1 == n2,
+        _ => false,
+    }
+}
+
+/// Is this instruction KNOWN to leave NZCV alone?
+///
+/// A WHITELIST, and the direction matters: answering "preserves" for something
+/// that does not is a miscompile, while answering "does not" for something that
+/// does costs one deleted compare. The first cut asked the opposite question —
+/// "does it DEFINE a flags register?" — and a CALL does not. Flags are a virtual
+/// register before allocation and a call's clobber set is physical, so
+/// `bl printf` sat between two identical compares and the second was deleted
+/// while NZCV had, in fact, been destroyed. `tests/decay.sh` failed on a ternary
+/// whose select then read the callee's flags: `c ? "T" : ""` returned the empty
+/// string with `c == 1`. AAPCS64 does not preserve the condition flags across a
+/// call, and neither does this pass now.
+fn preserves_flags(i: &MInst) -> bool {
+    match i {
+        MInst::Alu { flags, .. } => flags.is_none(),
+        MInst::Copy { .. }
+        | MInst::MovImm { .. }
+        | MInst::Load { .. }
+        | MInst::Store { .. }
+        | MInst::Pair { .. }
+        | MInst::Spill { .. }
+        | MInst::Reload { .. }
+        | MInst::Adrp { .. }
+        | MInst::AddLo12 { .. }
+        | MInst::SlotAddr { .. }
+        | MInst::SpAddr { .. }
+        | MInst::CSel { .. }
+        | MInst::CSet { .. }
+        | MInst::Ext { .. }
+        | MInst::Bfx { .. }
+        | MInst::Alu3 { .. }
+        | MInst::FpAlu { .. }
+        | MInst::FpUn { .. }
+        | MInst::FpCvt { .. }
+        | MInst::FMov { .. }
+        | MInst::VAlu { .. }
+        | MInst::ParallelCopy(_) => true,
+        // a call, an `asm`, an atomic, a barrier, a frame adjust, an FP compare
+        // and every compare-like form: not known to preserve, so they end it
+        _ => false,
+    }
+}

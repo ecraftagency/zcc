@@ -117,6 +117,10 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             crate::mir::pass::ext::run(f);
             crate::mir::pass::cmpelim::run(f);
             crate::mir::pass::cmpelim::branch_on_flags(f);
+            // AFTER the two rows above, which both CREATE flag values: fusing an
+            // arithmetic result and folding a compare into a branch each leave a
+            // compare that a later one may now duplicate exactly.
+            crate::mir::pass::cmpelim::drop_redundant_cmps(f);
             crate::mir::pass::const_share::run(f);
             crate::mir::pass::autoinc::run(f);
             // R5.3, LAST of the SSA-MIR rows: it consumes the shape the rows

@@ -1056,3 +1056,55 @@ fn slp_packs_two_scalar_lanes_into_one_vector() {
         assert_eq!(n, 0, "packed a shape it may not pack:\n{}", src);
     }
 }
+
+/// THEORY A6b  SQUARE the_same_compare_twice_sets_the_same_flags
+///
+/// One C condition consumed by several selects lowered to a compare, a `cset`
+/// turning the flags into a boolean, and a fresh `cmp v, #0` before every
+/// consumer turning that boolean back into flags. The second and third of those
+/// compares are dead by construction — `csel`, `csinc`, `movz` and a non-`S`
+/// `add` do not write NZCV — and deleting two of them in the hot states of
+/// `m2_http_parse` measured 68.4 ms to 65.4 ms.
+///
+/// The refusals are the interesting half: a compare whose operand was redefined
+/// is a DIFFERENT compare, and one separated by another flags definition may not
+/// be merged, because the machine has a single NZCV however many flag values MIR
+/// is holding.
+#[test]
+fn the_same_compare_twice_sets_the_same_flags() {
+    use crate::mir::MInst;
+    let cmps = |src: &str| -> usize {
+        let ast = frontend(src);
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module_with(&mut h, &crate::compile::pinned_symbols(&ast));
+        let m = allocated(&h).unwrap();
+        m.funcs
+            .iter()
+            .map(|f| {
+                f.blocks
+                    .iter()
+                    .map(|b| b.insts.iter().filter(|i| matches!(i, MInst::Cmp { .. })).count())
+                    .sum::<usize>()
+            })
+            .sum()
+    };
+    // one condition, three consumers — the shape the measurement came from
+    let three = "int f(int c,int x,int y){int t=(c==13);int a=t?x:y,b=t?y:x,d=t?1:2;\
+                 return a*100+b*10+d;}int main(void){return f(13,3,4);}";
+    same(three);
+    // …and the refusals still compute the right answer with their compares kept
+    same("int f(int c,int x){int t=(c==13);c=c+x;int u=(c==13);return t*10+u;}\
+          int main(void){return f(13,0);}");
+    same("int f(int c,int d,int x){int t=(c==13),u=(d==7);return (t?x:0)+(u?1:0);}\
+          int main(void){return f(13,7,5);}");
+    // EFFECT: the pass fires on the three-consumer shape. Counted against the
+    // same program compiled with the row's own predecessors but not it — there
+    // is no toggle, so the assertion is that the count is BELOW the number of
+    // consumers, which only a merge can achieve.
+    let n = cmps(three);
+    assert!(
+        n < 3,
+        "three consumers still cost {} compares: the flags are being rematerialized",
+        n
+    );
+}
