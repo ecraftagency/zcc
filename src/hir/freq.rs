@@ -103,7 +103,32 @@ pub fn set_weights(on: Option<bool>) {
 /// function; an environment lookup on each is a cost the answer cannot change.
 fn env_weights() -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| std::env::var_os("ZCC_WEIGHTS").is_some())
+    *ENV.get_or_init(|| {
+        std::env::var_os("ZCC_WEIGHTS").is_some()
+            || std::env::var_os("ZCC_WEIGHTS_LAYOUT").is_some()
+            || std::env::var_os("ZCC_WEIGHTS_SPILL").is_some()
+    })
+}
+
+/// R5.1 IS TWO CONSUMERS UNDER ONE SWITCH, and the first measurement said the
+/// pair loses — EXEC 1.0206 → 1.0873, INSN 1.0719 → 1.0880 on the 42-program
+/// taxonomy suite (2026-08-28, this machine). A pair that loses says nothing
+/// about which half lost, so each consumer gets its own seam: `ZCC_WEIGHTS`
+/// still turns both on, and `ZCC_WEIGHTS_LAYOUT` / `ZCC_WEIGHTS_SPILL` turn on
+/// exactly one. This is Law 2's "locate mechanically first" applied to a
+/// performance defect rather than a correctness one.
+pub fn layout_wanted() -> bool {
+    weights_wanted() && sub("ZCC_WEIGHTS_SPILL", "ZCC_WEIGHTS_LAYOUT")
+}
+
+/// The same, for the spiller's eviction ranking.
+pub fn spill_wanted() -> bool {
+    weights_wanted() && sub("ZCC_WEIGHTS_LAYOUT", "ZCC_WEIGHTS_SPILL")
+}
+
+/// A consumer is on unless the OTHER consumer was named alone.
+fn sub(other: &str, own: &str) -> bool {
+    std::env::var_os(own).is_some() || std::env::var_os(other).is_none()
 }
 
 /// Stamp every block with its estimated frequency, so the layers BELOW HIR can
@@ -167,7 +192,7 @@ pub fn estimate(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest) -> Vec<u64> {
                 if back_edge(&latches_of, p, b) {
                     continue;
                 }
-                let (w, tot) = edge_weight(f, pi, b);
+                let (w, tot) = edge_weight(f, lf, pi, b);
                 sum = sum.saturating_add(freq[pi].saturating_mul(w) / tot.max(1));
             }
             freq[bi] = sum;
@@ -190,17 +215,56 @@ fn back_edge(latches_of: &[Vec<BlockId>], p: BlockId, b: BlockId) -> bool {
 /// Weights are integers and the total is computed the same way for every
 /// successor, so the probabilities sum to one by construction and no
 /// normalization step can drift.
-fn edge_weight(f: &Func, p: usize, b: BlockId) -> (u64, u64) {
+///
+/// THE LOOP-BRANCH HEURISTIC, and leaving it out was a defect rather than an
+/// omission (found by measurement, 2026-08-28). A loop that runs `TRIPS` times
+/// leaves ONCE: the exit edge is taken on one iteration in `TRIPS`, not on one
+/// in two. Scoring it uniformly gave a loop's exit block half the body's
+/// frequency — so the "not found" return of a search loop scored as hot as the
+/// search — and `layout` duly chained that cold block into the middle of the hot
+/// one. EXEC over the 42-program taxonomy suite went 1.0206 to 1.0925 with block
+/// weights on, `d3_early_exit` 1.00 to 1.98, and the reason was here rather than
+/// in the consumer.
+///
+/// Wu-Larus call this the LOOP BRANCH heuristic and measure it the most accurate
+/// of the family (88%); it is also the one heuristic that is a fact about the
+/// CFG rather than a claim about C programs, since `TRIPS` is already the trip
+/// count every other part of this model assumes.
+fn edge_weight(f: &Func, lf: &dom::LoopForest, p: usize, b: BlockId) -> (u64, u64) {
     let succs = f.blocks[p].term.succs();
     if succs.len() <= 1 {
         return (1, 1);
     }
+    // the innermost loop containing the SOURCE; an edge leaving it is an exit
+    let inner = lf.of[p];
+    // `s` is inside loop `a` when a walk up its loop ancestry reaches `a` — the
+    // successor may sit in a loop NESTED inside this one, which is still not an
+    // exit.
+    let inside = |a: u32, s: BlockId| -> bool {
+        let mut cur = lf.of[s as usize];
+        while let Some(x) = cur {
+            if x == a {
+                return true;
+            }
+            cur = lf.loops[x as usize].parent;
+        }
+        false
+    };
+    let stays = |s: BlockId| -> bool {
+        match inner {
+            Some(a) => inside(a, s),
+            // outside every loop, no edge is an exit
+            None => true,
+        }
+    };
     let w = |s: BlockId| -> u64 {
         match &f.blocks[s as usize].term {
             // a path the program does not take
             Term::Unreachable => 1,
             // the early-exit arm of a guard, more often than not
             Term::Ret(_) if f.blocks[s as usize].insts.is_empty() => 250,
+            // one iteration in TRIPS leaves; the rest stay
+            _ if !stays(s) => 1_000 / TRIPS,
             _ => 1_000,
         }
     };

@@ -28,7 +28,7 @@ pub fn run(f: &mut MFunc) {
     thread_empty_blocks(f);
     duplicate_latch(f);
     let cfg = crate::mir::verify::cfg(f);
-    f.order = if crate::hir::freq::weights_wanted() {
+    f.order = if crate::hir::freq::layout_wanted() {
         chain_by_weight(f, &cfg)
     } else {
         // Reverse postorder. A sort by `(rpo_num, depth)` used to stand above
@@ -113,12 +113,29 @@ fn chain_by_weight(f: &MFunc, cfg: &Cfg) -> Vec<MBlockId> {
         loop {
             placed[b as usize] = true;
             order.push(b);
+            // TIES KEEP REVERSE POSTORDER, and the tie is the common case rather
+            // than the exception. A character-dispatch chain compares, branches
+            // to the handler on equal and falls through to the next comparison
+            // otherwise; both arms are reached once per dispatch, so the
+            // estimate scores them the SAME. Breaking that tie on the lower
+            // `rpo_num` picks the handler — which is what reverse postorder
+            // visits first — and makes the common no-match path pay a taken
+            // branch at EVERY step of the chain. Measured on `m2_http_parse`:
+            // EXEC 1.375 to 2.250, for two extra instructions.
+            //
+            // So the tie-break is "whichever successor reverse postorder was
+            // about to place", the one whose `rpo_num` is nearest ABOVE this
+            // block's. The chain then deviates from RPO only where the weights
+            // actually decide something, which is the whole claim it can make.
+            let here = cfg.rpo_num[b as usize];
             let next = cfg.succs[b as usize]
                 .iter()
                 .copied()
                 .filter(|&s| !placed[s as usize] && cfg.rpo_num[s as usize] != u32::MAX)
                 .max_by_key(|&s| {
-                    (f.blocks[s as usize].weight, std::cmp::Reverse(cfg.rpo_num[s as usize]))
+                    let n = cfg.rpo_num[s as usize];
+                    let near = if n > here { n - here } else { u32::MAX - n };
+                    (f.blocks[s as usize].weight, std::cmp::Reverse(near))
                 });
             match next {
                 Some(s) => b = s,

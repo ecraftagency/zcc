@@ -2507,7 +2507,7 @@ impl<'a> Trace<'a> {
             u.sort_unstable();
             u.dedup();
         }
-        let weighted = crate::hir::freq::weights_wanted();
+        let weighted = crate::hir::freq::spill_wanted();
         let mut starts: Vec<(usize, u32)> = Vec::new();
         if weighted {
             starts = (0..f.blocks.len())
