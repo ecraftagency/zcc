@@ -126,7 +126,27 @@ fn rotate_one(f: &mut Func) -> bool {
     let report = residual_wanted();
     for li in order {
         match try_rotate(f, &c, &dt, &lf, li, &pin) {
-            Ok(()) => return true,
+            Ok(()) => {
+                if report {
+                    // what a rotation COSTS, for the profitability question:
+                    // the guard it duplicates is the header's own body, and the
+                    // loop it buys a branch back for is `body` blocks deep.
+                    let n: usize = lf.loops[li]
+                        .body
+                        .iter()
+                        .map(|&b| f.blocks[b as usize].insts.len())
+                        .sum();
+                    eprintln!(
+                        "rotate-did {} loop@bb{} depth{} guard{} body{}",
+                        f.name,
+                        lf.loops[li].header,
+                        lf.loops[li].depth,
+                        f.blocks[lf.loops[li].header as usize].insts.len(),
+                        n
+                    );
+                }
+                return true;
+            }
             Err(why) => {
                 if report && why != "already bottom-tested" {
                     eprintln!(
