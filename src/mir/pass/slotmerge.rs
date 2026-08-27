@@ -96,8 +96,14 @@ pub fn run(f: &mut MFunc) -> bool {
             let mut cur = vec![0u64; words];
             for &s in cfg.succs[bi].iter() {
                 let si = s as usize;
+                // ONE call per successor, not one per WORD. `live_in_of` walks
+                // the successor's whole instruction list and clones a
+                // `words`-long bitset; calling it inside the `w` loop recomputed
+                // that same vector `words` times and discarded all but one word
+                // of each. Same value, `words`× less of it.
+                let lin = live_in_of(f, &live_out, &idx, si, words);
                 for w in 0..words {
-                    cur[w] |= live_in_of(f, &live_out, &idx, si, words)[w];
+                    cur[w] |= lin[w];
                 }
             }
             if cur != live_out[bi] {
@@ -118,15 +124,21 @@ pub fn run(f: &mut MFunc) -> bool {
         // Everything live at the block's EXIT is simultaneously live there, and
         // a slot can cross a whole block without being named in it — so the
         // exit set is a clique in its own right, not merely a starting point.
-        for i in 0..m {
-            if !get(&live, i) {
-                continue;
-            }
-            for j in (i + 1)..m {
-                if get(&live, j) {
-                    set(&mut inter[i], j);
-                    set(&mut inter[j], i);
+        // Word-wise, because the clique is exactly `inter[i] |= live` for every
+        // live `i`: the pair loop tested all `m` positions one bit at a time,
+        // including whole zero words, which is `blocks × live × m` index-tests
+        // for a set the bitset can OR in `words` steps. `inter[i][i]` is never
+        // set (every writer below carries a `j != i` guard), so clearing the
+        // self-bit preserves that invariant rather than losing information.
+        for wi in 0..words {
+            let mut wv = live[wi];
+            while wv != 0 {
+                let i = wi * 64 + wv.trailing_zeros() as usize;
+                wv &= wv - 1;
+                for w in 0..words {
+                    inter[i][w] |= live[w];
                 }
+                clr(&mut inter[i], i);
             }
         }
         for inst in f.blocks[bi].insts.iter().rev() {
@@ -144,10 +156,21 @@ pub fn run(f: &mut MFunc) -> bool {
                 // corroborates, it does not discover.
                 MInst::Spill { slot, .. } if idx[*slot as usize] != usize::MAX => {
                     let i = idx[*slot as usize];
-                    for j in 0..m {
-                        if j != i && get(&live, j) {
-                            set(&mut inter[i], j);
-                            set(&mut inter[j], i);
+                    // Same rewrite as the exit clique above: one row-OR for
+                    // `inter[i]`, then bit `i` into each live row, walking SET
+                    // bits instead of all `m` positions.
+                    for w in 0..words {
+                        inter[i][w] |= live[w];
+                    }
+                    clr(&mut inter[i], i);
+                    for wj in 0..words {
+                        let mut wv = live[wj];
+                        while wv != 0 {
+                            let j = wj * 64 + wv.trailing_zeros() as usize;
+                            wv &= wv - 1;
+                            if j != i {
+                                set(&mut inter[j], i);
+                            }
                         }
                     }
                     clr(&mut live, i);

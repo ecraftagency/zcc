@@ -183,12 +183,20 @@ impl LoopForest {
     pub fn new(cfg: &Cfg, dt: &DomTree) -> LoopForest {
         let n = cfg.succs.len();
         let mut headers: Vec<(Node, Vec<Node>)> = Vec::new();
+        // Where each header already sits in `headers`, so a second back edge to
+        // the same header is an index instead of a scan of every header found so
+        // far. Same list, same order, same latch order — the scan was answering
+        // a question the block number can answer directly.
+        let mut hpos: Vec<usize> = vec![usize::MAX; n];
         for &b in &cfg.rpo {
             for &s in &cfg.succs[b as usize] {
                 if dt.dominates(s, b) {
-                    match headers.iter_mut().find(|(h, _)| *h == s) {
-                        Some((_, l)) => l.push(b),
-                        None => headers.push((s, vec![b])),
+                    match hpos[s as usize] {
+                        usize::MAX => {
+                            hpos[s as usize] = headers.len();
+                            headers.push((s, vec![b]));
+                        }
+                        k => headers[k].1.push(b),
                     }
                 }
             }
@@ -234,13 +242,20 @@ impl LoopForest {
         // the smaller body nests inside the larger: sorting by size makes the
         // first enclosing loop the immediate parent
         loops.sort_by_key(|l| l.body.len());
-        for i in 0..loops.len() {
-            for j in i + 1..loops.len() {
-                if loops[j].body.contains(&loops[i].header) {
-                    loops[i].parent = Some(j as u32);
-                    break;
-                }
+        // The parent is the FIRST loop after `i` in this size order whose body
+        // holds `i`'s header. Asked as a scan it is O(loops² × body); asked of an
+        // index from block to the loops containing it — built once in ascending
+        // loop order, so the first entry past `i` IS that first loop — it is one
+        // walk of Σbody. Same parent for every loop.
+        let mut holding: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (j, l) in loops.iter().enumerate() {
+            for &b in &l.body {
+                holding[b as usize].push(j as u32);
             }
+        }
+        for i in 0..loops.len() {
+            let h = loops[i].header as usize;
+            loops[i].parent = holding[h].iter().copied().find(|&j| j as usize > i);
         }
         for i in 0..loops.len() {
             let mut d = 0;

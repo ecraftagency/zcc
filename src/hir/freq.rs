@@ -80,8 +80,14 @@ pub fn estimate(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest) -> Vec<u64> {
     let mut freq = vec![0u64; n];
     // which blocks head a loop, and the header a back edge returns to
     let mut header = vec![false; n];
+    // The latches of every loop headed HERE, indexed by header. `back_edge`
+    // asked the same question by scanning the whole loop list once per CFG
+    // EDGE, which is `edges × loops` for a fact that is a table: a loop's
+    // latches are known before the walk starts and do not change during it.
+    let mut latches_of: Vec<Vec<BlockId>> = vec![Vec::new(); n];
     for l in &lf.loops {
         header[l.header as usize] = true;
+        latches_of[l.header as usize].extend(l.latches.iter().copied());
     }
     freq[f.entry as usize] = ENTRY;
 
@@ -95,7 +101,7 @@ pub fn estimate(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest) -> Vec<u64> {
             let mut sum: u64 = 0;
             for &p in &c.preds[bi] {
                 let pi = p as usize;
-                if back_edge(c, lf, p, b) {
+                if back_edge(&latches_of, p, b) {
                     continue;
                 }
                 let (w, tot) = edge_weight(f, pi, b);
@@ -112,11 +118,8 @@ pub fn estimate(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest) -> Vec<u64> {
 
 /// Is `p -> b` a back edge? It is exactly the edge a loop's latch takes to its
 /// own header, which `LoopForest` already knows.
-fn back_edge(c: &dom::Cfg, lf: &dom::LoopForest, p: BlockId, b: BlockId) -> bool {
-    let _ = c;
-    lf.loops
-        .iter()
-        .any(|l| l.header == b && l.latches.contains(&p))
+fn back_edge(latches_of: &[Vec<BlockId>], p: BlockId, b: BlockId) -> bool {
+    latches_of[b as usize].contains(&p)
 }
 
 /// `(weight of p -> b, total weight of p's edges)`.
