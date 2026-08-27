@@ -20,7 +20,7 @@
 // nothing but a branch to a branch. Removing it is not cosmetic — it is the
 // difference between one branch per loop iteration and two, and it is the second
 // half of the reason loop rotation was measured worthless (§13e).
-use crate::cfg::{Cfg, LoopForest, DomTree};
+use crate::cfg::{Cfg, DomTree};
 use crate::mir::*;
 
 /// THEORY A6b  SQUARE layout_preserves_every_edge — order changes, edges do not
@@ -28,14 +28,19 @@ pub fn run(f: &mut MFunc) {
     thread_empty_blocks(f);
     duplicate_latch(f);
     let cfg = crate::mir::verify::cfg(f);
-    let dt = DomTree::new(&cfg, f.entry);
-    let lf = LoopForest::new(&cfg, &dt);
-    // reverse postorder, but visiting the deeper-nested successor first so a
-    // loop body stays contiguous
-    let mut order = cfg.rpo.clone();
-    order.sort_by_key(|&b| (cfg.rpo_num[b as usize], std::cmp::Reverse(lf.depth[b as usize])));
-    order.sort_by_key(|&b| cfg.rpo_num[b as usize]);
-    f.order = order;
+    f.order = if crate::hir::freq::weights_wanted() {
+        chain_by_weight(f, &cfg)
+    } else {
+        // Reverse postorder. A sort by `(rpo_num, depth)` used to stand above
+        // this one, described as visiting the deeper-nested successor first so a
+        // loop body stays contiguous; `rpo_num` is unique per block, so the
+        // second sort fully determined the order and the first could not affect
+        // it. It is gone rather than fixed: `chain_by_weight` is what that
+        // comment wanted, and it now has a real frequency to do it with.
+        let mut order = cfg.rpo.clone();
+        order.sort_by_key(|&b| cfg.rpo_num[b as usize]);
+        order
+    };
 
     // fall-through: invert a conditional whose TAKEN target is the next block
     for i in 0..f.order.len() {
@@ -70,6 +75,58 @@ pub fn run(f: &mut MFunc) {
     // whose taken target is the next block would otherwise turn a trampoline
     // back into a direct branch to the far target.
     relax_branches(f);
+}
+
+/// R5.1-B — LAY THE HOT EDGE OUT AS THE FALL-THROUGH.
+///
+/// Reverse postorder is an order that respects the CFG but knows nothing about
+/// which way a branch usually goes: at a two-armed conditional it lays out
+/// whichever arm happens to number lower, and the other arm pays a taken branch
+/// on every execution. When one arm is the loop body and the other is the
+/// error return, that is the wrong way round for essentially every iteration.
+///
+/// The rule is Pettis & Hansen's without their profile: from a block, place its
+/// HEAVIEST not-yet-placed successor next, so the heavy edge becomes the
+/// fall-through and the light one takes the branch. `run`'s inversion step below
+/// then rewrites the terminator to match. Chains are seeded in reverse postorder,
+/// so a block whose predecessors are all placed still comes out after them
+/// wherever the chain did not reach it, and the entry block is still first.
+/// Ties break on `rpo_num`, which is unique, so the order is a function of the
+/// IR alone (`tests/determinism.sh`).
+///
+/// This is the greedy 90% of the algorithm, not the bottom-up version: chains
+/// are grown forward from a seed rather than merged best-first across the whole
+/// function. The difference shows only where two chains compete for one hot
+/// target, and the full version needs an edge profile to arbitrate.
+///
+/// SQUARE. Order, not edges: `layout_preserves_every_edge` is unchanged, and the
+/// interpreter follows edges rather than order. What changes is only which of
+/// two successors is reached by falling through.
+fn chain_by_weight(f: &MFunc, cfg: &Cfg) -> Vec<MBlockId> {
+    let mut placed = vec![false; f.blocks.len()];
+    let mut order: Vec<MBlockId> = Vec::with_capacity(cfg.rpo.len());
+    for &seed in &cfg.rpo {
+        if placed[seed as usize] {
+            continue;
+        }
+        let mut b = seed;
+        loop {
+            placed[b as usize] = true;
+            order.push(b);
+            let next = cfg.succs[b as usize]
+                .iter()
+                .copied()
+                .filter(|&s| !placed[s as usize] && cfg.rpo_num[s as usize] != u32::MAX)
+                .max_by_key(|&s| {
+                    (f.blocks[s as usize].weight, std::cmp::Reverse(cfg.rpo_num[s as usize]))
+                });
+            match next {
+                Some(s) => b = s,
+                None => break,
+            }
+        }
+    }
+    order
 }
 
 /// BRANCH RELAXATION. A64's conditional forms do not all reach as far as the
