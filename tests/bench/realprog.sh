@@ -40,7 +40,7 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 $GCC -O2 -w -o "$T/maxrss" "$W/tests/bench/maxrss.c" || { echo "maxrss build failed"; exit 2; }
 M="$T/maxrss"
 
-# `<ms> <peak_kb> <rc>` on fd 3; the child's own output is left alone.
+# `<us> <peak_kb> <rc>` on fd 3; the child's own output is left alone.
 meas() { out=$1; shift; "$M" "$@" >"$out" 2>>"$T/err" 3>"$T/m"; cat "$T/m"; }
 
 CFLAGS="-w -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DISABLE_LFS"
@@ -50,7 +50,7 @@ echo "# §19 REAL PROGRAM — sqlite CLI, built and RUN by both      #"
 echo "############################################################"
 echo
 echo "== BUILD (compile wall · compiler peak RSS · binary bytes) =="
-printf "%-10s %10s %12s %12s\n" compiler wall_ms peak_rss_kb bytes
+printf "%-10s %10s %12s %12s\n" compiler wall_us peak_rss_kb bytes
 
 build() { # name  cc-command...
     nm=$1; shift
@@ -81,11 +81,12 @@ printf "%-10s %10s %12s %12s\n" "RATIO" \
 echo
 
 echo "== RUN (per phase: wall · peak RSS; output differentially checked first) =="
-printf "%-14s %9s %9s %7s %11s %11s %7s\n" phase gcc_ms zcc_ms t_ratio gcc_rss_kb zcc_rss_kb r_ratio
+printf "%-14s %9s %9s %7s %11s %11s %7s\n" phase gcc_us zcc_us t_ratio gcc_rss_kb zcc_rss_kb r_ratio
 
 SQLDIR="$W/tests/bench/sql"
 rm -f "$T/g.db" "$T/z.db"
 tot_g=0; tot_z=0; peak_g=0; peak_z=0; diverge=0
+: > "$T/ratios"
 for f in "$SQLDIR"/*.sql; do
     p=$(basename "$f" .sql)
     # correctness FIRST, on a scratch pair of databases carried across phases
@@ -114,6 +115,7 @@ for f in "$SQLDIR"/*.sql; do
     tr=$(awk "BEGIN{ if($gm>0) printf \"%.3f\", $zm/$gm; else print \"-\" }")
     rr=$(awk "BEGIN{ if($gk>0) printf \"%.3f\", $zk/$gk; else print \"-\" }")
     printf "%-14s %9s %9s %7s %11s %11s %7s\n" "$p" "$gm" "$zm" "$tr" "$gk" "$zk" "$rr"
+    echo "$p $tr" >> "$T/ratios"
 done
 
 echo "---"
@@ -121,6 +123,17 @@ printf "%-14s %9s %9s %7s %11s %11s %7s\n" TOTAL "$tot_g" "$tot_z" \
   "$(awk "BEGIN{ if($tot_g>0) printf \"%.3f\", $tot_z/$tot_g; else print \"-\" }")" \
   "$peak_g" "$peak_z" \
   "$(awk "BEGIN{ if($peak_g>0) printf \"%.3f\", $peak_z/$peak_g; else print \"-\" }")"
+# TOTAL is SUM-WEIGHTED and the GEOMEAN is not, and on this workload they say
+# different things: p07_join alone is about two thirds of the total wall time
+# and is the BEST phase, so the total is close to being a report on the join
+# while the geomean weights all eleven equally. Both are printed, because
+# quoting either alone has misled this project once already.
+awk '{n++; r=$2; s+=log(r); a[n]=r; if(r>worst){worst=r; wn=$1}; if(r>1.1)hi++}
+     END{ if(n==0){print "GEOMEAN: no phases"; exit}
+       for(i=1;i<=n;i++)for(j=i+1;j<=n;j++)if(a[j]<a[i]){t=a[i];a[i]=a[j];a[j]=t}
+       med=(n%2)?a[(n+1)/2]:(a[n/2]+a[n/2+1])/2;
+       printf "GEOMEAN over %d phases: %.4f | median %.3f | worst %s %.3f | %d>1.1x\n",
+              n, exp(s/n), med, wn, worst, hi }' "$T/ratios"
 echo
 echo "PARITY on this axis = build ratios ≈1.0 AND total run ratio ≈1.0 AND peak RSS ≈1.0,"
 echo "with 0 DIVERGE. Unlike the taxonomy suite this program is large enough to"
