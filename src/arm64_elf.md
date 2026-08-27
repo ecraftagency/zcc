@@ -326,6 +326,47 @@ This is Law 3's "certify at the middle" applied to the machine: the `.s`
 CONFIRMS, and here it also DISCOVERS, but it discovers with a controlled
 experiment rather than with a patch and a suite run.
 
+### 6.1 A CEILING IS NOT A COUNT
+
+The most expensive habit this project has recorded, and it cost three rows in
+one day (2026-08-27). Each time, a plan carried a number that looked like an
+opportunity, a mechanism was built on it, and the number turned out to count ONE
+of the conditions the mechanism needed:
+
+| the number in the plan | what it actually counted | what it was worth |
+|---|---|---|
+| 8,696 hints refused with a "locally evictable" occupant | occupants whose LAST USE is in this block — silent about whether they were also live-IN, and a live-in range reaches back through blocks the colourer keeps no record of | **7 firings in all of sqlite** |
+| 3,020 unpaired accesses "a layout could pair" | pairs considered one at a time, silent about the fact that making one adjacent separates another — `ldp`/`stp` consume RUNS | **negative**; two orderings both lost to the shipped one |
+| 5,130 "missing `ldp`/`stp`" against gcc | gcc's PAIRS, not zcc's removable INSTRUCTIONS — gcc pairs more because it spills more. Counted as instructions, zcc emits 22,070 frame instructions to gcc's 24,720 and is **2,650 ahead** | **~1,009** |
+
+The test that catches all three takes thirty seconds: **name a case inside the
+count where the mechanism would still refuse.** If you can, it is not a ceiling.
+
+A ceiling is a hand-edit — the shape built by hand in the `.s`, linked, checked
+for the same output, and timed. Everything else is a hypothesis wearing a
+number. On the same day the hand-edit refuted two rows that had been carried as
+plans for weeks (a loop-invariant constant hoist and small-struct SROA, both
+worth **zero** on the program they were written for) and found the one that was
+worth 2.2× — each in about four minutes.
+
+### 6.2 gcc's OUTPUT IS AN EXISTENCE PROOF, NOT A TEMPLATE
+
+The fact underneath every row in §7 is not a theorem: it is that **gcc's binary
+runs faster on the same source.** That is evidence a better shape exists, and
+its assembly is a witness naming the shape. The work is then to (a) enumerate
+the differences, (b) price each ONE AT A TIME by hand-edit, and (c) derive the
+transform ourselves and ship it with its commuting square.
+
+Copying gcc is not the goal and would be a ceiling of its own: on
+`e3_struct_byval` the hand-edited zcc shape ran **3,332 µs against gcc's
+3,889** — 14% faster — because zcc's other choices (`msub`, folding `k & 255`
+into `uxtb`) were already better than gcc's. gcc -O1 is a LOWER BOUND on what is
+reachable, not the target.
+
+And re-price after every row: the parameter copy in that same program was worth
+**nothing** while the call stood, and **35%** once the call was inlined.
+Removing one cost promotes the next.
+
 ---
 
 ## §7 — The big-win ledger
@@ -348,6 +389,8 @@ the machine actually charges for. Numbers are static instruction counts on
 | **Row-strided load walks a pointer** (§3.3, `35e87ef`) | `matmul` **1.638× → 1.000×**, instruction count UNCHANGED at 7 | The purest instance of Law 3c on record. One multiply, in front of one strided load, 64% |
 | **`inv + k` becomes the counter** (§3.4) | `d2_nested_loops` 6 → 5 insns/iter, **1.400 → 1.000** | Needed `fold::narrow_mask` (§3.5) or the saving came straight back as a `mov w,w` |
 | **The frame adjust becomes an ordinary instruction** and folds into the save pair (R4.15) | sqlite **186,705 → 183,253**, −3,452; ≈3,300 `sub sp`/`add sp` absorbed by pre/post-index | |
+| **Belady's distance is measured along the TRACE** (`SPILL.md` S1, `eeb15b2`) | `nestjoin.c` **8 ms → 1 ms = gcc**; 6 of the inner loop's 11 instructions were frame traffic and 0 remain; sqlite −792; `VdbeExec` frame slots 244 → 200 | `linear_positions` numbers instructions in reverse postorder, and **a back edge runs backwards in that order** — so `next_use` from a latch found nothing and answered `usize::MAX`, "never used again". The loop index, the loop pointer and the accumulator were therefore ranked as the BEST possible eviction candidates while 24 values used only after the loop kept their registers. Belady's rule is a theorem about a trace; measuring its distance in text order inverts it exactly where it matters |
+| **A composite parameter no longer blocks inlining, and its copy is elided** (`820cc22` + `af19bfd`) | `e3_struct_byval` **1.93× → 1.045×** (7,399 → 3,990 µs); the hot loop goes from 4 stores + `ldp`/`stp` + 4 loads + a `bl` to **no memory access at all**; suite INSN 1.0772 → 1.0725 | Two one-line-shaped causes behind a 2× program. `args_match` accepted only scalar parameters, so **every** by-value struct call in the language was un-inlinable. Then the callee's C 6.9.1p9 parameter copy — which `SROA` marks as an ESCAPE, disqualifying both objects from promotion — is provably dead when the callee writes no memory, and removing it let mem2reg promote the whole struct. Neither cause was visible from instruction counts; both came from diffing gcc's assembly |
 
 **What the ledger says when you read it as a whole.** The three largest entries
 are not peepholes — they are a data-structure decision (locals in registers), a
