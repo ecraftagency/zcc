@@ -421,6 +421,35 @@ sqlite is deterministic and needs no quiet box.
 
 ---
 
+## M11-correction. "Locally evictable" counts ONE of three conditions
+
+**WHAT THE REPORT SAYS.** `ZCC_HINT=1` prints, of the hints refused because the
+wanted register was occupied, how many have an occupant that "dies in this block
+(locally evictable)". On sqlite that is 8,696 of 14,764, and the FULL-RANGE line
+then says a register is free across the occupant's whole range in 100% of them.
+
+**WHY THAT IS NOT A CEILING.** `HINT_OCC_LOCAL` tests only that the occupant's
+LAST USE is in this block. A value can die here and still be LIVE-IN, its range
+reaching back through dominating blocks the colourer walked earlier and keeps no
+occupancy record of. Recolouring one of those changes its register in those
+blocks too. Measured, by building the mechanism and running it:
+`regalloc::verify` stopped the compile at
+`unixShmSystemLock: V(4) and V(25) are both live at bb0[3] and both hold Gpr9`.
+
+**THE REAL NUMBER.** Restricted to occupants DEFINED in this block, dying in it,
+and not live-out — the case a block-local history can actually justify — the
+recolour fires **7 times in the whole of sqlite**, for −37 instructions. Seven,
+against a reported eight thousand six hundred.
+
+**WHAT USES IT.** Nothing, now: the mechanism was reverted (`SPILL.md` §4b).
+The entry exists so the next reader of that column knows it is an upper bound on
+an upper bound, and so the row is not attempted a seventh time on the strength
+of the same number.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+---
+
 ## M12. Assumed trips per loop level is TEN, and the choice is not load-bearing
 
 **VALUE.** `TRIPS = 10` in `regalloc/spill.rs`. The spiller's next-use distance

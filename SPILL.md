@@ -188,10 +188,10 @@ Status lives HERE, edited in place. Do not open a new numbering elsewhere.
 | S0 | **A shape-matched kernel in the exec suite** — and, it turned out, an INSTRUMENT that could see it. Two things were hiding this defect from geo40, not one: no kernel in the suite spills, AND the harness timed with `date +%s%N` and then divided by 1,000,000, throwing the nanoseconds away before declaring everything under 5 ms unmeasurable. See §4a. | kernel `k1_vdbe_dispatch` reads **exec 1.939× / insn 1.561×**; timed programs 18 → 25 | ✅ |
 | S1 | **The trace-distance model.** ~~Loop-weighted eviction~~ — the measurement (§1) refuted that framing: the defect was the `usize::MAX` a back edge produces, not a missing weight. Shipped `spill.rs::Trace`: Belady's distance measured along the execution trace (a use behind, inside this loop, is one wrap away; a use outside costs the remaining trips) and over the SSA WEB (the granularity at which eviction is paid, since `Sim::More` retires a whole web). | `nestjoin.c` **8 ms → 1 ms = gcc**; inner loop 11 insns → 8, frame ops 6 → 2 | ✅ |
 | S2a | **The invariant reload.** ✅ The mechanism that carries a memory-resident value through a loop in a register — the cold-edge phi — was already built and was being REFUSED by its own pruning gate, which asked for a read strictly AFTER the block head when the read is AT the head, and answered `usize::MAX` for a value read only across the back edge. The same trace query S1 installed fixes it. | `nestjoin` inner loop 8 insns → **7**, zero reloads; at 36M iterations **12 ms → 11 ms = gcc's 11** | ✅ |
-| S2b | **The accumulator's store.** The one frame op left: every definition of a memory-resident value emits a `Spill` immediately after it (`apply`, ~line 2138), so an accumulator that never leaves its register still writes its slot every iteration. It is off the dependence chain, so measure the ceiling by hand before building anything — sinking a store to the loop's exit edges is a dataflow pass, not a peephole. | no `str` to a slot inside a loop whose slot no instruction in that loop reads | ⬜ |
-| S3 | **`sqlite3VdbeExec`.** Re-measure after S1+S2. | distinct frame slots 235 → **< 80**; function ratio 1.78× → **< 1.2×** | ⬜ |
+| S2b | **The accumulator's store.** ⛔ REFUSED BY ITS OWN CEILING, and no code was written — the §3 method working as intended. Hand-edited the store out of `nestjoin`'s inner loop and timed it at microsecond resolution: gcc 11,599 µs, zcc 11,634 µs, zcc-with-the-store-sunk **11,594 µs**. A 0.34% difference, because the store is off the dependence chain and retires into the write buffer (Law 3c: count is not cost, in the direction that says DON'T build it). A store-sinking dataflow pass is not worth 0.34% of one program. | ceiling measured at **0.34%**; not built | ⛔ |
+| S3 | **`sqlite3VdbeExec`.** Re-measured after S1+S2a. **Gate NOT met**, and the reason was already on the record: slots fell 244 → **199** (−18%) while the function's ratio moved only 1.823× → **1.786×**, because `excess.sh` had already shown the gap in that function is COPIES, not spill traffic (+10,464 reg-reg `mov` file-wide against +1,741 frame accesses). Spill ranking was never going to close it. | wanted slots <80 (got 199) and ratio <1.2× (got 1.786×) | ⛔ |
 | S4a | **The argument registers go last.** ✅ `assign` picks `hint.or_else(alloc_order.find(free))` and `alloc_order` began at x0, so every unhinted value in the function took an argument register before anything else and the argument that wanted it paid a `mov`. Reordering the caller-saved half to x8–x15 then x0–x7 (`MEASURED M13`) — no set, mask or ABI changes. | sqlite 175,407 → **174,677** (1.1167× → **1.1120×**); movs into x0–x7 22,829 → 19,985; geo40 INSN 1.0432 → **1.0301** | ✅ |
-| S4b | **Re-colour the occupant.** The measured lever, and the biggest one open. `ZCC_HINT=1` on sqlite: 34,569 hints wanted, 56.7% taken, **14,879 refused because the wanted register was OCCUPIED and never for want of a free one** — and for **8,784** of those the occupant dies inside the same block with a register free across its WHOLE range, which `color.rs`'s statistics replay computes and then discards. Greedy colouring in dominance order cannot revisit the occupant; a bounded local re-colour can. ⚠️ §3 lists five refuted attempts in this area — none of them had this measurement, and none of them re-coloured the occupant. | reg-reg `mov` in `VdbeExec` < 800; sqlite movs 30,669 → < 25,000 | ⬜ |
+| S4b | **Re-colour the occupant.** ⛔ BLOCKED — attempted, refuted by the verifier, and the ceiling it was aimed at turns out not to exist. See §4b. | attempted; **7 recolours in all of sqlite**, −37 instructions | ⛔ |
 | S4 | **The copy residual.** +1,252 reg-reg mov in that function. Only after S1–S3, because eviction pressure changes once hot values stop moving. | reg-reg mov in `VdbeExec` < 800 | ⬜ |
 | S6 | **A small copy is not a libcall.** ✅ Added IN PLACE, not as a new numbering: S0's instrument made `e3_struct_byval` visible at **2.630× exec**, the worst program in the suite on both axes, and the cause was `isel/lower.rs` lowering EVERY `Inst::MemCpy` to `bl memcpy` — including the 16-byte home of a by-value struct parameter, which made a leaf function build a frame and call libc four million times. Now open-coded up to 32 bytes (`MEASURED M14`, the measured minimum of a nine-point sweep), emitted as two loads then two stores so `ldstp.rs` fuses them. | `e3_struct_byval` 2.630× → **1.953×** (insn 1.724 → 1.621); sqlite 174,677 → **174,572**; suite EXEC 1.0403 → **1.0304** | ✅ |
 | S5 | **`ldp`/`stp` pairing.** File-wide gcc 12,305 pairs vs zcc 7,266 — **−5,039 instructions**, the cheapest untouched size win, and it touches no allocator theorem. | file ratio ≤ 1.09× | ⬜ |
@@ -259,6 +259,53 @@ geo40 becomes geo41. At HEAD, 36 programs: **EXEC 1.0403 over 25 timed** (median
 36** (median 0.991, worst 1.724, 12 above 1.1×). Never compare either against
 0.9494×, 0.9565× or 0.9500×: those are a different program set read through a
 different instrument.
+
+### §4b S4b — why the 8,784 was never a ceiling
+
+The row was aimed at a number the colourer prints itself: of sqlite's 14,764
+hints refused because the wanted register was OCCUPIED, **8,696 have an occupant
+that "dies in this block"**, and the statistics replay says a register is free
+across that occupant's whole range in 100% of them. The plan read that as 8,696
+removable copies.
+
+**It is not, and the instrument's wording is what misled it.** `HINT_OCC_LOCAL`
+tests ONE condition — the occupant's LAST USE is in this block — and labels the
+result "locally evictable". A value can die in this block and still have been
+LIVE-IN, with its range reaching back through dominating blocks the colourer
+walked earlier and keeps no occupancy record of. Recolouring one of those
+changes its register in those blocks too, where the new register is very likely
+taken.
+
+That is not a deduction; it is what happened. The mechanism was built —
+a per-point occupancy history so a refusal could ask what was busy in the part
+of the occupant's range already walked — and on the first real program
+`regalloc::verify` stopped the compile:
+
+```
+unixShmSystemLock: V(4) and V(25) are both live at bb0[3] and both hold Gpr9
+```
+
+Restricted to the genuinely local case — occupant DEFINED in this block, dying
+in this block, not live-out — it is correct, the full corpus passes, and it
+fires **7 times in the whole of sqlite** for **−37 instructions**. Seven, against
+a claimed eight thousand.
+
+**So the lever needs global interference**, which this allocator deliberately
+does not carry: chordal colouring in dominance order is optimal in k precisely
+because it never revisits (THEORY A7). Getting it would mean an interference
+graph or live-range splitting at colouring time — a different allocator, not a
+row. Reverted; the ~150 lines are not worth 37 instructions and they carry an
+edge the verifier had to catch.
+
+**What to fix instead of retrying this.** The instrument should say what it
+measures. `HINT_OCC_LOCAL` should require defined-here AND dying-here before it
+calls anything "locally evictable", so the next reader is not handed an 8,696
+that means something else. Until then, treat that column as an upper bound on an
+upper bound.
+
+⚠️ §3 said five previous attempts in this area were refuted. This is the sixth,
+and it is the first that says WHY in a form the next session can check: the
+number in the report is not the number of removable copies.
 
 ---
 
