@@ -1485,3 +1485,60 @@ fn eviction_ranks_by_dynamic_distance_not_text_order() {
         traffic
     );
 }
+
+/// R5.1 — THE WEIGHTS DECIDE SOMETHING, AND WHAT THEY DECIDE IS STILL RIGHT.
+///
+/// The row has three parts and one switch: `freq::annotate` computes the block
+/// frequencies, `layout` chains blocks so the heavy edge falls through, and the
+/// spiller's `Trace::rank` scales Belady's distance by the frequency of the block
+/// where the reload would be paid. A commuting square proves nothing where the
+/// pass never fires, so this asks both halves of the obligation:
+///
+///   * NON-VACUITY — the emitted text differs with the weights on. The fixture
+///     is built to make it: twenty-four values that a call defines (so none can
+///     be rematerialized), a hot inner loop that reads four of them, and a cold
+///     guarded arm that reads the other twenty. Ranked by distance alone the two
+///     groups are comparable; ranked by what an eviction COSTS they are not.
+///   * MEANING — `⟦mir_v⟧ = ⟦mir_p⟧` with the weights on, and the same answer
+///     with them off. A ranking may choose any victim it likes; it may not
+///     change what the program computes.
+#[test]
+fn frequency_weights_move_the_code_and_not_the_answer() {
+    let decls: String = (0..24).map(|i| format!("int v{}=f({});", i, i + 1)).collect();
+    let cold: String = (4..24).map(|i| format!("+v{}", i)).collect();
+    let src = format!(
+        "int f(int x){{ return x*3+1; }}\n\
+         int g(int n){{ int i, a = 0; {d}\n\
+         for (i = 0; i < n; i++) {{ a += v0*v1 + v2*v3; a ^= a >> 3; }}\n\
+         if (n < 0) {{ a += 0{c}; }}\n\
+         return a + v0 + v23; }}\n\
+         int main(void){{ return g(7); }}\n",
+        d = decls,
+        c = cold
+    );
+    let ast = frontend(&src);
+    let build = |on: bool| -> (i64, i64, String) {
+        hir::freq::set_weights(Some(on));
+        let mut h = hir::build::build(&ast);
+        hir::pass::run_module(&mut h);
+        for f in h.funcs.iter_mut() {
+            hir::freq::annotate(f);
+        }
+        let v = isel::lower(&h);
+        let before = mi::new_machine(&v, &ast).call("main", &[], &[]).expect("⟦mir_v⟧ trapped");
+        let p = crate::compile::backend(&h).expect("allocation failed");
+        let after = mi::new_machine(&p, &ast).call("main", &[], &[]).expect("⟦mir_p⟧ trapped");
+        let text = crate::emit::emit(&ast, &p);
+        hir::freq::set_weights(None);
+        (before as i32 as i64, after as i32 as i64, text)
+    };
+    let (voff, poff, off) = build(false);
+    let (von, pon, on) = build(true);
+    assert_eq!(voff, poff, "⟦mir_v⟧ != ⟦mir_p⟧ with the weights off");
+    assert_eq!(von, pon, "⟦mir_v⟧ != ⟦mir_p⟧ with the weights on");
+    assert_eq!(voff, von, "the weights changed the answer, which is not theirs to change");
+    assert_ne!(
+        off, on,
+        "the weights changed nothing: the fixture stopped exercising layout and eviction"
+    );
+}

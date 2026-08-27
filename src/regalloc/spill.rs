@@ -1332,7 +1332,7 @@ fn simulate(
             // sort with the copies, or it could displace a name whose loss is the
             // expensive kind.
             let droppable = |r: &Res| r.copy.is_some() || spilled[r.v as usize];
-            cand.sort_by_key(|r| (droppable(r), trace.next_use(r.v, bi, head)));
+            cand.sort_by_key(|r| (droppable(r), trace.rank(r.v, bi, head)));
             let hm = phys_mask(&physlive, c) & masks[ki(c)];
             let budget = isa::k(c).saturating_sub(hm.count_ones() as usize);
             let mut bcross = cs[ki(c)]
@@ -1383,7 +1383,7 @@ fn simulate(
                     .iter()
                     .enumerate()
                     .filter(|(_, r)| r.class == c && r.cross)
-                    .max_by_key(|(_, r)| trace.next_use(r.v, bi, head))
+                    .max_by_key(|(_, r)| trace.rank(r.v, bi, head))
                     .map(|(j, r)| (j, r.v));
                 match pick {
                     Some((j, v)) => {
@@ -1512,7 +1512,7 @@ fn simulate(
                                     .and_then(|p| p.vreg())
                                     .map(|p| (j, p))
                             })
-                            .max_by_key(|&(_, p)| trace.next_use(p, bi, head + i));
+                            .max_by_key(|&(_, p)| trace.rank(p, bi, head + i));
                         match pick {
                             Some((j, p)) => {
                                 kept.remove(j);
@@ -1615,7 +1615,7 @@ fn simulate(
                         // outranks every paying one, and among equals Belady still
                         // decides. This is Law 3c's dual for the allocator — a
                         // decision is judged by what it COSTS, not by a count.
-                        .max_by_key(|(_, r)| (remat.contains_key(&r.v), trace.next_use(r.v, bi, at)))
+                        .max_by_key(|(_, r)| (remat.contains_key(&r.v), trace.rank(r.v, bi, at)))
                         .map(|(j, r)| (j, *r));
                     match pick {
                         Some((j, r)) => {
@@ -1695,7 +1695,7 @@ fn simulate(
                         .enumerate()
                         .filter(|(_, r)| r.class == c && r.cross)
                         .filter(|(_, r)| !pinned_defs.contains(&r.v))
-                        .max_by_key(|(_, r)| trace.next_use(r.v, bi, at))
+                        .max_by_key(|(_, r)| trace.rank(r.v, bi, at))
                         .map(|(j, r)| (j, *r));
                     match pick {
                         Some((j, r)) => {
@@ -2464,6 +2464,13 @@ const TRIPS: usize = 10;
 /// allocator never buys.
 struct Trace<'a> {
     lf: &'a crate::cfg::LoopForest,
+    /// R5.1-C — `(first position, weight)` per block, ascending by position, so
+    /// the block holding a use is a binary search rather than a scan. Empty when
+    /// weights are off, and `rank` then never asks.
+    starts: Vec<(usize, u32)>,
+    /// whether `rank` scales at all (`ZCC_WEIGHTS`); off, it IS `next_use` and
+    /// the allocator makes exactly the decisions it made before.
+    weighted: bool,
     /// each loop's body in POSITION space. A natural loop's body is contiguous
     /// in reverse postorder for a reducible CFG, so min..max is that span; where
     /// irreducibility makes it wider the model over-estimates a wrap distance,
@@ -2500,7 +2507,16 @@ impl<'a> Trace<'a> {
             u.sort_unstable();
             u.dedup();
         }
-        Trace { lf, span: Self::spans(f, lf, base), wuses, root }
+        let weighted = crate::hir::freq::weights_wanted();
+        let mut starts: Vec<(usize, u32)> = Vec::new();
+        if weighted {
+            starts = (0..f.blocks.len())
+                .filter(|&b| base[b] != usize::MAX)
+                .map(|b| (base[b], f.blocks[b].weight))
+                .collect();
+            starts.sort_unstable();
+        }
+        Trace { lf, span: Self::spans(f, lf, base), wuses, root, starts, weighted }
     }
 
     fn spans(
@@ -2528,9 +2544,17 @@ impl<'a> Trace<'a> {
     /// Dynamic distance from `from` (a position in block `bi`) to the next read
     /// of value `x`'s WEB. This is the number the eviction rule ranks by.
     fn next_use(&self, x: VReg, bi: usize, from: usize) -> usize {
+        self.next_use_at(x, bi, from).0
+    }
+
+    /// `(dynamic distance, the position of the use it settled on)`. The second
+    /// half is what `rank` needs and the walk already knows: which use answered
+    /// is not recoverable from the distance once a loop wrap has folded a
+    /// backwards step into a forwards one.
+    fn next_use_at(&self, x: VReg, bi: usize, from: usize) -> (usize, usize) {
         let uses: &[Vec<usize>] = match self.root.get(x as usize) {
             Some(&r) => std::slice::from_ref(&self.wuses[r as usize]),
-            None => return usize::MAX,
+            None => return (usize::MAX, usize::MAX),
         };
         let x = 0usize;
         let mut pos = from;
@@ -2543,14 +2567,15 @@ impl<'a> Trace<'a> {
             }
             let u = next_use(uses, x, pos);
             if u <= hi {
-                return acc.saturating_add(u - pos);
+                return (acc.saturating_add(u - pos), u);
             }
             let w = use_from(uses, x, lo);
             if w < hi {
                 // one wrap: out to the latch, then in from the header
-                return acc
-                    .saturating_add(hi.saturating_sub(pos))
-                    .saturating_add(w - lo);
+                return (
+                    acc.saturating_add(hi.saturating_sub(pos)).saturating_add(w - lo),
+                    w,
+                );
             }
             // not wanted anywhere in this loop: the trips still to run are the
             // distance, and the question moves outward
@@ -2559,8 +2584,58 @@ impl<'a> Trace<'a> {
             cur = self.lf.loops[li as usize].parent;
         }
         match next_use(uses, x, pos) {
-            usize::MAX => usize::MAX,
-            u => acc.saturating_add(u - pos),
+            usize::MAX => (usize::MAX, usize::MAX),
+            u => (acc.saturating_add(u - pos), u),
+        }
+    }
+
+    /// R5.1-C — WHAT AN EVICTION COSTS, not only how far away it is paid.
+    ///
+    /// Belady ranks by distance because in the cache his theorem is about, every
+    /// miss costs the same. Here it does not: evicting a value inserts a reload
+    /// AT ITS NEXT USE, so the price is one load times the number of times that
+    /// block runs. Two values whose next reads are equally distant — one in the
+    /// body of a hot loop, one on an error path that runs once — are not equally
+    /// cheap to evict, and distance alone cannot tell them apart. `Trace` already
+    /// charges `TRIPS` per loop LEVEL, which is the same idea at the resolution
+    /// loop depth can express; block frequency is that idea at the resolution the
+    /// CFG can express, and R5.1-A finally computes it.
+    ///
+    /// The rank is `distance × ENTRY / weight(block of the next use)`: an entry-
+    /// block use leaves the distance as it was (`weight == ENTRY` there by
+    /// construction), a hot use shrinks it — the value becomes harder to evict —
+    /// and a cold one stretches it. A dead value stays `usize::MAX`, which every
+    /// caller reads as "evict this first".
+    ///
+    /// This composes with, and does not replace, the rematerialization term that
+    /// `4de446c` put in front of the distance: a value that can be rebuilt in one
+    /// instruction is still the first victim whatever the frequencies say.
+    ///
+    /// SOUNDNESS. It is a RANKING, not a fact: any order this produces is a legal
+    /// eviction order, so no correctness obligation rides on the arithmetic. What
+    /// rides on it is speed, which is why the whole thing is behind the toggle
+    /// and off by default until measured on a machine.
+    fn rank(&self, x: VReg, bi: usize, from: usize) -> usize {
+        if !self.weighted {
+            return self.next_use(x, bi, from);
+        }
+        let (d, at) = self.next_use_at(x, bi, from);
+        if d == usize::MAX {
+            return usize::MAX;
+        }
+        let w = self.weight_at(at).max(1) as u128;
+        let r = (d as u128) * (crate::hir::freq::ENTRY as u128) / w;
+        // one below the sentinel: a live value must never rank as dead
+        r.min(usize::MAX as u128 - 1) as usize
+    }
+
+    /// The weight of the block holding position `at`, by binary search over the
+    /// block starts — the positions are numbered blockwise, so the block is the
+    /// last one that starts at or before `at`.
+    fn weight_at(&self, at: usize) -> u32 {
+        match self.starts.partition_point(|&(p, _)| p <= at) {
+            0 => 1,
+            i => self.starts[i - 1].1,
         }
     }
 }

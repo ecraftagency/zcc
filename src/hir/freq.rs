@@ -71,11 +71,39 @@ pub const TRIPS: u64 = 10;
 /// real distinguishes that from "as hot as it gets".
 const CEIL: u64 = ENTRY.saturating_mul(1_000_000_000);
 
-/// Whether the frequency estimate is written into `Block.weight` at all
-/// (`ZCC_WEIGHTS=1`). R5.1's A/B seam: off, `weight` keeps the `1` it has always
-/// held and every consumer sees today's behaviour.
+/// R5.1's A/B SEAM, and it is one switch for the whole row: whether the estimate
+/// is written into `Block.weight` at all, whether `layout` chains blocks by it,
+/// and whether the spiller's eviction ranking scales by it. Off, `weight` keeps
+/// the `1` it has always held, and all three read today's behaviour — which the
+/// refactor gate checks byte for byte.
+///
+/// A thread-local overlay over the environment, for the reason `spill.rs`'s seams
+/// are thread-locals: the battery runs in parallel threads, and a process-wide
+/// switch would make one test's measurement depend on another's timing. `None`
+/// means "ask the environment", which is what every non-test caller gets.
 pub fn weights_wanted() -> bool {
-    std::env::var_os("ZCC_WEIGHTS").is_some()
+    WEIGHTS.with(|c| c.get()).unwrap_or_else(env_weights)
+}
+
+thread_local! {
+    // THEORY A7b — instrument half. Not a value the compiler computes with: it
+    // is what lets a test ask what the weights DID, which is the non-vacuity
+    // obligation Law 0 puts on every pass.
+    static WEIGHTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force the weights on or off for the CURRENT THREAD, or hand the decision back
+/// to the environment with `None`.
+#[cfg(test)]
+pub fn set_weights(on: Option<bool>) {
+    WEIGHTS.with(|c| c.set(on));
+}
+
+/// `ZCC_WEIGHTS` read once. The spiller asks this per function and `layout` per
+/// function; an environment lookup on each is a cost the answer cannot change.
+fn env_weights() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| std::env::var_os("ZCC_WEIGHTS").is_some())
 }
 
 /// Stamp every block with its estimated frequency, so the layers BELOW HIR can
