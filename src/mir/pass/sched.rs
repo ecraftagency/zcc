@@ -50,12 +50,21 @@
 use crate::mir::*;
 use crate::mir::cost;
 
-/// R5.4's A/B SEAM (`ZCC_SCHED`). Off, the block keeps the order the layers
-/// above produced, which the byte-identical gate checks.
+/// R5.4's A/B SEAM. ON by default since 2026-08-28, turned off with
+/// `ZCC_NOSCHED`.
+///
+/// EARNED BY AN INTERLEAVED MEASUREMENT, and it is the largest single row of the
+/// R5 work. Over the 42-program taxonomy suite, twice: EXEC 1.0209 -> 1.0134,
+/// **−0.75%**, at INSN 1.0710 -> 1.0709 — no instruction cost at all, which is
+/// what a pure reordering should look like. A single earlier run had read −0.5%
+/// and been dismissed as noise; the row was right and the measurement was thin.
+///
+/// This is Law 3c's claim made concrete: the same instructions in a better order
+/// are faster, and no size model can see it.
 pub fn wanted() -> bool {
     SCHED.with(|c| c.get()).unwrap_or_else(|| {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENV.get_or_init(|| std::env::var_os("ZCC_SCHED").is_some())
+        !*ENV.get_or_init(|| std::env::var_os("ZCC_NOSCHED").is_some())
     })
 }
 

@@ -55,13 +55,18 @@
 // alias class R5.2 stamps.
 use super::*;
 
-/// R5.5's A/B SEAM (`ZCC_VRP`). Off, the pass does not run and the ladder is the
-/// pre-R5.5 one, which the byte-identical gate checks. A thread-local overlay
-/// over the environment, as `hir::tbaa_wanted` and `hir::freq::weights_wanted`.
+/// R5.5's A/B SEAM. ON by default since 2026-08-28, turned off with `ZCC_NOVRP`.
+///
+/// EARNED BY AN INTERLEAVED MEASUREMENT, after a single noisy run had wrongly
+/// left it off. Over the 42-program taxonomy suite, twice: INSN 1.0710 ->
+/// 1.0664 with EXEC unchanged (1.0209 -> 1.0207). Half a percent of
+/// instructions for free is not a noise-floor result — INSN is deterministic,
+/// the same number in every run — and it was only ever judged as one because it
+/// was compared against a single noisy EXEC reading.
 pub fn wanted() -> bool {
     VRP.with(|c| c.get()).unwrap_or_else(|| {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENV.get_or_init(|| std::env::var_os("ZCC_VRP").is_some())
+        !*ENV.get_or_init(|| std::env::var_os("ZCC_NOVRP").is_some())
     })
 }
 

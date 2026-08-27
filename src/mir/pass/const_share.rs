@@ -279,8 +279,17 @@ pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
     moved
 }
 
-/// R5's loop-constant seam. ON by default and turned off with `ZCC_NOHOIST`,
-/// which is the direction the measurement earned: interleaved A/B over the
+/// R5's loop-constant seam. OFF by default, turned on with `ZCC_HOIST`.
+///
+/// THE MEASUREMENT IT EARNED, AND THE ONE IT DID NOT. Interleaved with `sched`
+/// and `vrp` on, it is EXEC 1.0159 -> 1.0116 and INSN 1.0662 -> 1.0894: about
+/// four tenths of a percent of time, inside the run-to-run spread, bought with
+/// 2.3% of instructions that is not. THE ULTIMATUM asks for 1x on BOTH axes, and
+/// this trades the axis zcc already wins (sqlite's binary is 0.927 of gcc's) for
+/// the one it loses. So it stays off until the allocator makes the pressure
+/// affordable, and its number is kept here rather than argued about.
+///
+/// The original, hoist-alone reading was: interleaved A/B over the
 /// 42-program taxonomy suite, twice,
 ///
 ///     off  EXEC 1.0228, 1.0182   (mean 1.0205)   INSN 1.0710
@@ -295,7 +304,7 @@ pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
 pub fn hoist_wanted() -> bool {
     HOIST.with(|c| c.get()).unwrap_or_else(|| {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*ENV.get_or_init(|| std::env::var_os("ZCC_NOHOIST").is_some())
+        *ENV.get_or_init(|| std::env::var_os("ZCC_HOIST").is_some())
     })
 }
 
