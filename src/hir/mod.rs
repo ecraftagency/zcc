@@ -14,6 +14,7 @@
 //      which is what makes `⟦·⟧` (SEMANTICS.md §3) a closed definition.
 pub mod build;
 pub mod dom;
+pub mod freq;
 pub mod interp;
 pub mod pass;
 #[cfg(test)]

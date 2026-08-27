@@ -124,7 +124,36 @@ fn rotate_one(f: &mut Func) -> bool {
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     let report = residual_wanted();
+    // PROFITABILITY (`hir::freq`, Wu-Larus 1994). Rotation duplicates the guard
+    // to save one branch per iteration, so it pays exactly when the loop
+    // ITERATES — and it fired on every loop in the program regardless.
+    //
+    // Measured on sqlite: 1,387 rotations, ~3.5 instructions each, and **325 of
+    // them (23%) are loops the estimate puts BELOW the entry block** — code
+    // guarded into a path that runs less often than the function is called.
+    // Those buy nothing and cost the guard.
+    //
+    // The gate is `frequency < ENTRY` and no tighter, because the model gives
+    // every loop the same `TRIPS` multiplier per level: what separates these 325
+    // is not their trip count but the GUARD in front of them, and a threshold
+    // above the entry frequency would start refusing loops whose only sin is
+    // being at depth 0 — which is what most of the taxonomy suite's hot loops
+    // are (`MEASURED M17`: disabling rotation costs that suite 40%).
+    let cold = {
+        let fq = crate::hir::freq::estimate(f, &c, &lf);
+        move |h: BlockId| fq.get(h as usize).copied().unwrap_or(crate::hir::freq::ENTRY)
+            < crate::hir::freq::ENTRY
+    };
     for li in order {
+        if cold(lf.loops[li].header) {
+            if report {
+                eprintln!(
+                    "rotate-residual {} loop@bb{} depth{}: cold",
+                    f.name, lf.loops[li].header, lf.loops[li].depth
+                );
+            }
+            continue;
+        }
         match try_rotate(f, &c, &dt, &lf, li, &pin) {
             Ok(()) => {
                 if report {

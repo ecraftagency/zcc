@@ -857,3 +857,69 @@ best-of-5 wall time through `tests/bench/timeit.c`.
 
 **WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, qbe and cproc at their
 repository tips.
+
+
+---
+
+## M19. Static block execution frequency, and the 23% of loops that are cold
+
+**VALUE.** `hir::freq::estimate` gives every block a relative execution
+frequency, the entry block scaled to `ENTRY = 10_000`. Wu & Larus, *Static
+Branch Frequency and Program Profile Analysis*, MICRO-27 (1994) — the same paper
+`M12` cites for the trip-count convention.
+
+`ENTRY` and `CEIL` are a SCALE and a saturation bound, not thresholds: `ENTRY`
+is the fixed-point denominator that lets integer division carry a fraction, and
+`CEIL` stops a deep nest from overflowing. Neither was tuned and neither can be:
+every consumer reads a RATIO against `ENTRY`.
+
+**WHY IT WAS BUILT.** Three decisions in one day could not be made for want of
+it, and one of them was refused twice:
+
+* the profitability gate for `rotate`/`licm`/`iv`, which add 7,728 instructions
+  to sqlite for no measurable speed and are worth 40% of exec on the taxonomy
+  suite (`M17`);
+* the spiller's `TRIPS = 10`, a stand-in for exactly this analysis (`M12`);
+* "we have no profile", offered three times as a reason not to decide.
+
+**THE MODEL.** Reverse postorder, one pass, no linear system: a loop header takes
+its non-back-edge predecessors' sum times `TRIPS`; every other block sums its
+predecessors weighted by edge probability. Two structural heuristics ship — an
+edge into an `Unreachable` terminator is weighted 1 against 1,000, and a
+successor that returns immediately 250 against 1,000. **No statistical heuristic
+from the paper is included**, because each is a claim about C programs that this
+compiler has not measured.
+
+**WHAT IT FOUND, and it is the point.** Of the 1,387 loops rotation touches in
+sqlite:
+
+| loop frequency | count |
+|---|---|
+| **below entry — runs less than once per call** | **325 (23%)** |
+| 1–10× entry | 708 |
+| 10–100× | 244 |
+| above 100× | 110 |
+
+Loop DEPTH cannot see this: 1,066 of those 1,387 are outermost loops, and so are
+most of the taxonomy suite's hot loops. What separates the cold 23% is the GUARD
+in front of them, which is what a frequency estimate measures and a depth does
+not.
+
+**WHAT IT BOUGHT, first consumer.** `rotate` now declines a loop below entry
+frequency: sqlite **173,611 → 172,949** instructions (−662), and the taxonomy
+suite's INSN geomean is **unchanged to four decimals** (1.0721) — the hot loops
+were never touched, which is the whole claim.
+
+**WHY THE GATE IS AT `ENTRY` AND NO TIGHTER.** The model gives every loop the
+same `TRIPS` multiplier per level, so it cannot rank two loops by trip count —
+only by the guards above them. A threshold above the entry frequency would start
+refusing loops whose only property is being at depth 0, which is what most of the
+suite's hot loops are.
+
+**DETERMINISM.** Integers, `Vec` by block id, reverse postorder. No hash
+iteration, no floating point. `tests/determinism.sh` checks it end to end.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `hir/pass/rotate.rs`. The gates for `licm` and `iv`, and the
+spiller's `TRIPS`, are the obvious next consumers and are NOT yet wired.
