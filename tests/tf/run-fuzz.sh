@@ -70,16 +70,27 @@ YARP_JOBS="$J" sh tests/suites/yarpgen.sh "$SEED" 2>&1 | tee "$FAILDIR/yarpgen.l
 #    FAILDIR. csmith/yarpgen are seed-deterministic, so the source .c/dir IS the reproducer —
 #    generator-version-independent, and (given zcc's HashMap nondeterminism) re-runnable N× locally.
 #    The gate prints "DIVERGE: name(detail) ..."; parse the names, copy the sources.
-for nm in $(sed -n 's/^DIVERGE://p' "$FAILDIR/csmith.log" | tr ' ' '\n' | sed 's/(.*//' | grep .); do
-    cp "/suites/csmith/$nm.c" "$FAILDIR/csmith/" 2>/dev/null || true
-done
-for nm in $(sed -n 's/^DIVERGE://p' "$FAILDIR/yarpgen.log" | tr ' ' '\n' | sed 's/(.*//' | grep .); do
-    cp -r "/suites/yarpgen/$nm" "$FAILDIR/yarpgen/" 2>/dev/null || true
+#    EVERY non-PARITY category is captured, not only DIVERGE. yarpgen s7876 (a >300s
+#    compile in the 2026-08-27 10k seal) was reported by name and its source was never
+#    saved, because CTIMEOUT was not on this list; the case could not be worked on
+#    afterwards at all. A seed is NOT a reproducer — the same generator commit built on
+#    two machines emits different programs for one seed — so a category that prints a
+#    name but keeps no source is a finding thrown away. The gate lines are
+#    "DIVERGE: n(d) ...", "CTIMEOUT (...): n(d) ...", etc; the label may carry a
+#    parenthesised note before the colon, so the name list starts after the LAST colon.
+cap_names() { sed -n "s/^$2[^:]*: *//p" "$1" | tr ' ' '\n' | sed 's/(.*//' | grep . ; }
+for kind in DIVERGE CTIMEOUT TIMEOUT NOT-IMPL; do
+    for nm in $(cap_names "$FAILDIR/csmith.log" "$kind"); do
+        cp "/suites/csmith/$nm.c" "$FAILDIR/csmith/" 2>/dev/null || true
+    done
+    for nm in $(cap_names "$FAILDIR/yarpgen.log" "$kind"); do
+        cp -r "/suites/yarpgen/$nm" "$FAILDIR/yarpgen/" 2>/dev/null || true
+    done
 done
 # generator provenance (version-lock audit) + zcc binary hash (nondeterminism baseline)
 { echo "csmith: $(csmith --version 2>&1 | head -1)"; echo "yarpgen: $(yarpgen --version 2>&1 | head -1)";
   echo "zcc: $(sha256sum "$ZCC" | cut -c1-16)"; } > "$FAILDIR/provenance.txt"
-echo ">> fail-capture: $(ls "$FAILDIR/csmith" | wc -l) csmith + $(ls "$FAILDIR/yarpgen" | wc -l) yarpgen DIVERGE sources in $FAILDIR"
+echo ">> fail-capture: $(ls "$FAILDIR/csmith" | wc -l) csmith + $(ls "$FAILDIR/yarpgen" | wc -l) yarpgen non-PARITY sources in $FAILDIR"
 REMOTE
 
 # Pull the fail-capture back to the operator BEFORE any teardown — a paid divergence must be
