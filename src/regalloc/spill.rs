@@ -679,6 +679,27 @@ pub fn check_pressure(f: &MFunc) -> Result<(), PressureErr> {
         for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
+            // A PARALLEL COPY IS SIMULTANEOUS. Every source is read and every
+            // destination written at one instant, so a destination may take the
+            // register of a source that dies here — and when the pairs form a
+            // cycle, sequentialization breaks it through the RESERVED scratch
+            // (x16 = AAPCS64 IP0, v31), which is not in `alloc_order` and so
+            // costs no allocatable register. Pressure at such a point is
+            // therefore max(|live-in|, |live-out|), and counting live-in PLUS
+            // every destination over-approximates it by the width of the copy.
+            //
+            // Measured (csmith c04804, 2026-08-27): the over-approximation read
+            // 18 + 9 held > k=26 at a `pcopy` and aborted the compile of a
+            // function the spiller had in fact converged on. For every other
+            // instruction the def-and-live-through overlap is real, so the
+            // relaxation is confined to this one form.
+            if matches!(inst, MInst::ParallelCopy(..)) {
+                let dying: Vec<usize> =
+                    live.iter().copied().filter(|&x| last[x] == Some(i)).collect();
+                for x in dying {
+                    live.remove(&x);
+                }
+            }
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
                     live.insert(sp.idx(*r));
