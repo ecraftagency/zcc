@@ -824,6 +824,22 @@ repository returns nothing: it does not claim sqlite among the software it
 builds. (The small compilers known for compiling sqlite are chibicc and tcc,
 both of which implement `volatile`.)
 
+**AND THE OBVIOUS OBJECTION, ANSWERED.** cproc builds Oasis Linux, so how can it
+fail on sqlite? Three facts, and they are consistent:
+
+* `cproc/qbe.c:458` refuses UNCONDITIONALLY —
+  `if (tq & QUALVOLATILE) error("volatile store is not yet supported")`;
+* cproc's `doc/software.md` says of Oasis: *"One of the main goals of cproc is to
+  compile the entire oasis linux system (excluding kernel and libc). This is a
+  WORK IN PROGRESS, but many packages have PATCHES to fix various ISO C
+  conformance issues, enabling them to be built."*;
+* Oasis's package tree holds **153 packages and sqlite is not one of them**
+  (`api.github.com/repos/oasislinux/oasis/contents/pkg`, checked 2026-08-27).
+
+So Oasis is cproc-built on patched sources, by design, and never had to compile
+sqlite. That is the difference the comparison is about: `Article C` asks zcc to
+be a DROP-IN, and the amalgamation is compiled here unmodified.
+
 zcc compiles the amalgamation unmodified, which is Article C's whole premise.
 
 **WHAT THIS ENTRY IS FOR, AND WHAT IT IS NOT.** THE ULTIMATUM names `gcc -O1` as
