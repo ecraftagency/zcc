@@ -40,6 +40,10 @@ use crate::mir::*;
 /// spends a taken branch per level and scatters the arms. See `arm64_elf.md`.
 const MIN_CASES: usize = 24;
 
+/// MEASURED M14 — the inline small-copy bound, in BYTES
+/// MEASURED M14 — the inline small-copy bound, in BYTES
+const INLINE_COPY_MAX: usize = 32;
+
 pub fn lower(m: &hir::Module) -> MModule {
     MModule {
         funcs: m.funcs.iter().map(lower_func).collect(),
@@ -830,6 +834,90 @@ impl<'a> L<'a> {
     }
 
     /// The register holding an HIR operand, materializing a constant if needed.
+    /// MEASURED M14 — the inline small-copy bound
+    ///
+    /// A `MemCpy` this size or smaller becomes loads and stores here instead of
+    /// a call to libc. The threshold is a size/speed trade with a measured
+    /// crossover, not a taste: see `MEASURED.md` M14.
+    ///
+    /// WHY IT MATTERS AT ALL, and the case that found it. C says a by-value
+    /// parameter IS a local object, so the frontend homes one by copying the
+    /// incoming registers into the local's storage — a `MemCpy` of, for a
+    /// four-int struct, SIXTEEN BYTES. Lowering that to `bl memcpy` costs the
+    /// call itself, makes a leaf function non-leaf (so it saves x30 and builds
+    /// a frame), and clobbers the caller-saved half at a point where the
+    /// argument registers are still live. Measured on `e3_struct_byval`: 2.630x
+    /// gcc -O1 on the clock, the worst program in the whole taxonomy suite on
+    /// both axes, for a copy gcc does not perform at all.
+    ///
+    /// The shape emitted is two loads then two stores per sixteen bytes, not
+    /// load-store-load-store, because `mir/pass/ldstp.rs` fuses ADJACENT
+    /// accesses of the same kind — so this hands that pass exactly the pattern
+    /// it already knows how to turn into one `ldp` and one `stp`.
+    ///
+    /// COMMUTING SQUARE. `memcpy` is defined on non-overlapping objects, so the
+    /// order bytes move in is not observable; every byte of `[dst, dst+len)`
+    /// receives the byte at the same offset of `[src, src+len)` and nothing
+    /// else is written. The chunking is a partition of `[0, len)` into
+    /// 16/8/4/2/1-byte pieces, so each byte is copied exactly once. Unaligned
+    /// forms are legal: A64 permits unaligned `ldr`/`str`/`ldp`/`stp` to Normal
+    /// memory (DDI 0487 B2.5.2), which is what a C object is.
+    fn copy_inline(&mut self, d: Reg, s: Reg, len: i32) {
+        let mut off = 0i32;
+        while len - off >= 16 {
+            let (a, b) = (self.tmp(Width::W64), self.tmp(Width::W64));
+            self.push(MInst::Load {
+                op: MemOp::X,
+                dst: a,
+                mem: AddrMode::BaseImm { base: s, off },
+                vol: false,
+            });
+            self.push(MInst::Load {
+                op: MemOp::X,
+                dst: b,
+                mem: AddrMode::BaseImm { base: s, off: off + 8 },
+                vol: false,
+            });
+            self.push(MInst::Store {
+                op: MemOp::X,
+                src: a,
+                mem: AddrMode::BaseImm { base: d, off },
+                vol: false,
+            });
+            self.push(MInst::Store {
+                op: MemOp::X,
+                src: b,
+                mem: AddrMode::BaseImm { base: d, off: off + 8 },
+                vol: false,
+            });
+            off += 16;
+        }
+        for (bytes, op, w) in [
+            (8i32, MemOp::X, Width::W64),
+            (4, MemOp::W, Width::W32),
+            (2, MemOp::H, Width::W32),
+            (1, MemOp::B, Width::W32),
+        ] {
+            while len - off >= bytes {
+                let t = self.tmp(w);
+                self.push(MInst::Load {
+                    op,
+                    dst: t,
+                    mem: AddrMode::BaseImm { base: s, off },
+                    vol: false,
+                });
+                self.push(MInst::Store {
+                    op,
+                    src: t,
+                    mem: AddrMode::BaseImm { base: d, off },
+                    vol: false,
+                });
+                off += bytes;
+            }
+        }
+        debug_assert_eq!(off, len, "small-copy expansion did not partition the length");
+    }
+
     fn reg(&mut self, o: Operand, t: hir::Ty) -> Reg {
         let w = wid(t);
         match o {
@@ -1137,8 +1225,12 @@ impl<'a> L<'a> {
             } => self.call(*dst, sig, callee, args, *sret),
             Inst::MemCpy { dst, src, len } => {
                 let (d, s) = (self.reg(*dst, hir::Ty::I64), self.reg(*src, hir::Ty::I64));
-                let n = self.reg(Operand::Imm(*len as i64), hir::Ty::I64);
-                self.libcall("memcpy", &[d, s, n]);
+                if (*len as usize) <= INLINE_COPY_MAX {
+                    self.copy_inline(d, s, *len as i32);
+                } else {
+                    let n = self.reg(Operand::Imm(*len as i64), hir::Ty::I64);
+                    self.libcall("memcpy", &[d, s, n]);
+                }
             }
             Inst::MemSet { dst, byte, len } => {
                 let d = self.reg(*dst, hir::Ty::I64);

@@ -621,3 +621,51 @@ fn multiply_accumulate_takes_a_literal_multiplier() {
     equiv("long f(long a,long b,long c){return a*b+c;} int main(void){return (int)f(3,4,5);}");
     equiv("int f(int a,int c){return a*7+c;} int main(void){return f(3,4);}");
 }
+
+/// MEASURED M14 — a small copy is open-coded, and a by-value struct parameter
+/// is the case that pays for it.
+///
+/// C 6.9.1p9: a parameter is a local object, so the frontend homes an aggregate
+/// one by copying the incoming registers into the local's storage. That is a
+/// sixteen-byte `MemCpy` for a four-`int` struct, and lowering it to
+/// `bl memcpy` cost far more than the copy: the call, a frame and an x30 save
+/// in a function that is otherwise a LEAF, and the caller-saved half clobbered
+/// while the argument registers are still live. `e3_struct_byval` measured
+/// 2.630x gcc -O1 — the worst program in the taxonomy suite on both axes — for
+/// a copy gcc does not make at all.
+///
+/// NON-VACUOUS: with `INLINE_COPY_MAX = 0` this function contains exactly one
+/// `bl memcpy` and the first assertion fails.
+#[test]
+fn a_small_struct_copy_is_open_coded_not_called() {
+    use crate::mir::{CallTarget, MInst};
+    let src = "struct V{ int a,b,c,d; };\n\
+               long sum(struct V v){ return (long)v.a + v.b - v.c + v.d; }\n\
+               int main(void){ struct V v; v.a=1; v.b=2; v.c=3; v.d=4;\n\
+               return (int)sum(v); }";
+    let f = mir_of(src, "sum");
+    let calls = count(&f, |i| {
+        matches!(i, MInst::Call { callee: CallTarget::Direct(n), .. } if n == "memcpy")
+    });
+    assert_eq!(calls, 0, "a 16-byte parameter home still goes through libc");
+    // and it is a copy, not a deletion: the bytes still move
+    assert!(
+        count(&f, |i| matches!(i, MInst::Load { .. })) >= 2
+            && count(&f, |i| matches!(i, MInst::Store { .. })) >= 2,
+        "the copy vanished instead of being open-coded"
+    );
+    equiv(src);
+    // past the bound it stays a call — the bound is a real boundary, not a
+    // direction of travel
+    let big = "struct W{ int v[64]; };\n\
+               long tot(struct W w){ long s=0; int i; for(i=0;i<64;i++) s+=w.v[i]; return s; }\n\
+               int main(void){ struct W w; int i; for(i=0;i<64;i++) w.v[i]=i;\n\
+               return (int)tot(w); }";
+    assert!(
+        count(&mir_of(big, "tot"), |i| {
+            matches!(i, MInst::Call { callee: CallTarget::Direct(n), .. } if n == "memcpy")
+        }) >= 1,
+        "a 256-byte copy was open-coded, which MEASURED M14 says costs size"
+    );
+    equiv(big);
+}

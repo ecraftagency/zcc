@@ -504,3 +504,56 @@ does not do. That is the open lever, and it is larger than this one.
 
 **WHAT USES IT.** `regalloc/color.rs::assign`'s fallback scan — and nothing
 else: masks, `k`, and the callee-saved set are all order-independent.
+
+---
+
+## M14. A copy of 32 bytes or less is cheaper open-coded than called
+
+**VALUE.** `INLINE_COPY_MAX = 32` in `isel/lower.rs`. An `Inst::MemCpy` of this
+many bytes or fewer becomes loads and stores; anything larger stays a call to
+`memcpy`.
+
+**WHY THERE IS A DECISION AT ALL.** C says a by-value parameter IS a local
+object, so the frontend homes one by copying the incoming registers into the
+local's storage. For a four-`int` struct that is a sixteen-byte `MemCpy`, and
+lowering it to `bl memcpy` costs far more than the copy: the call itself, a
+frame and an x30 save in what would otherwise be a LEAF function, and a
+clobbered caller-saved half at the point where the argument registers are still
+live. `e3_struct_byval` was **2.630× gcc -O1 on the clock — the worst program in
+the taxonomy suite on both axes** — for a copy gcc does not perform at all.
+
+**METHOD.** The threshold trades size against that cost, so it was swept rather
+than chosen. sqlite compiled at nine settings, everything else identical:
+
+| bound (bytes) | sqlite instructions |
+|---|---|
+| 0 (always call) | 174,677 |
+| 8 | 174,659 |
+| 16 | 174,604 |
+| **32** | **174,572** |
+| 48 | 174,584 |
+| 64 | 174,604 |
+| 128 | 174,703 |
+| 256 | 174,703 |
+
+A clean minimum at 32, and past 64 the open-coded form is worse than not
+inlining at all — which is the shape the trade predicts, since a call is four
+instructions whatever the length while the expansion grows with it.
+
+**WHAT IT BOUGHT ON THE CLOCK.** `e3_struct_byval` 2.630× → **1.953×**, and its
+instruction ratio 1.724 → 1.621. The taxonomy suite's EXEC geomean 1.0403 →
+**1.0304** over 25 timed programs.
+
+**WHAT IS STILL WRONG THERE, because the row is not exhausted (Law 4).** zcc
+still round-trips the struct through memory twice: the incoming registers go to
+the argument home, the home is copied to the local, and the fields are then
+loaded back. gcc keeps the whole struct in x0/x1 and extracts the four `int`s
+with `sxtw` and `asr #32`, touching memory not at all. Closing that needs the
+local copy to be recognised as redundant when the parameter is never modified,
+and small aggregates to live in registers (SROA) — neither is this row.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `isel/lower.rs::copy_inline`, reached from `Inst::MemCpy`.
+The expansion emits two loads then two stores per sixteen bytes so that
+`mir/pass/ldstp.rs` sees adjacent same-kind accesses and fuses them.
