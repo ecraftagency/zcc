@@ -164,6 +164,11 @@ pub fn finish(m: &mut crate::mir::MModule) {
             crate::mir::pass::legalize::run(f);
             crate::mir::pass::ldstp::run(f);
             crate::mir::pass::frame_fold::run(f);
+            // R5.4, and the position is the whole of its risk budget: AFTER
+            // `ldstp`, so a pair it formed is scheduled as the one instruction
+            // it now is rather than being pulled apart; BEFORE `layout`, which
+            // reads the final terminators and inserts trampolines by size.
+            crate::mir::pass::sched::run(f);
             crate::mir::pass::layout::run(f);
             crate::mir::pass::layout::drop_dead_copies(f);
         }

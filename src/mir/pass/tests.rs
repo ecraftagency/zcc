@@ -915,3 +915,53 @@ fn slots_that_never_overlap_share_one() {
     );
     same(&src2);
 }
+
+// ── R5.4 scheduling ────────────────────────────────────────────────────────
+
+/// THEORY A6b  SQUARE sched_is_a_topological_order_of_the_dependence_dag
+///
+/// The proof is the construction — a topological order of a DAG that carries
+/// every ordering the machine can observe (RAW, WAR, WAW, memory, barriers) —
+/// so what a test can add is the two halves that construction alone does not
+/// show: that the order the pass produces is legal ON REAL PROGRAMS, checked by
+/// running both sides, and that it is not the identity, checked by finding a
+/// block it actually reordered.
+#[test]
+fn sched_is_a_topological_order_of_the_dependence_dag() {
+    let cases: &[&str] = &[
+        // independent chains: everything to reorder, nothing that must not be
+        "int main(void){int a=1,b=2,c=3,d=4;int x=a*b+c*d;int y=a+b+c+d;return x*y;}",
+        // a division stands at the head of a chain (7 cycles, MEASURED M10) with
+        // independent work beside it — the shape the priority exists for
+        "int f(int n){int q=n/7;int s=0,i;for(i=0;i<4;i++)s+=i*i;return q+s;}\
+         int main(void){return f(70);}",
+        // memory that MUST stay ordered: a store and a load of the same object
+        "int g[4];int main(void){g[0]=5;g[1]=g[0]+1;g[0]=9;return g[0]*10+g[1];}",
+        // a call is a barrier, and the value around it is spilled
+        "int f(int x){return x+1;}\
+         int main(void){int a=3,b=4;int c=f(a);int d=f(b);return c*10+d;}",
+        // volatile: C99 6.7.3 forbids reordering the access at all
+        "int main(void){volatile int v=1;int s=0;v=2;s+=v;v=3;s+=v;return s;}",
+    ];
+    for src in cases {
+        crate::mir::pass::sched::set_sched(Some(true));
+        same(src);
+        crate::mir::pass::sched::set_sched(None);
+    }
+    // …and it is not the identity on at least one of them: some block came out
+    // in a different order than it went in.
+    let moved = cases.iter().any(|src| {
+        let ast = frontend(src);
+        let h = hir::build::build(&ast);
+        let mut off = allocated(&h).unwrap();
+        crate::mir::pass::sched::set_sched(Some(false));
+        finish(&mut off);
+        let mut on = allocated(&h).unwrap();
+        crate::mir::pass::sched::set_sched(Some(true));
+        finish(&mut on);
+        crate::mir::pass::sched::set_sched(None);
+        let text = |m: &crate::mir::MModule| format!("{:?}", m.funcs[0].blocks);
+        text(&off) != text(&on)
+    });
+    assert!(moved, "the scheduler moved nothing: the fixtures have no slack to schedule");
+}

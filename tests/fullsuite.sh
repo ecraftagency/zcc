@@ -89,7 +89,11 @@ fi
 # ======== ON THE HOST (mac): build ELF + launch box ========
 cd "$(dirname "$0")/.." || exit 1
 command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
-docker image inspect zcc-box >/dev/null 2>&1 || { echo "image zcc-box not found"; exit 1; }
+# `docker image inspect` is the obvious probe and it FAILS on this machine while
+# `docker run zcc-box` works — Desktop's CLI plugin answers "No such image" for a
+# bare repository name that `docker images` lists. A gate that cannot start is
+# indistinguishable from a gate that found nothing, so the probe is the listing.
+[ -n "$(docker image ls -q zcc-box 2>/dev/null)" ] || { echo "image zcc-box not found"; exit 1; }
 echo "== build zcc-ELF (aarch64-unknown-linux-musl, release) ..."
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
     cargo build -q --release --target aarch64-unknown-linux-musl \
@@ -97,7 +101,21 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
 ELF="$PWD/target/aarch64-unknown-linux-musl/release/zcc"
 SUITES="${ZCC_SUITE_CACHE:-$HOME/.cache/zcc-suites}"
 [ -d "$SUITES" ] || { echo "suite cache not found: $SUITES"; exit 1; }
-exec docker run --rm -e ZCC_IN_BOX=1 \
+# EVERY ZCC_* THE HOST SET GOES IN WITH IT. A row shipped behind a toggle is
+# tested by the gate only if the gate can SEE the toggle: without this, running
+# `ZCC_VRP=1 fullsuite.sh all` builds the compiler with the row present, runs it
+# with the row off, and reports green for something it never exercised. FUZZ_N
+# is forwarded for the same reason — a seal asked for on the host that arrives
+# inside as the default 300 is a seal in name only.
+ENVS=""
+for v in $(env | sed -n 's/^\(ZCC_[A-Z_0-9]*\)=.*/\1/p'); do
+    [ "$v" = ZCC_IN_BOX ] && continue
+    [ "$v" = ZCC_SUITE_CACHE ] && continue
+    ENVS="$ENVS -e $v"
+done
+[ -n "${FUZZ_N:-}" ] && ENVS="$ENVS -e FUZZ_N"
+# shellcheck disable=SC2086
+exec docker run --rm -e ZCC_IN_BOX=1 $ENVS \
     -v "$ELF":/usr/local/bin/zcc:ro \
     -v "$SUITES":/suites \
     -v "$PWD":/work/zcc:ro \
