@@ -353,6 +353,42 @@ spends itself without moving the ladder. The facts:
 | geo40 worst exec | `d1_switch` 1.111× | 2026-08-27 |
 | realprog total | 1.410× Apple / 2.03× Graviton | report |
 
+### THE HEADLINE, taken at session end 2026-08-27 — sqlite exec is UNMOVED
+
+Three interleaved runs of each binary, `realprog.sh` at microsecond resolution,
+session start (`d85aac9`) against HEAD (`47f8e77`) — seven shipped rows apart:
+
+| | session start | HEAD |
+|---|---|---|
+| **SQL geomean over 11 phases** | 1.7179 / 1.6558 / 1.6620 → **1.679** | 1.6493 / 1.6363 / 1.6626 → **1.649** |
+| TOTAL (sum-weighted) | 1.498 / 1.477 / 1.548 → 1.508 | 1.474 / 1.424 / 1.500 → 1.466 |
+| worst phase | `p01_insert` 2.67–3.01× | `p01_insert` 2.79–2.92× |
+| phases above 1.1× | 10–11 of 11 | 10–11 of 11 |
+
+**The ranges overlap** (old 1.656–1.718, new 1.636–1.663), so a 1.8% shift
+against a 3.7% spread is not a result. Say it plainly: the session moved the
+taxonomy suite from 1.0400 to 1.0190 and sqlite's SIZE from 1.1216× to 1.1085×,
+and did not measurably move real sqlite EXECUTION.
+
+⚠️ **THE STANDING LESSON, and it is the one to read first.** Every row shipped
+today was aimed at a shape found in a KERNEL — a by-value struct parameter, a
+parser's dispatch arm, a nested-loop join. Each was real and each paid on its own
+program. None of them was aimed at sqlite, and sqlite did not move. The 1.11×
+size against 1.65× exec split said this in advance: **the remaining real-program
+gap is not instruction count**, so rows found by counting instructions cannot
+close it.
+
+**What that makes necessary.** A localizer — WHICH FUNCTIONS carry the 1.65×.
+`-DSQLITE_PRIVATE=` already exposes all 1,260 internal functions as symbols in
+both compilers, and `objcopy --weaken-symbols=<list>` allows a hybrid link:
+weaken every global in gcc's object except a chosen set, weaken exactly that set
+in zcc's, link the two, and the chosen functions come from gcc while everything
+else comes from zcc. One link and one run per experiment, no recompiles, so
+binary-searching 1,260 functions is about eleven cycles. (An earlier attempt to
+split the amalgamation into its original translation units failed — 47 of 102
+units do not compile because the headers interleave — and `objcopy
+--only-section` destroys the symbol table. The weaken-list route avoids both.)
+
 ### After S1 — taken 2026-08-27 with ONE harness across both binaries
 
 The baseline column is not a recorded number: `d85aac9` was rebuilt and run
