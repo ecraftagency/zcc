@@ -689,9 +689,49 @@ subsystem, the allocator**; the loop rows have reached everything they can.
 
 ### R5 — the O2 headroom stack (§16)
 User principle (2026-08-24): "to reach 1× we must stack enough technique to reach 0.5×, and keep 0.5×
-as headroom" — O1 parity must be reached with margin, not asymptotically. R5 pulls the §16 shelf in
-rank order (effect on the measured arm64 gap ÷ proof cost) until the paired scoreboard sits at ≤ 1.0 on
-BOTH axes with the distribution flat. Items marked ★ in §16 are cheap enough to ship inside R2/R3.
+as headroom" — O1 parity must be reached with margin, not asymptotically. R5 pulls the §16 shelf until
+the paired scoreboard sits at ≤ 1.0 on BOTH axes with the distribution flat. Items marked ★ in §16 are
+cheap enough to ship inside R2/R3.
+
+**R5 IS FOR BROADENING SPEED — NOT for driving sqlite to 1× (user, 2026-08-27).** The 2026-08-27
+localization (`MEASURED M21`) settled that sqlite's residual gap is register RESIDENCY — keep p/pOp/pC
+resident across the mispredicting VdbeExec dispatch — and that chasing it to 1× is a **grind trap**, for
+four measured reasons: (a) the ceiling is ~2–4% (one reload = +0.9% on the realprog geomean, full
+residency est. +2–4%), so it lands at ~1.12× and stops, ~12% short of 1×; (b) the win sits at the
+realprog run-to-run **noise floor** (±1%), so levers past the first few cannot be told from noise;
+(c) any live-range-splitting change alters what EVERY function spills (the §5 `c04804` class), so each
+step needs a full 10k AWS seal — grind-war iteration economics; (d) it may hit the §4b wall — chordal-SSA
+in dominance order cannot revisit, so true global recoloring is a DIFFERENT allocator, a REARCH decision
+not a row. A hand-edit proved residency is real and correct; it is banked as a Tier-2 row below, NOT the
+R5 goal. **The R5 goal is broad sub-1× margin across the spectrum, ranked by broad-speed ÷ effort:**
+
+**Tier 1 — cheap, broad, ship early (the R5 opening hand, in order).**
+- **R5.1 = ★4** static branch prediction → block weights → **layout + spill-weighting** (`Block.weight`
+  hook exists). The universal enabler: every program gets hot/cold layout and a spiller that keeps hot
+  values resident. Also feeds R5's Tier-2 residency row and #9's priorities.
+- **R5.2 = ★1** TBAA → **load-elim / DSE / LICM** (`aclass` hook exists). The biggest generic
+  across-the-board win; radius = alias-oracle soundness vs C99 6.5p7.
+- **R5.3 = #13** **SLP-SIMD** — the SIMPLE half (local straight-line pack, no cross-iteration analysis;
+  user 2026-08-27). Infra = `Ty::V128` in HIR + NEON ops in MIR, FPR class already holds v-regs. This is
+  where the headroom MARGIN lives: kernels are already 0.95×, NEON pushes them well below 1×.
+- **R5.4 = #9** **BB list-scheduling** — simple algo (user 2026-08-27); needs a MEASURED arm64 latency
+  table (no vendor guide → `MEASURED`). Broad on exposed critical paths (Law 3c).
+- **R5.5 = ★2** VRP + branch-folding + `udiv`/shift narrowing — cheap lattice pass, folds branches
+  everywhere.
+
+**Tier 2 — medium, broad.**
+- **R5.6 = #15** remat + live-range-splitting refinements (**the residency lever — now one broad row for
+  every register-pressured program, NOT the sqlite-1× target**; the proven pOp hand-edit is its seed,
+  `MEASURED M21`). Bounded scope only; a full allocator revisit is out of R5 (§4b).
+- **R5.7 = ★3** tail-call · **R5.8 = #5** PRE/LCM · **R5.9 = #12** unroll/peel/unswitch (code-size watch).
+
+**Tier 3 — big radius / grind / research (defer until Tiers 1–2 are banked and the surface is widened).**
+- #6 GCM+GVN · #7 IPCP/SRA/ICF · #8 inlining policy · #10 store-merge/strlen · #11 switch-conv/cross-jump
+  · #16 superopt/e-graph · #14 alignment (size-only, track don't copy).
+
+**Widen the surface in parallel (Law 3c standing order).** The 35 kernels + sqlite are <10% of the
+spectrum; a broad-speed claim needs 100–200 real programs. Rank Tier-1 rows by their effect on the WIDE
+suite, not on sqlite.
 
 **Rules of the ladder.** One commit per task, push after each R-gate. A red gate after one bounded
 Law-2 attempt quarantines the task (⚠️ + reason), never the milestone. `main` is never touched; merge
