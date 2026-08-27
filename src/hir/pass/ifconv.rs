@@ -105,7 +105,20 @@ fn diamond(f: &Func, c: &dom::Cfg, pin: &[bool], b: BlockId) -> Option<Diamond> 
         return None;
     }
     let join = tj.block;
-    if pin[join as usize] || c.preds[join as usize].len() != 2 {
+    // THE JOIN MAY HAVE OTHER PREDECESSORS, and requiring exactly two refused
+    // the commonest shape there is. A small `if` inside a `switch` arm joins at
+    // the arm's `break` — which is the LOOP LATCH, shared by every arm — so the
+    // join has one predecessor per arm and this test rejected all of them.
+    // `convert` never reads the count: it moves the arms into the head and
+    // redirects ONE edge carrying the selects, leaving every other predecessor's
+    // edge and arguments exactly as they were.
+    //
+    // Measured on `m1_resp_parse`, a redis RESP parser, where the refused shape
+    // was `if (--want == 0) st = S_CR;` in the arm that runs for every payload
+    // byte: hand-converting that one branch to a `csel` in the emitted `.s` took
+    // the program from 91,328us to 76,465us — 16% of the whole program for one
+    // branch, because it is data-dependent and mispredicts.
+    if pin[join as usize] || c.preds[join as usize].len() < 2 {
         return None;
     }
     // Both sides must already have the PARAMETER's type. `build` sometimes hands
