@@ -297,6 +297,24 @@ impl P<'_> {
         }
         Ok(())
     }
+    /// A value of type `t`, as C stores it: modular narrowing for the integer
+    /// types, and C99 6.3.1.2's `!= 0` for `_Bool` — which is NOT modular, and
+    /// collides with the `v as u8` arm (`(_Bool)0x100` would be 0), so it comes
+    /// first.
+    fn narrow_to(&self, t: TypeId, v: i64) -> i64 {
+        if matches!(self.tt.tys[t as usize], Ty::Bool) {
+            return (v != 0) as i64;
+        }
+        match self.tt.size(t) {
+            1 if self.tt.is_unsigned(t) => v as u8 as i64,
+            1 => v as i8 as i64,
+            2 if self.tt.is_unsigned(t) => v as u16 as i64,
+            2 => v as i16 as i64,
+            4 if self.tt.is_unsigned(t) => v as u32 as i64,
+            4 => v as i32 as i64,
+            _ => v,
+        }
+    }
     fn fold(&self, id: NodeId) -> Result<i64, String> {
         match &self.nodes[id as usize] {
             Node::Num(v) => Ok(*v),
@@ -320,21 +338,7 @@ impl P<'_> {
             Node::Cast(e) => {
                 // narrow to the target type so that (char)300 etc. is correct
                 let v = self.fold(*e)?;
-                let t = self.ty(id);
-                // _Bool does NOT narrow modularly: C99 6.3.1.2 = (value != 0). size 1 +
-                // unsigned collides with the `v as u8` arm → (_Bool)0x100 would yield 0 (wrong). Handle first.
-                if matches!(self.tt.tys[t as usize], Ty::Bool) {
-                    return Ok((v != 0) as i64);
-                }
-                Ok(match self.tt.size(t) {
-                    1 if self.tt.is_unsigned(t) => v as u8 as i64,
-                    1 => v as i8 as i64,
-                    2 if self.tt.is_unsigned(t) => v as u16 as i64,
-                    2 => v as i16 as i64,
-                    4 if self.tt.is_unsigned(t) => v as u32 as i64,
-                    4 => v as i32 as i64,
-                    _ => v,
-                })
+                Ok(self.narrow_to(self.ty(id), v))
             }
             Node::Cond(c, t, e) => {
                 if self.fold(*c)? != 0 {
@@ -353,7 +357,7 @@ impl P<'_> {
                     || self.tt.is_unsigned(self.ty(*l))
                     || self.tt.is_unsigned(self.ty(*r));
                 let (l, r) = (self.fold(*l)?, self.fold(*r)?);
-                Ok(match *op {
+                let v = match *op {
                     "+" => l.wrapping_add(r),
                     "-" => l.wrapping_sub(r),
                     "*" => l.wrapping_mul(r),
@@ -379,7 +383,19 @@ impl P<'_> {
                     ">=" if u => ((l as u64) >= r as u64) as i64,
                     ">=" => (l >= r) as i64,
                     _ => return Err("operator not usable in constant expression".into()),
-                })
+                };
+                // C99 6.2.5/9 + 6.3.1.3: an arithmetic operation has the type of its
+                // (promoted) operands, and an unsigned one wraps modulo 2^N AT THAT
+                // WIDTH. Folding in `i64` and stopping there keeps a value no C type
+                // can hold: `232U - 3008373104U` is 1286594424, but the raw i64 is
+                // -3008372872, and the next unsigned comparison reads that as
+                // 18446744070701178744. Measured (yarpgen s02611): the guard
+                // `(unsigned)(signed char)-22 > 232U - 3008373104U` folded FALSE where
+                // it is true, so a whole `if` body never ran and a global kept its
+                // initial value — a wrong answer at -O0, where no optimizer had run.
+                // The comparisons above yield 0/1 and narrowing them to `int` is a
+                // no-op, so one rule covers every operator.
+                Ok(self.narrow_to(self.ty(id), v))
             }
             _ => Err("constant expression required".into()),
         }
