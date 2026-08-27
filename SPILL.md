@@ -100,6 +100,35 @@ cand.sort_by_key(|r| (droppable(r), next_use(&uses, r.v as usize, head)))
 cold-edge reload placement test, and a reporting histogram (`inloop`, ~line 526).
 **Never in the decision.**
 
+### ⚠️ WHAT THE DEFECT ACTUALLY WAS — measured 2026-08-27, and it is not §0's story
+
+§0 above says "one missing weight in one sort key". That diagnosis was made by
+reading. Instrumenting every eviction site (a temporary `eprintln!` at each
+`newsp.push`) said something sharper, and a session that trusts §0's wording
+will build the wrong mechanism:
+
+```
+SPILL joinit site=TERMARG bb29 depth2 v484 nextuse-1 from89   <- inner-loop latch
+SPILL joinit site=TERMARG bb31 depth1 v439..v452 nextuse-1    <- outer-loop latch
+```
+
+`nextuse-1` is `usize::MAX`. **A back edge runs backwards in reverse postorder**,
+so a value carried around a loop is read at a LOWER position than the latch that
+passes it on; `partition_point(|&p| p <= from)` finds nothing and `next_use`
+answers *never used again* — the strongest possible reason to evict, handed to
+precisely the values that are used most. It was not that hot values were
+under-weighted. **They were ranked as dead.**
+
+A second blindness sat behind it. mem2reg splits one C variable into a chain of
+SSA values joined by block parameters, and every link of that chain has exactly
+ONE use: being passed to the next link. Asked of the vreg, "how far to the next
+use of `c0`?" and "of `j`?" both answer 1 — twenty-four cold values and three
+hot ones become indistinguishable at the exact edge where the choice is made.
+Measured: every candidate at the preheader's terminator reported distance 3.
+
+Both are fixed by measuring the distance the way Belady's theorem defines it —
+along the TRACE, over the WEB (`spill.rs::Trace`). Neither is a weight.
+
 ---
 
 ## §2 WHY NOT A REWRITE
@@ -157,8 +186,8 @@ Status lives HERE, edited in place. Do not open a new numbering elsewhere.
 | # | row | gate | status |
 |---|---|---|---|
 | S0 | **A shape-matched kernel in the exec suite** (§4a). geo40 cannot currently SEE this defect — that is why it reads 0.9494× while the same compiler reads 1.4–2.0× on real sqlite. Build one kernel with `sqlite3VdbeExec`'s shape and admit it to the suite, so the standard metric gates S1 instead of hiding it. | the kernel reproduces zcc/gcc ≈ **1.7–1.8×**, matching the real function | ⬜ |
-| S1 | **Loop-weighted eviction.** Weight next-use by loop depth so Belady ranks by expected *dynamic* distance, not static distance. Scale positions by depth, or weight the sort key by `10^depth` (gcc's own rule) — pick whichever keeps `linear_positions` honest. | `nestjoin.c` inner loop contains **zero** frame ops; time 8 ms → ~1 ms | ⬜ |
-| S2 | **Placement.** A value that must spill gets its store/reload in the **preheader**, never the body. Falls out of S1 for loop-invariant values; needs an explicit rule for values live *through* a loop and used after it. | no `ldr`/`str` to a spill slot inside any loop body whose value is loop-invariant | ⬜ |
+| S1 | **The trace-distance model.** ~~Loop-weighted eviction~~ — the measurement (§1) refuted that framing: the defect was the `usize::MAX` a back edge produces, not a missing weight. Shipped `spill.rs::Trace`: Belady's distance measured along the execution trace (a use behind, inside this loop, is one wrap away; a use outside costs the remaining trips) and over the SSA WEB (the granularity at which eviction is paid, since `Sim::More` retires a whole web). | `nestjoin.c` **8 ms → 1 ms = gcc**; inner loop 11 insns → 8, frame ops 6 → 2 | ✅ |
+| S2 | **Placement.** A value that must spill gets its store/reload in the **preheader**, never the body. Falls out of S1 for loop-invariant values; needs an explicit rule for values live *through* a loop and used after it. **S1 named the residual exactly** — the two frame ops left in `nestjoin`'s inner loop are (a) the reload of the loop-INVARIANT pointer, memory-resident for its whole web so it is re-loaded every iteration, and (b) the store of the accumulator, register-resident but kept in sync with its slot for a read after the loop. Both are placement, neither is ranking. | no `ldr`/`str` to a spill slot inside any loop body whose value is loop-invariant | ⬜ |
 | S3 | **`sqlite3VdbeExec`.** Re-measure after S1+S2. | distinct frame slots 235 → **< 80**; function ratio 1.78× → **< 1.2×** | ⬜ |
 | S4 | **The copy residual.** +1,252 reg-reg mov in that function. Only after S1–S3, because eviction pressure changes once hot values stop moving. | reg-reg mov in `VdbeExec` < 800 | ⬜ |
 | S5 | **`ldp`/`stp` pairing.** File-wide gcc 12,305 pairs vs zcc 7,266 — **−5,039 instructions**, the cheapest untouched size win, and it touches no allocator theorem. | file ratio ≤ 1.09× | ⬜ |
@@ -240,6 +269,35 @@ spends itself without moving the ladder. The facts:
 | geo40 INSN geomean | **1.0432×** (deterministic, all 35, worst `e3_struct_byval` 1.759×) | 2026-08-27 |
 | geo40 worst exec | `d1_switch` 1.111× | 2026-08-27 |
 | realprog total | 1.410× Apple / 2.03× Graviton | report |
+
+### After S1 — taken 2026-08-27 with ONE harness across both binaries
+
+The baseline column is not a recorded number: `d85aac9` was rebuilt and run
+through the same script in the same box session, because a ratio taken by two
+different scripts is not a comparison.
+
+| | before S1 | after S1 | gcc -O1 |
+|---|---|---|---|
+| `nestjoin.c` best-of-5 | 8 ms | **1 ms** | 1 ms |
+| sqlite file instructions | 176,186 | **175,394** | 157,074 (1.1216× → **1.1166×**) |
+| `VdbeExec` instructions | 11,014 | **10,841** | 6,041 (1.823× → **1.794×**) |
+| `VdbeExec` distinct frame slots | 244 | **200** | 43 |
+| `VdbeExec` frame accesses | 1,928 | **1,704** | 598 |
+| geo40 EXEC / INSN | 0.9565 / 1.0432 | **0.9474 / 1.0432** | — |
+
+The taxonomy suite's INSN geomean is unchanged **to four decimal places**, and
+the whole 35-kernel corpus is byte-identical across a 1000× sweep of the model's
+one constant (`MEASURED M12`). That is S0's thesis stated as a measurement: no
+kernel in the suite is under enough pressure to spill, so the suite cannot see
+this row at all — it can only certify that the row broke nothing.
+
+⚠️ **`realprog.sh`'s ratio is not stable enough to read from one run.** Three
+runs of the SAME tree gave totals of 1.390×, 1.467× and (before S1) 1.415×,
+while gcc's own total moved 1,181 → 773 ms between them — the box's load
+compresses the ratio toward 1. A realprog A/B must interleave the two binaries
+in one sequence and be read across runs, never as a single pair. The gate that
+DOES resolve S1 is `nestjoin` (8× effect) and the deterministic instruction and
+slot counts above.
 
 ⚠️ **`exectime.sh` NEEDS `SUITE=`.** It defaults to `/work/tests/bench/suite`
 while the repo mounts at `/work/zcc`, and with the wrong path it prints

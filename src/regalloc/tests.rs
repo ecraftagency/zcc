@@ -1404,3 +1404,75 @@ fn every_pointer_rotation_under_pressure_keeps_its_permutation() {
         }
     }
 }
+
+/// SPILL.md S1 — BELADY'S DISTANCE IS MEASURED ALONG THE TRACE, NOT THE TEXT.
+///
+/// `linear_positions` numbers instructions in reverse postorder, in which a back
+/// edge runs backwards. A value carried around a loop is therefore read at a
+/// LOWER position than the latch that passes it on, so the static `next_use`
+/// from the latch found nothing and answered "never used again" — the strongest
+/// possible reason to evict. Measured on `tests/bench/nestjoin.c`: the loop
+/// index, the loop pointer and the accumulator were all spilled out of a
+/// four-million-iteration inner loop, while twenty-four values used only after
+/// both loops kept their registers. Six of the inner loop's eleven instructions
+/// were frame traffic; removing them by hand made the program as fast as
+/// `gcc -O1` (8 ms → 1 ms), which is the whole reason this row exists.
+///
+/// The fixture is that shape: `n` values live ACROSS an inner loop but read only
+/// after it, against three values the inner loop reads every iteration. The
+/// theorem says the three win, so the frame traffic left inside the inner loop
+/// is bounded by what the model still cannot place — the invariant pointer's
+/// reload and the accumulator's live-out store, both S2's business, not S1's.
+///
+/// NON-VACUOUS: with the distance taken statically — the one-line change of
+/// asking `next_use` instead of the trace — the same fixture leaves FOUR frame
+/// instructions in that block and this test fails.
+#[test]
+fn eviction_ranks_by_dynamic_distance_not_text_order() {
+    let n = 24;
+    let decls: String = (0..n).map(|i| format!("long c{}=pa[{}];", i, i)).collect();
+    let bump: String = (0..n).map(|i| format!("c{}+=i;", i)).collect();
+    let sum: String = (0..n).map(|i| format!("+c{}", i)).collect();
+    let src = format!(
+        "long joinit(int *pa, int *pb, int n, int m){{\n\
+         {d} long hits=0; int i,j;\n\
+         for(i=0;i<n;i++){{ int key=pa[i];\n\
+         for(j=0;j<m;j++){{ if(pb[j]==key) hits++; }}\n\
+         {b} }}\n\
+         return hits{s}; }}\n\
+         int A[64],B[64];\n\
+         int main(void){{ int k; for(k=0;k<64;k++){{A[k]=k%7;B[k]=k%7;}}\n\
+         return (int)joinit(A,B,64,64); }}\n",
+        d = decls,
+        b = bump,
+        s = sum
+    );
+    same(&src);
+
+    let ast = frontend(&src);
+    let mut h = hir::build::build(&ast);
+    hir::pass::run_module(&mut h);
+    let p = crate::compile::backend(&h).unwrap();
+    let f = p.funcs.iter().find(|f| f.name == "joinit").unwrap();
+    let cfg = crate::mir::verify::cfg(f);
+    let dt = crate::cfg::DomTree::new(&cfg, f.entry);
+    let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+    let deepest = *lf.depth.iter().max().unwrap();
+    assert!(deepest >= 2, "the fixture lost its inner loop; nothing is being tested");
+    use crate::mir::MInst;
+    let traffic: usize = (0..f.blocks.len())
+        .filter(|&b| lf.depth[b] == deepest)
+        .map(|b| {
+            f.blocks[b]
+                .insts
+                .iter()
+                .filter(|i| matches!(i, MInst::Spill { .. } | MInst::Reload { .. }))
+                .count()
+        })
+        .sum();
+    assert!(
+        traffic <= 2,
+        "the innermost loop carries {} frame instructions: the hot values lost to the cold ones again",
+        traffic
+    );
+}

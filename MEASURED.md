@@ -418,3 +418,48 @@ best, and this entry says so rather than dressing a plausible story as a fact �
 `MIN_CASES = 4` sat unswept in `isel/lower.rs` for a milestone and cost d1 50%
 when someone finally measured it (`MEASURED M4`). Sweeping 4/5/6 on INSN and
 sqlite is deterministic and needs no quiet box.
+
+---
+
+## M12. Assumed trips per loop level is TEN, and the choice is not load-bearing
+
+**VALUE.** `TRIPS = 10` in `regalloc/spill.rs`. The spiller's next-use distance
+is measured along the execution trace, and a value whose next use lies OUTSIDE
+the current loop is reached only after the iterations still to run; that count
+is unknowable statically, so the model assumes ten per nesting level — the same
+convention as gcc's `10^depth` block frequency.
+
+**METHOD.** The number is a cost-model parameter, so the honest question is not
+"is ten right?" (no static analysis can know) but Article E's: *is this the
+spec's number or my convenience's number?* Answered by sweeping it and showing
+the decisions barely move. `ZCC_TRIPS` was made to override the constant and
+sqlite plus all 35 taxonomy kernels were compiled at 1, 2, 3, 4, 5, 10, 20, 100
+and 1000:
+
+| TRIPS | sqlite instructions | taxonomy suite |
+|---|---|---|
+| 1 | 175,452 | byte-identical throughout |
+| 2 | 175,438 | ″ |
+| 5 | 175,405 | ″ |
+| **10** | **175,394** | ″ |
+| 20 | 175,390 | ″ |
+| 100 | 175,380 | ″ |
+| 1000 | 175,380 (identical bytes to 100) | ″ |
+
+The whole three-orders-of-magnitude sweep moves sqlite by **72 instructions,
+0.04%**, monotonically, and saturates at 100 — beyond which no ranking changes
+at all. The taxonomy suite does not move by one byte at any value, which is a
+second reading of the same fact recorded in `SPILL.md` §4a: none of its kernels
+is under enough register pressure to spill, so nothing there can see this
+constant. Ten sits on the flat part of a flat curve.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `regalloc/spill.rs::Trace::next_use` — the step that leaves a
+loop the value is not wanted in, and only that step.
+
+**WHAT WOULD MAKE IT MATTER.** A body long enough that one loop's remaining
+instructions outweigh a factor of ten across a level — deep nests over long
+bodies. Nothing in the current corpus is that shape; a program that is would
+show up as a sqlite-scale gap between TRIPS=10 and TRIPS=100, which today is
+14 instructions.

@@ -232,10 +232,11 @@ pub fn spill_with(
     // live) so it is recomputed inside the loop; `simulate`'s `linear_positions`
     // likewise re-reads the (now longer) instruction lists off the same CFG.
     let cfg = crate::mir::verify::cfg(f);
-    let depth = {
+    let lf = {
         let dt = crate::cfg::DomTree::new(&cfg, f.entry);
-        crate::cfg::LoopForest::new(&cfg, &dt).depth
+        crate::cfg::LoopForest::new(&cfg, &dt)
     };
+    let depth = &lf.depth;
 
     // TERMINATION — one monotone lattice, and a SPENDING LIMIT on the other
     // (spec §4.4).
@@ -319,7 +320,7 @@ pub fn spill_with(
                 prev_exit = vec![Vec::new(); f.blocks.len()];
             }
             let lv = live::compute(f, &cfg);
-            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &depth)? {
+            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web)? {
                 Sim::Plan(p) => {
                     // SPEND A ROUND ONLY IF IT CAN BUY SOMETHING. The seeding is
                     // worth another walk while it is still finding NEW block
@@ -892,9 +893,15 @@ fn simulate(
     // is the back edge carried at all? (`BACKEDGE_CARRY`, and off in the
     // graceful last phase of `spill_with`)
     carry: bool,
-    // loop nesting depth per block — the cost side of a cold-edge reload
-    depth: &[u32],
+    // the loop nesting — the cost side of a cold-edge reload (`lf.depth`) and
+    // the trace the next-use distance is measured along (`Trace`, below)
+    lf: &crate::cfg::LoopForest,
+    // one root per value's SSA web — eviction is ranked over the WEB, because
+    // that is the granularity at which it is PAID (`Sim::More` retires a whole
+    // web to memory, § below)
+    web: &[VReg],
 ) -> Result<Sim, String> {
+    let depth = &lf.depth;
     let reconstruct = RECONSTRUCT.with(|c| c.get()) >= 1;
     let regional = REGIONAL.with(|c| c.get());
     // WHICH VALUES STILL HAVE A DEFINITION — the fence that keeps SSA
@@ -939,6 +946,7 @@ fn simulate(
     };
     let base = linear_positions(f, cfg);
     let uses = use_positions(f, lv, cfg, &base);
+    let trace = Trace::new(f, lf, &base, &uses, lv, web);
     // Once the function contains a call the register file is PARTITIONED: a value
     // live across a call may use only the callee-saved half (AAPCS64 §6.1.1, and
     // `color.rs` applies it per VALUE over its whole range), and a value that is
@@ -1314,7 +1322,7 @@ fn simulate(
             // sort with the copies, or it could displace a name whose loss is the
             // expensive kind.
             let droppable = |r: &Res| r.copy.is_some() || spilled[r.v as usize];
-            cand.sort_by_key(|r| (droppable(r), next_use(&uses, r.v as usize, head)));
+            cand.sort_by_key(|r| (droppable(r), trace.next_use(r.v, bi, head)));
             let hm = phys_mask(&physlive, c) & masks[ki(c)];
             let budget = isa::k(c).saturating_sub(hm.count_ones() as usize);
             let mut bcross = cs[ki(c)]
@@ -1365,7 +1373,7 @@ fn simulate(
                     .iter()
                     .enumerate()
                     .filter(|(_, r)| r.class == c && r.cross)
-                    .max_by_key(|(_, r)| next_use(&uses, r.v as usize, head))
+                    .max_by_key(|(_, r)| trace.next_use(r.v, bi, head))
                     .map(|(j, r)| (j, r.v));
                 match pick {
                     Some((j, v)) => {
@@ -1494,7 +1502,7 @@ fn simulate(
                                     .and_then(|p| p.vreg())
                                     .map(|p| (j, p))
                             })
-                            .max_by_key(|&(_, p)| next_use(&uses, p as usize, head + i));
+                            .max_by_key(|&(_, p)| trace.next_use(p, bi, head + i));
                         match pick {
                             Some((j, p)) => {
                                 kept.remove(j);
@@ -1574,7 +1582,7 @@ fn simulate(
                         .filter(|(_, r)| r.class == c && !pinned.contains(&r.v))
                         .filter(|(_, r)| !over_cross || r.cross)
                         .filter(|(_, r)| !(over_plain && !over_cross && !over_k) || !r.cross)
-                        .max_by_key(|(_, r)| next_use(&uses, r.v as usize, at))
+                        .max_by_key(|(_, r)| trace.next_use(r.v, bi, at))
                         .map(|(j, r)| (j, *r));
                     match pick {
                         Some((j, r)) => {
@@ -1636,7 +1644,7 @@ fn simulate(
                         .enumerate()
                         .filter(|(_, r)| r.class == c && r.cross)
                         .filter(|(_, r)| !pinned_defs.contains(&r.v))
-                        .max_by_key(|(_, r)| next_use(&uses, r.v as usize, at))
+                        .max_by_key(|(_, r)| trace.next_use(r.v, bi, at))
                         .map(|(j, r)| (j, *r));
                     match pick {
                         Some((j, r)) => {
@@ -2335,13 +2343,174 @@ fn use_positions(
 }
 
 /// The next position at which value `x` is read, strictly after `from`;
-/// `usize::MAX` when it is never used again. Belady's rule evicts the value
-/// whose next use is furthest away, so this number IS the policy.
+/// `usize::MAX` when it is never used again — in the STATIC order.
 fn next_use(uses: &[Vec<usize>], x: usize, from: usize) -> usize {
     let u = &uses[x];
     match u.partition_point(|&p| p <= from) {
         i if i < u.len() => u[i],
         _ => usize::MAX,
+    }
+}
+
+/// The first position ≥ `lo` at which value `x` is read; `usize::MAX` if none.
+fn use_from(uses: &[Vec<usize>], x: usize, lo: usize) -> usize {
+    let u = &uses[x];
+    match u.partition_point(|&p| p < lo) {
+        i if i < u.len() => u[i],
+        _ => usize::MAX,
+    }
+}
+
+/// Assumed trips per loop level (`MEASURED M12`). Belady's distance counts
+/// DYNAMIC steps, so leaving a loop costs the iterations still to run, and no
+/// static analysis knows that number. Only the ORDER this factor induces is
+/// used — a value wanted inside this loop must outrank one wanted after it — so
+/// the question Article E makes mandatory ("the spec's number, or my
+/// convenience's number?") is answered by measuring how much the number
+/// matters: swept 1…1000 over sqlite and the taxonomy suite, the whole range
+/// moves sqlite by 72 instructions (0.04%) and the suite not at all, and the
+/// output saturates from 100 upward. Ten is the value every other compiler uses
+/// (gcc's `10^depth` block frequency), so it is the one a reader can check.
+const TRIPS: usize = 10;
+
+/// THE TRACE — Belady's rule measured along the EXECUTION order, not the text.
+///
+/// `linear_positions` numbers instructions in reverse postorder, and a back edge
+/// runs BACKWARDS in that numbering. So for a value carried around a loop —
+/// the induction variable, the pointer, the accumulator — the static
+/// `next_use` from the latch finds no later use and answers `usize::MAX`,
+/// "never used again", which is the strongest possible reason to evict it.
+/// The value is in fact read by the very next dynamic instruction. Measured on
+/// `tests/bench/nestjoin.c`, that is exactly what happened: the three hot values
+/// were spilled out of a four-million-iteration inner loop while twenty-four
+/// cold ones, whose uses lie at higher positions, kept their registers.
+///
+/// Belady's MIN is a theorem about a TRACE (THEORY I — optimal replacement is
+/// furthest-next-use *in time*), so the distance it ranks by has to be counted
+/// in time. This walks out through the loop nest from the point of the
+/// question and answers with the first of:
+///
+/// * a use still ahead in this iteration → its static distance;
+/// * a use behind, inside the same loop → one wrap: to the latch, then in from
+///   the header;
+/// * neither → the remaining trips of this loop, then the same question of the
+///   enclosing loop.
+///
+/// The result is `usize::MAX` only for a value that is genuinely dead, which is
+/// what the sentinel meant all along.
+///
+/// ONE MORE THING THE VREG CANNOT SEE — the question is asked of a WEB.
+/// mem2reg splits one C variable into a chain of SSA values joined by block
+/// parameters, and each link of that chain has exactly ONE use: being passed to
+/// the next link. Asked of the vreg, "how far to the next use of `c0`?" and
+/// "how far to the next use of `j`?" both answer 1, because both are about to
+/// be handed to the next block — the twenty-four cold values and the three hot
+/// ones become indistinguishable at precisely the edge where the choice is
+/// made. So the distance is measured over the web: the next use of the
+/// VARIABLE, not of this link. That is also the granularity at which the
+/// decision is PAID, since a value evicted here retires its whole web to memory
+/// (`Sim::More`, above) — ranking by anything finer prices something the
+/// allocator never buys.
+struct Trace<'a> {
+    lf: &'a crate::cfg::LoopForest,
+    /// each loop's body in POSITION space. A natural loop's body is contiguous
+    /// in reverse postorder for a reducible CFG, so min..max is that span; where
+    /// irreducibility makes it wider the model over-estimates a wrap distance,
+    /// which costs a ranking, never a correctness obligation.
+    span: Vec<(usize, usize)>,
+    /// `uses`, unioned over each web and indexed by the web's root value.
+    wuses: Vec<Vec<usize>>,
+    /// the root of each value's web, extended to values minted after `webs`
+    /// ran (they are their own root: a fresh name nothing has joined yet).
+    root: Vec<VReg>,
+}
+
+impl<'a> Trace<'a> {
+    fn new(
+        f: &MFunc,
+        lf: &'a crate::cfg::LoopForest,
+        base: &[usize],
+        uses: &[Vec<usize>],
+        lv: &live::Liveness,
+        web: &[VReg],
+    ) -> Trace<'a> {
+        let nv = f.vregs.len();
+        let root: Vec<VReg> =
+            (0..nv as VReg).map(|v| web.get(v as usize).copied().unwrap_or(v)).collect();
+        let mut wuses: Vec<Vec<usize>> = vec![Vec::new(); nv];
+        for v in 0..nv as VReg {
+            let u = &uses[lv.sp.idx(Reg::V(v))];
+            if u.is_empty() {
+                continue;
+            }
+            wuses[root[v as usize] as usize].extend_from_slice(u);
+        }
+        for u in wuses.iter_mut() {
+            u.sort_unstable();
+            u.dedup();
+        }
+        Trace { lf, span: Self::spans(f, lf, base), wuses, root }
+    }
+
+    fn spans(
+        f: &MFunc,
+        lf: &crate::cfg::LoopForest,
+        base: &[usize],
+    ) -> Vec<(usize, usize)> {
+        lf.loops
+            .iter()
+            .map(|l| {
+                let (mut lo, mut hi) = (usize::MAX, 0usize);
+                for &b in l.body.iter() {
+                    let bi = b as usize;
+                    if base[bi] == usize::MAX {
+                        continue;
+                    }
+                    lo = lo.min(base[bi]);
+                    hi = hi.max(base[bi] + f.blocks[bi].insts.len());
+                }
+                (lo, hi)
+            })
+            .collect()
+    }
+
+    /// Dynamic distance from `from` (a position in block `bi`) to the next read
+    /// of value `x`'s WEB. This is the number the eviction rule ranks by.
+    fn next_use(&self, x: VReg, bi: usize, from: usize) -> usize {
+        let uses: &[Vec<usize>] = match self.root.get(x as usize) {
+            Some(&r) => std::slice::from_ref(&self.wuses[r as usize]),
+            None => return usize::MAX,
+        };
+        let x = 0usize;
+        let mut pos = from;
+        let mut acc = 0usize;
+        let mut cur = self.lf.of.get(bi).copied().flatten();
+        while let Some(li) = cur {
+            let (lo, hi) = self.span[li as usize];
+            if lo == usize::MAX {
+                break;
+            }
+            let u = next_use(uses, x, pos);
+            if u <= hi {
+                return acc.saturating_add(u - pos);
+            }
+            let w = use_from(uses, x, lo);
+            if w < hi {
+                // one wrap: out to the latch, then in from the header
+                return acc
+                    .saturating_add(hi.saturating_sub(pos))
+                    .saturating_add(w - lo);
+            }
+            // not wanted anywhere in this loop: the trips still to run are the
+            // distance, and the question moves outward
+            acc = acc.saturating_add(TRIPS.saturating_mul(hi.saturating_sub(pos)));
+            pos = hi;
+            cur = self.lf.loops[li as usize].parent;
+        }
+        match next_use(uses, x, pos) {
+            usize::MAX => usize::MAX,
+            u => acc.saturating_add(u - pos),
+        }
     }
 }
 
