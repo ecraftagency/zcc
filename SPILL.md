@@ -156,11 +156,46 @@ Status lives HERE, edited in place. Do not open a new numbering elsewhere.
 
 | # | row | gate | status |
 |---|---|---|---|
+| S0 | **A shape-matched kernel in the exec suite** (§4a). geo40 cannot currently SEE this defect — that is why it reads 0.9494× while the same compiler reads 1.4–2.0× on real sqlite. Build one kernel with `sqlite3VdbeExec`'s shape and admit it to the suite, so the standard metric gates S1 instead of hiding it. | the kernel reproduces zcc/gcc ≈ **1.7–1.8×**, matching the real function | ⬜ |
 | S1 | **Loop-weighted eviction.** Weight next-use by loop depth so Belady ranks by expected *dynamic* distance, not static distance. Scale positions by depth, or weight the sort key by `10^depth` (gcc's own rule) — pick whichever keeps `linear_positions` honest. | `nestjoin.c` inner loop contains **zero** frame ops; time 8 ms → ~1 ms | ⬜ |
 | S2 | **Placement.** A value that must spill gets its store/reload in the **preheader**, never the body. Falls out of S1 for loop-invariant values; needs an explicit rule for values live *through* a loop and used after it. | no `ldr`/`str` to a spill slot inside any loop body whose value is loop-invariant | ⬜ |
 | S3 | **`sqlite3VdbeExec`.** Re-measure after S1+S2. | distinct frame slots 235 → **< 80**; function ratio 1.78× → **< 1.2×** | ⬜ |
 | S4 | **The copy residual.** +1,252 reg-reg mov in that function. Only after S1–S3, because eviction pressure changes once hot values stop moving. | reg-reg mov in `VdbeExec` < 800 | ⬜ |
 | S5 | **`ldp`/`stp` pairing.** File-wide gcc 12,305 pairs vs zcc 7,266 — **−5,039 instructions**, the cheapest untouched size win, and it touches no allocator theorem. | file ratio ≤ 1.09× | ⬜ |
+
+### §4a S0 — the shape-matched kernel
+
+**Why it comes first.** Every existing geo40 kernel fits in L1i and stays under
+register pressure, so none of them can express the defect. Gating S1 on a suite
+that is blind to it would let a real regression pass and a real win go unseen.
+`tests/bench/nestjoin.c` proves the mechanism but is a nested loop, not the
+interpreter shape that carries sqlite's cost.
+
+**Step 1 — extract the true shape.** `sqlite3VdbeExec` starts at line 93917 of
+the cached amalgamation. A naive `awk '/^}/{exit}'` stops after 267 lines on a
+nested brace; extract it properly and record: number of locals live across the
+dispatch, opcode-case count, loop nest depth inside the cases, and how many
+values are live ACROSS the switch. Those four numbers are the spec.
+
+**Step 2 — write the kernel to that spec.** A switch-dispatch interpreter: a
+`while` loop over a synthetic bytecode program, a switch with the measured number
+of cases, the measured number of VM-state locals held live across every case, and
+an inner loop in the cases that carry one. Drive it with enough bytecode to time
+cleanly at kernel scale (target ~5–50 ms under gcc, so the suite stays fast).
+
+**Step 3 — ADMISSION IS CONDITIONAL.** The kernel joins the suite only if it
+reproduces the real function's ratio, **1.7–1.8× zcc/gcc**. A kernel that
+compiles to 1.0× is decorative: it proves the shape was not captured, and
+admitting it would dilute the geomean with a program that tests nothing. Iterate
+on the spec until the ratio matches, or report that the shape could not be
+reproduced and say why.
+
+**Step 4 — re-baseline.** geo40 becomes geo41 and the headline number MOVES,
+because a program that was previously absent is now included. State the new
+baseline explicitly and never compare a post-S0 geomean against 0.9494×; they
+are different suites. This is the honest version of "widen the surface" from
+Law 3c — one program chosen because it carries a known defect, rather than 100
+chosen at random.
 
 ---
 
