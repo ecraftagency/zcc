@@ -236,8 +236,21 @@ spends itself without moving the ladder. The facts:
 | sqlite file ratio | 1.1238× (173,176 / 154,097) | §1 |
 | functions in both compilers | 1.045× | §1 |
 | `ldp`/`stp` file-wide | zcc 7,266 / gcc 12,305 | S5 |
-| geo40 exec | 0.9494× (tag `rc5`) | rc5 |
+| geo40 EXEC geomean | **0.9565×** at HEAD (18 timed, median 1.000, 0 DIVERGE) | 2026-08-27 |
+| geo40 INSN geomean | **1.0432×** (deterministic, all 35, worst `e3_struct_byval` 1.759×) | 2026-08-27 |
+| geo40 worst exec | `d1_switch` 1.111× | 2026-08-27 |
 | realprog total | 1.410× Apple / 2.03× Graviton | report |
+
+⚠️ **`exectime.sh` NEEDS `SUITE=`.** It defaults to `/work/tests/bench/suite`
+while the repo mounts at `/work/zcc`, and with the wrong path it prints
+"EXEC: no timed programs" instead of failing. Always:
+
+```
+docker run --rm -e ZCC=/usr/local/bin/zcc -e SUITE=/work/zcc/tests/bench/suite \
+  -v "$PWD/target/aarch64-unknown-linux-musl/release/zcc":/usr/local/bin/zcc:ro \
+  -v ~/.cache/zcc-suites:/suites -v "$PWD":/work/zcc:ro zcc-box \
+  sh /work/zcc/tests/bench/exectime.sh
+```
 
 **Re-measure only when the tree has changed in a way that could move the number**
 — i.e. AFTER shipping a row, as that row's gate. Never before, and never "to be
