@@ -1239,3 +1239,64 @@ the faster code.
 
 **WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
 zcc, gcc -O1 referee, the 49-program taxonomy suite.
+
+## M26. Where zcc's instructions actually go, against gcc -O1
+
+**WHAT THIS IS.** Three rows were built or tested on the strength of reading one
+program's assembly, and all three lost (`M25`, and the refutations beside it).
+This is the measurement that should have come first: the whole 49-program suite
+compiled by both compilers, every mnemonic counted, and the excess attributed.
+It says what to work on and, more usefully, what not to.
+
+**THE TOTAL.** zcc 7,551 instructions, gcc -O1 6,598 — **+953, or +14.4%.**
+
+**SPELLING FIRST, or the table lies.** gcc writes `mov w7, 18725` where zcc
+writes `movz w8, #1`, and `bne` where zcc writes `b.ne`. Uncombined, `movz`
+reads as +432 against a gcc that never emits it and `b.lt` as +195 against zero.
+Both are the same instruction. The families below are combined.
+
+| family | zcc | gcc | Δ | share of the +953 |
+|---|---|---|---|---|
+| `mov` register→register | 1,006 | 339 | **+667** | 70% |
+| load/store slots (`ldr`+`ldp`, `str`+`stp`) | 1,107 | 967 | +140 | 15% |
+| `cmp` + `subs` | 484 | 359 | +125 | 13% |
+| `mul` + `madd` + `msub` | 187 | 70 | +117 | 12% |
+| `sxtw` + `sbfiz` | 161 | 93 | +68 | 7% |
+| `mov` register→immediate | 608 | 790 | **−182** | — |
+
+The last row is the one that says the constant-sharing row works: zcc
+materializes fewer constants than gcc does, not more.
+
+**WHERE THE COPIES ARE**, classified by what follows them — a `bl` within the
+next few instructions (argument placement), a branch or a label (a block edge,
+which is where SSA destruction puts a phi), or neither:
+
+| | zcc | gcc | Δ |
+|---|---|---|---|
+| at a block edge | 519 | 56 | **+463** |
+| in the body | 312 | 206 | +106 |
+| placing a call argument | 175 | 77 | +98 |
+
+**So half of zcc's entire instruction excess over gcc -O1 is a phi copy at a
+block edge** — 519 against 56, a factor of nine. It is not a missing
+optimization row: it is the copy SSA destruction leaves and coalescing does not
+remove. The same shape was measured independently on the sqlite amalgamation,
+where register-to-register moves are +10,464 of a 20,264-instruction gap (52%).
+
+**AND 67 OF THEM COPY A REGISTER TO ITSELF** (gcc: none). `k1_dispatch` ends
+every one of its switch arms with the identical `mov w10, w10` — a zero-extension
+of a value the preceding `and x10, x11, #7` already left zero above bit 32.
+`mir/pass/ext.rs` turns a redundant extension into a `Copy`, colouring then gives
+it the same register, and `emit.rs` prints every `Copy` without asking whether
+its two ends are the same. Removing it is NOT unconditionally sound — a `w`-form
+write zeroes bits 63:32, and at `Width::W32` the lattice proves a fact about the
+low half only — so it wants the fact restated at full width first, not a peephole.
+
+**WHAT THIS RETIRES.** Ranking work by what the suite's assembly actually
+contains, rather than by what one program's inner loop suggests: the three rows
+tried before this measurement (magic division, switch trees, shift-and-add for a
+constant multiply) address families worth 12%, 0% and 12% of the gap, and each
+one measured a loss. The 70% family was not touched by any of them.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, the 49-program taxonomy suite, both compilers at `-S`.
