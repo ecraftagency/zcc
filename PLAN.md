@@ -123,14 +123,19 @@ used to turn on `freq::annotate` AND its two consumers, both measured losses, so
 under test. It now means "compute the annotation" alone: **codegen-neutral on
 49/49 programs, byte-identical**.
 
-**NEXT, and three separate findings point at it:** the estimate is DEPTH-based.
-It ranked m1's doubly-nested setup loops at 58% while the single-nested parse
-loop beside them runs 60× more, and two hand edits went to the wrong place.
-Feed SCEV's `s.trips` — already computed, already read by the IVX gate — into
-`freq::estimate`. That is also what would let `ZCC_HOIST` fire only in hot loops
-instead of everywhere, which is the whole of why it loses (+17 instructions for
-0.5% on m1, and it is the SAME defect in n7, n1 and m1: a loop-invariant constant
-rebuilt every iteration where gcc hoists it).
+**AND THE OBVIOUS NEXT STEP IS REFUTED.** Feeding SCEV's trip counts into
+`freq::estimate` was built (byte-identical 49/49) and **did not move the ranking**:
+SCEV bounds a loop only when its count is a compile-time constant, and m1's setup
+loop runs `3 + k%9` times while its parse loop runs `n`. Both fall back to
+`TRIPS = 10`. Reverted.
+
+**⭐ TWO ROWS THIS SESSION TERMINATED AT THE SAME ANSWER, AND IT IS PGO.**
+`M31` cannot rank a state machine's switch arms — which one is hot is a property
+of the INPUT. `M33` cannot rank two loops — the bound is a runtime value. Neither
+is a missing analysis. A counter per block, dumped at exit and read on a second
+compile, answers both AND turns `mir::cost::weighted` from an estimate into an
+instrument. Before building it, weigh it against Article C: a two-pass build is a
+change to the `CC=zcc` drop-in contract, so it is a milestone, not a row.
 
 **THE SCOREBOARD IS THE TAIL, NOT THE GEOMEAN.** Σln(rᵢ) ≈ 0.97 over 49
 programs, and essentially all of the positive mass is the 11–13 programs above

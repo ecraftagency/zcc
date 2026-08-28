@@ -3082,6 +3082,27 @@ reads it. That is the next row, and it is what would let `ZCC_HOIST` be gated on
 "this loop is hot" instead of hoisting into cold paths, which is the whole of why
 it loses at +17 instructions for 0.5%.
 
+**AND SCEV CANNOT FIX IT — the row was built and reverted.** The obvious repair
+is to use SCEV's proven trip count per header instead of `TRIPS = 10`, and it was
+wired in: `estimate_with`, `LoopScev::analyze` per loop in `annotate`, still
+byte-identical on 49/49. **The ranking did not move.** SCEV bounds a loop only
+when its trip count is a compile-time constant, and the loops that matter never
+are: `m1`'s setup loop runs `kl = 3 + k % 9` times and its parse loop runs `n`
+times, where `n` is a parameter. Both fall back to `TRIPS`, and depth decides
+again. Reverted — it costs a SCEV analysis per function and buys nothing
+measured.
+
+**SO BOTH ROWS THIS SESSION THAT ASKED "WHICH PATH IS HOT" TERMINATED AT THE SAME
+ANSWER.** `M31` needed to know which switch arm a state machine spends its time
+in, and no static rule separates them because it is a property of the INPUT.
+`M33` needs to know which loop of two runs sixty times more often, and SCEV
+cannot say because the bound is a runtime value. Neither is a missing analysis;
+both are missing MEASUREMENTS of a real execution. That is the project's first
+convergent argument for profile-guided optimization, and it is worth recording as
+such rather than as two separate residuals: a counter per block, dumped at exit
+and read back on a second compile, answers both — and would also make
+`mir::cost::weighted` an instrument rather than an estimate.
+
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, 49-program taxonomy suite.
 
