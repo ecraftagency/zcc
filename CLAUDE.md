@@ -91,8 +91,16 @@ one it discovers — it finds the cliffs, while real programs carry the geomean.
 ## Articles
 
 **A** — (1) strict C99; extensions only when real software demands one, marked
-`EXT(...)`. (2) Minimal LOC: no feature before a real `.c` demands it, no
-anticipatory abstraction, zero external crates. **Compliance beats LOC.**
+`EXT(...)`. (2) **Nothing is built before a real `.c` demands it** — no
+anticipatory abstraction, no feature acquired from a checklist, zero external
+crates.
+
+*There is no line-count ceiling and there never really was one: the constraint
+is DEMAND, not size.* A cap on lines cannot tell a proof from bloat, and this
+project spends most of its lines on the proofs Law 0 ranks above every number —
+so a ceiling would have to be paid for by deleting exactly what makes the
+compiler worth reading. The rule that does the work is the demand rule, and it
+is unchanged.
 
 **B** — `main.rs → lexer → parser → AST → compile.rs → HIR (target-independent
 SSA) → isel → MIR (machine SSA) → regalloc → frame/layout → emit.rs → .s`. The
@@ -136,10 +144,10 @@ cryptic crashes. Read the spec tables before touching the ISA tables, the ABI
 automaton or the emitter.
 
 **G** — refactor, optimize and extend all obey Laws 1–3 and none trades
-verification for a number. A **refactor** ships a byte-identical proof, ranked
-*better ground for optimization ∧ easier proof ≫ fewer lines* — never merge two
-proof-carrying passes to save lines. An **optimization** ships both squares. An
-**extension** stays strict C99 with the deviation visible.
+verification for a number. A **refactor** ships a byte-identical proof and is
+ranked *better ground for optimization ∧ easier proof* — never merge two
+proof-carrying passes or blur a theorem seam. An **optimization** ships both
+squares. An **extension** stays strict C99 with the deviation visible.
 
 ## Index — five documents, and `src/` may point at no others
 
