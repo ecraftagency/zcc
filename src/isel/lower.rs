@@ -20,6 +20,14 @@ use super::imm;
 use crate::hir::{self, BinOp, CmpOp, CvtOp, Inst, Operand, Term, UnOp, ValueId};
 use crate::mir::*;
 
+/// The A/B seam for the commutative-immediate swap in `binop`. ON by default;
+/// `ZCC_NOCOMMUTE=1` turns it off, which is the only way to take the paired
+/// EXEC reading the ±0.007 session spread demands (`MECHANISM.md` Part E §6).
+fn commute() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_NOCOMMUTE").is_err())
+}
+
 /// MEASURED M4 — the jump-table/compare-tree crossover, UNSETTLED
 /// The jump-table density threshold (MECHANISM.md Part F R4.14 (2)) — the case count at
 /// which a table beats a compare tree on THIS machine, taken on the clock.
@@ -1323,6 +1331,36 @@ impl<'a> L<'a> {
     fn binop(&mut self, dst: ValueId, op: BinOp, ty: hir::Ty, a: Operand, b: Operand) {
         let d = self.dst_of(dst);
         let w = wid(ty);
+        // A64 PUTS THE IMMEDIATE ON THE RIGHT, and only there: `add wd, wn, #k`
+        // has no mirror form. Everything below offers `b` to `imm::as_rhs` and
+        // `a` to a register, so a COMMUTATIVE operation written with its
+        // constant on the left — `'a' + i % 26`, which is how C source usually
+        // says it — materializes that constant into a register and then adds two
+        // registers. Two instructions where the ISA has one, inside whatever
+        // loop the expression sits in.
+        //
+        // `MEASURED M30`'s worklist found it: `m1_resp_parse`'s two hottest blocks
+        // are 58% of that program's weighted cost and each holds
+        // `movz w13, #97 ; add w12, w13, w12` where gcc -O1 writes
+        // `add w0, w0, 97`.
+        //
+        // Commutativity is the whole justification and it is exact for these
+        // five over the integers modulo 2^n (ISO 9899 6.5: `+`, `*`, `&`, `^`,
+        // `|` are all commutative, and unsigned wrap-around is associative and
+        // commutative too). `Sub`, the divisions and the shifts are NOT, and are
+        // not listed. The floating-point adds and multiplies are not listed
+        // either: IEEE-754 addition commutes, but this is a LOWERING and the FP
+        // path below takes both operands in registers regardless, so swapping
+        // would buy nothing and would put a NaN-payload question in the way of a
+        // reader for no reason.
+        let (a, b) = match (op, a, b) {
+            (
+                BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor,
+                Operand::Imm(_),
+                Operand::Val(_),
+            ) if commute() => (b, a),
+            _ => (a, b),
+        };
         if let Some(fop) = match op {
             BinOp::FAdd => Some(FpOp::Fadd),
             BinOp::FSub => Some(FpOp::Fsub),

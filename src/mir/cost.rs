@@ -274,6 +274,70 @@ fn latch_args(f: &MFunc, from: MBlockId, to: MBlockId) -> Option<Vec<Reg>> {
     None
 }
 
+/// The THIRD model, and the one `MEASURED M29` asked for (built: `MEASURED M30`): **executions, not
+/// instructions**.
+///
+/// `cost = |MIR(f)|` is exact for size and Law 3c names its blindness to
+/// dependence chains. There is a simpler blindness beside it: a static count
+/// weighs an instruction in a latch executed 5,760,000 times exactly as it
+/// weighs one in a cold arm. `n7_nested_subq` is the proof — removing two
+/// executed instructions and a taken branch from its inner loop moved the
+/// program 1.370 → 1.195 while the suite's INSN geomean moved 0.0008.
+///
+/// So this sums each block's instruction count against the frequency
+/// `hir::freq` already computed and `isel` already copied into `MBlock.weight`:
+///
+/// ```text
+///     wcost(f) = Σ_b  weight(b) · |insts(b)|
+/// ```
+///
+/// It is an ESTIMATE of executions, not a cycle count — it prices every
+/// instruction at one and knows nothing of latency or issue width, so it is the
+/// dual of `cost = |MIR|` rather than of `recurrence`. Its job is RANKING: it
+/// says which blocks a codegen row should be read in, which is the question the
+/// static count answers wrongly.
+pub fn weighted(f: &MFunc) -> u64 {
+    f.blocks
+        .iter()
+        .map(|b| b.weight as u64 * b.insts.len() as u64)
+        .sum()
+}
+
+/// `ZCC_WCOST=1` — the weighted count per function, and the blocks that carry
+/// it. The list is the worklist: a block near the top is where an instruction
+/// costs something, and every parity win this project has recorded came from
+/// reading one loop body against gcc's.
+pub fn wreport(f: &MFunc) {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*W.get_or_init(|| std::env::var("ZCC_WCOST").is_ok()) {
+        return;
+    }
+    let total = weighted(f);
+    if total == 0 {
+        return;
+    }
+    let mut rows: Vec<(u64, usize, usize, u32)> = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| !b.insts.is_empty())
+        .map(|(i, b)| (b.weight as u64 * b.insts.len() as u64, i, b.insts.len(), b.weight))
+        .collect();
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    eprintln!("WCOST {} total={} blocks={}", f.name, total, f.blocks.len());
+    for (w, b, n, wt) in rows.iter().take(6) {
+        eprintln!(
+            "  WCOST {} b{} {} insts x weight {} = {} ({:.0}%)",
+            f.name,
+            b,
+            n,
+            wt,
+            w,
+            100.0 * *w as f64 / total as f64
+        );
+    }
+}
+
 /// `ZCC_CYCLES=1` — print each loop's recurrence bound beside its instruction
 /// count, so the two models can be read against each other. A loop whose count
 /// is at parity with gcc while its bound is not is exactly the case `cost=|MIR|`

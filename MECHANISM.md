@@ -2870,6 +2870,67 @@ Gate `fullsuite.sh all`: 15 PASS / 0 RED. Battery:
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee, 49-program taxonomy suite.
 
+### M30. The weighted count, built — and the first thing it found
+
+`M29` asked for `Σ_b weight(b)·|insts(b)|` and named it the cost model an EXEC
+claim should be predicted on. It is now `mir::cost::weighted`, reported by
+`ZCC_WCOST=1`.
+
+**IT NEEDS `ZCC_WEIGHTS=1` TO MEAN ANYTHING, and that is a finding of its own.**
+`hir::freq::annotate` computes the frequencies but is OFF by default, because
+R5.1 measured its two CONSUMERS (layout and spill) as a loss and put all three
+behind one switch. So `MBlock.weight` is 1 everywhere in a default build and the
+weighted count degenerates to the static one. The annotation and the consumers
+want separate switches; until then, take the ranking with `ZCC_WEIGHTS=1` and
+apply it to a default build.
+
+**WHAT IT FOUND IMMEDIATELY.** `m1_resp_parse` (EXEC 1.44, the suite's worst):
+
+```
+WCOST main total=18,455,179
+  b6  11 insts x weight 500,000 = 5,500,000  (30%)
+  b10 11 insts x weight 477,270 = 5,249,970  (28%)
+```
+
+**58% of the program in two eleven-instruction blocks**, and the static count
+ranks them nineteenth. Both held
+
+```
+movz w13, #97 ; add w12, w13, w12          gcc -O1:  add w0, w0, 97
+```
+
+**A64 puts the immediate on the RIGHT and has no mirror form**, and `isel::binop`
+offered only its `b` operand to `imm::as_rhs`. A commutative operation written
+with its constant on the left — `'a' + i % 26`, which is how C source usually
+says it — therefore materialized the constant into a register and added two
+registers: two instructions where the ISA has one, inside whatever loop the
+expression sits in.
+
+**THE ROW.** Swap the operands of `Add`/`Mul`/`And`/`Or`/`Xor` when the left is
+an immediate and the right is not (ISO 9899 6.5 — all five commute, including
+unsigned wrap-around; `Sub`, the divisions and the shifts do not and are not
+listed). `ZCC_NOCOMMUTE=1` is the A/B seam.
+
+| | EXEC (two interleaved pairs) | INSN |
+|---|---|---|
+| off | 1.0214 · 1.0236 | 1.0706 |
+| on | **1.0206 · 1.0202** | **1.0688** |
+
+Both axes, and the row wins both pairs — a single earlier reading had said 1.0293
+and was noise of twice the effect's size. Gate `fullsuite.sh all`: 15 PASS / 0
+RED.
+
+**WHERE THE SUITE STANDS after the day's four rows** — and the shape of it
+matters more than the geomean: EXEC **1.0204**, INSN **1.0688**, median 1.02,
+**but 11 of 49 programs above 1.1× and a worst of 1.44**. The geomean is 2% from
+parity and the tail is not. Law 3c's rule applies to the next session's choice of
+row: a geomean already at 1.02 cannot be moved by anything, while `m1` 1.44,
+`n1` 1.33, `m2` 1.32 each hold a `n7`-sized win — that one was 13% of a program
+for 0.0008 of the INSN geomean.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee, 49-program taxonomy suite.
+
 ---
 
 # Part G — the pipeline, layer by layer

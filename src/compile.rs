@@ -137,6 +137,7 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
     // edges are the header parameters, and `regalloc` is about to destroy them.
     for f in m.funcs.iter() {
         crate::mir::cost::report(f);
+        crate::mir::cost::wreport(f);
     }
     phase("mir::verify", || {
         for f in &m.funcs {

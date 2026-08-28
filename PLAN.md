@@ -67,20 +67,31 @@ been aimed at it. First question, unanswered: `isa::mov_chain` knows
 ALU operands. Count the constants whose chain is ≥2 and which `logical_imm`
 accepts before writing anything.
 
-**BANKED, and it is the session's largest win.** `promote::sink_stores`
-(`MEASURED M29`): a loop-carried slot promoted to a register left its store alone
-in the latch's split block, three executed instructions and a taken branch in a
-fifteen-instruction body running 5.76M times. **n7_nested_subq 1.370 → 1.195**,
-suite EXEC 1.0235 → 1.0210, gate 15/0.
+**BANKED — four rows, and the shape of the day is that the geomean is the wrong
+scoreboard.** Suite EXEC **1.0204**, INSN **1.0688**, gate 15/0. But 11 of 49
+programs are still above 1.1× and the worst is 1.44, so the 2% left in the
+geomean is not where the work is.
 
-**THE INSTRUMENT THIS EXPOSED, and it is the next thing to build.** The INSN
-geomean moved 1.0714 → 1.0706 for that. A static count weighs a latch executed
-5.76M times exactly as it weighs a cold arm, so **`cost = |MIR|` cannot rank a
-codegen row by time** — a third blindness beside Law 3c's chains. zcc already
-carries the frequencies (`hir::freq::annotate` → `MBlock.weight`): build
-`Σ_b weight(b)·|insts(b)|` and rank the remaining rows on it. Every 1.3–1.4×
-program left (m1 1.433, n1 1.316, m2 1.318, a2/a3 ~1.11) should be re-read with
-that number in hand rather than by eye.
+| row | what it was | effect |
+|---|---|---|
+| `ZCC_CSBIAS` | partner-aware callee-saved bias (`M27`) | sqlite runtime 0.9740 |
+| `promote::sink_stores` | the latch store, sunk into its producer (`M29`) | n7 1.370 → **1.195** |
+| `cost::weighted` + `ZCC_WCOST` | the executions model (`M30`) | the instrument, not a row |
+| isel commutative-immediate swap | `97 + x` lowered as `add x, #97` (`M30`) | EXEC −0.002, INSN −0.0018, both pairs |
+
+**THE METHOD THAT PRODUCED ALL OF IT, and it is repeatable:** rank the failing
+program's blocks by `ZCC_WEIGHTS=1 ZCC_WCOST=1`, read the top two against gcc's
+same loop, hand-edit the `.s`, verify the output, time it with alternating
+best-of-N — and only then touch the compiler. n7's win was 13% of a program for
+0.0008 of the INSN geomean; m1's two hottest blocks are 58% of that program and
+the static count ranks them nineteenth.
+
+**NEXT, in order, and each is one program not one percent:** `m1_resp_parse`
+1.44 (its two hot blocks still hold a loop-invariant `movz #26` and a redundant
+second induction variable, both visible in the listing above), `n1_btree_page`
+1.33, `m2_http_parse` 1.32. Split `ZCC_WEIGHTS` from its two consumers first —
+`freq::annotate` is off by default because R5.1's layout and spill consumers
+lost, which leaves `MBlock.weight` at 1 and the weighted count degenerate.
 
 **REFUTED THE SAME SESSION** (`M28`): the sign-extended index. zcc emits 141
 memory operands of the form `[base, wN, sxtw]` against gcc's 11, 78 in
