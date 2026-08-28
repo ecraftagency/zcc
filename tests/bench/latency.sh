@@ -7,7 +7,7 @@
 # blindness has cost a benchmark 40-64% — matmul at IDENTICAL instruction count,
 # j3 with the same. The fix is a TIME model, and a time model needs latencies.
 # Apple publishes no Software Optimization Guide for this core, so there is no
-# table to transcribe: it has to be measured, and `MEASURED.md` is where the
+# table to transcribe: it has to be measured, and `MECHANISM.md` Part F is where the
 # result lives. Inventing the numbers would be inventing provenance (Law 0).
 #
 # THE METHOD, and why it needs no clock frequency. Time a loop whose body is a
@@ -129,5 +129,5 @@ done
 echo
 echo "Read: a form at 1.00 is one dependent ALU op. \`nop_control\` measures the"
 echo "harness, not the machine — if it is not far below 1.00 the rows are noise."
-echo "Record what this prints in MEASURED.md with the date and the machine; it is"
+echo "Record what this prints in MECHANISM.md Part F with the date and the machine; it is"
 echo "a fact about the core that measured it, not about AArch64."

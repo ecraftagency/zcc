@@ -9,7 +9,7 @@
  * "never used again" — and spilled the loop index, the loop pointer and the
  * accumulator while the twenty-four cold values kept their registers.  Six of
  * the inner loop's eleven instructions were frame traffic; gcc -O1 ran the same
- * program eight times faster.  SPILL.md S1.
+ * program eight times faster.  MECHANISM.md Part D S1.
  *
  * It stays in the suite as the regression test for that: the shape is the whole
  * point, and 24-live-across-a-loop is not something any other member expresses.

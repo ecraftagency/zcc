@@ -21,7 +21,7 @@
 #              crash     zcc panic/signal (rc=101 or >128) — the compiler died.
 #
 # Gate = 0 FAIL. NOT-IMPL is permitted but the manifest must NAME the specific
-# reason (torture.not-impl) for auditing. Cache clone: see tests/README.md.
+# reason (torture.not-impl) for auditing. Cache clone: see MECHANISM.md Part A.
 set -e
 cd "$(dirname "$0")/../.."
 if [ -z "$ZCC" ]; then
@@ -30,7 +30,7 @@ if [ -z "$ZCC" ]; then
 fi
 C="${ZCC_SUITE_CACHE:-$HOME/.cache/zcc-suites}"
 export DIR="$C/gcc/gcc/testsuite/gcc.c-torture/execute"
-[ -d "$DIR" ] || { echo "cache not found: sparse-clone gcc per tests/README.md"; exit 2; }
+[ -d "$DIR" ] || { echo "cache not found: sparse-clone gcc per MECHANISM.md Part A"; exit 2; }
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 # gcc-ext manifest: cases where the gcc REFEREE runs semantics outside strict C99

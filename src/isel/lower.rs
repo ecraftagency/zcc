@@ -838,7 +838,7 @@ impl<'a> L<'a> {
     ///
     /// A `MemCpy` this size or smaller becomes loads and stores here instead of
     /// a call to libc. The threshold is a size/speed trade with a measured
-    /// crossover, not a taste: see `MEASURED.md` M14.
+    /// crossover, not a taste: see `MECHANISM.md` Part F M14.
     ///
     /// WHY IT MATTERS AT ALL, and the case that found it. C says a by-value
     /// parameter IS a local object, so the frontend homes one by copying the

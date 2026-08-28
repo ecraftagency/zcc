@@ -758,7 +758,7 @@ fn the_time_model_separates_shapes_the_size_model_cannot() {
     // THE SQUARE FOR A COST MODEL IS THAT IT RE-DERIVES WHAT IS ALREADY MEASURED.
     // R4.18 ships only if the latency table alone reproduces the two gaps that
     // were taken on the clock, so these are not invented expectations — each one
-    // has a wall-time measurement behind it in MEASURED.md.
+    // has a wall-time measurement behind it in MECHANISM.md Part F.
 
     // (1) An ACCUMULATOR recurrence is one cycle, and it stays one cycle when a
     // multiply feeds it: `madd`'s accumulator operand forwards late (measured

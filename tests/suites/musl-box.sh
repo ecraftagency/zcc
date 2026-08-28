@@ -3,7 +3,7 @@
 # Runs INSIDE the Linux box (zcc-box): requires $ZCC = a static ELF zcc binary, the
 # musl-1.2.5 source tree + libc-test in $SUITES (default /suites = a mount of
 # ~/.cache/zcc-suites). Two-tier referee: gcc+glibc for the smoke test (byte match),
-# musl-gcc for libc-test (only F_zcc \ F_ref are suspects — see tests/README.md).
+# musl-gcc for libc-test (only F_zcc \ F_ref are suspects — see MECHANISM.md Part A).
 set -e
 : "${ZCC:?ZCC=/path/to/zcc (ELF binary)}"
 S="${SUITES:-/suites}"
@@ -72,7 +72,7 @@ ZCC_SYSROOT="$INST" make -k -j"${JOBS:-$(nproc)}" >/dev/null 2>&1 || true
 LC_ALL=C sh -c 'find src -name "*.err" -size +0c | sort' > ZCC-FAILS.txt
 echo "LIBC-TEST: $(wc -l < ZCC-FAILS.txt) err-file (list: $LT/ZCC-FAILS.txt)"
 
-# ---- 5. differential vs the musl-gcc referee (if already built — see tests/README.md)
+# ---- 5. differential vs the musl-gcc referee (if already built — see MECHANISM.md Part A)
 REF="$S/libc-test-ref/REF-FAILS.txt"
 if [ -f "$REF" ]; then
     LC_ALL=C sort "$REF" > "$D/ref.txt"

@@ -1,0 +1,2585 @@
+# MECHANISM — how zcc is built, and what has been measured
+
+**THE CONTRACT OF THIS FILE.** Everything here is a FACT about the compiler that
+is currently green. A plan is not a fact: an unproven row lives in `PLAN.md`,
+which is capped and allowed to be wrong, and leaves it only by being baked into
+this file (it won) or into Part F as a refutation (it lost). Nothing arrives here
+without a date and the commit it was measured on — a line without one is
+suspect, and that is the mechanism against a claim that quietly expires.
+
+This is one of five documents the source is allowed to point at: `THEORY.md`
+(the theorems and the spec tables), `SEMANTICS.md` (the meaning behind `⟦·⟧`),
+this file (the machinery and the measurements), `ARM64.md` (the target's own
+facts) and `README.md`. `CLAUDE.md` stands above all five as the charter.
+
+## Contents
+
+- **Part A — the gate**, and what a green verdict is allowed to mean.
+- **Part B — purity**, the precondition Law 0 names, and what checks it.
+- **Part C — compile speed**, the profile and the fixes that were banked.
+- **Part D — the spiller**, its ladder, and the two rows its own ceiling refused.
+- **Part E — the copy census**, the family worth seventy percent of the gap.
+- **Part F — MEASURED**, the facts that have no spec to cite. This is the
+  citation namespace: code says `MEASURED M<n>` and `tests/provenance.sh`
+  resolves it here.
+
+Section numbers repeat across parts (each was its own document until
+2026-08-28); read a `§n` as belonging to the part it sits in.
+
+---
+
+# Part A — the gate
+
+## zcc test-asset ledger
+
+Principle: **every test asset is either a script runnable within the repo, or is
+documented here together with instructions to reconstruct it**. No orphan assets.
+
+**zcc is fundamentally an ACADEMIC artifact**: each line of code maps to a
+compiler-theory theorem — `[math/compiler theorem] --compiled--> [rust source]
+--compiled--> zcc`. Tests are divided into TWO LAYERS:
+
+1. **THEOREM-VERIFICATION layer — sci-gate (ground truth, more important than
+   the corpus)**: exhausts the STRUCTURAL SPACE to certify a theorem. Speed does
+   NOT matter; completeness is paramount (running for a whole day is acceptable).
+   It must be EXTENDED further.
+2. **PRACTICAL-CORROBORATION layer — corpus + app**: torture/csmith/linux/libc
+   are only real-world SAMPLES, the lower layer, confirming that the theorem does
+   not diverge from real-world practice.
+
+**Minimalism**: the old framework (probe/gate-overnight/SOP/ledger + the
+nginx/redis/git/sqlite app-stack + m8..m14) has been REMOVED — over-automation
+slowed iteration and generated too many files (measure-the-speed rule,
+CLAUDE.md). The only application retained is musl libc (directly relevant to the
+minimal-distro goal). **ELF is the AUTHORITATIVE target; Mach-O/mac is currently
+kept only to let clang serve as an ORACLE** (Mach-O may be forked out later to
+reclaim LOC).
+
+```
+tests/
+├── shape.sh cpp.sh decay.sh alg.sh abi.sh   # SCI-GATE + gen_*.py (theorem layer)
+├── gate.sh                # dispatcher: gate.sh <area>  (runs exactly the gate owning the area)
+├── box.sh                 # run 1 file / shell inside the ELF box (iteration)
+├── run.sh  cases/ ext/    # base differential + hand-written cases (+ cases.known-fail)
+├── suites/*.sh            # external corpus (gate = FAIL ⊆ *.known-fail)
+├── halfsuite.sh           # thin alias: = fullsuite.sh base (fast loop)
+└── fullsuite.sh           # SOLE RUNNER, 100% BOX: [TARGET] [SEEK] — self-build+docker
+```
+
+### Runner — 100% BOX (the box is fast; the mac runner has been removed)
+
+`fullsuite.sh` is the SOLE entry point: on the mac it self-builds zcc-ELF
+(musl,release) + `docker run zcc-box` + re-invokes itself inside the box. The mac
+remains only to let clang serve as an ad-hoc oracle; there is NO mac runner any
+more (static-musl inside the box is nearly free, whereas the mac costs 2.7s/case
+for codesign/dyld).
+
+**`sh tests/fullsuite.sh [TARGET] [SEEK]`** — SEEK reaches an individual LAYER
+without re-running the whole thing:
+
+| TARGET | what it runs |
+|---|---|
+| `all` (default) | sci + corpus + app |
+| `sci` `corpus` `app` `base` | group (`base` = run.sh cases+ext, fast loop) |
+| `shape` `cpp` `decay` `alg` `abi` | 1 sci-gate |
+| `cases` `ext` | 1 base differential |
+| `torture` `cts` | 1 corpus suite |
+| `musl` | app libc |
+
+**`SEEK`** (2nd argument, optional) = a substring of a case name → seek deep into
+an INDIVIDUAL UNIT within 1 suite. E.g.: `fullsuite.sh torture pr22061`,
+`fullsuite.sh cases float`. Applies to cases/ext + every corpus suite (filtered
+with `grep -F` over the file list). Sci-gates generate cases INTERNALLY via
+gen_*.py and therefore do not yet accept SEEK (to be extended later if needed).
+
+**`sh tests/halfsuite.sh [SEEK]`** = alias for `fullsuite.sh base [SEEK]` — fast
+loop.
+
+### Sci-gate — theorem-verification layer (run inside the box via fullsuite.sh sci)
+
+| Gate | Mathematical foundation | What is exhausted |
+|---|---|---|
+| `shape.sh` | regular languages + grammar automata + recursive record-layout | integer-literal 3.1.3.2 × escape × maximal-munch; declarator depth ≤3 (including calls through a fn-ptr); struct/union/bitfield layout, member combinations ≤3 + per-member offset |
+| `cpp.sh` | term rewriting (terminating due to blue-painting) | expansion matrix (prescan/paste/stringize/rescan) + exhaustive `#if` arithmetic (dual oracle zcc==cc==python) |
+| `decay.sh` | type-derivation lattice (lvalue conversion 6.3.2.1) | 12 ways to produce an array expr × 11 contexts × 2 branches; differential oracle over observables |
+| `alg.sh` | UAC semilattice (3.2.1.5) + commuting-square (isomorphic oracle) | op × type × type × corner²: ~43k runtime points + ~21k fold; 4 comparisons including fold↔runtime INTERNAL to zcc (two paths from the same AST must meet) |
+| `abi.sh` | finite automaton (AAPCS64 = an NGRN/NSRN/NSAA state machine) | 292 cases × 4 directions CROSS-LINK zcc↔gcc — a same-compiler ABI error self-cancels; only cross-link exposes it |
+
+**"Exhaustion"** = exhausting the STRUCTURAL space + boundary samples of the
+value space (not the full 2^64) — any claim of "proof" must be qualified with
+this sentence (honest bounds).
+
+**Theoretical weak points to be reinforced**: the ABI/register/memory-layout/ELF
+layer has NO ISO standard guarding it (only AAPCS64 + the ELF psABI). The ground
+truth here = the ABI spec + the **gcc/ld reference implementation** (exploited
+through abi.sh's cross-link automaton). abi.sh is the thinnest guardian → priority
+for extension: return HFA/composite, C.11 split reg↔stack, variadic edges,
+over-alignment, and the full 9×9 product when the counters are mixed.
+
+### Corpus — practical-corroboration layer (fullsuite.sh corpus)
+
+Common template: referee-filter (`cc` rejects = out of scope → skip), differential
+on exit+stdout, **gate = FAIL ⊆ baseline `*.known-fail`** (triaged line by line).
+Run SEQUENTIALLY (each suite consumes all cores).
+
+| Suite | Source (clone --depth 1) | Baseline notes |
+|---|---|---|
+| `torture.sh` | gcc-mirror/gcc (`gcc.c-torture/execute`) | **2-fact, 3-way** (see below): PASS \| NOT-IMPL (`torture.not-impl`, named) \| FAIL. Gate = **0 FAIL**. Has caught real bugs (pr60017, pr33631, va_arg HFA, pr92904 aligned) |
+| `cts.sh` | c-testsuite/c-testsuite | oracle `.expected` (stdout-byte, no referee → cheap/deterministic). 00162 `[const 5]`, 00219 `_Generic` (construct UNIQUE to torture=0, pinned in Phase-3), 00204 LD=fp128 (ELF debt) |
+
+**REMOVED (mechanical coverage-diff):** `kr` (UB in the reference answer —
+diff-invalid), `nora` (1630 cases, 0 unique constructs — fingerprint dominated by
+torture in every column), `chibicc` (41 cases, duplicate constructs; `_Generic`
+already covered by cts), `tcc` (Darwin-locked `xcrun` → zombie dies inside the ELF
+box). Evidence: torture dominates every construct by 1-2 orders of magnitude; the
+only construct UNIQUE across all four = `_Generic`, retained via cts. The
+bootstrap-compiler idea (from tcc) is reborn at the **third-party build** layer
+(counterweight slimcc), not at the construct-corpus layer.
+
+#### torture 2-fact — classification contract (against silent skipping)
+
+`torture.sh` no longer uses known-fail/skip. Referee = `cc -std=c99 -w -O0` (gcc
+inside the box, an independent referee native to this suite). Each case receives
+exactly 1 label:
+
+- **PASS** — zcc compiles a valid C99 program → binary exits 0 (self-check
+  abort()).
+- **NOT-IMPL** — not a bug; recorded in `torture.not-impl`, NAMING the specific
+  reason:
+  - `oracle-invalid` — the c99 referee itself rejects it / does not run cleanly
+    (gcc-ext, target-specific, UB). Reason = gcc's `error:` line.
+  - `zcc-reject` — the referee is OK but zcc prints `zcc:…` then exits 1, produces
+    NO binary and does NOT crash (honestly not yet implemented). Reason = the zcc
+    diagnostic (`<case>:<ln>: msg`).
+- **FAIL** — zcc SWALLOWS a valid C99 program then miscompiles/crashes (the count
+  must be = 0): `runtime` (produces a binary but wrong/abort), `backend` (exit 1
+  WITHOUT a `zcc:` line → as/ld chokes on junk asm), `crash` (panic/signal). This
+  is what a reviewer fears: swallow-then-crash instead of reject-at-compile.
+
+**CONSERVATION LAW** (enforced, not a promise): `pass+not-impl+fail` must = the
+number of cases loaded; each case appears with exactly 1 verdict. A vanished case
+(worker died/hung) or a duplicate → the harness TURNS RED immediately, allowing no
+false green. → a green verdict is valid only when the equation is closed; a
+reviewer verifies one line, without having to trust any narration.
+
+### App — musl libc (fullsuite.sh app)
+
+`musl-box.sh` / `musl.sh`: build musl 1.2.5 + libc-test, differential
+`F_zcc \ F_ref` (referee musl-gcc). LDBL64 port; outstanding debt `-shared`/.so,
+wide/mbc. It is the ONLY real software retained (foundation of the minimal-distro)
+— test it thoroughly.
+
+### float_h — a DOCUMENTED standard deviation (base differential)
+
+zcc chooses `long double = double` on ELF (VALID per C99 §5.2.4.2.2 "LD ≥ double";
+MSVC makes the same choice), and `float.h` declares `LDBL_MANT_DIG=53` for
+SELF-CONSISTENCY (memory layout stays binary128 for ABI interop). Linux `cc` uses
+binary128 (113) → `cases/float_h.c` differs, the ONLY objective failure inside the
+box, already recorded in `cases.known-fail`. On the mac (Darwin LD=double) this
+case passes.
+
+Baseline principle: every known-fail line must carry an explanation (this table /
+the head of the `*.known-fail` file / the commit). **The baseline is NOT a trash
+can for hiding bugs** — a new, unexplained failure = a zcc bug until proven
+otherwise (presumption-of-guilt rule, CLAUDE.md).
+
+### Traps already paid for (read before debugging "ghosts")
+
+- **A same-compiler ABI error self-cancels** — an integration test that runs fine
+  may still have a wrong ABI; only cross-linking zcc↔gcc (abi.sh) exposes it.
+- **The arg offset lives in 3 places that must match byte-for-byte**: codegen
+  `call()`, the codegen spill prologue, and the parser's `va_off`. Change 1 =
+  change 3 + run abi.sh.
+- **implicit-int truncates pointer/double**: a libc missing a prototype → returns
+  int → (1) a pointer sxtw truncated to 64-bit → segfault dependent on ASLR
+  (heisenbug); (2) a returned double in d0 while the caller reads junk from x0 →
+  wrong SILENTLY. Suspect: `nm -u` + cross-check `src/headers/*.h`.
+- **A stale old-generation .o** → a "ghost" link error. Run `make distclean`
+  before debugging a link.
+- **A diff at a point of UB is meaningless** — a program reading stdin/argv:
+  feeding the source as stdin manufactures UB (uninitialized var) = exactly the
+  reason the kr suite (UB answers) was DROPPED.
+- **"missing image zcc-box" while `docker images` STILL lists it** — docker's
+  name index is stale: `docker image inspect zcc-box` fails but inspect-by-ID
+  (716e3cce…) is OK. Fix: `docker tag <ID> zcc-box:latest` (a local, non-
+  destructive operation).
+
+### The test & proof laws — full text (offloaded from `CLAUDE.md`)
+
+`CLAUDE.md` keeps these as terse articles and points here for the full text + recorded lessons. Nothing below is optional; it is the evidence layer those laws rest on.
+
+- **Iteration-speed law (stands above every other test law)**: an iteration mechanism, however academically or scientifically elegant, is discarded immediately if *measurement* yields the opposite number — that is, if it makes iteration *slower* than the direct approach (detect bug → fix → re-test exactly the failing case) — regardless of how much code it represents. Recorded lesson: a four-tier SOP with harvest/regress staging was eliminated on the same day it was created, because it made the actual redis test queue behind bureaucracy. Ritchie wrote a C compiler on the PDP-11 without any of it.
+- **Mathematical foundation (root law)**: every compiler feature must connect to, or be derived from, a principle — compiler theory, discrete mathematics, set theory, automata (lexer = regular language, preprocessor = term-rewriting system, parser = context-free grammar, UAC = semilattice, ABI = finite automaton, codegen = per-node simulation). Internal tests must cover the mathematical proof as far as possible: a new feature is first asked "which space does it belong to, can that space be exhausted, which gate guards it?"
+- **Test-first forces LOC**: compile real programs *first*; implement a construct only when a program breaks on it.
+- **Every correctness verdict is differential**: the referee is `cc` (the specification made flesh) or an independent oracle; a diff at a point of undefined behavior is meaningless — the generator must filter UB first.
+- **Presumption-of-guilt law (recorded lesson)**: the compiler is *guilty until proven innocent*. Every accusation of "oracle/generator/test defect, not zcc" requires *multi-angle proof before it is asserted* — several independent formulations / viewpoints converging on the *same* result. The instinct to blame the test is precisely what *conceals* compiler bugs. Evidence: four "fall-off-end-of-main" cases were once declared "oracle-invalid, diff at UB" *without proof*; a double-check showed `clang -std=c89` also returned 0, revealing the real cause to be a zcc-ELF codegen bug (failing to emit `return 0` on falling off the end of `main`). Two errors compounded: (1) being lazy and not proving, (2) even the supposed "proof" being wrong. **Meta-conclusion: within a single session an AI assistant produced two contradictory judgments, so correctness-by-assertion is impossible; only correctness-by-mechanical-differential-verdict is viable. The assistant is an unreliable narrator and must be removed from the trust path: it may only *build* and *run* the oracle, and stay silent until the oracle speaks. Measure-before-speaking: no classification (bug / oracle / ext) may be asserted before a script has printed a verdict.** The fall-off paradox is evidence that the *mechanism* is correct: measurement crushed faulty reasoning — the error was in speaking before measuring. Consequences: (a) "diff at UB" may be *invoked* only after that point is proven to *genuinely* be UB / unspecified, by specification plus referee, never hand-waved; (b) "clang/gcc also fail, so we are allowed to fail" is *absolutely forbidden* as an excuse — the root cause of the referee's rejection must be dug out, as it may itself expose an edge case; (c) a case is excluded only when proven to lie outside the implementation scope (IR + Optimization / vendor dialect); mistakenly dropping a case that represents a semantic edge case is a disaster.
+- **The science-gate is the theorem-verification tier (ground truth, more important than the corpus)**: zcc is academic in nature — each line maps to a compiler-theory theorem, and the science-gate *exhausts the structural space* to verify that theorem (corpus / csmith / linux are only *practical* verification, a lower tier). The relevant space is exhausted on contact: `abi.sh` (ABI automaton, *cross*-linked — same-compiler ABI errors cancel), `alg.sh` (UAC semilattice + fold↔runtime commuting square = isomorphic oracle), `cpp.sh` (term-rewriting system), `shape.sh` (lexer / declarator / layout — grammar automata), `decay.sh` (type-derivation lattice). "Exhaustion" means exhausting the *structural* space plus boundary samples of the *value* space — any claim of "proof" must carry this qualifier. Dispatcher: `gate.sh <area>`; run inside the ELF box via `box.sh`. The single runner is `fullsuite.sh [TARGET] [SEEK]`, entirely *inside the box* — TARGET seeks to a tier (sci | corpus | app | all | one gate | one suite | base), SEEK seeks an individual case; `halfsuite.sh` = `fullsuite.sh base`. **The science-gate is to be *expanded*, never contracted.** The application stack (nginx/redis/git/sqlite) has been removed from the runner (run manually when needed).
+- **External suites**: a new failure outside the triaged baseline is a zcc bug until proven otherwise; the baseline is not a dumping ground for hidden bugs.
+- **Clean-input law: the ultimate source of error is bad/garbage input collected while running the suite.** A PASS/FAIL verdict is worthless if the measurement itself rests on garbage data (a referee-filter skipping wrongly, `2>/dev/null` swallowing errors, mislabeled counts, a suite that is "green" without running anything). A green verdict is valid *only* when accompanied by a *mechanical evidence trail* proving real work occurred: number of artifacts produced + checksums + observed exit codes, *not* merely a pass/fail number. Publication standard: a "torture pass" claim must carry evidence of N real ELF binaries + total codegen bytes + a deterministic re-run sample (e.g. a torture-box run of 16s producing 1377 real ELF binaries / 21MB / 1694 cases fully covered — the suspicion "16s means no-op" is refuted by the manifest). An abnormal timing (fast *or* slow) is *measured*, not guessed (macOS clang compile+run is 2.7s per invocation due to codesign/dyld; Linux static-musl is nearly free — the same suite is 19 minutes on macOS versus 16s in the box).
+- **Test-loop optimization**: during triage/fix, re-run *exactly* the case/unit that failed last time, *not* the full suite; the full suite runs only once at the end to close the books (in the background, not blocking). Heavy suites run *sequentially*, not contending for cores.
+- **Numeric-provenance rule**: every number / decision must be derivable from a stated premise — no magic number without provenance.
+- **Byte-identical gate** — proves a pure-code-motion refactor changed nothing: identical `md5(.s)` *is* the commuting-square `⟦f⟧=⟦refactor f⟧` (Article G). Mechanism + usage in the script header: `tests/refactor_gate.sh`.
+
+  **It takes two witnesses, and the second one is why.** The corpus is 58 small
+  programs, and on 2026-08-28 six inlining rows passed it — green every time —
+  while changing the assembly of the sqlite amalgamation. Nothing in the corpus
+  is large enough to make an inliner, a spiller, or anything else that reruns an
+  analysis per rewrite do the work where its behaviour differs. So the gate also
+  compiles ONE large translation unit and compares its `md5` against
+  `sums.large.txt`, which costs a single compile. When the box is unavailable the
+  gate reports that and FAILS: a gate that quietly proves less than it claims is
+  precisely what went wrong. `ZCC_GATE_LARGE=0` runs the corpus alone and prints
+  the waiver in place of the result.
+
+  **The baseline is the compiler being reproduced, never an earlier candidate.**
+  The same episode ran six rows against a hash produced by the first of them, so
+  the chain agreed with itself while walking away from the tree it was supposed
+  to match. Record `baseline` on a tree you trust, then leave it alone.
+- Compare against the reference answer at any time: `clang -S -O0 -std=c99 foo.c`.
+</content>
+</invoke>
+
+---
+
+# Part B — purity
+
+## PURITY — the one goal, and how it is checked
+
+**Purity is the precondition, not a phase.** The ULTIMATUM names 1× against
+gcc-O1 on both axes as the stopping point; purity is what may not be spent to
+get there. Standing order, 2026-08-26:
+
+```
+purity  ≫  exec  >  size  >  compile speed
+```
+
+No number is banked at the cost of a citation. A row that would reach parity by
+removing a proof does not ship.
+
+---
+
+### What purity means, exactly
+
+Two of the three Laws are claims **about the source**, and until 2026-08-26
+neither was checked by anything:
+
+| | the claim | the check |
+|---|---|---|
+| **Law 1** | every line of `src/` is a theorem (Side I) or a constant transcribed from a spec line (Side II) | every module, constant and pass carries a citation |
+| **Law 3** | every pass ships the commuting square that certifies it | every pass names its square, and the square is not vacuous |
+| — | compilation is a FUNCTION: identical input, identical bytes | `tests/determinism.sh` |
+
+`tests/provenance.sh` is the first two. It runs in the sci gate.
+
+#### The three documents
+
+* **`THEORY.md`** — Side I theorems and Side II **citations**: a section number
+  in ISO 9899, AAPCS64, DDI 0487 or the ELF ABI that a reader can look up.
+* **`MEASURED.md`** — facts with **no spec to cite**. Apple publishes no
+  Software Optimization Guide for the M1, so a latency, or whether a transform
+  pays here, can only be measured. Keeping these out of `THEORY.md` is what lets
+  Law 1's two-side claim stay literally true.
+* **`SEMANTICS.md`** — the ⟦·⟧ every square is stated against.
+
+`REARCH.md` is **not** one of these. It is the execution plan — R4 is unfinished
+(R4.15, R4.12, and the tracked residuals) and it stays until that ladder closes.
+What comes OUT of it as purity work proceeds is the durable half: theorems into
+`THEORY.md`, spec constants into II-*, measured facts into `MEASURED.md`, ⟦·⟧
+definitions into `SEMANTICS.md`. It gets thinner, not deleted.
+
+#### A citation is a reading path, not a lint
+
+zcc is a teaching compiler. A student who lands on any line should be able to
+read upward to the theorem it realizes, so a citation is written for a person:
+
+```rust
+// src/mir/pass/ldstp.rs
+// THEORY A6b — MIR, the machine layer
+// THEORY II-5 — DDI 0487 C6.2.130, the paired forms
+// SQUARE      — a_pair_replaces_two_adjacent_accesses
+```
+
+The script only checks that what a person reads is true.
+
+#### Why the vacuity check is the one with teeth
+
+A commuting square holds **vacuously** for a pass that never fires. A test that
+checks only `⟦f⟧ = ⟦P f⟧` therefore stays green when the pass does nothing at
+all — which is how §17 came to carry eight ✔ marks that were measurably false,
+and how `scev::compute_trips` was wrong for weeks under a green gate.
+
+So a square must assert **both** halves: the equivalence (a battery helper, or
+`⟦·⟧` named in its own failure message) **and an effect** — at least one
+assertion of its own about what the pass DID. A body that calls `same_all([…])`
+and asserts nothing else has checked exactly one thing: that the pass did not
+break the program.
+
+---
+
+### State — 2026-08-26
+
+```
+provenance: 55 modules, 58 constants, 21 passes; 25 distinct citations
+PROVENANCE PASS (every LOC in theory ∪ fact; every pass squared, none vacuous)
+```
+
+#### What the audit found
+
+Six real defects, none of which the full gate could see:
+
+1. **`mir/pass/cmpelim.rs` shipped with NO commuting square.** A pass in the
+   default pipeline since R3, with no proof at all. Written:
+   `an_arithmetic_result_needs_no_second_compare`, which also pins the condition
+   rewrite (`lt` → `mi` once `subs` sets V from the arithmetic).
+2. **Four vacuous squares** — `frame`, `layout`, `ldstp`, `legalize` — each
+   calling a battery helper and asserting nothing else. All four would have
+   stayed green for a pass that did nothing. Each now asserts its effect.
+3. **`ladder_is_idempotent_at_the_fixpoint` had the effect half and not the
+   equivalence half.** It proved the ladder reaches a fixpoint without ever
+   proving the fixpoint means what the source meant — a ladder that miscompiled
+   identically on both runs satisfied it.
+4. **`layout_preserves_every_edge` is misnamed**, and the effect half is what
+   exposed it: layout THREADS empty blocks, so a predecessor's successor changes
+   (bb2: `[11,12]` → `[2,12]`). The edge set is not the invariant; the run is.
+5. **Constants with no provenance**, now each carrying one — and four that have
+   no spec to cite are labelled honestly in `MEASURED.md` rather than given
+   invented citations: `MIN_CASES` (M4, measured INCONCLUSIVE), `WINDOW` (M5),
+   `MAX_HEADER_INSTS` (M7, gcc's `--param`, not a spec), `ARM_LIMIT` (M8,
+   reasoned, never swept).
+6. **A missed pairing, found while writing the square.** `p->a + p->b` emits two
+   adjacent loads off one base and does not pair: `ldstp::fuse` refuses when a
+   destination equals the base register. DDI 0487 C6.2.130 constrains that only
+   for the **writeback** forms — plain `ldp x1, x0, [x0]` reads the base once to
+   form the address and is well defined. Recorded, not fixed: a correctness-
+   sensitive ISA change does not belong at the end of a long session.
+
+
+---
+
+# Part C — compile speed
+
+## CP.md — the compile-speed campaign (transient)
+
+> **Lifecycle (anti-bloat).** This is a TRANSIENT working doc, the compile-speed twin of `OPT.md`'s
+> role for the optimizer. It holds the plan + scoreboard for the §CP campaign only. **Delete it when
+> the campaign closes.** Before deleting, cook the durable results into the permanent record: any new
+> algorithm that becomes load-bearing (bitset liveness, worklist dataflow, memoized SCEV) is a
+> Side-I theorem and its provenance belongs in `THEORY.md`; the measured phase profile and final
+> baseline belong in `REARCH.md` §13/§CP-closeout. `REARCH.md` keeps only a one-line pointer here
+> while this runs, and that pointer is removed at deletion. This doc introduces NO new plan
+> numbering that forks the R-ladder — it is the CP2.x detail of one REARCH side-campaign, edited in
+> place here (anti-fragmentation law still binds).
+
+### §CP — THE COMPILE-SPEED CAMPAIGN (opened 2026-08-25; a side campaign, orthogonal to R4)
+
+**Why.** Gating R4.2 surfaced **6 yarpgen CTIMEOUT** (compile > 300 s: s0007, s0025, s0035, s0075,
+s0231, s0228) where the fuzz suites are meant to be ~constant. Isolated to the OPTIMIZER + BACKEND,
+not R4.2 (that change is in `destruct`, after the optimizer; `ZCC_O0=1` compiles s0007 in **12 s**
+vs **259 s** opt-on). The trigger is a class of yarpgen function that is pathologically large — `init`
+in s0007 is **7,266 blocks / 27,999 values / 1,643 loops / 1,643 SROA pieces** (sqlite's largest is
+6,231 blocks / 59 loops / 328 pieces) — and several passes plus the register allocator are
+super-linear in one of those dimensions.
+
+**Goal (user, 2026-08-25):** MAINTAIN MAXIMUM OPTIMIZATION — no output change, no de-optimizing size
+cap. Replace every super-linear site with the right algorithm (N² → N log N → N), trading MEMORY for
+speed where it helps (bitsets, hash indices, incremental maps). The per-fix gate is **byte-identical
+`.s`** over a corpus: identical bytes ARE the proof that output speed/size are untouched (the dual of
+the refactor gate). A size cap that skips a pass is NOT allowed here — that is a different tool and it
+loses optimization.
+
+**FIRST, THE BUILD FACT (Law-2 measurement exception).** Every alarming compile number this session
+was a **debug** zcc. `tests/box.sh` / `tests/fullsuite.sh` build the musl ELF debug; debug Rust is
+**~9× slower**. Measured in-box (aarch64 musl), sqlite `-O1 -S`, byte-identical output (217,160 insns):
+**debug 112 s → RELEASE 12 s**; old-main (rc3) debug was ALSO 112 s (no branch regression). The 6
+yarpgen "CTIMEOUT" seeds: debug 259–300 s → **release 36–56 s, 0 CTIMEOUT**. gcc-O1 in-box = 7 s, so
+release zcc is **1.7× gcc**. **Rule: TIME with a release zcc.** So §CP is a POLISH (12 s → ~7 s), not
+a fire — but the quadratics below are real and DO scale the 12 s.
+
+**MEASURED phase profile (RELEASE, `ZCC_TIME=1`, phase totals over the whole module):**
+
+| phase | sqlite -O1 (~12 s) | s0025 -O1 (~29 s) | share |
+|---|---|---|---|
+| **`regalloc` (of which `spill`)** | **6.7 s (spill 6.1 s)** | **18.6 s (spill 18.5 s)** | **51 % / 64 %** |
+| `hir::pass` (the HIR optimizer) | 3.2 s | 7.4 s | 27 % / 25 % |
+| `mir::pass` | 0.7 s | 3.3 s | 6 % / 11 % |
+| isel · emit · frame · verify · cfg · domtree | each < 0.2 s | each < 0.03 s | negligible |
+
+**The spiller is HALF the compile.** `regalloc::spill::spill_with` (`src/regalloc/spill.rs`, 1495 lines)
+is #1 by a wide margin on BOTH real code and the fuzzer monster — its `for _ in 0..bound` fixpoint
+re-runs an O(function) decision over `BTreeSet`s (log-factor everywhere), so it is at least
+O(bound × n log n). That is the campaign's first target, ahead of everything HIR.
+
+**Root-cause anatomy of the spiller (`spill_with`, measured this session).** The fixpoint reruns the
+whole pipeline from scratch every round:
+
+```
+for _ in 0..bound {              // bound = f.vregs.len() + 2   (s0007: ~28k)
+    cfg = crate::mir::verify::cfg(f);   // CFG rebuilt from scratch every round
+    lv  = live::compute(f, &cfg);       // full BTreeSet dataflow, clone/block/round
+    simulate(f, &lv, &cfg, &spilled, …) // full-function pass, BTreeSet residency
+}
+```
+
+Three compounding costs: (1) CFG + liveness are recomputed over the whole function EVERY round
+though block structure is loop-invariant until `apply`; (2) `live::compute` is a `while changed`
+round-robin over all blocks with `BTreeSet<usize>` cloned per block per round (log factor +
+pointer-chase + allocation); (3) `spilled` / `physlive` / the simulate residency sets are all
+`BTreeSet`. Liveness is the KEYSTONE — it runs inside this fixpoint AND is used again by `color.rs`,
+so fixing it once pays in two places.
+
+**Measured catalog (worst wall-time first; each fix must be byte-identical):**
+| site | cost class | fix (memory-for-speed) | output |
+|---|---|---|---|
+| **`regalloc::spill::spill_with`** | **#1 — 51 % (sqlite) / 64 % (s0025)**; `for _ in 0..bound` fixpoint × O(n) BTreeSet work | bound the fixpoint / dirty-worklist; BTreeSet→bitset/Vec where order is not needed | identical |
+| `hir::pass` (the optimizer, all rounds) | #2 — 27 %; the sroa/rotate/licm/scev O(n²) sites below live here | the rows below | identical |
+| `mir::pass` | #3 — 6–11 % | profile which MIR pass | identical |
+| `sroa` mem2reg DF construction | O(preds × domdepth × `df.contains`-Vec) | bitset frontier + Cytron IDF | identical |
+| `LoopForest::new` nesting | O(loops² × body) + per-header `vec![false;n]` | near-linear parent (of[]-based), reused scratch | identical |
+| `rotate::force` | O(iters × full CFG/dom/loop rebuild) | batch, or incremental invalidation | identical |
+| `licm` hoist scan | O(hoists × body) restart-scan | worklist, not restart | identical |
+| `scev::eval_fuel` | unmemoized, up to 2^16 per `eval` on DAGs | memoize `(ValueId, fuel)` | identical |
+| `sroa` `ever.contains` | **✅ SHIPPED 3894fb5** — Vec→bitset, reused across pieces | — | identical |
+| `licm` `refresh_defs` | **✅ SHIPPED 3894fb5** — full-`Func` per hoist → scoped `refresh_block_defs` | — | identical |
+
+**Baseline table (RELEASE, in-box, sqlite `-O1 -S`):** gcc 7 s · **zcc 12 s (1.7×)** · target **≤ 7–10 s**
+(user's sufficiency bar). The two shipped fixes are IN this 12 s; the spiller is where the next ~5 s is.
+
+**Shipped with R4.2 (byte-identical, "minor compile-speed" per the bank):** the two ✅ rows — `sroa`'s
+IDF `ever`/`seen` bitmaps and `licm`'s scoped `refresh_block_defs`. Verified output-neutral: sqlite
+**217,160 insns unchanged**, opt-parity 1552/0, torture 0 FAIL, determinism 86×8. On the suite they
+cut licm on yarpgen `test` from **10.7 s → 2.4 s** and dropped the CTIMEOUT count under a session's
+worth of guard experiments from **6 → 1** (s0025, backend-bound). NOT shipped: the large-function
+size guards trialed this session — they de-optimize and violate the campaign goal; the algorithm
+fixes below replace them.
+
+### Status
+
+- **Phase 0 (profiler) — DONE.** No new instrument; the pipeline's existing `ZCC_TIME=1` phase timers
+  gave the profile above. Reproduce with any release zcc: `ZCC_TIME=1 <compile>` then group the
+  `[time]` lines per phase.
+- **Phase 1 (rank by measured wall-time) — DONE.** The catalog table is the ranking.
+- **Phase 2 (the algorithm fixes) — the CP2.x ladder below. NOT STARTED.**
+- **Phase 3 (re-measure) — after each bank + at close:** release sqlite (target ≤ 7–10 s) and the 6
+  yarpgen seeds, output byte-identical.
+
+### Phase 2 — the CP2.x ladder (worst-first; each step byte-identical gated)
+
+Ordered by measured share. The spiller is > half the compile, so CP2.1–2.4 come first; within them the
+**bitset + worklist liveness (CP2.2) is the keystone** — the single biggest lever, reused by `color.rs`.
+Then the HIR sites by their 27 % share, cheapest-high-value first (the exponential SCEV memo).
+
+| # | site | current cost | industrial fix (trade = memory) | class | status |
+|---|---|---|---|---|---|
+| **CP2.1** | spiller fixpoint invariants | rebuild CFG + liveness every round | build CFG once above the loop (topology invariant across rounds); liveness stays per-round | bound× → 1× | **✅ banked** |
+| **CP2.2** ⭐ | `live::compute` (keystone) | `while changed` round-robin + `BTreeSet` clone/block/round | **predecessor worklist** (re-queue preds only when `live_in` changes — Kildall), seeded reverse-RPO | fewer visits | **✅ banked** |
+| **CP2.3** | spiller `spilled` set | `BTreeSet<VReg>` contains on the per-operand hot path | dense `Vec<bool>` over the (fixed) vreg index; `physlive` left as-is (order-iterated) | log→O(1) | **✅ banked (small)** |
+| **CP2.4** | spiller `simulate` per-call cost | s0025 spill 16.5 s = 3 rounds × `simulate(6555 blk, 10039 spilled)` — the cost is INSIDE `simulate`, NOT round count (measured, `ZCC_ROUNDS`) | profile `simulate`; cheapen the per-point work; a dirty-worklist only caps at 3→1 | needs profile | ⬜ **NEXT — profile-first** |
+| **CP2.5** | `scev::eval_fuel` | unmemoized, up to 2^16 per `eval` on DAGs | per-call memo `(ValueId, fuel)` | **exp→linear** | **✅ banked** |
+| **CP2.6** | `LoopForest::new` | per-header `vec![false;n]` | one `mark` scratch reused, cleared by body | O(loops×n)→O(Σbody) | **✅ banked (scratch)** |
+| **CP2.6b** | `LoopForest::new` parent nesting | O(loops²×body) `body.contains(header)` | per-loop membership bitset → O(1) contains (O(loops²)) | N²×body→N² | ⬜ |
+| **CP2.7** | `rotate::force` | full CFG/dom/loop rebuild per rotation | batch rotations, or incremental invalidation | iters×N→N | ⬜ |
+| **CP2.8** | `licm` hoist scan | restart-scan per hoist | worklist, no restart | hoists×body→N | ⬜ |
+| **CP2.9** | `sroa` DF construction | `contains`-bitmap shipped; DF build still O(preds×domdepth) | Cytron IDF + bitset frontier | N²→~N | ⬜ |
+| **CP2.10** | `destruct` parallel-copy seq | `.position().any()` (spill.rs/destruct.rs ~498, 312) | Boissinot in-degree worklist sequencing | N²→N | ⬜ |
+#### The witness this campaign needed, and did not have (2026-08-28)
+
+The byte-identical gate runs 58 small programs. Six `inline` rows passed it and
+sqlite's assembly still moved: the gate-passing compiler emits
+`c655fe3e83f79da3a1ddfa83c50e2c06` (289,478 lines) and the rows produced
+`4f1b49325f69ce5efcf0abe68d7da714`. Nothing in the corpus inlines the way a
+250,000-line translation unit does, so nothing in it could see the difference.
+
+Two lessons, both paid for:
+
+  * **A corpus proof is scoped to the corpus.** For a pass whose behaviour scales
+    with function size, a green gate on small programs is not evidence. The
+    reference `.s` for sqlite costs one slow run (5,332 s with the defect in
+    place) and then every candidate is a one-second `cmp`. Take it FIRST.
+  * **Never chain the baseline.** The hash the rows were compared against was set
+    by the first candidate, not by the reference — so the chain agreed with
+    itself while drifting away from the compiler it was supposed to reproduce.
+
+`cfg`'s branch-threading carries the same warning from the other direction: it
+was batched twice, and both times all 58 programs stayed identical while sqlite
+changed. The second attempt rebuilt the use-count table from scratch after every
+rewrite, which proves the cause is the interleaving of `run`'s six identities and
+not stale bookkeeping — that fixpoint is not confluent.
+
+| **CP2.11** ⭐ | `inline::run_module` — THE WALL, found 2026-08-28 | sqlite did not finish in 20 min against gcc -O1's 6 s. Five whole-program costs, all inside the per-splice `loop`: `live_across` (a whole-function dataflow) every splice; `has_loop` (CFG+domtree+loops of the CALLEE) and `body_size` and `inlinable` per CANDIDATE; `loop_blocks` (CFG+domtree+loops of the caller) every splice; and the site scan restarted from block 0 after every splice | (a) liveness asked LAST and only where it can win, at most once per splice; (b) per-callee facts memoised, invalidated only for the caller a splice rewrote; (c) `inloop` carried across splices — a splice appends, so the new blocks lie in exactly the loops `b` lies in; (d) the set is a **sparse set** (Briggs–Torczon, generation-stamped clear) not a `HashSet` and not a bitset — both of those are sized by how many values EXIST while the live set is a few dozen; (e) the scan RESUMES at the last site taken, since a refusal is a property of the callee and does not change | S×(N+V) → ~N | 🔬 **in flight — each step byte-identical (58 programs)** |
+
+**Overlap guard (already shipped, do NOT redo):** the `sroa` `ever/seen`-`contains` bitmap and the
+`licm` scoped `refresh_block_defs` landed in 3894fb5. CP2.9 is the REMAINING sroa work (the IDF/DF
+construction algorithm), and CP2.8 is the REMAINING licm work (the hoist restart-scan) — neither
+touches the shipped code.
+
+### Scoreboard — first batch banked (2026-08-25)
+
+CP2.1, CP2.2, CP2.5, CP2.6 shipped together (`src/regalloc/spill.rs`, `src/regalloc/live.rs`,
+`src/hir/pass/scev.rs`, `src/cfg.rs`). All four are pure algorithm swaps, no output change.
+
+**Measured, in-box (aarch64 musl, RELEASE, `-O1 -S`):**
+| target | baseline | after batch 1 | Δ |
+|---|---|---|---|
+| sqlite wall | 12 s (1.7× gcc) | **9.99 s (1.43×)** | **−17 %** |
+| sqlite `spill` | 6.1 s | **4.54 s** | **−26 %** |
+| sqlite `regalloc` | 6.7 s | 5.08 s | −24 % |
+| sqlite `hir::pass` | 3.2 s | 3.22 s | flat (few loops) |
+| s0025 wall | 29 s | **23.14 s** | **−20 %** |
+| s0025 `hir::pass` | 7.4 s | **2.69 s** | **−64 %** (scev+loopforest) |
+
+Spill wins come from CP2.1+2.2 (real code); the −64 % HIR win on the yarpgen loop monster comes from
+CP2.5+2.6, invisible on sqlite by design. Output identical: sqlite **217,160** insns, s0025 **31,651**.
+
+**Correctness gate (batch 1):** byte-identical `.s` proven over — 57 host corpus (default opt),
+7 freestanding stress at `-O1` (loops → scev/loopforest exercised), **1000 csmith at `-O1` patched
+vs pristine (0 differ)**, in-box sqlite + s0025 (identical output). torture **1378 pass, 0 FAIL**.
+(Full yarpgen-seed sweep skipped in this session — the pathological seeds are ~40 s each and the pure
+byte-identical proof already covers the loop path; run it at campaign close.)
+
+**Batch 2 (CP2.3) banked:** `spilled` `BTreeSet<VReg>` → dense `Vec<bool>` (contains on the
+per-operand hot path is now O(1); `apply` still mints slots in ascending-vreg order, byte-identical).
+Marginal by design: s0025 spill 16,954 → 16,493 ms (−3 %), sqlite neutral (low pressure). The bitset
+removed the log factor, but the spiller's dominant cost on the high-pressure yarpgen function is the
+NUMBER OF FIXPOINT ROUNDS (each re-simulates the whole function), not the per-lookup constant.
+
+**Measurement correction (Law-2, `ZCC_ROUNDS`):** the spiller fixpoint runs only **3 rounds** on
+s0025 (6555 blocks, 10039 spilled) and ≤5 on sqlite's biggest functions — it is NOT round-count
+bound. The 16.5 s is `3 × simulate(...)`; the cost lives INSIDE one `simulate` call, superlinear in
+the pressure (10039 memory-resident values), not in the number of rounds. So a dirty-worklist that
+cut 3→1 caps at −66 % and carries real byte-identical risk (the per-block plan depends on cross-block
+entry sets) — it is NOT the first move.
+
+**Next ⬜ = profile `simulate` itself** (`ZCC_TIME`-style coarse timers around its setup vs its RPO
+per-point loop, then within the loop) to find the construct that scales with the resident-value count,
+and cheapen THAT (same memory-for-speed pattern as CP2.3 — a bitset/index where a set/scan sits on the
+per-point path). `physlive` is bounded by the ~32 physical registers, so it is unlikely to be the
+sink; the suspect is value-level residency tracking (`w` / `held` / `room`) over the up-to-nsp working
+set. Measure before converting. Then CP2.6b / CP2.7–2.10 for the HIR tail.
+
+### The per-fix loop (constitution's iteration process; unchanged)
+
+For each CP2.x, worst-first, one at a time:
+
+1. **Predict** the Δ on the complexity model (state the class change, e.g. `bound×n log n → n·E`).
+2. **Baseline first** (TDD-shaped): record the RELEASE `ZCC_TIME=1` time for the target phase on
+   sqlite + s0025, and snapshot the md5 corpus.
+3. **Implement** the algorithm swap (memory-for-speed; no output change, no size cap).
+4. **Gate — byte-identical `.s`** via `tests/refactor_gate.sh` over the fixed corpus (the proof output
+   is untouched, Article G refactor dual) **PLUS the full correctness gate** (cargo + torture +
+   opt-parity + csmith300 + yarpgen300 + determinism). Byte-identical alone is necessary, not
+   sufficient — a correctness regression can still be byte-identical by luck, so the full gate stays
+   mandatory.
+5. **Re-measure** RELEASE sqlite (target ≤ 7–10 s) + s0025; record the number.
+6. **Bank** (commit, number recorded) or, on a wall, quarantine that CP2.x with a `BLOCKED:` note and
+   advance — never fork the plan.
+
+**Standing caution (from §CP + §13n):** the allocator is where the nastiest defects live. Any CP2.x
+that weakens an allocator invariant ships its verifier check (`mir::verify` virtual mode) in the same
+commit. CP2.4's convergence argument is the one at risk of getting hairy — bounded Law-2 attempt; if
+the dirty-worklist termination proof does not close, ship the CP2.1–2.3 gains and mark CP2.4 residual.
+
+### Running the campaign
+
+Each CP2.x is near-independent and has an objective acceptance gate (byte-identical + full gate), so
+it maps cleanly onto `superpowers:subagent-driven-development`: one fix per subagent, the gate as the
+acceptance criterion, `superpowers:verification-before-completion` as the proof-before-bank step.
+Keep the scoreboard here (mark each row `✅ banked <sha>` / `BLOCKED: …`), edited in place.
+
+---
+
+# Part D — the spiller
+
+## SPILL.md — the spill-placement campaign
+
+The plan of record for closing zcc's real-program performance gap. Opened
+2026-08-27, after the sqlite-segfault night. Read §0, then start at §3.
+
+---
+
+### §0 BOOT — the one paragraph that matters
+
+zcc's spiller ranks eviction by **raw static next-use distance**. Every
+instruction counts 1, whether it runs once or four million times, so the loop
+index, the loop pointer and the accumulator get spilled **inside** hot loops
+while cold values sit in registers. gcc weights each use by `10^loop_depth` and
+therefore never does this. `LoopForest` depth is already computed in
+`spill.rs` — it just never reaches the eviction decision.
+
+**This is one missing term in one sort key, not a broken architecture.** Do not
+rewrite the allocator (§2).
+
+---
+
+### §1 THE MEASUREMENTS — all taken 2026-08-27, all reproducible
+
+#### The ceiling, proven by hand (`scratchpad/nestjoin.c`, 25 lines)
+
+A nested-loop join with 24 unfoldable values live across the inner loop:
+
+| build | time | output |
+|---|---|---|
+| gcc -O1 | **1 ms** | 4087392 |
+| zcc -O1 | **8 ms** | 4087392 |
+| zcc, inner loop hand-edited | **1 ms** | 4087392 |
+
+The hand-edit removes **five instructions** and closes **the entire 8× gap**.
+That is the whole campaign in one number: the shape is worth everything.
+
+Before (zcc, 4,000,000 iterations, 6 of 11 instructions are frame traffic):
+
+```
+.Ljoinit_6:
+    ldr x2, [sp, #80]      <- reload pb       the POINTER
+    ldr x3, [sp, #240]     <- reload j        the LOOP INDEX
+    ldr w2, [x2, x3, lsl #2]
+    cmp w2, w0
+    ldr x2, [sp, #144]     <- reload hits     the ACCUMULATOR
+    csinc x2, x2, x2, ne
+    str x2, [sp, #144]     <- spill hits
+    add x2, x3, #1
+    str x2, [sp, #240]     <- spill j
+    cmp x2, x1
+    b.lt .Ljoinit_6
+```
+
+After (hoist the three into x4/x5/x7 before the loop, sink after):
+
+```
+    ldr x4, [sp, #80]      / mov x5, xzr / ldr x7, [sp, #144]
+.Ljoinit_6:
+    ldr w2, [x4, x5, lsl #2]
+    cmp w2, w0
+    csinc x7, x7, x7, ne
+    add x5, x5, #1
+    cmp x5, x1
+    b.lt .Ljoinit_6
+    str x7, [sp, #144]     / str x5, [sp, #240]
+```
+
+Note what the allocator did: it kept the COLD `c0..c23` in x6/x8/x10/x12/x14/
+x15/x20/x22/x24 across the loop and spilled the hot three. Exactly inverted.
+
+#### The same defect at scale — `sqlite3VdbeExec`
+
+| | zcc | gcc -O1 |
+|---|---|---|
+| instructions | 10,766 | 6,040 (**1.78×**) |
+| **distinct frame slots** | **235** | **43** |
+| frame accesses | 1,862 | 515 (**3.6×**) |
+| reg-reg mov | 1,736 | 484 (3.6×) |
+| callee-saved used | x19–x28 (all) | x19–x28 (all) |
+
++4,726 instructions — **25% of the whole 19,079-instruction sqlite gap in one
+function**, and it is the function every query runs. Across functions present in
+both compilers zcc is only **1.045×**; the file-wide 1.1238× is mostly gcc
+inlining small statics away, which is a different lever entirely.
+
+⚠️ **This corrects a recorded belief.** "zcc spills less than gcc file-wide" is
+true *on average* and hid the opposite where it counts. Never judge spilling by
+a file-wide average again.
+
+#### The code
+
+`spill.rs::next_use` returns a position from `linear_positions`, which numbers
+instructions in reverse-postorder, unweighted. The eviction key is
+
+```rust
+cand.sort_by_key(|r| (droppable(r), next_use(&uses, r.v as usize, head)))
+```
+
+`lf.depth` appears three times in the file: the fixpoint round budget, a
+cold-edge reload placement test, and a reporting histogram (`inloop`, ~line 526).
+**Never in the decision.**
+
+#### ⚠️ WHAT THE DEFECT ACTUALLY WAS — measured 2026-08-27, and it is not §0's story
+
+§0 above says "one missing weight in one sort key". That diagnosis was made by
+reading. Instrumenting every eviction site (a temporary `eprintln!` at each
+`newsp.push`) said something sharper, and a session that trusts §0's wording
+will build the wrong mechanism:
+
+```
+SPILL joinit site=TERMARG bb29 depth2 v484 nextuse-1 from89   <- inner-loop latch
+SPILL joinit site=TERMARG bb31 depth1 v439..v452 nextuse-1    <- outer-loop latch
+```
+
+`nextuse-1` is `usize::MAX`. **A back edge runs backwards in reverse postorder**,
+so a value carried around a loop is read at a LOWER position than the latch that
+passes it on; `partition_point(|&p| p <= from)` finds nothing and `next_use`
+answers *never used again* — the strongest possible reason to evict, handed to
+precisely the values that are used most. It was not that hot values were
+under-weighted. **They were ranked as dead.**
+
+A second blindness sat behind it. mem2reg splits one C variable into a chain of
+SSA values joined by block parameters, and every link of that chain has exactly
+ONE use: being passed to the next link. Asked of the vreg, "how far to the next
+use of `c0`?" and "of `j`?" both answer 1 — twenty-four cold values and three
+hot ones become indistinguishable at the exact edge where the choice is made.
+Measured: every candidate at the preheader's terminator reported distance 3.
+
+Both are fixed by measuring the distance the way Belady's theorem defines it —
+along the TRACE, over the WEB (`spill.rs::Trace`). Neither is a weight.
+
+---
+
+### §2 WHY NOT A REWRITE
+
+The user asked. The answer is no, and the reason is evidence, not conservatism.
+
+CCC (the AI compiler benchmarked at 737×–158,000× on sqlite) needs a rewrite: it
+has no allocator, uses "a single shuttle register", and produces 11,000-byte
+frames for 32 variables. zcc is 1.4–2.0× on the same program, with:
+
+* SSA-form allocation on a **chordal** interference graph, where greedy colouring
+  along a dominator preorder is **optimal in k by construction** (THEORY A7);
+* Braun–Hack spilling, live-range splitting, rematerialization, biased colouring;
+* a commuting square `⟦mir_v⟧ = ⟦mir_p⟧` and structural obligations checked on
+  every compile.
+
+This is the modern design — the same family LLVM uses. A rewrite would spend
+weeks re-deriving what A7 already proves and would put every correctness square
+back in play; both bugs fixed on 2026-08-27 lived **at allocator seams**. The
+measured defect is a cost model, and cost models are replaceable in isolation.
+
+---
+
+### §3 THE METHOD — this is the part that decides success
+
+**Five previous attempts at this area all failed.** Every one of them edited
+`color.rs` directly and was reverted: hint-set without re-check; rollback;
+excluding the ParallelCopy path; a separate post-colouring pass (fired 0 times —
+ABI args are `ParallelCopy` pairs, not `UseFixed`); retargeting (collides on
+simultaneity). **Do not retry any of them.**
+
+What worked instead — the method that took geo40 below 1×:
+
+> **Never patch the compiler to test a codegen theory. Hand-edit the `.s`, link
+> it, run it, time it. Prove the shape wins first; only then build the mechanism
+> that produces that shape.**
+
+So every phase below is: **(a) hand-edit to the target shape and measure the
+ceiling → (b) only if the ceiling is worth it, build the minimal mechanism →
+(c) prove it with a non-vacuous square → (d) full gate + seal.**
+
+Phase 1's ceiling is already measured (§1): 8 ms → 1 ms. That is why it is
+Phase 1.
+
+**Non-vacuity is mandatory.** On 2026-08-27 two fixtures passed with their fix
+disabled and were withdrawn. A test that passes without the change is not a
+proof; `tests/provenance.sh` exists to refuse exactly that.
+
+---
+
+### §4 THE LADDER
+
+Status lives HERE, edited in place. Do not open a new numbering elsewhere.
+
+| # | row | gate | status |
+|---|---|---|---|
+| S0 | **A shape-matched kernel in the exec suite** — and, it turned out, an INSTRUMENT that could see it. Two things were hiding this defect from geo40, not one: no kernel in the suite spills, AND the harness timed with `date +%s%N` and then divided by 1,000,000, throwing the nanoseconds away before declaring everything under 5 ms unmeasurable. See §4a. | kernel `k1_vdbe_dispatch` reads **exec 1.939× / insn 1.561×**; timed programs 18 → 25 | ✅ |
+| S1 | **The trace-distance model.** ~~Loop-weighted eviction~~ — the measurement (§1) refuted that framing: the defect was the `usize::MAX` a back edge produces, not a missing weight. Shipped `spill.rs::Trace`: Belady's distance measured along the execution trace (a use behind, inside this loop, is one wrap away; a use outside costs the remaining trips) and over the SSA WEB (the granularity at which eviction is paid, since `Sim::More` retires a whole web). | `nestjoin.c` **8 ms → 1 ms = gcc**; inner loop 11 insns → 8, frame ops 6 → 2 | ✅ |
+| S2a | **The invariant reload.** ✅ The mechanism that carries a memory-resident value through a loop in a register — the cold-edge phi — was already built and was being REFUSED by its own pruning gate, which asked for a read strictly AFTER the block head when the read is AT the head, and answered `usize::MAX` for a value read only across the back edge. The same trace query S1 installed fixes it. | `nestjoin` inner loop 8 insns → **7**, zero reloads; at 36M iterations **12 ms → 11 ms = gcc's 11** | ✅ |
+| S2b | **The accumulator's store.** ⛔ REFUSED BY ITS OWN CEILING, and no code was written — the §3 method working as intended. Hand-edited the store out of `nestjoin`'s inner loop and timed it at microsecond resolution: gcc 11,599 µs, zcc 11,634 µs, zcc-with-the-store-sunk **11,594 µs**. A 0.34% difference, because the store is off the dependence chain and retires into the write buffer (Law 3c: count is not cost, in the direction that says DON'T build it). A store-sinking dataflow pass is not worth 0.34% of one program. | ceiling measured at **0.34%**; not built | ⛔ |
+| S3 | **`sqlite3VdbeExec`.** Re-measured after S1+S2a. **Gate NOT met**, and the reason was already on the record: slots fell 244 → **199** (−18%) while the function's ratio moved only 1.823× → **1.786×**, because `excess.sh` had already shown the gap in that function is COPIES, not spill traffic (+10,464 reg-reg `mov` file-wide against +1,741 frame accesses). Spill ranking was never going to close it. | wanted slots <80 (got 199) and ratio <1.2× (got 1.786×) | ⛔ |
+| S4a | **The argument registers go last.** ✅ `assign` picks `hint.or_else(alloc_order.find(free))` and `alloc_order` began at x0, so every unhinted value in the function took an argument register before anything else and the argument that wanted it paid a `mov`. Reordering the caller-saved half to x8–x15 then x0–x7 (`MEASURED M13`) — no set, mask or ABI changes. | sqlite 175,407 → **174,677** (1.1167× → **1.1120×**); movs into x0–x7 22,829 → 19,985; geo40 INSN 1.0432 → **1.0301** | ✅ |
+| S4b | **Re-colour the occupant.** ⛔ BLOCKED — attempted, refuted by the verifier, and the ceiling it was aimed at turns out not to exist. See §4b. | attempted; **7 recolours in all of sqlite**, −37 instructions | ⛔ |
+| S4 | **The copy residual.** +1,252 reg-reg mov in that function. Only after S1–S3, because eviction pressure changes once hot values stop moving. | reg-reg mov in `VdbeExec` < 800 | ⬜ |
+| S6 | **A small copy is not a libcall.** ✅ Added IN PLACE, not as a new numbering: S0's instrument made `e3_struct_byval` visible at **2.630× exec**, the worst program in the suite on both axes, and the cause was `isel/lower.rs` lowering EVERY `Inst::MemCpy` to `bl memcpy` — including the 16-byte home of a by-value struct parameter, which made a leaf function build a frame and call libc four million times. Now open-coded up to 32 bytes (`MEASURED M14`, the measured minimum of a nine-point sweep), emitted as two loads then two stores so `ldstp.rs` fuses them. | `e3_struct_byval` 2.630× → **1.953×** (insn 1.724 → 1.621); sqlite 174,677 → **174,572**; suite EXEC 1.0403 → **1.0304** | ✅ |
+| S5 | **`ldp`/`stp` pairing.** ⛔ RE-CLOSED, and for a different reason than the first time — the row's premise was arithmetic that did not hold. "gcc emits 12,637 pairs to zcc's 7,616" counts gcc's PAIRS as if each one zcc lacks were an instruction zcc could delete, but a pair only saves an instruction when the two accesses exist. Counted properly, zcc emits **22,070 frame instructions to gcc's 24,720** — zcc is **2,650 AHEAD**; gcc has more pairs because it has 7,009 more frame accesses, i.e. it spills more. The real quantity is efficiency (0.757 instructions per access against 0.683), of which the census says ~1,009 are reachable. The first closure blamed gcc's lead on SCHEDULING; that was asserted, not measured, and it is false: at `-O1` gcc has `-fschedule-insns2` disabled, and forcing it on moves sqlite by 2 instructions and 0 in total count. | true ceiling ~1,009 pairs, not 5,130 | ⛔ |
+
+#### §4a S0 — what was actually wrong with the instrument
+
+**The suite could not see the defect for two reasons, and only one was planned
+for.** The first is the one this row was written about: every geo40 kernel fits
+in the register file and spills nothing. That is now proven rather than assumed —
+the whole 35-program corpus is byte-identical across a 1000× sweep of the
+spiller's one cost constant (`MEASURED M12`), which is only possible if no
+allocation decision in any of them is pressure-bound.
+
+**The second was the harness.** `exectime.sh` timed with `date +%s%N` — a
+nanosecond clock — and then wrote `(t1-t0)/1000000`, truncating to whole
+milliseconds, with a shell `fork` for `date` sitting between the two readings.
+On the strength of that truncation it declared everything under 5 ms
+"startup-dominated" and skipped it. **Fifteen of the thirty-five programs never
+produced an exec number at all.** The resolution was never missing from the
+machine: `clock_gettime(CLOCK_MONOTONIC)` is a vDSO read here, the counter
+behind it runs at 24 MHz (41.7 ns/tick, 0.5% run-to-run over ten million
+iterations), and the real floor — `fork`+`execve` of `/bin/true`, best of 20 —
+is **189 µs**, reproducible to the microsecond. `tests/bench/timeit.c` measures
+that floor on every run and prints it, so the cutoff is a measured number times
+a margin rather than a constant someone chose.
+
+What that changed, at the SAME tree:
+
+| | old instrument | µs instrument |
+|---|---|---|
+| programs timed | 18 | **25** |
+| EXEC geomean | 0.9500 | **1.0165** |
+| worst exec | `d2_nested_loops` 1.111 | `e3_struct_byval` **2.642** |
+
+⚠️ **The sub-1× reading was substantially an artifact of the skipping.**
+`e3_struct_byval` was reported as `fast` and dropped; it is 2.6× slower than
+gcc. `a2_udiv_mod`, `a3_sdiv_mod` and `a4_shift_mask` were dropped; they are
+1.11–1.14×. A geomean over the 18 programs that survived a 5 ms floor was not a
+statement about the suite. This is Law 3c's own warning arriving from an
+unexpected direction: the narrow surface was narrower than anyone had counted.
+
+**The kernel.** `tests/bench/suite/k1_vdbe_dispatch.c`, generated to the spec
+measured from `sqlite3VdbeExec` itself (8,363 lines at amalgamation line 93,917;
+**196 arms in one switch**; **42 for/while loops inside them**; brace depth 9;
+a VM-state set live across every arm; per-arm locals with mutually exclusive
+live ranges). Arms are heterogeneous by construction — integer chain,
+struct-field chasing, byte/short work, double arithmetic, compare-and-select —
+because a uniform body measures one lowering row 196 times instead of a
+dispatch.
+
+**Admission, and the honest shortfall.** Step 3 asked for 1.7–1.8×. On the
+arbiter axis it exceeds that: **exec 1.939×**. On instructions it reaches
+**1.561×** against the real function's 1.794×, with 86 zcc frame slots to gcc's
+37 (the real pair is 199/43). Seven parameter settings were swept; the
+instruction ratio plateaus at 1.5–1.6, and adding calls to the arms — VdbeExec
+is the most call-dense function in sqlite — LOWERED it, because argument
+marshalling costs gcc as much as zcc per call. The residual is heterogeneous
+hand-written code over a large frame, which a generator does not reproduce. The
+program carries the shape and the exec ratio; the last 0.23× of the instruction
+ratio lives in sqlite, where `realprog.sh` measures it.
+
+**Step 4 — the suite is re-baselined and the old numbers do not compare.**
+geo40 becomes geo41. At HEAD, 36 programs: **EXEC 1.0403 over 25 timed** (median
+1.004, worst `e3_struct_byval` 2.630, 6 above 1.1×) and **INSN 1.0421 over all
+36** (median 0.991, worst 1.724, 12 above 1.1×). Never compare either against
+0.9494×, 0.9565× or 0.9500×: those are a different program set read through a
+different instrument.
+
+#### §4b S4b — why the 8,784 was never a ceiling
+
+The row was aimed at a number the colourer prints itself: of sqlite's 14,764
+hints refused because the wanted register was OCCUPIED, **8,696 have an occupant
+that "dies in this block"**, and the statistics replay says a register is free
+across that occupant's whole range in 100% of them. The plan read that as 8,696
+removable copies.
+
+**It is not, and the instrument's wording is what misled it.** `HINT_OCC_LOCAL`
+tests ONE condition — the occupant's LAST USE is in this block — and labels the
+result "locally evictable". A value can die in this block and still have been
+LIVE-IN, with its range reaching back through dominating blocks the colourer
+walked earlier and keeps no occupancy record of. Recolouring one of those
+changes its register in those blocks too, where the new register is very likely
+taken.
+
+That is not a deduction; it is what happened. The mechanism was built —
+a per-point occupancy history so a refusal could ask what was busy in the part
+of the occupant's range already walked — and on the first real program
+`regalloc::verify` stopped the compile:
+
+```
+unixShmSystemLock: V(4) and V(25) are both live at bb0[3] and both hold Gpr9
+```
+
+Restricted to the genuinely local case — occupant DEFINED in this block, dying
+in this block, not live-out — it is correct, the full corpus passes, and it
+fires **7 times in the whole of sqlite** for **−37 instructions**. Seven, against
+a claimed eight thousand.
+
+**So the lever needs global interference**, which this allocator deliberately
+does not carry: chordal colouring in dominance order is optimal in k precisely
+because it never revisits (THEORY A7). Getting it would mean an interference
+graph or live-range splitting at colouring time — a different allocator, not a
+row. Reverted; the ~150 lines are not worth 37 instructions and they carry an
+edge the verifier had to catch.
+
+**What to fix instead of retrying this.** The instrument should say what it
+measures. `HINT_OCC_LOCAL` should require defined-here AND dying-here before it
+calls anything "locally evictable", so the next reader is not handed an 8,696
+that means something else. Until then, treat that column as an upper bound on an
+upper bound.
+
+⚠️ §3 said five previous attempts in this area were refuted. This is the sixth,
+and it is the first that says WHY in a form the next session can check: the
+number in the report is not the number of removable copies.
+
+---
+
+### §4c THE NEXT SESSION STARTS HERE — pointer-residency, NOT copy-coalescing
+
+> **VERDICT 2026-08-27 (supersedes the copy-coalescing framing below; full
+> derivation `MEASURED M21`).**
+> 1. **Full gate GREEN on `slotmerge.rs`** — `FUZZ_N=300 fullsuite.sh all` =
+>    15 PASS / 0 RED (determinism ✅, csmith 254/0, yarpgen 300/0, musl ✅).
+>    §4c item 1 discharged.
+> 2. **The copy-coalescing campaign is CANCELLED.** The 283 cs←cs `mov`s are
+>    COLD (100% branch to `abort_due_to_error`/`no_mem`) — a size cost, ~0
+>    speed. M20's "these execute" was the Law-2 measurement exception.
+>    libFIRM co-heur would buy SIZE only; not built (toggle-off if ever authored).
+> 3. **The hot lever is pointer RESIDENCY.** gcc keeps p/pOp/pC register-
+>    resident across the dispatch; zcc reloads them, and pOp's reload gates the
+>    mispredicting jump-table branch. Proven: keeping pOp resident moves the
+>    canonical `realprog.sh` geomean **1.1661× → 1.1553×** (+0.9%), size-neutral.
+> 4. **No smash-and-grab remains.** `OP_Column`/`OP_Next` carry no structural
+>    defect — only systemic spilling. Path to lower = a gated residency pass
+>    (keep p+pOp+pC resident at the dispatch join), est. +2–4% → sqlite ~1.12×.
+>    1× is not reachable by one trick on this surface.
+
+**State at hand-off.** sqlite exec **1.159×** gcc -O1 (was 1.651 at the start of
+2026-08-27). Size 1.1052×. The 42-program suite 1.0206. Everything in `§6` is
+measured; do not re-take it.
+
+**BEFORE ANYTHING ELSE.** `mir/pass/slotmerge.rs` is committed but the FULL GATE
+WAS NOT RUN on it — the session ended first. It has: cargo 186/0, provenance
+PASS, `localize.sh`'s output check green on sqlite (which is what caught its
+predecessor's miscompile), and `determinism` NOT run. **Run
+`FUZZ_N=300 sh tests/fullsuite.sh all` first, before adding anything.**
+
+**THE TARGET, measured (`MEASURED M20`).** In `sqlite3VdbeExec`:
+
+```
+mov <callee-saved>, <callee-saved>      zcc 325   gcc 8     <- the gap
+mov <callee-saved>, x0..x7 after a call zcc  38   gcc 26    <- ABI-forced, near-equal
+mov -> x0..x7 (argument marshalling)    zcc 645   gcc 379
+```
+
+The excess is NOT the ABI. A result live across a later call must move to a
+callee-saved register and gcc does that too. What zcc does 325 times and gcc 8 is
+shuffle a value from one callee-saved register to another — coalescing failure,
+and unlike the frame rows these copies EXECUTE.
+
+**THE ORDER OF WORK, and step 1 is not code.**
+
+1. **MEASURE THE CEILING BY HAND.** Take one hot arm of the dispatch, delete its
+   callee-saved shuffles in the `.s` by renaming registers, link, check the
+   output, time it. That number decides whether the campaign is worth 7 points or
+   1. Everything on 2026-08-27 that skipped this step was refuted; everything
+   that did it shipped. `MEASURED M20` says 325 is an upper bound on what the ABI
+   does not force, NOT on what a colouring could avoid.
+2. **Diagnose ONE shuffle.** Why did the colourer put the value somewhere its
+   copy partner is not? `ZCC_HINT=1` already reports the refusals; the answer for
+   the block-local case is in `§4b` and it is that recolouring the occupant needs
+   interference the allocator does not carry.
+3. **The mechanism, if the ceiling justifies it.** Post-colouring recolouring
+   with WHOLE-FUNCTION occupancy, which is what `§4b`'s attempt lacked: build,
+   per physical register, the set of program points where it is held, then for a
+   copy `D = S` recolour `D` to `S`'s register when that register is free across
+   `D`'s entire live range and the caller/callee partition allows it. The copy
+   becomes a self-move and `destruct::sequentialize` already deletes those.
+4. **Verify with `localize.sh` before timing anything.** It compares program
+   output against the gcc build and refuses to report a number otherwise. It is
+   the only instrument in the tree that caught the slot-merge miscompile — 185
+   unit tests and all 42 suite programs passed it.
+
+**WHAT IS NOT THE PATH TO 1×, measured on 2026-08-27 so nobody re-tries it:**
+
+* frame-size work. Slot coalescing took `VdbeExec` from 203 slots to 116 and cut
+  6,832 bytes of stack; the clock moved 1.279 → 1.276. Fewer ADDRESSES is not
+  fewer ACCESSES, and the access count (1,629 against gcc's 598) is what costs.
+* cold-path work. The rotation gate removed 662 instructions from loops that by
+  definition do not execute.
+* `madd`→shifts, `cset`/`cmp` folding, dispatch reordering, dispatch trees,
+  small-struct SROA, invariant-constant hoisting — each priced by hand-edit and
+  each worth ~1% or less. `arm64_elf.md` §6.1 records why.
+
+**THE HONEST SIZING.** `VdbeExec` is ~47% of the remaining 15.9 points ≈ 7.5.
+The tail (`MemShallowCopy` ~8%) is ~1.3. The rest is below the attribution
+instrument's noise floor, which is what a systemic allocation problem looks like
+from a distance. **1× is not reachable without this campaign**, and it may end at
+"chordal colouring in dominance order cannot revisit, so this needs a different
+allocator" — which is a REARCH decision, not a row.
+
+---
+
+### §5 HOW TO JUDGE
+
+* **Speed on real programs, not instruction count** (Law 3c). `realprog.sh` per
+  phase, and `bench/quickapp.sh` for the SQL statements.
+* **Both microarchitectures.** Apple silicon and Graviton disagreed by 40% on the
+  same binary (geomean 1.45× vs 2.03×). A win on one is not a win.
+* **geo40 must not regress.** It stands at 0.9494× (tag `rc5`). Loop-weighted
+  eviction moves pressure *out* of loops and therefore *into* straight-line code;
+  the kernels are where that shows up first.
+* **A full seal, not the 300-seed gate.** S1 changes what every function spills.
+  `c04804` (over-k panic at a `pcopy`) was a one-in-ten-thousand event that the
+  300-seed gate never saw. Budget a 10k csmith + 10k yarpgen run on us-east-2 —
+  and **tear the box down and verify** (0 instances, 0 volumes, 0 spot requests).
+
+**Abandon criteria.** If S1's real yield is under 20% of the measured ceiling
+after one bounded attempt, mark it `BLOCKED: <reason>`, revert to green, bank
+anything positive, and advance. A blocker never authorizes a new direction.
+
+---
+
+### §6 THE NUMBERS ARE ALREADY TAKEN — DO NOT RE-TAKE THEM
+
+Everything in §1 was measured on 2026-08-27 against `2d6461a`. **A later session
+must not re-measure any of it to "confirm".** Re-measuring a recorded fact costs
+an hour, produces the same number, and is the single most common way a session
+spends itself without moving the ladder. The facts:
+
+| fact | value | source |
+|---|---|---|
+| `nestjoin.c` gcc -O1 | 1 ms | §1 |
+| `nestjoin.c` zcc -O1 | 8 ms | §1 |
+| `nestjoin.c` zcc, hand-edited loop | 1 ms | §1 — **the ceiling** |
+| `VdbeExec` distinct frame slots | zcc 235 / gcc 43 | §1 |
+| `VdbeExec` instructions | zcc 10,766 / gcc 6,040 | §1 |
+| sqlite file ratio | 1.1238× (173,176 / 154,097) | §1 |
+| functions in both compilers | 1.045× | §1 |
+| `ldp`/`stp` file-wide | zcc 7,266 / gcc 12,305 — ⚠️ **NOT a 5,039 opportunity**, see `MEASURED M15`: counted as instructions rather than pairs, zcc emits 22,070 frame instructions to gcc's 24,720 and is 2,650 AHEAD | S5 |
+| geo40 EXEC geomean | **0.9565×** — SUPERSEDED, see §4a: 18 timed under a 5 ms floor | 2026-08-27 |
+| **geo41 EXEC geomean** | **1.0403×** (25 timed at a 189 µs floor, median 1.004, worst `e3_struct_byval` 2.630, 6 above 1.1×) | 2026-08-27 |
+| **geo41 INSN geomean** | **1.0421×** (all 36, median 0.991, worst `e3_struct_byval` 1.724, 12 above 1.1×) | 2026-08-27 |
+| geo40 INSN geomean | **1.0432×** (deterministic, all 35, worst `e3_struct_byval` 1.759×) | 2026-08-27 |
+| geo40 worst exec | `d1_switch` 1.111× | 2026-08-27 |
+| realprog total | 1.410× Apple / 2.03× Graviton | report |
+
+#### ⭐ THE HEADLINE — sqlite exec 1.651 → 1.159, and what actually did it
+
+Three interleaved runs of each binary, `realprog.sh` at microsecond resolution,
+session start (`d85aac9`) against `5ed5648`:
+
+| | session start | after the jump-table row |
+|---|---|---|
+| **SQL geomean, 11 phases** | 1.6282 / 1.6743 → **1.651** | 1.1524 / 1.1646 → **1.159** |
+| TOTAL (sum-weighted) | 1.490 | **1.164** |
+| worst phase `p01_insert` | 2.818 / 2.593 | **1.313 / 1.301** |
+| median phase | 1.551 / 1.578 | **1.154 / 1.147** |
+| phases above 1.1× | 10 of 11 | 9 of 11 |
+
+**65% slower than gcc -O1 became 16% slower, from one condition in `isel`.**
+`sqlite3VdbeExec` dispatches 196 opcodes and every arm carries edge arguments,
+so the jump-table row refused it and the hottest dispatch in the program was a
+183-deep linear compare chain, walked ~1.4 million times per 100,000-row INSERT.
+
+**AND HERE IS THE LESSON, which cost a day to learn.** The seven rows shipped
+before it — trace-distance eviction, the phi gate, argument registers last,
+inline of composite parameters, the parameter-copy elision, if-conversion —
+were all real, all gated, all measured on their own programs, and together they
+moved sqlite **by nothing** (1.679 → 1.649, ranges overlapping). Every one had
+been aimed at a KERNEL, because kernels are the only programs small enough to
+diff by hand. The row that moved sqlite was aimed at sqlite.
+
+The chain that found it, in order, and none of the steps is skippable:
+
+1. `localize.sh` — attribution by linker: **85% of the gap in one function**
+   (`MEASURED M16`). Static instruction counts had said `VdbeExec` was 25% of
+   the *size* excess; they could not say it was 85% of the *time*.
+2. `xray.sh` — that function's mnemonic histogram against gcc. **Necessary but
+   not sufficient**: a histogram names CLASSES, not sites. Three hypotheses
+   drawn from it (`madd`→shifts, `cset`/`cmp` folding, dispatch reordering) were
+   built or hand-edited and each refuted at ~1%.
+3. **Narrowing the window.** `EXPLAIN` gave the opcodes the workload actually
+   runs; counting `br` in the two assemblies gave the answer in one line —
+   gcc 1, zcc 0.
+
+Step 3 is the one that mattered, and it is the cheapest of the three.
+
+#### The pre-jump-table state, kept because it is what the lesson is about
+
+Three interleaved runs of each binary, `realprog.sh` at microsecond resolution,
+session start (`d85aac9`) against HEAD (`47f8e77`) — seven shipped rows apart:
+
+| | session start | HEAD |
+|---|---|---|
+| **SQL geomean over 11 phases** | 1.7179 / 1.6558 / 1.6620 → **1.679** | 1.6493 / 1.6363 / 1.6626 → **1.649** |
+| TOTAL (sum-weighted) | 1.498 / 1.477 / 1.548 → 1.508 | 1.474 / 1.424 / 1.500 → 1.466 |
+| worst phase | `p01_insert` 2.67–3.01× | `p01_insert` 2.79–2.92× |
+| phases above 1.1× | 10–11 of 11 | 10–11 of 11 |
+
+**The ranges overlap** (old 1.656–1.718, new 1.636–1.663), so a 1.8% shift
+against a 3.7% spread is not a result. Say it plainly: the session moved the
+taxonomy suite from 1.0400 to 1.0190 and sqlite's SIZE from 1.1216× to 1.1085×,
+and did not measurably move real sqlite EXECUTION.
+
+⚠️ **THE STANDING LESSON, and it is the one to read first.** Every row shipped
+today was aimed at a shape found in a KERNEL — a by-value struct parameter, a
+parser's dispatch arm, a nested-loop join. Each was real and each paid on its own
+program. None of them was aimed at sqlite, and sqlite did not move. The 1.11×
+size against 1.65× exec split said this in advance: **the remaining real-program
+gap is not instruction count**, so rows found by counting instructions cannot
+close it.
+
+**What that makes necessary.** A localizer — WHICH FUNCTIONS carry the 1.65×.
+`-DSQLITE_PRIVATE=` already exposes all 1,260 internal functions as symbols in
+both compilers, and `objcopy --weaken-symbols=<list>` allows a hybrid link:
+weaken every global in gcc's object except a chosen set, weaken exactly that set
+in zcc's, link the two, and the chosen functions come from gcc while everything
+else comes from zcc. One link and one run per experiment, no recompiles, so
+binary-searching 1,260 functions is about eleven cycles. (An earlier attempt to
+split the amalgamation into its original translation units failed — 47 of 102
+units do not compile because the headers interleave — and `objcopy
+--only-section` destroys the symbol table. The weaken-list route avoids both.)
+
+#### After S1 — taken 2026-08-27 with ONE harness across both binaries
+
+The baseline column is not a recorded number: `d85aac9` was rebuilt and run
+through the same script in the same box session, because a ratio taken by two
+different scripts is not a comparison.
+
+| | before S1 | after S1 | gcc -O1 |
+|---|---|---|---|
+| `nestjoin.c` best-of-5 | 8 ms | **1 ms** | 1 ms |
+| sqlite file instructions | 176,186 | **175,394** | 157,074 (1.1216× → **1.1166×**) |
+| `VdbeExec` instructions | 11,014 | **10,841** | 6,041 (1.823× → **1.794×**) |
+| `VdbeExec` distinct frame slots | 244 | **200** | 43 |
+| `VdbeExec` frame accesses | 1,928 | **1,704** | 598 |
+| geo40 EXEC / INSN | 0.9565 / 1.0432 | **0.9474 / 1.0432** | — |
+
+The taxonomy suite's INSN geomean is unchanged **to four decimal places**, and
+the whole 35-kernel corpus is byte-identical across a 1000× sweep of the model's
+one constant (`MEASURED M12`). That is S0's thesis stated as a measurement: no
+kernel in the suite is under enough pressure to spill, so the suite cannot see
+this row at all — it can only certify that the row broke nothing.
+
+⚠️ **`realprog.sh`'s ratio is not stable enough to read from one run.** Three
+runs of the SAME tree gave totals of 1.390×, 1.467× and (before S1) 1.415×,
+while gcc's own total moved 1,181 → 773 ms between them — the box's load
+compresses the ratio toward 1. A realprog A/B must interleave the two binaries
+in one sequence and be read across runs, never as a single pair. The gate that
+DOES resolve S1 is `nestjoin` (8× effect) and the deterministic instruction and
+slot counts above.
+
+⚠️ **`exectime.sh` NEEDS `SUITE=`.** It defaults to `/work/tests/bench/suite`
+while the repo mounts at `/work/zcc`, and with the wrong path it prints
+"EXEC: no timed programs" instead of failing. Always:
+
+```
+docker run --rm -e ZCC=/usr/local/bin/zcc -e SUITE=/work/zcc/tests/bench/suite \
+  -v "$PWD/target/aarch64-unknown-linux-musl/release/zcc":/usr/local/bin/zcc:ro \
+  -v ~/.cache/zcc-suites:/suites -v "$PWD":/work/zcc:ro zcc-box \
+  sh /work/zcc/tests/bench/exectime.sh
+```
+
+**Re-measure only when the tree has changed in a way that could move the number**
+— i.e. AFTER shipping a row, as that row's gate. Never before, and never "to be
+sure".
+
+#### The first hour
+
+1. Read `spill.rs` around `next_use`, `linear_positions`, and the
+   `cand.sort_by_key` at ~line 1317. That is the whole surface of S1.
+2. Decide the weighting form on the model *before* editing: what does `10^depth`
+   do to a position scale that `next_use` binary-searches with
+   `partition_point`? The ordering must stay monotone or the search breaks.
+3. Then, and only then, write code — and measure once, at the gate.
+
+---
+
+# Part E — the copy census
+
+## COALESCE — the register copy that is half the gap
+
+The plan of record for one campaign. Boot here, read §0 for the number that
+justifies it, §1 for what has already been refuted, and start at §3 — which is
+measurement, not code.
+
+---
+
+### §0 THE FINDING (`MEASURED M26`, 2026-08-28, commit `5e03858`)
+
+The 49-program taxonomy suite, compiled by both compilers, every mnemonic
+counted and the spellings combined:
+
+```
+zcc 7,551 instructions   gcc -O1 6,598      +953   (+14.4%)
+
+mov reg,reg          1006   339   +667   ← 70% of the whole excess
+  · at a block edge   519    56   +463   ← HALF the entire gap
+  · in the body       312   206   +106
+  · placing an argument 175   77    +98
+load/store slots     1107   967   +140
+cmp + subs            484   359   +125
+mul + madd + msub     187    70   +117
+sxtw + sbfiz          161    93    +68
+mov reg,#imm          608   790   −182   ← zcc materializes FEWER constants
+```
+
+The same shape was measured independently on the sqlite amalgamation:
+register-to-register moves are +10,464 of a 20,264-instruction gap, 52%. Two
+different corpora, one answer.
+
+**A block-edge copy is what SSA destruction leaves behind and coalescing does not
+remove.** It is not a missing optimization row, which is why three rows built on
+the strength of reading one inner loop (`MEASURED M25` and the refutations beside
+it) each addressed a family worth 12%, 0% and 12% and each measured a loss.
+
+### §1 WHAT IS ALREADY KNOWN, AND WHAT IS ALREADY REFUTED
+
+Read this before proposing anything; the obvious moves have been made.
+
+- **The hints are asked for and REFUSED.** On sqlite the coalescing hint hit rate
+  is 56.5%, and **14,615 hints were refused because the register was already
+  OCCUPIED** — not because the hint was absent or badly ordered. The conclusion
+  recorded there is that this needs EVICTION or priority colouring, and that
+  three ordering fixes were tried and refuted.
+- **ABI argument placement is 40% of sqlite's size gap** on its own (x0–x7
+  traffic 22,813 against gcc's 14,626), and §0's census puts +98 of the suite's
+  copies there too. It is a second front, not the same one.
+- **`evict_params` strips `has_def`**, so a loop-header phi can never carry an
+  accumulator; the recorded next lever there was to split the PARAMETER at the
+  terminator rather than the whole web.
+- **Reconstruction is Braun-2013 at joins and headers**, and eviction is already
+  a regional split rather than a whole-web one — the whole-web model was wrong
+  for 96% of spilled values.
+
+The surface: `regalloc/color.rs` (952 lines, where a hint is honoured or
+refused), `regalloc/destruct.rs` (715, where the edge copy is created),
+`regalloc/reconstruct.rs` (124), `regalloc/spill.rs` (2,862),
+`regalloc/promote.rs` (341).
+
+### §2 WHERE A COPY COMES FROM IN ZCC — the three sources, and they need separating
+
+The census counts what reaches the assembler; it does not say which mechanism
+minted each one. Nothing should be built until each of the 519 edge copies is
+attributed to one of:
+
+1. **SSA destruction** — a phi whose argument and result were coloured
+   differently, so `destruct` places a copy on the edge.
+2. **A parallel copy that is genuinely a permutation** — a swap or a cycle, which
+   costs copies no matter how it is coloured, and is NOT a coalescing failure.
+3. **A `Copy` minted by an earlier pass and never removed** — `mir/pass/ext.rs`
+   turns a redundant extension into a `Copy` and expects colouring to erase it.
+   67 of these survive with the SAME register at both ends (gcc: none);
+   `k1_dispatch` ends every switch arm with the identical `mov w10, w10` behind
+   an `and` that already zeroed the top half.
+
+These want opposite fixes, and the ratio between them decides the whole campaign.
+
+### §5 TRAPS, all of them paid for once already
+
+- **Combine the spellings or the table lies.** gcc writes `mov w7, 18725` where
+  zcc writes `movz`, and `bne` where zcc writes `b.ne`. Raw counts read as +432
+  and +195 against a gcc that never emits either mnemonic.
+- **The EXEC geomean has a ±0.007 spread across sessions.** Only interleaved
+  pairs inside one box session compare; a single reading has already dismissed
+  one row wrongly and promoted another wrongly.
+- **INSN geomean is deterministic** and is the axis to trust for a size claim.
+- **Never chain a baseline to an earlier candidate.** Six rows drifted unnoticed
+  that way.
+- **The byte-identical gate has no oracle** (it is zcc against zcc) and is scoped
+  to what it compiles. A row that fires on none of the corpus is invisible to it;
+  measure the row's coverage before trusting a green.
+- **A permutation is not a coalescing failure.** Counting it as one will make a
+  fix look like it did nothing.
+
+### §6 HOW TO MEASURE
+
+**The census** (one box command, the source of §0): for each `.c`, emit both
+`.s`; `grep -oE '^[[:space:]]+[a-z][a-z0-9._]*'` for mnemonics; `uniq -c`; `join`
+the two tables; sort by difference. Classify a `mov` by scanning forward up to
+seven instructions — a `bl` first means argument placement, a branch or a label
+first means a block edge, anything else means body. Split `mov` by whether its
+second operand begins with `#` or a digit (constant) or not (register), and by
+whether its two register operands are equal.
+
+**The scoreboard**: `SUITE=/work/zcc/tests/bench/suite sh tests/bench/exectime.sh`
+inside the box (its default `SUITE` path is wrong and it then reports "no timed
+programs" in silence). Interleaved pairs only.
+
+**The gate**: `sh tests/fullsuite.sh all` — 15 stages, about six minutes with
+inlining on. Batch two or three rows per full gate; per row use `cargo test`,
+`tests/fullsuite.sh provenance` and `tests/bench/localize.sh`.
+
+---
+
+# Part F — MEASURED: the facts with no spec to cite
+
+## MEASURED — target facts with no spec to cite
+
+Law 1 says every line of `src/` is either a theorem (Side I) or a constant
+transcribed from a spec line (Side II). `THEORY.md` holds both, and Side II's
+entries are **citations** — a section number in ISO 9899, AAPCS64, DDI 0487 or
+the ELF ABI that a reader can look up.
+
+Some facts have no such line to cite. **Apple publishes no Software Optimization
+Guide for the M1**, so an instruction's latency, or whether a transform pays on
+this machine, cannot be referenced — it can only be MEASURED. Those facts live
+here rather than in `THEORY.md`, so that Law 1's two-side claim stays literally
+true: `THEORY.md` II-* is cited spec and nothing else.
+
+An entry is not an opinion. Each carries:
+
+* **VALUE** — the number or verdict the compiler acts on;
+* **METHOD** — the instrument and the command, so it can be re-taken;
+* **WHEN / WHERE** — the date and the machine, because a measured fact is only
+  true of the machine that produced it;
+* **WHAT USES IT** — the site in `src/` that reads it, so a change here has a
+  visible blast radius.
+
+**THE STANDING CAUTION.** Every number below was taken on **Apple M1 Pro cores
+under Docker**, while the notional target is generic AArch64-Linux. A measured
+fact is evidence about the measuring machine first and about the target second.
+Where the two could differ, say so in the entry.
+
+Cite an entry from code as `MEASURED M<n>`, exactly as a spec fact is cited as
+`THEORY II-<n>`. `tests/provenance.sh` checks that every citation names an entry
+that exists.
+
+---
+
+### M1. Extended-register ALU latency — 2 cycles against 1
+
+**VALUE.** On this machine `add xN, xN, wM, sxtw` has a 2-cycle latency where
+`add xN, xN, xM` has 1. The two are the same instruction COUNT, so `cost = |MIR|`
+scores them identically and always will.
+
+**METHOD.** j3_prefix_sum's loop-carried recurrence is `acc += ext(load)`. With
+the extension in the ALU the recurrence bound is 2.0; with `ldrsw` doing the
+extension in the load it is 1.0. Predicted from that table alone, with no build:
+**2.0**. Measured: **1.940** — a 3% error. After the transform: **1.000**.
+
+**WHEN / WHERE.** 2026-08-25, M1 Pro under Docker, `tests/bench/exectime.sh`.
+
+**WHAT USES IT.** `isel/lower.rs`'s extending-load row prefers the extension in
+the LOAD over the ALU operand; `mir/pass/ext.rs::plain_operand` drops an operand
+extension the lattice proves is a no-op. Neither is justified by instruction
+count — both are justified by this entry.
+
+**CAUTION.** A core with a different extended-register path would not show this.
+The transform is never WRONG there, only unmotivated.
+
+---
+
+### M2. The UNIT-STRIDE pointer / 64-bit induction variable is NEGATIVE on this target
+
+**VALUE.** Rewriting a recomputed `[base, w, sxtw #k]` address into a pointer
+walked by a post-index writeback makes zcc measurably WORSE. `hir/pass/iv.rs`
+ships that half default-OFF because of this entry.
+
+**SCOPE, narrowed 2026-08-26.** This entry is about a step EQUAL to the access
+size, and only that. It is what the A/B below varied, and it is the only case
+A64's scaled index reaches: `ldr Xt,[Xn,Xm,lsl #3]` scales by the access size
+and by nothing else (DDI 0487 C6.2.130). An address whose step the mode cannot
+express — `B[k][j]` walking a 240 x 8-byte ROW, step 1920 — is rebuilt with a
+MULTIPLY on every iteration, so replacing it with an `add` costs the same
+instruction count and removes a multiply from in front of a load. That half
+ships ON and has its own fact, M9; nothing here measured it.
+
+**METHOD.** `ZCC_IV=1` A/B over the 35-program suite, twice, on two different
+compilers. §13k (pre-R4.7): EXEC ≥30 ms 1.3789 → 1.4087, INSN 1.2419 → 1.2454,
+sqlite +1,276. Re-taken post-R4.7 (2026-08-25): INSN **1.1493 → 1.1538**, EXEC
+**1.2044 → 1.2140**, programs above 1.1× 8 → 9.
+
+**WHY, and this is the part that generalizes.** A64's scaled-index addressing
+form makes rebuilding an address from a counter FREE — there is nothing to
+strength-reduce. R4.7 then removed the one thing that was not free about it (the
+`sxtw` feeding the loop-carried chain, M1), which is why the re-measurement is
+worse than the first.
+
+**WHEN / WHERE.** 2026-08-25, M1 Pro under Docker.
+
+**WHAT USES IT.** `hir/pass/iv.rs::ENABLED = false` — which now gates the
+unit-stride half alone (`strengthen`'s `unit` parameter), not the whole pass.
+
+**RE-ENTRY TRIGGER.** §13k's own gate: a cost model that can say WHEN a
+writeback pays. Until one exists this stays off. j5_insertion_sort is the one
+program where it would pay, which is a statement about j5, not about the target.
+
+---
+
+### M3. The copy-partner graph saturates at depth 3
+
+**VALUE.** `regalloc/color.rs` follows the copy-partner graph three hops looking
+for a coloured member to bias toward. Three, not one and not eight.
+
+**METHOD.** Swept on sqlite, `ZCC_CODEPTH=<n>`, whole-module instruction count:
+
+| depth | 1 | 2 | **3** | 5 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| insns | 188,659 | 187,260 | **187,097** | 187,081 | 187,104 | 187,104 |
+
+Depth 1 is the old one-hop behaviour. It is flat from 3 on; 5 buys 16
+instructions and 8 gives them back.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker.
+
+**WHAT USES IT.** `regalloc/color.rs`, the `depth` bound in `assign`.
+
+**CAUTION.** This is a property of sqlite's copy graph, not of the ISA. A corpus
+with longer copy chains would move it.
+
+---
+
+### M4. The jump-table crossover is ~24 arms, and a BALANCED TREE never wins
+
+**RE-TAKEN 2026-08-26, and the earlier entry is superseded below.** The first
+attempt could not separate the forms because it swept a synthetic whose arms did
+too little work. This one sweeps 4…64 arms with a pseudorandom index AND with a
+repeating one, and the two agree.
+
+**VALUE.** `isel/lower.rs::MIN_CASES = 24`, was 4 (chosen by taste at R3.3).
+
+**METHOD.** Three dispatch forms, same program, ms best-of-7, outputs compared
+first. Unpredictable index:
+
+| arms | gcc | chain | tree | table |
+|---|---|---|---|---|
+| 4 | 21 | **46** | 53 | 54 |
+| 8 | 36 | **54** | 69 | 62 |
+| 16 | 49 | **62** | 84 | 65 |
+| 32 | 50 | 71 | 98 | **67** |
+| 64 | 53 | 87 | 111 | **68** |
+
+Crossover, both index kinds (chain / table): 16 → 62/65 and 11/12 · 20 → 66/67
+and 12/12 · 24 → 68/**67** and 14/**12** · 28 → 70/**67** and 15/**12**. The
+chain is better or equal to 20 arms and the table wins from 24, whether the
+index repeats or not. 21…23 were not measured and the constant does not pretend
+otherwise — 24 is the first size where the table actually wins.
+
+**THE BALANCED SEARCH TREE IS REFUTED.** It was built, proven and measured, and
+it loses at EVERY size from 4 to 64 — at 16 arms, chain 62 ms, table 65, tree 84.
+It asks strictly fewer questions (4 against 7 on d1_switch) and takes more time,
+because the chain's tests FALL THROUGH while the tree spends a taken branch per
+level and scatters the arms. Law 3c pointing the other way: fewer questions is
+not less time either. The code was removed rather than kept behind a flag,
+because no measured size wants it.
+
+**RESULT.** d1_switch **1.500 → 1.200**; geo40 EXEC 1.0240 → **1.0180**; sqlite
+173,344 → 173,519 (+175, +0.1%), which is the Law 0 ordering — `exec > size`.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, gcc 14.2.0.
+
+**WHAT USES IT.** `isel/lower.rs::MIN_CASES`, and `jump_table`'s density test.
+
+**OPEN, and FOUR HYPOTHESES REFUTED.** d1 sits at 1.200, and none of the obvious
+explanations survives a controlled hand-edit (same file, one change, outputs
+compared, best-of-11):
+
+| d1 variant | ms |
+|---|---|
+| gcc -O1 | 10 |
+| **zcc, compare chain (what ships)** | **12** |
+| gcc's dispatch shape transcribed verbatim into zcc | 13 |
+| `csel` on the last arm (if-converted arm body) | 12 |
+| `tbnz` range split | 15 |
+| counter widened to 64 bits, arms read `x1` (no `sxtw`) | 13 |
+
+Transcribing gcc's own shape makes zcc SLOWER. The branchless arms buy nothing.
+The range split hurts. Widening the counter — which removes three
+extended-register operands (`MEASURED M1`) from the loop-carried accumulator —
+also loses. Whatever the last 2 ms is, it is not the switch and not the arms, and
+four experiments did not find it.
+
+QUARANTINED at 1.200 rather than guessed at further. The re-entry is **R4.18**,
+the time-dual cost model: this is precisely the case it exists for — a program at
+INSN 1.077 whose remaining time gap no instruction-level reasoning has located.
+
+---
+
+### M4-superseded. A jump table and a compare tree are indistinguishable by case count
+
+**VALUE.** `isel/lower.rs::MIN_CASES = 4` is UNSETTLED. The measurement does not
+support any constant derived from the case count, so the R3.3 value stands
+unchanged rather than being replaced by a fitted one.
+
+**METHOD, and it is the disagreement that is the finding.**
+
+* d1_switch (8 cases), repeatedly and directly: jump table **15 ms**, compare
+  tree **12 ms** — the tree wins by 20% while emitting **12 MORE instructions**
+  (95 against 83). The table's indirect branch is unpredictable.
+* A synthetic sweep at 4, 6, 8, 12, 16, 24 and 32 cases, with a pseudorandom
+  (unpredictable) index: table and tree within **1 ms of each other at every
+  case count**.
+* Whole-suite A/B: `ZCC_JT=9` moved the EXEC geomean 1.0899 → 1.0639, but d1
+  alone moves 13% and the geomean would need 35% from it — the rest is
+  cross-program noise.
+
+**THE CONCLUSION.** The case count is not the variable. Something about d1's
+switch — not how many arms it has — decides it, and no constant over arm-count
+would be honest. `ZCC_JT` is left in place as the instrument.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker.
+
+**WHAT USES IT.** `isel/lower.rs::MIN_CASES`, and `jump_table`'s density test.
+
+---
+
+### M5. The `ldp`/`stp` pairing window saturates within ten instructions
+
+**VALUE.** `mir/pass/ldstp.rs::WINDOW = 10`.
+
+**METHOD.** Distance distribution of pairable frame accesses on sqlite, after
+the spills-first frame layout: 433 adjacent, then 302, 299, 144, 117, 116, 107,
+102, 97, 90 at distances 2…10 — 1,807 in total, of which 761 are refused by the
+paired form's imm7 range regardless of distance. The tail beyond ten is flat.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, `tests/bench/excess.sh`.
+
+**WHAT USES IT.** `mir/pass/ldstp.rs::WINDOW`.
+
+---
+
+### M6. `alg.sh` is bound by zcc's compile time, not by the harness
+
+**VALUE.** The expression-algebra gate does not scale past two workers, and the
+reason is zcc, not the script.
+
+**METHOD.** `ALG_JOBS` sweep: 1 → 98s, 2 → 57s, 4 → 54s, 8 → 54s, 16 → 57s.
+Profiled: generation 147ms, the eleven `run` cases compile in **zcc 73.0s
+against cc 4.2s** (17×) on 3.4k-line files, the runs take 8ms, concatenation and
+diff 0ms.
+
+**WHY.** These are exhaustively generated op × type × corner files — one huge
+function each — which is the same superlinear compile-time shape that produced
+the yarpgen CTIMEOUTs before the release-build fix.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker.
+
+**WHAT USES IT.** `tests/alg.sh`'s comment, and §CP's target list. Nothing in
+`src/` reads this; it is here so the next person to look at gate speed does not
+re-derive it.
+
+---
+
+### M7. `MAX_HEADER_INSTS = 20` is gcc's number, not a spec's
+
+**VALUE.** `hir/pass/rotate.rs::MAX_HEADER_INSTS = 20` — the largest loop header
+worth copying.
+
+**METHOD.** NOT measured here. It is gcc's own -O1 value for the same transform
+(`--param max-loop-header-insns`, default 20, read by `-ftree-ch`), taken
+because rotation trades a STATIC copy of the header for a DYNAMIC branch per
+iteration — an exchange rate, so no bound falls out of the theorem.
+
+**WHY IT IS HERE AND NOT IN THEORY.md.** gcc's default is not a specification.
+Recording it as a Side-II citation would be inventing provenance, which is the
+Article E failure this file exists to prevent.
+
+**WHAT USES IT.** `hir/pass/rotate.rs`.
+
+**OPEN.** Never swept on this corpus. A sweep would move it from "gcc's number"
+to a measured one; until then it is honestly labelled.
+
+---
+
+### M8. The if-conversion arm bound is 2, and it is REASONED, not measured
+
+**VALUE.** `hir/pass/ifconv.rs::ARM_LIMIT = 2` — the most instructions an arm may
+hold and still be if-converted into a `select`.
+
+**METHOD.** NOT measured. It is a reading of the trade: converting replaces a
+compare, a taken branch and the pipeline bubble a misprediction costs with
+unconditional work on both arms, so the bound is "fewer instructions than a
+mispredict costs". Two is the conservative reading, and the shape this pass
+exists for — a join parameter and nothing else — needs none at all.
+
+**WHY IT IS HERE AND NOT IN THEORY.md.** There is no spec line for the cost of a
+branch misprediction on this core, and none was measured. Recording it as a
+Side-II citation would be inventing provenance. Labelled honestly instead.
+
+**WHAT USES IT.** `hir/pass/ifconv.rs`.
+
+**OPEN.** Never swept. A sweep over the suite would move it from "the
+conservative reading" to a measured entry — and `csel` sits at 599 against gcc's
+542, so the bound is not currently costing much either way.
+
+### M9. A ROW-STRIDED pointer IV is POSITIVE on this target
+
+**VALUE.** When a loop's load address advances by a step the addressing mode
+cannot express, walking a pointer removes a MULTIPLY from in front of the load
+at the same instruction count. `hir/pass/iv.rs` ships this half ON.
+
+**METHOD.** `tests/bench/matmul.c` — `s += A[i][k] * B[k][j]`, where `B[k][j]`
+walks a 240 x 8-byte row, step 1920. The k-loop is seven instructions either
+way; the difference is one `madd x12,x11,x4,x1` computing the address against
+one `add x14,x14,#1920` advancing a pointer. Both forms were HAND-ASSEMBLED from
+the same zcc output and linked and run side by side, so nothing but that one
+instruction differs, and both print `414714994`:
+
+| k-loop form | ms, best of 5 | vs gcc -O1 |
+|---|---|---|
+| gcc -O1 (same shape as the pointer walk) | 69 | 1.000 |
+| zcc, address rebuilt with `madd` | 113 | 1.638 |
+| zcc, pointer walked by `add #1920` | 69 | **1.000** |
+
+Adding gcc's other two tricks on top — post-index writeback for the `A` load and
+a pointer-limit exit test instead of a counter, six instructions — changed
+nothing: also 69 ms. The whole gap is the multiply.
+
+**WHY.** The multiply sits at the head of a dependence chain that ends in a
+strided load, and a strided load is where the machine most needs its address
+early. `cost = |MIR|` cannot see this: the instruction COUNT is identical. It is
+the same kind of fact as M1, and it is judged the same way — on the clock.
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, `zcc-box:latest`, gcc 14.2.0.
+
+**WHAT USES IT.** `hir/pass/iv.rs::strengthen` — the `scaled` test that separates
+this half from M2's.
+
+**OPEN.** Stores are still refused (M2's j2_histogram argument, which is about
+the unit-stride case). `ZCC_IVDBG=1` prints the residual per refusal reason;
+matmul still reports 17 `scev-refused` and 3 `unit-stride-gated`.
+
+---
+
+### M10. Instruction latency on this core, in units of a dependent `add`
+
+**VALUE.** The Side-II table the time model reads (`mir/cost.rs::latency`).
+
+| latency | forms |
+|---|---|
+| **1** | `add`/`sub`/`and`/`orr`/`eor` (reg or imm), `lsl` (imm or reg), `csel`, `sxtw`, `uxtb`, `ubfx`, `mvn`, `rev`, and **`madd` reached through its ACCUMULATOR** |
+| **2** | `add x,x,x,lsl #n` and `add x,x,w,sxtw` — a shifted or extended register operand |
+| **3** | `mul`, `madd` reached through a MULTIPLICAND, `ldr` L1 hit (plain or register-offset) |
+| **7** | `sdiv`, `udiv` |
+
+**METHOD.** `tests/bench/latency.sh`. Time a loop whose body is 32 copies of one
+instruction, each reading the register the previous wrote. The chain cannot
+overlap, so wall time is `K x latency x iterations` whatever the core does about
+width or reordering — and dividing by the same measurement for `add x0,x0,#1`
+cancels the clock, which is why no frequency is needed and the answer is a ratio.
+Measured ratios: 1.00 / 2.02 / 3.02 / 7.05, with a `nop` control at **0.12**
+confirming the harness is not measuring itself.
+
+**THE ONE THAT CHANGES DESIGN DECISIONS.** `madd` is TWO latencies in one
+instruction: 3.02 through a multiplicand, **1.00 through the accumulator**. So
+`s += a*b` accumulation is not multiply-bound, and a loop that looks
+multiply-heavy may have a one-cycle recurrence. matmul is exactly that, which is
+why a recurrence-only model could not see its gap and `Bound` grew a second axis.
+
+**IT RE-DERIVES WHAT WAS ALREADY MEASURED**, which is R4.18's ship condition:
+
+| case | from the table alone | measured on the clock | error |
+|---|---|---|---|
+| `loops.c`, `mul`+`add` (3+1) becomes `madd` (3) | 4/3 = **1.333x** | 771/565 = **1.365x** | 2.3% |
+| j3, extended operand (2) becomes `ldrsw`+`add` (1) | **2.00x** | **1.940x** | 3% |
+| matmul, `madd` address vs pointer walk | addr **3 -> 0** | 113/69 = 1.638x | direction |
+
+**WHEN / WHERE.** 2026-08-26, M1 Pro under Docker, `zcc-box`, gcc 14.2.0.
+
+**WHAT USES IT.** `src/mir/cost.rs`. `ZCC_CYCLES=1` prints the per-loop bounds.
+
+**OPEN.** The FP forms, `Call`, and the `ldp`/`stp` pair are unmeasured and take
+the ALU default of 1; a loop containing a call is reported UNSCORED rather than
+guessed at. Issue width, ports, the reorder window, cache misses and branch
+misprediction are not modelled at all — the recurrence is a LOWER bound, and
+programs it scores at 1 while they run slower (j5, g1, d1) are bounded by
+something else, which is itself a useful verdict.
+
+---
+
+### M11. Tail-duplicating a loop latch pays only at a MULTI-WAY dispatch
+
+**VALUE.** `mir/pass/layout.rs::duplicate_latch` copies a loop tail into its
+predecessors only when **three or more** of them reach it by an unconditional
+branch.
+
+**METHOD.** d1_switch's switch arms each end `b .Lwork_3`, and that block is the
+whole loop tail — bump the counter, test it, branch back. Every iteration paid
+TWO taken branches to reach the top. Hand-validated in zcc's own `.s` before the
+pass was written (three passes, output identical at 8000006000000):
+
+| d1_switch | ms |
+|---|---|
+| gcc -O1 | 10 |
+| zcc, arms jump to a shared tail | 12 |
+| zcc, tail copied into each arm | **10** |
+
+**THE THRESHOLD, and what it cost to find.** Firing on TWO or more predecessors
+— which describes any if-else join — fired on nearly every loop in the suite:
+
+| predecessors required | geo40 EXEC | geo40 INSN | sqlite |
+|---|---|---|---|
+| ≥ 2 | 0.9430 | **1.3668** (32 of 35 above 1.1×) | +3,906 |
+| **≥ 3** | **0.9494** | **1.0432** | **+840** |
+
+33% of size for 2% of time is the trade R4.14 refused at 16-for-7. Three is the
+count that distinguishes a multi-way dispatch from a two-armed join, which is
+where a second branch per iteration actually repeats.
+
+**AN EARLIER FENCE, AND THE VERIFIER THAT FOUND IT MISSING.** The first cut
+tested only "conditional terminator, ≥2 unconditional predecessors" — describing
+any join — and duplicating a join that reloads a spilled value moved the reload
+above its store on one path. `regalloc::verify` said so at once: "reload of
+unstored slot 31". A loop TAIL is a join whose terminator branches BACK to a
+block that dominates it, and that is what the pass tests now.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, gcc 14.2.0.
+
+**WHAT USES IT.** `mir/pass/layout.rs::duplicate_latch`.
+
+**OPEN — THE THRESHOLD IS UNSWEPT.** 2 and 3 were measured; 4, 5 and beyond
+were not. Three is where the measurement stopped, not where it was shown to be
+best, and this entry says so rather than dressing a plausible story as a fact —
+`MIN_CASES = 4` sat unswept in `isel/lower.rs` for a milestone and cost d1 50%
+when someone finally measured it (`MEASURED M4`). Sweeping 4/5/6 on INSN and
+sqlite is deterministic and needs no quiet box.
+
+---
+
+### M11-correction. "Locally evictable" counts ONE of three conditions
+
+**WHAT THE REPORT SAYS.** `ZCC_HINT=1` prints, of the hints refused because the
+wanted register was occupied, how many have an occupant that "dies in this block
+(locally evictable)". On sqlite that is 8,696 of 14,764, and the FULL-RANGE line
+then says a register is free across the occupant's whole range in 100% of them.
+
+**WHY THAT IS NOT A CEILING.** `HINT_OCC_LOCAL` tests only that the occupant's
+LAST USE is in this block. A value can die here and still be LIVE-IN, its range
+reaching back through dominating blocks the colourer walked earlier and keeps no
+occupancy record of. Recolouring one of those changes its register in those
+blocks too. Measured, by building the mechanism and running it:
+`regalloc::verify` stopped the compile at
+`unixShmSystemLock: V(4) and V(25) are both live at bb0[3] and both hold Gpr9`.
+
+**THE REAL NUMBER.** Restricted to occupants DEFINED in this block, dying in it,
+and not live-out — the case a block-local history can actually justify — the
+recolour fires **7 times in the whole of sqlite**, for −37 instructions. Seven,
+against a reported eight thousand six hundred.
+
+**WHAT USES IT.** Nothing, now: the mechanism was reverted (`SPILL.md` §4b).
+The entry exists so the next reader of that column knows it is an upper bound on
+an upper bound, and so the row is not attempted a seventh time on the strength
+of the same number.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+---
+
+### M12. Assumed trips per loop level is TEN, and the choice is not load-bearing
+
+**VALUE.** `TRIPS = 10` in `regalloc/spill.rs`. The spiller's next-use distance
+is measured along the execution trace, and a value whose next use lies OUTSIDE
+the current loop is reached only after the iterations still to run; that count
+is unknowable statically, so the model assumes ten per nesting level — the same
+convention as gcc's `10^depth` block frequency.
+
+**METHOD.** The number is a cost-model parameter, so the honest question is not
+"is ten right?" (no static analysis can know) but Article E's: *is this the
+spec's number or my convenience's number?* Answered by sweeping it and showing
+the decisions barely move. `ZCC_TRIPS` was made to override the constant and
+sqlite plus all 35 taxonomy kernels were compiled at 1, 2, 3, 4, 5, 10, 20, 100
+and 1000:
+
+| TRIPS | sqlite instructions | taxonomy suite |
+|---|---|---|
+| 1 | 175,452 | byte-identical throughout |
+| 2 | 175,438 | ″ |
+| 5 | 175,405 | ″ |
+| **10** | **175,394** | ″ |
+| 20 | 175,390 | ″ |
+| 100 | 175,380 | ″ |
+| 1000 | 175,380 (identical bytes to 100) | ″ |
+
+The whole three-orders-of-magnitude sweep moves sqlite by **72 instructions,
+0.04%**, monotonically, and saturates at 100 — beyond which no ranking changes
+at all. The taxonomy suite does not move by one byte at any value, which is a
+second reading of the same fact recorded in `SPILL.md` §4a: none of its kernels
+is under enough register pressure to spill, so nothing there can see this
+constant. Ten sits on the flat part of a flat curve.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `regalloc/spill.rs::Trace::next_use` — the step that leaves a
+loop the value is not wanted in, and only that step.
+
+**WHAT WOULD MAKE IT MATTER.** A body long enough that one loop's remaining
+instructions outweigh a factor of ten across a level — deep nests over long
+bodies. Nothing in the current corpus is that shape; a program that is would
+show up as a sqlite-scale gap between TRIPS=10 and TRIPS=100, which today is
+14 instructions.
+
+---
+
+### M13. The argument registers go LAST in the caller-saved half
+
+**VALUE.** `GPR_ORDER` offers x8–x15 before x0–x7. The allocatable SET is
+AAPCS64 §6.1.1 and does not change; only the order `assign` walks when a value
+has no coalescing hint.
+
+**WHY IT COULD MATTER.** x0–x7 are the only registers a call can demand by
+name. `assign` picks `hint.or_else(|| alloc_order.find(free))`, so with x0
+first every unhinted value in the function takes an argument register before
+anything else — and the argument that later wants x0 finds it occupied, which
+is one `mov` per refusal. The instrument (`ZCC_HINT=1`) had already measured
+the refusals: **34,569 hints wanted, 55.4% taken, 15,348 refused because the
+register was OCCUPIED**, never for want of a free register (0 refusals had no
+spare).
+
+**METHOD.** sqlite compiled with both orders, same binary otherwise:
+
+| | x0-first | x8-first |
+|---|---|---|
+| reg-reg `mov` | 31,352 | **30,669** |
+| of those, writing x0–x7 | 22,829 | **19,985** |
+| file instructions | 175,407 | **174,677** |
+| hint hit rate | 55.4% | 56.7% |
+
+−730 instructions, 1.1167× → 1.1120× against gcc -O1.
+
+**WHAT IT DOES NOT FIX, and the number that says so.** The hit rate moves by
+1.3 points. 14,879 hints are still refused because the wanted register is
+occupied, and for **8,784** of them the occupant dies inside the same block
+with a register free across its WHOLE range — the colourer computes that in
+its statistics replay and acts on none of it. Reordering cannot reach those:
+they need the occupant RE-COLOURED, which greedy colouring in dominance order
+does not do. That is the open lever, and it is larger than this one.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `regalloc/color.rs::assign`'s fallback scan — and nothing
+else: masks, `k`, and the callee-saved set are all order-independent.
+
+---
+
+### M14. A copy of 32 bytes or less is cheaper open-coded than called
+
+**VALUE.** `INLINE_COPY_MAX = 32` in `isel/lower.rs`. An `Inst::MemCpy` of this
+many bytes or fewer becomes loads and stores; anything larger stays a call to
+`memcpy`.
+
+**WHY THERE IS A DECISION AT ALL.** C says a by-value parameter IS a local
+object, so the frontend homes one by copying the incoming registers into the
+local's storage. For a four-`int` struct that is a sixteen-byte `MemCpy`, and
+lowering it to `bl memcpy` costs far more than the copy: the call itself, a
+frame and an x30 save in what would otherwise be a LEAF function, and a
+clobbered caller-saved half at the point where the argument registers are still
+live. `e3_struct_byval` was **2.630× gcc -O1 on the clock — the worst program in
+the taxonomy suite on both axes** — for a copy gcc does not perform at all.
+
+**METHOD.** The threshold trades size against that cost, so it was swept rather
+than chosen. sqlite compiled at nine settings, everything else identical:
+
+| bound (bytes) | sqlite instructions |
+|---|---|
+| 0 (always call) | 174,677 |
+| 8 | 174,659 |
+| 16 | 174,604 |
+| **32** | **174,572** |
+| 48 | 174,584 |
+| 64 | 174,604 |
+| 128 | 174,703 |
+| 256 | 174,703 |
+
+A clean minimum at 32, and past 64 the open-coded form is worse than not
+inlining at all — which is the shape the trade predicts, since a call is four
+instructions whatever the length while the expansion grows with it.
+
+**WHAT IT BOUGHT ON THE CLOCK.** `e3_struct_byval` 2.630× → **1.953×**, and its
+instruction ratio 1.724 → 1.621. The taxonomy suite's EXEC geomean 1.0403 →
+**1.0304** over 25 timed programs.
+
+**WHAT IS STILL WRONG THERE, because the row is not exhausted (Law 4).** zcc
+still round-trips the struct through memory twice: the incoming registers go to
+the argument home, the home is copied to the local, and the fields are then
+loaded back. gcc keeps the whole struct in x0/x1 and extracts the four `int`s
+with `sxtw` and `asr #32`, touching memory not at all. Closing that needs the
+local copy to be recognised as redundant when the parameter is never modified,
+and small aggregates to live in registers (SROA) — neither is this row.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `isel/lower.rs::copy_inline`, reached from `Inst::MemCpy`.
+The expansion emits two loads then two stores per sixteen bytes so that
+`mir/pass/ldstp.rs` sees adjacent same-kind accesses and fuses them.
+
+---
+
+### M15. The `ldp`/`stp` residual, and why the layout cannot collect it
+
+**VALUE.** On sqlite, `ZCC_LDSTP=1`:
+
+```
+paired=7616 | unpaired: no-partner=44137 (of which 3020 sit NEXT TO another
+frame access of the same shape — a LAYOUT could pair them)
+out-of-window=123  motion-blocked=886  partner-is-BEHIND=126
+```
+
+gcc -O1 emits 12,637 pairs to zcc's 7,616. This is the Law-4 residual of the
+pairing theorem, classified: 41,117 accesses have no partner at any distance and
+are a FUNDAMENTAL limit; 1,135 are convenience truncations of how this pass
+looks (window, motion rule, direction); and 3,020 are refused only because the
+two slots are not neighbours in the frame.
+
+**THE 3,020 IS AN UPPER BOUND ON AN UPPER BOUND, and it was tested.** Two
+orderings of the spill group were built and measured against the creation order
+that §13o leaves in place:
+
+| spill-slot order | pairs | sqlite instructions |
+|---|---|---|
+| creation order (shipped) | **7,616** | **174,572** |
+| heaviest disjoint affinity pairs | 7,516 | 174,730 |
+| first-access position | 7,435 | 174,882 |
+
+Both alternatives are WORSE. The count says "these two could be adjacent" one
+pair at a time and cannot say that making them adjacent separates two others —
+`ldp`/`stp` consume RUNS, and a disjoint matching cuts a four-slot run into two
+pairs where creation order had three. The allocator mints spill slots in an
+order already correlated with the order they are accessed in, which is why the
+inherited order is hard to beat.
+
+**THE PREMISE OF THE WHOLE ROW WAS WRONG, and here is the arithmetic.** "gcc
+emits 12,637 pairs to zcc's 7,616, so 5,130 instructions are being left on the
+table" counts gcc's PAIRS as if each one zcc lacks were an instruction zcc could
+delete. A pair only saves an instruction when the two accesses exist. Counted
+properly, on sqlite:
+
+| frame traffic | zcc | gcc -O1 |
+|---|---|---|
+| paired instructions (`ldp`/`stp` on sp/x29) | 7,097 | 11,456 |
+| single `ldr` | 8,862 | 7,976 |
+| single `str` | 6,111 | 5,288 |
+| **total frame instructions** | **22,070** | **24,720** |
+| accesses those instructions cover | 29,167 | 36,176 |
+
+**zcc emits 2,650 FEWER frame instructions than gcc -O1.** gcc has more pairs
+because it has 7,009 more frame accesses to pair — it spills more file-wide,
+which is a fact already on the record. There was never a 5,130-instruction
+opportunity here.
+
+What is real is pairing EFFICIENCY: 0.757 instructions per frame access against
+gcc's 0.683. Matching that on zcc's own accesses would be ~2,100 instructions,
+and the census above says ~1,009 of those are reachable (886 motion-blocked, 123
+out of window).
+
+**AND IT IS NOT SCHEDULING.** An earlier version of this entry blamed gcc's lead
+on instruction scheduling. Measured instead of asserted: at `-O1` gcc reports
+`-fschedule-insns [disabled]` and `-fschedule-insns2 [disabled]`, and forcing
+`-fschedule-insns2` on at `-O1` moves sqlite's pair count by **2 instructions**
+and its instruction count by **zero** (157,074 either way). 91% of gcc's pairs
+are sp/x29-based — prologue, epilogue and spill runs, emitted adjacent by the
+frame expander, with no scheduler involved. Scheduling is an `-O2` transform and
+is out of scope against an `-O1` reference.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** Nothing in the compiler: these are counters behind
+`ZCC_LDSTP`. The entry exists so the next reader of the 3,020 knows it was
+tried, and so the row is not attempted again on the strength of the number
+alone.
+
+
+---
+
+### M16. `sqlite3VdbeExec` IS the sqlite gap — 85% of it, in one function
+
+**VALUE.** On sqlite's worst workload (`p01_insert`, 100,000 rows through a
+recursive CTE, in-memory), compiling **one function** with gcc and the other
+1,259 with zcc takes the program from **1.98× to 1.15×**. That one function is
+`sqlite3VdbeExec`, the VDBE interpreter loop every statement runs.
+
+| function taken from gcc | ratio | closes |
+|---|---|---|
+| **`sqlite3VdbeExec`** | 1.145–1.165 | **83.2 / 83.9 / 85.2 / 88.5%** (four runs) |
+| `sqlite3BtreeInsert` | 1.87–1.95 | 1.8–2.1% |
+| `balance_nonroot` | 1.96 | 1.7% |
+| `sqlite3VdbeRecordCompare` | 1.91 | 0.4% |
+| `sqlite3VdbeMemGrow` | 2.00 | −0.5% |
+| `sqlite3BtreeMovetoUnpacked` | 2.04 | −4.4% |
+
+Everything that is not the interpreter is at or below the noise floor.
+
+**METHOD.** `tests/bench/localize.sh` — attribution by LINKER, because this box
+exposes no PMU (`/sys/bus/event_source/devices` carries software events only, and
+forcing gcc's own scheduler on at -O1 moves nothing, so there is no profiler to
+borrow). The same source is compiled by both compilers; every global in the gcc
+object is weakened except the chosen names; those names are weakened in the zcc
+object; the zcc object is linked first. A strong definition beats a weak one, so
+the chosen functions come from gcc and every other name from zcc. The output is
+compared against the pure-gcc build before any time is reported.
+
+**WHAT IT COST TO LEARN, and why it is worth an entry.** Seven optimization rows
+shipped on 2026-08-27 moved the 42-program taxonomy suite from 1.0400 to 1.0190
+and moved real sqlite execution by **nothing** (1.679 → 1.649, ranges
+overlapping). Every one of those rows was aimed at a shape found in a KERNEL,
+because kernels are the only programs small enough to diff by hand. This entry
+is the first fact about WHERE sqlite's time actually goes, and it says the
+kernels were never going to reach it.
+
+**⚠️ WHAT THE NUMBER IS NOT.** `-DSQLITE_PRIVATE=` externalizes sqlite's 1,260
+internal functions so they have symbols to select by, and that costs BOTH
+compilers their static-function inlining. The hybrid is therefore a slightly
+different program from the shipping build — read these ratios against the
+baselines the script prints under the same flag (gcc 43,070 µs / zcc 85,634 µs),
+never against `realprog.sh`'s.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** Nothing in the compiler — it is an instrument. What it
+DIRECTED, within the hour it was built: `sqlite3VdbeExec`'s 196-case dispatch
+was found to be a 183-deep linear compare chain (gcc: one indirect branch),
+because the jump-table row refused any switch whose arms carry edge arguments.
+Fixing that took **sqlite's SQL geomean from 1.651 to 1.159** and this workload
+from 1.988× to 1.279×. The instrument paid for itself the same day.
+
+**A CAUTION FOR THE NEXT READER.** Attribution to a function is not attribution
+to a defect. The histogram of that function (`xray.sh`) named classes — `mov`
++1148, `mov #imm` +485, `str` +353 — and three rows built from those classes
+were each refuted at ~1%. What worked was narrowing the window to what the
+workload actually executes (`EXPLAIN`) and then counting ONE mnemonic (`br`) in
+both assemblies.
+
+
+---
+
+### M17. The pass audit — which passes pay, which refuse, which are dead weight
+
+**METHOD.** `ZCC_NOPASS=<name>` disables one pass. Compile sqlite with each
+disabled in turn and compare: a pass whose removal costs nothing is a pass that
+is refusing everything, and a pass whose removal SHRINKS the program is buying
+its size with something else — or with nothing. No instrumentation is needed;
+the bisection tool already in the tree answers it.
+
+**SIZE, sqlite (baseline 173,611 instructions):**
+
+| pass | instructions if removed |
+|---|---|
+| `sroa` | **+18,635** |
+| `gvn` | +9,728 |
+| `cfg` | +6,706 |
+| `mem` | +3,122 |
+| `ifconv` | +1,424 |
+| `sccp` | +645 |
+| `purecall` | **0 — inert on this program** |
+| `iv` | −944 |
+| `inline` | −1,980 |
+| `licm` | −1,998 |
+| `rotate` | **−4,786** |
+
+**SPEED, `p01_insert`.** Four passes cost size, so the question is what they buy:
+
+| disabled | speed |
+|---|---|
+| `inline` | **+7.7% slower** — it earns its size |
+| `rotate`, `licm`, `iv` together | **−0.2% to −1.1%** — noise |
+
+**THE FINDING.** `rotate`, `licm` and `iv` add **7,728 instructions to sqlite —
+4.5% of it — for no measurable speed.** And they are not optional: disabling them
+on the 42-program taxonomy suite takes EXEC from **1.0206 to 1.4236**, with
+`l2_nested_join` at **10.889×** and 26 of 42 programs above 1.1×. They are worth
+40% of execution on loop code.
+
+So this is not a deletion, it is a **missing profitability gate**: three loop
+passes that pay enormously on loops and inflate everything else. The row is to
+make them decline a transform that cannot pay, not to switch them off.
+
+**A SECOND FINDING, smaller.** `purecall` changes sqlite by zero instructions —
+it fires nowhere in 173,611 instructions of real C. Either its precondition is
+too narrow or the shape does not occur outside the suite; it should be measured
+before it is trusted.
+
+**⚠️ WHAT THIS ENTRY IS NOT.** Removal cost is not the same as value: a pass can
+be worth nothing on its own and load-bearing in combination (its output feeding
+another's precondition). These numbers rank suspicion, not merit.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation,
+`p01_insert` in memory, best-of-7.
+
+**WHY IT WAS RUN.** Three of the four rows shipped on 2026-08-27 were an
+EXISTING pass refusing a common shape — `args_match` refusing composite
+parameters (2.2× on one program), `ifconv` requiring exactly two join
+predecessors (12.5%), and the jump table refusing arms with edge arguments (30%
+of sqlite). None was a missing optimization. The audit exists to find the next
+one by measurement instead of by accident.
+
+
+---
+
+### M18. The peer landscape — zcc against cproc+qbe, and what cproc cannot build
+
+**VALUE.** Over the 42 programs of `tests/bench/suite`, exec geomean against
+`gcc -O1` on the same machine, all three compilers producing byte-identical
+program output:
+
+| compiler | exec geomean |
+|---|---|
+| **zcc** | **1.0229** |
+| cproc + qbe | **1.5555** |
+| | worst: `i1_global_acc` **4.13×** |
+
+zcc is ~1.52× faster than cproc+qbe on this surface. cproc compiled all 42 with
+zero failures, so the comparison is over the whole set rather than a subset.
+
+**AND THE PART THAT IS NOT A RATIO.** The comparison could not be run on sqlite,
+because **cproc cannot compile the amalgamation.** Two separate walls:
+
+* the GCC atomic builtins sqlite selects when the preprocessor advertises
+  `__GNUC__` (`__atomic_load_n`/`__atomic_store_n`). This one is fair to patch —
+  sqlite's OWN non-GCC branch is `*(PTR)`, which is what any non-GCC compiler
+  takes — and past it lies the second;
+* `volatile store is not yet supported`. Patching around THAT would change the
+  program's semantics, so the run stops there rather than reporting a number for
+  different code.
+
+**AND IT IS UPSTREAM-DOCUMENTED, not a quirk of this setup.** cproc's own
+`README.md`, under *What's missing*: "`volatile`-qualified types ([#7], requires
+qbe support)" and "`long double` type ([#3], requires qbe support)". Its
+`doc/software.md` records that building binutils required patching out "subtle
+`volatile` usage" — the same wall. And `grep -ri sqlite` over the whole cproc
+repository returns nothing: it does not claim sqlite among the software it
+builds. (The small compilers known for compiling sqlite are chibicc and tcc,
+both of which implement `volatile`.)
+
+**AND THE OBVIOUS OBJECTION, ANSWERED.** cproc builds Oasis Linux, so how can it
+fail on sqlite? Three facts, and they are consistent:
+
+* `cproc/qbe.c:458` refuses UNCONDITIONALLY —
+  `if (tq & QUALVOLATILE) error("volatile store is not yet supported")`;
+* cproc's `doc/software.md` says of Oasis: *"One of the main goals of cproc is to
+  compile the entire oasis linux system (excluding kernel and libc). This is a
+  WORK IN PROGRESS, but many packages have PATCHES to fix various ISO C
+  conformance issues, enabling them to be built."*;
+* Oasis's package tree holds **153 packages and sqlite is not one of them**
+  (`api.github.com/repos/oasislinux/oasis/contents/pkg`, checked 2026-08-27).
+
+So Oasis is cproc-built on patched sources, by design, and never had to compile
+sqlite. That is the difference the comparison is about: `Article C` asks zcc to
+be a DROP-IN, and the amalgamation is compiled here unmodified.
+
+zcc compiles the amalgamation unmodified, which is Article C's whole premise.
+
+**WHAT THIS ENTRY IS FOR, AND WHAT IT IS NOT.** THE ULTIMATUM names `gcc -O1` as
+the finish line, and nothing here changes that. cproc+qbe is a PEER — the
+nearest comparable project, a small C compiler with a real SSA backend — so this
+answers "is zcc actually good, or only good against a toy?" It must never become
+a gate: beating a weaker reference is flattering, and a number quoted against it
+would be exactly the Law 3c failure of announcing parity from a favourable
+surface.
+
+**METHOD.** qbe and cproc built in-box with gcc (clang is not installed there;
+the compiler used to BUILD a compiler does not affect the code it GENERATES).
+Each program compiled by all three, outputs compared before any timing, then
+best-of-5 wall time through `tests/bench/timeit.c`.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, qbe and cproc at their
+repository tips.
+
+
+---
+
+### M19. Static block execution frequency, and the 23% of loops that are cold
+
+**VALUE.** `hir::freq::estimate` gives every block a relative execution
+frequency, the entry block scaled to `ENTRY = 10_000`. Wu & Larus, *Static
+Branch Frequency and Program Profile Analysis*, MICRO-27 (1994) — the same paper
+`M12` cites for the trip-count convention.
+
+`ENTRY` and `CEIL` are a SCALE and a saturation bound, not thresholds: `ENTRY`
+is the fixed-point denominator that lets integer division carry a fraction, and
+`CEIL` stops a deep nest from overflowing. Neither was tuned and neither can be:
+every consumer reads a RATIO against `ENTRY`.
+
+**WHY IT WAS BUILT.** Three decisions in one day could not be made for want of
+it, and one of them was refused twice:
+
+* the profitability gate for `rotate`/`licm`/`iv`, which add 7,728 instructions
+  to sqlite for no measurable speed and are worth 40% of exec on the taxonomy
+  suite (`M17`);
+* the spiller's `TRIPS = 10`, a stand-in for exactly this analysis (`M12`);
+* "we have no profile", offered three times as a reason not to decide.
+
+**THE MODEL.** Reverse postorder, one pass, no linear system: a loop header takes
+its non-back-edge predecessors' sum times `TRIPS`; every other block sums its
+predecessors weighted by edge probability. Two structural heuristics ship — an
+edge into an `Unreachable` terminator is weighted 1 against 1,000, and a
+successor that returns immediately 250 against 1,000. **No statistical heuristic
+from the paper is included**, because each is a claim about C programs that this
+compiler has not measured.
+
+**WHAT IT FOUND, and it is the point.** Of the 1,387 loops rotation touches in
+sqlite:
+
+| loop frequency | count |
+|---|---|
+| **below entry — runs less than once per call** | **325 (23%)** |
+| 1–10× entry | 708 |
+| 10–100× | 244 |
+| above 100× | 110 |
+
+Loop DEPTH cannot see this: 1,066 of those 1,387 are outermost loops, and so are
+most of the taxonomy suite's hot loops. What separates the cold 23% is the GUARD
+in front of them, which is what a frequency estimate measures and a depth does
+not.
+
+**WHAT IT BOUGHT, first consumer.** `rotate` now declines a loop below entry
+frequency: sqlite **173,611 → 172,949** instructions (−662), and the taxonomy
+suite's INSN geomean is **unchanged to four decimals** (1.0721) — the hot loops
+were never touched, which is the whole claim.
+
+**WHY THE GATE IS AT `ENTRY` AND NO TIGHTER.** The model gives every loop the
+same `TRIPS` multiplier per level, so it cannot rank two loops by trip count —
+only by the guards above them. A threshold above the entry frequency would start
+refusing loops whose only property is being at depth 0, which is what most of the
+suite's hot loops are.
+
+**DETERMINISM.** Integers, `Vec` by block id, reverse postorder. No hash
+iteration, no floating point. `tests/determinism.sh` checks it end to end.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+**WHAT USES IT.** `hir/pass/rotate.rs`. The gates for `licm` and `iv`, and the
+spiller's `TRIPS`, are the obvious next consumers and are NOT yet wired.
+
+
+---
+
+### M20. The copies that are NOT the ABI's fault — 325 against gcc's 8
+
+**VALUE.** `sqlite3VdbeExec`, register-to-register `mov`, zcc against gcc -O1:
+
+| kind | zcc | gcc | reading |
+|---|---|---|---|
+| total reg-reg `mov` | 1,757 | 482 | +1,275 |
+| writing x0–x7 (argument marshalling) | 645 | 379 | +266 |
+| into a callee-saved reg from x0–x7, right after a call | 38 | 26 | **near-equal — ABI-FORCED** |
+| **callee-saved ← callee-saved** | **325** | **8** | **the gap** |
+| into a caller-saved temp x8–x15 | 25 | 0 | 25 |
+
+**WHAT IT SETTLES.** The copy excess is not argument marshalling and not the
+call-result convention. A result that is live across a later call MUST move to a
+callee-saved register — gcc obeys that rule too, and does it 26 times to zcc's
+38. What zcc does 325 times and gcc 8 is move a value from one callee-saved
+register to ANOTHER: pure allocator shuffling, forced by nothing.
+
+**WHY IT MATTERS MORE THAN THE COUNT SUGGESTS.** These execute. Unlike the
+frame-size rows measured the same day — slot coalescing (203 → 116 slots,
+−6,832 bytes of stack) and the cold-loop rotation gate (−662 instructions) —
+both of which moved the clock by nothing, a copy in the dispatch path is
+retired on every pass through it.
+
+**WHAT IT DOES NOT SAY.** That 325 is an upper bound on what coalescing can
+remove, in the same sense `M11-correction` and `M15` were upper bounds: it counts
+copies that the ABI does not force, not copies that a colouring could avoid. Two
+callee-saved values that genuinely interfere still need a move between them at a
+join. The number to beat is 8; the number reachable is unmeasured, and the first
+job of the campaign is to measure it — by hand-editing the copies out of one hot
+arm and timing it, before any allocator code is written.
+
+**WHEN / WHERE.** 2026-08-27, M1 Pro under Docker, sqlite 3 amalgamation.
+
+### M21. M20 CORRECTED — the 283 copies are COLD; the hot lever is pointer residency
+
+**M20 CLAIMED** the 325 callee-saved←callee-saved `mov`s "execute, unlike the
+frame rows" and named a copy-coalescing campaign. **THAT HOTNESS CLAIM IS THE
+LAW-2 MEASUREMENT EXCEPTION** — it counted static `mov`s and never checked their
+branch targets.
+
+**WHAT THE BRANCH TARGETS SAY.** Of the 138 `mov x22, x19` (the dominant pair,
+90% of the 283 with `mov x21, x20`), **107 branch to `_220` (`abort_due_to_error`)
+and 32 to `_8` (`no_mem`)** — 100% land on error/OOM/return handlers. They are
+SSA phi-args for the error-state join, retired ~never in any workload. The count
+is real (a SIZE cost, ~283 insns); the "these execute" is false. A copy-coalescer
+(libFIRM co-heur, the §4c-planned recolour) would remove SIZE only, ~0 speed.
+Per Law 0 (`exec > size`) and the 1× *speed* goal, it is not built (keep any such
+pass behind a default-off toggle if authored, per user 2026-08-27).
+
+**WHERE THE HOT COST ACTUALLY IS — pointer RESIDENCY, proven.** The hot dispatch
+reloads the interpreter's core pointers that gcc keeps register-resident:
+`p`(Vdbe*, slot #96, 114 loads), `pOp`(#456/#472, ~68), `aOp`(#104, 67),
+`pC`(per-Column spill+reload). Only `pOp`'s reload is on the *branch-resolution
+critical path* (reload pOp → read opcode → jump-table `br`).
+
+**THE MICROBENCH (isolates one reload+respill of a loop-carried dispatch index
+on this core):**
+* perfectly-predicted dispatch: ratio mem/reg = **0.966** — the reload is FREE
+  (store-forwarding + spare LSU bandwidth; the Law-3c load-analogue of move
+  elimination).
+* mispredicted dispatch (random opcode stream, like real VdbeExec): ratio
+  **1.129** — the L1 load lands on the misprediction-recovery critical path.
+  The cost is not the instruction; it is that the reload GATES the mispredicting
+  branch.
+
+**THE HAND-EDIT (actual sqlite `.s`, keep pOp resident across the dispatch:
+carry it in x20 from both preds of `_15`, drop the reload — a store-to-load of
+the pOp slot, provably equivalent; verified byte-for-byte identical output):**
+on the CANONICAL `realprog.sh` 11-phase geomean, box-exclusive best-of-5,
+**base 1.1661× → patch 1.1553× gcc -O1** — **+0.9%, ~6.5% of the remaining gap,
+from removing ONE reload/opcode.** Size-neutral (entry +1 `mov`, `_15` −1 `ldr`).
+Gains concentrate in the dispatch-bound phases (p03 index 1.214→1.143, p05 scan
+1.222→1.185, p08 subquery 1.192→1.178); no regression.
+
+**SMASH-AND-GRAB VERDICT.** Hunted the two hottest arms (`OP_Column` _81 run
+2×/row, `OP_Next` _132 1×/row) for a jump-table-class structural defect: none.
+No bad `madd`, no redundant `sxtw`, no wrong addressing — every arm just reloads
+p/pOp/pC. The jump-table row was the last big grab; what remains is systemic
+spilling worth single-digit % (full p+pOp+pC residency est. +2–4%, sqlite
+~1.15×→~1.12×), a gated allocator campaign, not one trick. The stopping point
+is honest: 1× is not reachable by a grab on this surface.
+
+**REPRODUCE.** microbench `scratchpad/disp*.s` + `bench*.c`; hand-edit
+`scratchpad/patch.pl` against a fresh `zcc -S sqlite3.c` (slot number is
+build-specific — the pass will not be). **WHEN / WHERE.** 2026-08-27, M1 Pro
+under Docker, sqlite 3 amalgamation, gcc -O1 referee.
+
+### M22. The unroll budgets — how many copies of a loop are worth making
+
+**WHAT THIS IS.** `hir/pass/unroll.rs` fully unrolls a loop whose trip count is
+a small literal. Two numbers decide when: `max_trips` (how many copies at most)
+and `max_body` (how large the body may be, in HIR instructions). Neither the ISA
+nor the ABI has anything to say about either — no spec sentence sets them — so
+Article E's question ("the spec's number, or my convenience's number?") has only
+one honest answer available: measure. This is that measurement, and the row is
+cited from the code as `MEASURED M22`.
+
+**METHOD.** The 49-program taxonomy suite, each program compiled by both
+compilers and its output compared before any time was taken, best-of-3 twice per
+program with the fork+exec floor subtracted, gcc -O1 re-timed in the same rounds.
+The reported figure is the EXEC geomean over all 49 — no program excluded, no
+bucket. The budgets are read from the environment so a sweep costs no rebuild
+(`ZCC_UNROLL_TRIPS`, `ZCC_UNROLL_BODY`).
+
+| max_trips (body 24) | EXEC geomean | | max_body (trips 4) | EXEC geomean |
+|---|---|---|---|---|
+| 0 — pass off | 1.0261 | | 12 | 1.0212 |
+| 2 | 1.0210 | | **24** | **1.0181** |
+| **4** | **1.0181** | | 48 | 1.0184 |
+| 8 | 1.0196 | | | |
+
+**WHAT IT SAYS.** Trips has a real optimum at 4 and turns over after it: eight
+copies is measurably worse than four (1.0196 vs 1.0181), which is the point
+where the duplicated code stops paying for the branch and the register it saves.
+Body is flat above 24 — 48 buys nothing (1.0184 vs 1.0181) and 12 costs 0.3% —
+so 24 is the smallest value that gives up nothing, which is the one to hold.
+
+**WHY IT IS NOT A TUNING KNOB.** Both numbers move a geomean over 49 programs on
+one microarchitecture, which is the same narrow surface Law 3c warns about: they
+are the best available answer for THIS suite on THIS core, and a wider suite may
+move them. What the sweep does establish is the shape — a maximum near 4, and
+saturation in body — and that shape is what a re-measurement should be checked
+against.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, 49-program suite (42 taxonomy + the 7 database kernels).
+
+### M23. What the interprocedural row costs, and what it buys
+
+**SUPERSEDED BY M24 (2026-08-28, the same day).** Every number below is a correct
+reading of the row as it stood, and the conclusion drawn from them — park the row
+— was wrong, because the measurement was taken of the ROW when the cost belonged
+to ONE OF ITS THREE RULES. M24 attributes it. The row is on by default again.
+
+**WHAT THIS IS.** `hir/pass/inline.rs` was off by default. That is a POLICY, and a
+policy needs a number rather than a preference, so this is the measurement it was
+decided on.
+
+**THE ROW IS NOT SLOW ITSELF.** Its own time on the sqlite amalgamation is about
+two seconds — splicing 1.1 s over 7,968 splices, plus 0.5 s of liveness rebuilds.
+What it does is GROW every function it touches, and the passes below it are
+superlinear in function size, so it multiplies their cost. sqlite goes from
+237,846 to 289,478 lines of assembly, +22%, and the growth concentrates in the
+functions that were already largest.
+
+| | with the row | without it |
+|---|---|---|
+| sqlite compile (gcc -O1: 6.4 s) | 22.2 s | 4.7 s |
+| 60 cached yarpgen tests, vs gcc | 5.19× | 3.84× |
+| taxonomy suite EXEC geomean | 1.0184 | 1.0784 |
+| taxonomy suite INSN geomean | — | 1.0768 |
+
+**WHAT IT COSTS TO TURN OFF.** About six points of exec geomean over the 49
+programs, and the damage is concentrated rather than spread: `e3_struct_byval`
+is 1.985, a by-value-struct callee the row used to erase entirely.
+
+**WHY IT IS OFF ANYWAY.** The fuzzing campaigns are how miscompiles are found,
+and they are gated on compile time: at 5.19× a 300-seed local gate does not fit
+in the ten minutes it is meant to, and a 10,000-seed campaign is about six hours
+of compiling. A correctness gate that cannot be run often is not a gate. The row
+waits for the passes it feeds, not the other way round.
+
+**WHAT TURNS IT BACK ON.** `spill` (7.7 s of the 22) and `cfg` (~3 s) growing
+faster than linearly in function size. Make those proportional and the row's cost
+falls to roughly its code growth — about +22%, not +370% — and the six points
+come back with it.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.
+
+
+### M24. Which of the three inlining rules was the growth, and what it bought
+
+**WHAT THIS IS.** M23 measured the interprocedural row and parked it. This
+attributes that measurement to the individual rule responsible, which reverses
+the decision. Cited from `hir/pass/inline.rs` and `hir/pass/mod.rs`.
+
+**THE THREE RULES.** A site was admitted if the callee is called once (and either
+has internal linkage, or the site is in a loop and the callee has none of its
+own); or if the body is no larger than the call sequence it replaces; or — the
+third rule — if the site is in a loop, the callee is loop-free, and the body is no
+larger than the call sequence PLUS the number of values live across the site.
+
+The first two cannot make the program bigger. The first moves a body that is then
+deleted; the second substitutes something smaller than what it removes. Only the
+third can grow code, by up to the live-across count per site, and it is the only
+one that fires at many sites for the same callee.
+
+**ATTRIBUTION, sqlite amalgamation**, counted at the chosen site:
+
+| rule | splices | instructions added |
+|---|---|---|
+| called-once | 523 | +24,376 (bodies then deleted) |
+| body ≤ call sequence | 3,592 | +9,288 (each ≤ what it replaced) |
+| live-across | 4,555 | **+62,520** |
+
+**WHAT THE THIRD RULE COST**, with the row on both times:
+
+| | all three rules | first two only |
+|---|---|---|
+| sqlite compile | 24,235 ms | 7,006 ms |
+| sqlite assembly | 219,461 insn | 174,730 insn |
+| `cfg` row | 6,285 ms | 675 ms |
+| `spill` | 8,155 ms | 1,809 ms |
+| the inline row itself | 2,708 ms | 198 ms |
+
+Code grew 28.1% while the function COUNT fell 30%, so the average function grew
+83% — that, not the 28%, is what the superlinear passes below were charging for.
+
+**WHAT THE THIRD RULE BOUGHT.** Three interleaved pairs of the 49-program
+taxonomy suite, alternating within one session because the geomean's spread
+across sessions is ±0.007:
+
+| | all three | first two |
+|---|---|---|
+| EXEC geomean | 1.0236 / 1.0227 / 1.0218 | 1.0254 / 1.0252 / 1.0247 |
+
+0.24%, consistent in sign across all three pairs, and it is one program:
+`n1_btree_page` 1.314 → 1.244, the byte-pair reader inside a binary search that
+the rule was written for.
+
+**WHY IT WAS REMOVED, and it is not a compile-speed argument.** The file already
+carries the criterion: dropping `is_static` was refused at 16% size for 7% speed
+as failing THE ULTIMATUM's both-axes clause. This rule is 26% size for 0.24%
+speed. And its compile cost is what parked the WHOLE row, so it was spending 4.9
+points of exec geomean to buy 0.24 — an exec-for-exec trade, decided on the axis
+Law 0 ranks first among the two, not on compile speed.
+
+**WHAT THE ROW IS WORTH WITHOUT IT**, measured on the shipped default:
+
+| | row off | row on |
+|---|---|---|
+| taxonomy suite EXEC geomean | 1.0741 | 1.0220 |
+| sqlite compile (gcc -O1: 6,544–6,814 ms) | 4,829 ms | 6,687–6,808 ms |
+| sqlite assembly (gcc -O1: 157,074) | 171,287 | 174,730 |
+| `fullsuite.sh all` | 4m00s | 5m55s |
+
+Compile time is at gcc -O1 parity with the row on. The 1.45× is against zcc's own
+no-inline build, which is faster than the referee.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.
+The off/on geomeans in the last table are from different box sessions; only the
+three-pair table above is interleaved, and it is the one the removal rests on.
+
+### M25. Division by a constant: the theorem is right and it loses on this core
+
+**WHAT THIS IS.** Granlund–Montgomery division-by-multiplication was implemented,
+proven, measured, and REMOVED. This is the measurement, recorded so the row is
+not rebuilt on the strength of the textbook.
+
+**WHAT WAS BUILT.** A HIR pass rewriting `UDiv`/`URem`/`SDiv`/`SRem` by a
+non-power-of-two constant into the high half of a product plus a shift — Hacker's
+Delight §10-9 `magicu` and §10-4 `magic`, at 32 and 64 bits, the 32-bit case as a
+widening product with its top half taken (what `umull`/`smull` are). Powers of
+two, `d = 0` and `|d| = 1` refused, remainder derived as `n - (n / d) * d`.
+
+**THE TRANSCRIPTION IS CORRECT, and that is not the question it answers.** The
+multiplier and shift were checked against the real division over every divisor
+from 3 to 2000 at the boundaries of the width — 0, 1, 2, the powers, `INT_MIN`,
+`INT_MAX`, `UINT_MAX` — and at 64 bits over a divisor sample including
+`0x1_0000_0001` and `u64::MAX - 1`, signed and unsigned, positive and negative
+divisors. Not one case disagreed. The row was correct; it was not profitable.
+
+**WHAT IT MEASURED**, 49-program taxonomy suite, against the shipped compiler:
+
+| | shipped | + divmagic | + divmagic + `ZCC_HOIST` |
+|---|---|---|---|
+| EXEC geomean | 1.023 | 1.045 | 1.034 |
+| INSN geomean | 1.0717 | 1.1101 | 1.1440 |
+| `a2_udiv_mod` | 1.117 | 1.100 | — |
+| `a3_sdiv_mod` | 1.128 | 1.148 | — |
+| `e3_struct_byval` | 1.052 | 1.322 | — |
+
+**WHY IT LOSES, and it is not the theorem.** gcc -O1 emits the same rewrite on
+the same programs and is faster, so the decision is not what separates them —
+the ENCODING is. For `k % 5` in `e3_struct_byval`'s loop zcc emits nine
+instructions and gcc five:
+
+```
+sxtw x10, w8
+movz x11, #26215
+movk x11, #26214, lsl #16    ← the multiplier, rebuilt every iteration
+mul  x11, x10, x11
+asr  x11, x11, #32
+asr  w11, w11, #1
+add  w11, w11, w11, lsr #31
+movz w12, #5                 ← and the divisor, also every iteration
+msub w11, w11, w12, w8
+```
+
+Three of the nine are constant materialization inside the loop, which gcc hoists.
+So the row is a DEPENDENT of the loop-invariant constant hoist, and that hoist is
+itself off because it costs 3.0% of INSN geomean across the suite (this section's
+third column is the pair measured together: still a loss on both axes).
+
+**AND THE DIVIDER ON THIS CORE IS NOT SLOW**, which is the fact the textbook
+assumes and this machine denies. `a2_udiv_mod` runs three million iterations of a
+loop containing TWO `udiv` in 4,068 us — 1.36 ns, about 4.3 cycles per iteration.
+A divider that were "tens of cycles, not pipelined" could not produce that
+number. The folklore is a Cortex-A53-era fact; it is not a fact about this core,
+and there is no vendor optimization guide to have told us otherwise, which is
+precisely why this section exists.
+
+**WHAT WOULD HAVE TO CHANGE** before it is worth rebuilding: the loop-invariant
+constant hoist must pay for itself first, and the emitted sequence must reach
+gcc's five instructions rather than nine. Until both hold, the shipped `udiv` is
+the faster code.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, the 49-program taxonomy suite.
+
+### M26. Where zcc's instructions actually go, against gcc -O1
+
+**WHAT THIS IS.** Three rows were built or tested on the strength of reading one
+program's assembly, and all three lost (`M25`, and the refutations beside it).
+This is the measurement that should have come first: the whole 49-program suite
+compiled by both compilers, every mnemonic counted, and the excess attributed.
+It says what to work on and, more usefully, what not to.
+
+**THE TOTAL.** zcc 7,551 instructions, gcc -O1 6,598 — **+953, or +14.4%.**
+
+**SPELLING FIRST, or the table lies.** gcc writes `mov w7, 18725` where zcc
+writes `movz w8, #1`, and `bne` where zcc writes `b.ne`. Uncombined, `movz`
+reads as +432 against a gcc that never emits it and `b.lt` as +195 against zero.
+Both are the same instruction. The families below are combined.
+
+| family | zcc | gcc | Δ | share of the +953 |
+|---|---|---|---|---|
+| `mov` register→register | 1,006 | 339 | **+667** | 70% |
+| load/store slots (`ldr`+`ldp`, `str`+`stp`) | 1,107 | 967 | +140 | 15% |
+| `cmp` + `subs` | 484 | 359 | +125 | 13% |
+| `mul` + `madd` + `msub` | 187 | 70 | +117 | 12% |
+| `sxtw` + `sbfiz` | 161 | 93 | +68 | 7% |
+| `mov` register→immediate | 608 | 790 | **−182** | — |
+
+The last row is the one that says the constant-sharing row works: zcc
+materializes fewer constants than gcc does, not more.
+
+**WHERE THE COPIES ARE**, classified by what follows them — a `bl` within the
+next few instructions (argument placement), a branch or a label (a block edge,
+which is where SSA destruction puts a phi), or neither:
+
+| | zcc | gcc | Δ |
+|---|---|---|---|
+| at a block edge | 519 | 56 | **+463** |
+| in the body | 312 | 206 | +106 |
+| placing a call argument | 175 | 77 | +98 |
+
+**So half of zcc's entire instruction excess over gcc -O1 is a phi copy at a
+block edge** — 519 against 56, a factor of nine. It is not a missing
+optimization row: it is the copy SSA destruction leaves and coalescing does not
+remove. The same shape was measured independently on the sqlite amalgamation,
+where register-to-register moves are +10,464 of a 20,264-instruction gap (52%).
+
+**AND 67 OF THEM COPY A REGISTER TO ITSELF** (gcc: none). `k1_dispatch` ends
+every one of its switch arms with the identical `mov w10, w10` — a zero-extension
+of a value the preceding `and x10, x11, #7` already left zero above bit 32.
+`mir/pass/ext.rs` turns a redundant extension into a `Copy`, colouring then gives
+it the same register, and `emit.rs` prints every `Copy` without asking whether
+its two ends are the same. Removing it is NOT unconditionally sound — a `w`-form
+write zeroes bits 63:32, and at `Width::W32` the lattice proves a fact about the
+low half only — so it wants the fact restated at full width first, not a peephole.
+
+**WHAT THIS RETIRES.** Ranking work by what the suite's assembly actually
+contains, rather than by what one program's inner loop suggests: the three rows
+tried before this measurement (magic division, switch trees, shift-and-add for a
+constant multiply) address families worth 12%, 0% and 12% of the gap, and each
+one measured a loss. The 70% family was not touched by any of them.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, the 49-program taxonomy suite, both compilers at `-S`.

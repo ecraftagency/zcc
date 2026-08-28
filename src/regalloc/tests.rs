@@ -1412,7 +1412,7 @@ fn every_pointer_rotation_under_pressure_keeps_its_permutation() {
     }
 }
 
-/// SPILL.md S1 — BELADY'S DISTANCE IS MEASURED ALONG THE TRACE, NOT THE TEXT.
+/// MECHANISM.md Part D S1 — BELADY'S DISTANCE IS MEASURED ALONG THE TRACE, NOT THE TEXT.
 ///
 /// `linear_positions` numbers instructions in reverse postorder, in which a back
 /// edge runs backwards. A value carried around a loop is therefore read at a

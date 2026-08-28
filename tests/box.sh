@@ -4,7 +4,7 @@
 # ~19min; the static-musl box ~16s. Rebuild the ELF debug (~2s) then run inside an
 # ephemeral container (--rm); the ELF is bind-mounted so it is always fresh, no
 # docker cp. ELF-specific bugs (fall-off-main, float_h) reproduce ONLY here.
-# Requires the 'zcc-box' image + the suite cache (see tests/README.md).
+# Requires the 'zcc-box' image + the suite cache (see MECHANISM.md Part A).
 # Usage:
 #   tests/box.sh torture              # torture suite (16s) — ELF gate
 #   tests/box.sh c FILE.c             # compile+run 1 file, print exit code + output

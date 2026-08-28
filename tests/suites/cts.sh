@@ -11,7 +11,7 @@ if [ -z "$ZCC" ]; then
 fi
 C="${ZCC_SUITE_CACHE:-$HOME/.cache/zcc-suites}"
 export DIR="$C/c-testsuite/tests/single-exec"
-[ -d "$DIR" ] || { echo "cache not found: clone c-testsuite per tests/README.md"; exit 2; }
+[ -d "$DIR" ] || { echo "cache not found: clone c-testsuite per MECHANISM.md Part A"; exit 2; }
 export D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
 

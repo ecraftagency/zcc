@@ -21,8 +21,9 @@ purity  ≫  exec  >  size  >  compile speed
 by removing a proof does not ship, however large the number. Laws 1 and 3 are
 claims ABOUT THE SOURCE — every line in theory ∪ fact, every pass carrying its
 commuting square — and `tests/provenance.sh` checks both in the sci gate.
-`PURITY.md` is the plan of record for that work; `MEASURED.md` holds the facts
-that have no spec to cite, so `THEORY.md` II-* stays cited-spec and nothing else.
+`MECHANISM.md` Part B is the plan of record for that work; its Part F holds the
+facts that have no spec to cite, so `THEORY.md` II-* stays cited-spec and
+nothing else.
 
 zcc is an EDUCATIONAL compiler and a community project. A citation is therefore
 a READING PATH — a student who lands on any line should be able to read upward
@@ -45,7 +46,7 @@ Every line of `src/` lies on exactly one side — an algorithm derived from a th
 
 The **one exception**, rare and rarer still, is that the **measurement itself is wrong** — the oracle / referee / test / generator lied, and zcc was *innocent all along*. This is not a co-equal Side III; it is the case that proves zcc was never guilty, so it may be claimed **only after multi-angle proof** (several independent formulations converging). Reflexive blame of the test is exactly what conceals a real Side-I/II bug.
 
-**Measure before speaking:** locate the line mechanically *first*, classify into I / II (/ the measurement exception) *after* — guessing the wrong side first is normal, keep measuring. No classification is asserted before a script has printed a verdict; the AI may only build and run the oracle, then stay silent until it speaks. (Recorded evidence + full presumption-of-guilt text: `tests/README.md`.)
+**Measure before speaking:** locate the line mechanically *first*, classify into I / II (/ the measurement exception) *after* — guessing the wrong side first is normal, keep measuring. No classification is asserted before a script has printed a verdict; the AI may only build and run the oracle, then stay silent until it speaks. (Recorded evidence + full presumption-of-guilt text: `MECHANISM.md` Part A.)
 
 ## Law 3 — early-catch: certify at the middle, not at the binary
 
@@ -81,8 +82,8 @@ thing: `madd` on a strided address → `add`; `add …, w, sxtw` → `ldrsw` + `
 **Measured, not asserted.** The law was not reasoned into this file; it
 was forced by a kernel that reached parity at an instruction count that did not
 change at all, because a multiply had stood at the head of a chain ending in a
-strided load. `MEASURED.md` holds that case and the latency table it rests on,
-and `REARCH.md` holds the derivation and the row that builds the model.
+strided load. `MECHANISM.md` Part F holds that case and the latency table it rests
+on, and `REARCH.md` holds the derivation and the row that builds the model.
 
 **Law-4 dual (exhaustion).** A row is exhausted only when no remaining site
 trades chain length for instruction count. A residual measured on `cost = |MIR|`
@@ -148,10 +149,10 @@ Extension logic lives in **`src/ext.rs`**; the core only calls `ext_*`. Unfactor
 - **Science-gate** (theorem-verification tier, above the corpus) — `abi.sh` / `alg.sh` / `cpp.sh` / `shape.sh` / `decay.sh` exhaust the *structural* space + boundary value-samples; to be *expanded, never contracted*. Runner `fullsuite.sh [TARGET] [SEEK]`, 100% in-box.
 - **Clean-input** — a green verdict is valid only with a mechanical evidence trail (N binaries + bytes + exit codes), never a bare pass/fail number. Abnormal timing is measured, not guessed.
 - **Numeric-provenance** — every number derives from a stated premise.
-- **Byte-identical gate** — pure code motion (file splits, helper extraction, renames) is proven by `md5(.s)` held unchanged: identical bytes *are* the commuting-square `⟦f⟧=⟦refactor f⟧`, confirming not discovering. It takes TWO witnesses, because a corpus of small programs cannot see a pass whose behaviour scales with the size of a function — one large translation unit is compiled alongside the corpus, and when it cannot be, the gate says so and fails rather than reporting a pass it did not establish. A green result is scoped to what was actually compiled; a baseline is the artefact of the compiler being reproduced, never of an earlier candidate. `tests/refactor_gate.sh`; corpus + rationale in `tests/README.md`.
+- **Byte-identical gate** — pure code motion (file splits, helper extraction, renames) is proven by `md5(.s)` held unchanged: identical bytes *are* the commuting-square `⟦f⟧=⟦refactor f⟧`, confirming not discovering. It takes TWO witnesses, because a corpus of small programs cannot see a pass whose behaviour scales with the size of a function — one large translation unit is compiled alongside the corpus, and when it cannot be, the gate says so and fails rather than reporting a pass it did not establish. A green result is scoped to what was actually compiled; a baseline is the artefact of the compiler being reproduced, never of an earlier candidate. `tests/refactor_gate.sh`; corpus + rationale in `MECHANISM.md` Part A.
 - **Resource-fidelity** (the dual of the commuting-square, for *performance*-theorems) — the commuting-square certifies a pass is *correctness*-faithful (`⟦f⟧=⟦f'⟧`); this gate certifies it is *realization*-faithful. A performance-pass must declare (a) the hardware ultimate-fact it exploits, as a **spec citation**, and (b) that it is instantiated over the **full** fact, not a convenient truncation. Every resource-constant is either the **spec's number** or carries a dated justification for the gap. The mandatory question for each: **"is this the spec's number, or my convenience's number?"** — a truncation posing as a Side-II constant is a **Law-1 violation** (algorithm not faithfully realizing its side) catchable as a **Law-2 Side-II defect**, *not* a missing "improvement law": improvement stays inside Law 1's "faithfully realizes" clause, measured against the full ultimate-fact. (This is Law 3's "certify at the middle" extended from the correctness-theorem to the cost-theorem.)
 - **Determinism seal** — identical IR ⟹ identical bytes, checked by compiling each corpus program in several FRESH processes so a per-process hash seed cannot leak into the output. Distinct from the byte-identical refactor gate, which only compares across a refactor.
-- Full text of the correctness five + recorded traps: **`tests/README.md`**, which also names every place a spec constant is duplicated and the gate that proves the copies agree.
+- Full text of the correctness five + recorded traps: **`MECHANISM.md` Part A**, which also names every place a spec constant is duplicated and the gate that proves the copies agree.
 
 ## Article F — ABI
 
@@ -163,17 +164,35 @@ Every operation is subordinate to Laws 1–3 + THE ULTIMATUM and must leave CbC 
 
 ## Index
 
+**FIVE documents, and the source may point at no others.** A doc-per-campaign is
+how a repository acquires contradictions faster than it acquires facts; the file
+count is the mechanism against it, and a new one is not created without deleting
+one.
+
 - **`THEORY.md`** — the two-side catalog (Part I theorems / Part II spec-tables); answers "what foundation does zcc rest on". Adding a theorem or constant updates it.
 - **`SEMANTICS.md`** — the reference operational semantics (the executable meaning behind `⟦·⟧`).
-- **`MILESTONES.md`** — milestone ladder, LOC budget, C99-remaining, debt ledger.
-- **`tests/README.md`** — test-asset register, full test-mechanism text, baseline + traps.
-- **`PURITY.md`** — the ONE goal: every LOC provably in theory ∪ fact, every pass
-  squared and non-vacuous. What `tests/provenance.sh` checks, what the audit
-  found, and what is open. Purity outranks every number (Law 0).
-- **`MEASURED.md`** — target facts with no spec to cite (no vendor optimization
-  guide exists for this core): value, method, date, machine, and what reads it.
-  Cited from code as `MEASURED M<n>`, exactly as spec is cited as `THEORY II-<n>`.
-- **`REARCH.md`** — the plan of record: the layer map, the layers themselves, the
-  proof map and cost model, the milestone ladder whose status is edited in place,
-  the baselines and the decision log. Boot here and resume at its first open row.
+- **`MECHANISM.md`** — how the compiler is actually built, and every fact measured
+  about it: the gate (Part A), purity (B), compile speed (C), the spiller (D),
+  the copy census (E), and the facts with no spec to cite (F, cited from code as
+  `MEASURED M<n>` exactly as spec is cited as `THEORY II-<n>`). Everything in it
+  carries the date and the commit it was measured on.
+- **`ARM64.md`** — the target's own facts and the ledger of what has beaten
+  gcc -O1 on it. *(Stage 2: still `src/arm64_elf.md`.)*
+- **`README.md`** — what zcc is and how to build it. *(Stage 2: absorbs
+  `MILESTONES.md`.)*
+
+**`PLAN.md` is not one of the five and is not a document.** It holds what is NOT
+proven, is capped at 100 lines, may not be cited from `src/`, and a row leaves it
+only by being baked into `MECHANISM.md` (it won) or written into Part F as a
+refutation (it lost).
+
+**A citation is a NAME, not a fetch.** A comment must say enough *why* to fix the
+line it sits on without opening any document; the citation names where the full
+derivation lives, for a reader who wants it and for `tests/provenance.sh`, which
+checks this direction and can check no other — a document that points back at
+`file.rs:412` is stale at the next refactor and nothing catches it.
+
+- **`REARCH.md`** — the battlefield, being dismantled: 3,194 lines and the one
+  document `src/` is still allowed to point into while stage 2 runs. It is not a
+  sixth document; it is a queue that empties.
 - **`src/ext.rs` + `grep 'EXT(' src/`** — the entire current deviation surface.

@@ -52,7 +52,7 @@ use std::collections::HashMap;
 /// Both are policy numbers, so Article E's question applies: the spec's number
 /// or the author's convenience? Neither ISA nor ABI has anything to say about
 /// how many copies of a loop are worth making, so the answer had to be measured
-/// rather than cited, and `MEASURED.md` M22 records the sweep that set them.
+/// rather than cited, and `MECHANISM.md` Part F M22 records the sweep that set them.
 /// Overridable at run time so the sweep needs no rebuild.
 fn max_trips() -> i64 {
     static W: std::sync::OnceLock<i64> = std::sync::OnceLock::new();

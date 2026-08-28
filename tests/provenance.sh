@@ -43,13 +43,13 @@
 set -u
 cd "$(dirname "$0")/.."
 
-DOCS="THEORY.md SEMANTICS.md MEASURED.md"
+DOCS="THEORY.md SEMANTICS.md MECHANISM.md"
 BAD=$(mktemp)
 note() { printf '  %s\n' "$1" >> "$BAD"; }
 
 # ── the citable universe ───────────────────────────────────────────────────
 # THEORY.md's Side-I sections (A1…A8, A6b, A7b, B, C, D) and Side-II sections
-# (II-1…II-6); SEMANTICS.md's numbered sections; MEASURED.md's M<n> entries.
+# (II-1…II-6); SEMANTICS.md's numbered sections; MECHANISM.md's M<n> entries.
 ids=$(mktemp); trap 'rm -f "$ids" "$ids.used" "$ids.sq" "$BAD" "$squares"' EXIT
 # THE FIRST TOKEN OF EVERY HEADING, and nothing cleverer. A pattern with `§` in
 # it does not survive the box: `§` is two bytes, and GNU grep in the C locale
@@ -58,7 +58,7 @@ ids=$(mktemp); trap 'rm -f "$ids" "$ids.used" "$ids.sq" "$BAD" "$squares"' EXIT
 # RED in the box with ten "no doc has A1" findings. Taking the first field is
 # both simpler and dialect-proof.
 {
-    grep -ohE '^#+ [^ ]+' THEORY.md SEMANTICS.md MEASURED.md | sed -E 's/^#+ //; s/\.$//'
+    grep -ohE '^#+ [^ ]+' THEORY.md SEMANTICS.md MECHANISM.md | sed -E 's/^#+ //; s/\.$//'
 } | sort -u > "$ids"
 
 known() { grep -qxF "$1" "$ids"; }
