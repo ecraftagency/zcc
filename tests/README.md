@@ -172,9 +172,9 @@ otherwise (presumption-of-guilt rule, CLAUDE.md).
   (716e3cce…) is OK. Fix: `docker tag <ID> zcc-box:latest` (a local, non-
   destructive operation).
 
-## Constitutional test & proof laws — full text (offloaded from `CLAUDE.md`)
+## The test & proof laws — full text (offloaded from `CLAUDE.md`)
 
-`CLAUDE.md` (the constitution) keeps these as terse amendments (III/IV/VIII/IX/X) and points here for the full text + recorded lessons. Nothing below is optional; it is the constitution's evidence layer.
+`CLAUDE.md` keeps these as terse articles and points here for the full text + recorded lessons. Nothing below is optional; it is the evidence layer those laws rest on.
 
 - **Iteration-speed law (stands above every other test law)**: an iteration mechanism, however academically or scientifically elegant, is discarded immediately if *measurement* yields the opposite number — that is, if it makes iteration *slower* than the direct approach (detect bug → fix → re-test exactly the failing case) — regardless of how much code it represents. Recorded lesson: a four-tier SOP with harvest/regress staging was eliminated on the same day it was created, because it made the actual redis test queue behind bureaucracy. Ritchie wrote a C compiler on the PDP-11 without any of it.
 - **Mathematical foundation (root law)**: every compiler feature must connect to, or be derived from, a principle — compiler theory, discrete mathematics, set theory, automata (lexer = regular language, preprocessor = term-rewriting system, parser = context-free grammar, UAC = semilattice, ABI = finite automaton, codegen = per-node simulation). Internal tests must cover the mathematical proof as far as possible: a new feature is first asked "which space does it belong to, can that space be exhausted, which gate guards it?"

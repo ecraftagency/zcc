@@ -30,9 +30,16 @@ const ARM_LIMIT: usize = 2;
 /// THEORY A7b  SQUARE ifconv_turns_a_diamond_into_a_select — a side-effect-free diamond
 pub fn run(f: &mut Func) -> bool {
     let mut changed = false;
+    // WHAT IS PINNED DOES NOT CHANGE HERE, so it is asked once. A block is pinned
+    // by being the entry, by having its address taken, or by being a computed
+    // goto's target. `convert` MOVES instructions rather than deleting them, so
+    // no `SymAddr(Label)` disappears; it only ever replaces an arm's terminator,
+    // and `diamond` accepts an arm only when that terminator is a `Jmp`, so no
+    // `GotoPtr` disappears either; and it adds no blocks. Rebuilding it per
+    // converted diamond was a full walk of every instruction in the function.
+    let pin = pinned(f);
     loop {
         let c = dom::cfg(f);
-        let pin = pinned(f);
         let mut hit = None;
         for b in 0..f.blocks.len() {
             if !c.reachable(b as BlockId) {
@@ -221,5 +228,10 @@ fn convert(f: &mut Func, d: Diamond) {
         args.push(Operand::Val(dst));
     }
     f.blocks[d.head as usize].term = Term::Jmp(Target { block: d.join, args });
-    refresh_defs(f);
+    // ONE BLOCK CHANGED. The arms' instructions are now the head's, at new
+    // positions, and the selects were stamped as they were pushed; the arms are
+    // empty and the join is untouched. The whole-function version costs O(values)
+    // per converted diamond, inside a loop that converts one per pass — the same
+    // defect licm already had, and fixed the same way.
+    super::refresh_block_defs(f, d.head);
 }

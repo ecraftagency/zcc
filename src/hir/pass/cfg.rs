@@ -84,19 +84,130 @@ pub fn run(f: &mut Func) -> bool {
     // A sweep can expose work for the next one (a merge makes the merged block's
     // successor single-predecessor). The bound is termination insurance: each
     // successful sweep strictly removes a block or an edge.
+    // ONE ANALYSIS PER SWEEP, NOT ONE PER IDENTITY. Four of the six below build
+    // a control-flow graph on entry and one of them also walks every instruction
+    // for the pin vector — and a late sweep, where only one identity still has
+    // work, rebuilt all of it five times over an unchanged function. The graph is
+    // therefore built on demand and dropped the moment an identity reports a
+    // change, so each identity still reads a graph of the function exactly as it
+    // stands when it runs. Same analyses, same order, same rewrites.
+    let mut c: Option<dom::Cfg> = None;
+    let mut pin: Option<Vec<bool>> = None;
+    let mut uses: Option<Vec<u32>> = None;
     for _ in 0..f.blocks.len().max(1) {
         let mut changed = fold_terms(f);
-        changed |= drop_unreachable(f);
-        changed |= thread(f);
-        changed |= thread_known_condition(f);
-        changed |= thread_branch_into_pred(f);
-        changed |= merge(f);
+        if changed {
+            c = None;
+            pin = None;
+        }
+        if changed {
+            uses = None;
+        }
+        // WHAT EACH IDENTITY CAN DISTURB, and nothing more. The graph goes stale
+        // on any change. The PIN VECTOR does not: it marks the entry, the blocks
+        // whose address is taken and a computed goto's targets, and only the two
+        // identities that can DELETE an instruction or retarget a `GotoPtr` —
+        // folding a decided terminator, and emptying an unreachable block — can
+        // move it. Threading and merging move instructions and rewrite `Jmp`s and
+        // `Br`s, which leaves every one of those marks where it was.
+        let hit = {
+            let cc = cfg_of(f, &mut c);
+            let pp = pin_of(f, &mut pin);
+            drop_unreachable(f, cc, pp)
+        };
+        if hit {
+            changed = true;
+            c = None;
+            pin = None;
+            uses = None;
+        }
+        let hit = {
+            let cc = cfg_of(f, &mut c);
+            let pp = pin_of(f, &mut pin);
+            thread(f, cc, pp)
+        };
+        if hit {
+            changed = true;
+            c = None;
+            uses = None;
+        }
+        let hit = {
+            let cc = cfg_of(f, &mut c);
+            let pp = pin_of(f, &mut pin);
+            thread_known_condition(f, cc, pp)
+        };
+        if hit {
+            changed = true;
+            c = None;
+            uses = None;
+        }
+        let hit = {
+            let cc = cfg_of(f, &mut c);
+            let pp = pin_of(f, &mut pin);
+            let uu = uses_of(f, &mut uses);
+            thread_branch_into_pred(f, cc, pp, uu)
+        };
+        if hit {
+            changed = true;
+            c = None;
+        }
+        let hit = {
+            let cc = cfg_of(f, &mut c);
+            let pp = pin_of(f, &mut pin);
+            merge(f, cc, pp)
+        };
+        if hit {
+            changed = true;
+            c = None;
+            uses = None;
+        }
         any |= changed;
         if !changed {
             break;
         }
     }
     any
+}
+
+/// The control-flow graph of `f` as it stands, built once and kept until an
+/// identity changes the function.
+fn cfg_of<'a>(f: &Func, slot: &'a mut Option<dom::Cfg>) -> &'a dom::Cfg {
+    if slot.is_none() {
+        *slot = Some(dom::cfg(f));
+    }
+    slot.as_ref().unwrap()
+}
+
+/// Which blocks may not be absorbed or renamed, on the same terms.
+fn pin_of<'a>(f: &Func, slot: &'a mut Option<Vec<bool>>) -> &'a [bool] {
+    if slot.is_none() {
+        *slot = Some(pinned(f));
+    }
+    slot.as_ref().unwrap()
+}
+
+/// How many times each value is read, on the same terms — built once and kept
+/// current by the one identity that carries it.
+fn uses_of<'a>(f: &Func, slot: &'a mut Option<Vec<u32>>) -> &'a mut Vec<u32> {
+    if slot.is_none() {
+        let mut u = vec![0u32; f.values.len()];
+        for b in &f.blocks {
+            for inst in &b.insts {
+                inst.uses(|o| {
+                    if let Operand::Val(v) = o {
+                        u[v as usize] += 1;
+                    }
+                });
+            }
+            b.term.uses(|o| {
+                if let Operand::Val(v) = o {
+                    u[v as usize] += 1;
+                }
+            });
+        }
+        *slot = Some(u);
+    }
+    slot.as_mut().unwrap()
 }
 
 /// (f) — a branch whose condition is a select between two literals observes only
@@ -132,25 +243,8 @@ fn fold_select_conditions(f: &mut Func) -> bool {
 /// condition. Shares (e)'s side conditions: S is instruction-free, branches on
 /// its own parameter, and every parameter of S is read nowhere but that
 /// terminator, so the substitution below removes every occurrence.
-fn thread_branch_into_pred(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let pin = pinned(f);
+fn thread_branch_into_pred(f: &mut Func, c: &dom::Cfg, pin: &[bool], uses: &mut Vec<u32>) -> bool {
     let n = f.blocks.len();
-    let mut uses = vec![0u32; f.values.len()];
-    for b in &f.blocks {
-        for inst in &b.insts {
-            inst.uses(|o| {
-                if let Operand::Val(v) = o {
-                    uses[v as usize] += 1;
-                }
-            });
-        }
-        b.term.uses(|o| {
-            if let Operand::Val(v) = o {
-                uses[v as usize] += 1;
-            }
-        });
-    }
     let mut changed = false;
     for b in 0..n {
         if !c.reachable(b as BlockId) {
@@ -276,22 +370,63 @@ fn thread_branch_into_pred(f: &mut Func) -> bool {
         if nx.block == ny.block && nx.args != ny.args {
             continue;
         }
+        let clone_cmp2 = clone_cmp.clone();
         if let Some(ci) = clone_cmp {
             f.blocks[b].insts.push(ci);
+            // The clone's `Def` was stamped before its position was known; the
+            // verifier reads that record, so it is re-stamped here. Without it,
+            // `hir::verify` reports "use of undefined %n" — which it did, on 21
+            // torture cases, the moment this identity started cloning compares.
+            super::refresh_block_defs(f, b as BlockId);
         }
         f.blocks[b].term = match cond {
             // a decided compare needs no branch at all
             Operand::Imm(k) => Term::Jmp(if k != 0 { nx } else { ny }),
             _ => Term::Br(cond, nx, ny),
         };
-        changed = true;
+        // THE TABLE IS CARRIED, AND THIS REWRITE'S EFFECT ON IT IS EXACT: the old
+        // terminator was a `Jmp` whose arguments were its only uses, the clone
+        // reads its two operands, and the new terminator reads what it names.
+        // Nothing here touches a count the gates above read — S's parameters and
+        // its condition are used inside S alone, by the terminator and compare
+        // just copied. The caller drops the table whenever another identity
+        // changes the function.
+        uses.resize(f.values.len(), 0);
+        for a in &t.args {
+            if let Operand::Val(u) = *a {
+                uses[u as usize] -= 1;
+            }
+        }
+        if let Some(ci) = clone_cmp2 {
+            ci.uses(|o| {
+                if let Operand::Val(u) = o {
+                    uses[u as usize] += 1;
+                }
+            });
+        }
+        f.blocks[b].term.uses(|o| {
+            if let Operand::Val(u) = o {
+                uses[u as usize] += 1;
+            }
+        });
+
+        // ONE REWRITE PER CALL, AND IT STAYS THAT WAY — measured, not assumed.
+        //
+        // Sweeping instead would remove a full walk of the function per rewrite,
+        // worth 1.5 s on the sqlite amalgamation. It also CHANGES THE OUTPUT, and
+        // the reason is not a stale use-count table: with the table rebuilt from
+        // scratch after every rewrite the assembly changed in exactly the same
+        // way. `run` interleaves six identities to a fixpoint and that fixpoint is
+        // not confluent — taking several of one identity before the others get
+        // their turn lands somewhere else. All 58 corpus programs stayed identical
+        // through both attempts; only sqlite could see it.
+        return true;
     }
-    changed
+    let _ = changed;
+    false
 }
 
-fn thread_known_condition(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let pin = pinned(f);
+fn thread_known_condition(f: &mut Func, c: &dom::Cfg, pin: &[bool]) -> bool {
     let n = f.blocks.len();
     // THE SIDE CONDITION THAT MAKES THIS A PROOF. Skipping S skips the
     // DEFINITION of S's parameters, and a parameter may be read far below S —
@@ -451,9 +586,7 @@ fn fold_terms(f: &mut Func) -> bool {
     changed
 }
 
-fn drop_unreachable(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let pin = pinned(f);
+fn drop_unreachable(f: &mut Func, c: &dom::Cfg, pin: &[bool]) -> bool {
     let mut changed = false;
     for b in 0..f.blocks.len() {
         if c.reachable(b as BlockId) || pin[b] {
@@ -472,9 +605,7 @@ fn drop_unreachable(f: &mut Func) -> bool {
 }
 
 /// (c) — redirect every edge into an empty forwarding block.
-fn thread(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let pin = pinned(f);
+fn thread(f: &mut Func, c: &dom::Cfg, pin: &[bool]) -> bool {
     let n = f.blocks.len();
     // `fwd[b] = Some(target)` when b is a pure forwarder.
     let mut fwd: Vec<Option<Target>> = vec![None; n];
@@ -524,19 +655,52 @@ fn thread(f: &mut Func) -> bool {
 }
 
 /// (d) — concatenate a block with its only successor.
-fn merge(f: &mut Func) -> bool {
+///
+/// ONE SUBSTITUTION PER SWEEP, not one per merge. The first cut rebuilt the CFG
+/// and the pin vector, allocated a value-wide map, rewrote every use in the
+/// function and re-stamped every definition — and then restarted from block
+/// zero — for EACH block absorbed. That is a full walk of the function per
+/// merge, and on the sqlite amalgamation this pass and its neighbour in `run`
+/// were 3.3 s of a 6.6 s ladder.
+///
+/// The sweep is safe to carry on, and the substitution is safe to accumulate:
+///
+///   NOTHING EARLIER BECOMES MERGEABLE. Absorbing S into B re-parents S's
+///   successors from S to B, so no other block's predecessor COUNT changes, and
+///   a merge is gated on that count being one. The restart therefore could only
+///   ever find the block the sweep is already standing on, which is why the
+///   inner loop lets B keep absorbing.
+///
+///   THE PENDING MAP DOES NOT CHANGE A DECISION. `rewrite_values` resolves
+///   chains, so an argument that is itself a mapped parameter lands where it
+///   would have. The one test that reads a value is the type check below, and it
+///   is what makes that sound: a parameter is only substituted by an argument of
+///   the SAME type, so a pending substitution cannot change the answer.
+///
+/// Stale reachability is likewise harmless: a block emptied by a merge is left
+/// with `Term::Unreachable`, which the `Jmp` match below simply does not take.
+fn merge(f: &mut Func, c0: &dom::Cfg, pin0: &[bool]) -> bool {
     let mut changed = false;
+    let mut map: Vec<Option<Operand>> = Vec::new();
+    // The sweep already holds a graph and a pin vector for the function as it
+    // stands; the first pass here reads those rather than building its own. Most
+    // sweeps merge nothing and return on this pass, so the pair it used to build
+    // on entry was built to be thrown away.
+    let (mut own_c, mut own_pin) = (None::<dom::Cfg>, None::<Vec<bool>>);
     loop {
-        let c = dom::cfg(f);
-        let pin = pinned(f);
+        let c: &dom::Cfg = own_c.as_ref().unwrap_or(c0);
+        let pin: &[bool] = own_pin.as_deref().unwrap_or(pin0);
+        map.clear();
+        map.resize(f.values.len(), None);
         let mut done = true;
         for b in 0..f.blocks.len() {
             if !c.reachable(b as BlockId) {
                 continue;
             }
+            loop {
             let s = match &f.blocks[b].term {
                 Term::Jmp(t) if t.block as usize != b => t.block,
-                _ => continue,
+                _ => break,
             };
             // A labelled successor may NOT be absorbed: `emit` writes the
             // `lg_<func>.<label>` symbol at the head of the block that carries
@@ -544,7 +708,7 @@ fn merge(f: &mut Func) -> bool {
             // a merge the symbol would name B's first instruction instead of
             // S's, moving a program point the linker can see.
             if pin[s as usize] || c.preds[s as usize].len() != 1 || !f.blocks[s as usize].labels.is_empty() {
-                continue;
+                break;
             }
             let args = match &f.blocks[b].term {
                 Term::Jmp(t) => t.args.clone(),
@@ -564,13 +728,12 @@ fn merge(f: &mut Func) -> bool {
                     None => true,
                 });
             if !typed {
-                continue;
+                break;
             }
             let succ = std::mem::replace(
                 &mut f.blocks[s as usize],
                 Block { params: Vec::new(), insts: Vec::new(), term: Term::Unreachable, labels: Vec::new(), weight: 1 },
             );
-            let mut map: Vec<Option<Operand>> = vec![None; f.values.len()];
             for (p, a) in succ.params.iter().zip(args.iter()) {
                 map[*p as usize] = Some(*a);
             }
@@ -582,6 +745,10 @@ fn merge(f: &mut Func) -> bool {
             changed = true;
             done = false;
             break;
+            }
+            if !done {
+                break;
+            }
         }
         if done {
             return changed;

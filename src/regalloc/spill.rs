@@ -204,8 +204,8 @@ pub fn spill_with(
     forced: &BTreeSet<VReg>,
     cross_cap: usize,
 ) -> Result<usize, String> {
-    let remat = rematerializable(f);
-    let web = webs(f);
+    let remat = crate::compile::phase("    remat", || rematerializable(f));
+    let web = crate::compile::phase("    webs", || webs(f));
     // CP2.3 (compile-speed): `spilled` is membership-tested on the per-operand
     // hot path of `simulate` and never iterated in order, so a dense `Vec<bool>`
     // over the (fixed) vreg index replaces the `BTreeSet<VReg>` — O(1) contains,
@@ -319,8 +319,8 @@ pub fn spill_with(
                 fell_back = true;
                 prev_exit = vec![Vec::new(); f.blocks.len()];
             }
-            let lv = live::compute(f, &cfg);
-            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat)? {
+            let lv = crate::compile::phase("    lv", || live::compute(f, &cfg));
+            match crate::compile::phase("    simulate", || simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat))? {
                 Sim::Plan(p) => {
                     // SPEND A ROUND ONLY IF IT CAN BUY SOMETHING. The seeding is
                     // worth another walk while it is still finding NEW block
@@ -948,9 +948,9 @@ fn simulate(
         }
         d
     };
-    let base = linear_positions(f, cfg);
-    let uses = use_positions(f, lv, cfg, &base);
-    let trace = Trace::new(f, lf, &base, &uses, lv, web);
+    let base = crate::compile::phase("      base", || linear_positions(f, cfg));
+    let uses = crate::compile::phase("      uses", || use_positions(f, lv, cfg, &base));
+    let trace = crate::compile::phase("      trace", || Trace::new(f, lf, &base, &uses, lv, web));
     // Once the function contains a call the register file is PARTITIONED: a value
     // live across a call may use only the callee-saved half (AAPCS64 §6.1.1, and
     // `color.rs` applies it per VALUE over its whole range), and a value that is
@@ -2696,9 +2696,19 @@ fn webs(f: &MFunc) -> Vec<VReg> {
             });
         }
         live::last_use_into(f, sp, &lv, b, &mut lu);
-        for v in 0..nv as VReg {
-            if let Some(j) = lu.at[sp.idx(Reg::V(v))] {
-                last[b].insert(v, j);
+        // WHAT THIS BLOCK WROTE, not the whole value space. `last_use_into` only
+        // ever records a register the block's own instructions read, and it keeps
+        // the list of those entries for exactly this reason — walking `0..nv` per
+        // block is O(blocks × values), which `live.rs` itself calls out as
+        // "invisible on a small function and the dominant cost on a real one".
+        // A virtual register's index IS its number and the physical ones sit
+        // above `nv`, so the vreg entries are the ones below it. `last[b]` is
+        // ordered by key, so the order they arrive in does not matter.
+        for &i in lu.touched() {
+            if i < nv {
+                if let Some(j) = lu.at[i] {
+                    last[b].insert(i as VReg, j);
+                }
             }
         }
     }
@@ -2758,18 +2768,28 @@ fn webs(f: &MFunc) -> Vec<VReg> {
                 if ra == rq {
                     continue;
                 }
-                let ma: Vec<VReg> = members.get(&ra).cloned().unwrap_or_else(|| vec![ra]);
-                let mq: Vec<VReg> = members.get(&rq).cloned().unwrap_or_else(|| vec![rq]);
                 // Transitivity is not free: merging two classes makes EVERY
                 // member share one slot, so the check is class against class,
                 // not just the pair that proposed the merge.
-                if ma.iter().any(|&x| mq.iter().any(|&y| interfere(x, y))) {
+                //
+                // READ THE CLASSES, do not copy them. Both were cloned here on
+                // every edge argument in the function — including the ones the
+                // check below rejects at the first pair, and including the
+                // singletons — so a variable threaded through many joins paid a
+                // heap allocation per attempt. The two are only taken apart once
+                // the merge is agreed.
+                let (sa, sq) = ([ra], [rq]);
+                let clash = {
+                    let ma: &[VReg] = members.get(&ra).map(Vec::as_slice).unwrap_or(&sa);
+                    let mq: &[VReg] = members.get(&rq).map(Vec::as_slice).unwrap_or(&sq);
+                    ma.iter().any(|&x| mq.iter().any(|&y| interfere(x, y)))
+                };
+                if clash {
                     continue;
                 }
                 parent[ra as usize] = rq;
-                let mut all = ma;
-                all.extend(mq);
-                members.remove(&ra);
+                let mut all = members.remove(&ra).unwrap_or_else(|| vec![ra]);
+                all.extend(members.remove(&rq).unwrap_or_else(|| vec![rq]));
                 members.insert(rq, all);
             }
         }

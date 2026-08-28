@@ -93,34 +93,54 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
     let n = f.blocks.len();
     let (mut live_in, mut live_out) = (vec![BTreeSet::new(); n], vec![BTreeSet::new(); n]);
 
-    // per-block use/def summaries (uses = read before any local definition)
-    let mut uses = vec![BTreeSet::new(); n];
-    let mut defs = vec![BTreeSet::new(); n];
+    // Per-block use/def summaries (uses = read before any local definition),
+    // built AS the sorted runs the fixpoint below reads. The first cut built a
+    // `BTreeSet` per block and then copied each one into a run, so every summary
+    // was constructed twice — once in a structure whose ordering was then thrown
+    // away. Membership while building is a stamp per index, cleared by the block
+    // that wrote it, so the "already defined here" test stays O(1).
+    let mut uses: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut defs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut seen_def = vec![u32::MAX; sp.len()];
     for (bi, blk) in f.blocks.iter().enumerate() {
         let (u, d) = (&mut uses[bi], &mut defs[bi]);
+        let era = bi as u32;
         for p in &blk.params {
-            d.insert(sp.idx(*p));
+            let i = sp.idx(*p);
+            if seen_def[i] != era {
+                seen_def[i] = era;
+                d.push(i);
+            }
         }
         for inst in &blk.insts {
-            inst.visit(&mut |r, c| match c {
-                Constraint::Use | Constraint::UseFixed(_) => {
-                    let i = sp.idx(r);
-                    if !d.contains(&i) {
-                        u.insert(i);
+            inst.visit(&mut |r, c| {
+                let i = sp.idx(r);
+                match c {
+                    Constraint::Use | Constraint::UseFixed(_) => {
+                        if seen_def[i] != era {
+                            u.push(i);
+                        }
                     }
-                }
-                Constraint::Def | Constraint::DefFixed(_) => {
-                    d.insert(sp.idx(r));
+                    Constraint::Def | Constraint::DefFixed(_) => {
+                        if seen_def[i] != era {
+                            seen_def[i] = era;
+                            d.push(i);
+                        }
+                    }
                 }
             });
         }
         // the terminator's own operands; edge arguments are handled by live_out
         blk.term.visit(&mut |r, _| {
             let i = sp.idx(r);
-            if !d.contains(&i) {
-                u.insert(i);
+            if seen_def[i] != era {
+                u.push(i);
             }
         });
+        u.sort_unstable();
+        u.dedup();
+        d.sort_unstable();
+        d.dedup();
     }
 
     // CP2.2 (compile-speed): a predecessor-worklist instead of a `while changed`
@@ -130,29 +150,51 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
     // grew (a backward problem: `live_out[b]` reads `live_in[succ]`), so on a
     // change to `live_in[b]` its predecessors are re-queued. Seeded in reverse
     // RPO, the order that converged fastest under the old sweep. Byte-identical.
+    // A SORTED RUN OF INDICES, not a tree of them. The set operations this
+    // fixpoint performs are union at a join, difference against the block's
+    // definitions, and equality — all of which a sorted array answers in one
+    // linear pass, in cache, with the buffers reused. A `BTreeSet` pays a node
+    // allocation and a pointer chase per element on every visit, and a block is
+    // visited many times; measured on the sqlite amalgamation, this fixpoint was
+    // 3.1 s, the largest single item in the whole allocator.
+    //
+    // The ORDER is the same order — ascending — so `live_in`/`live_out` are the
+    // same sets, iterated the same way, and the sets handed to the caller below
+    // are the same sets. Only their representation while the fixpoint runs
+    // differs.
+    let mut vin: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut vout: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut inq = vec![true; n];
     let mut wl: std::collections::VecDeque<usize> =
         cfg.rpo.iter().rev().map(|&b| b as usize).collect();
+    let (mut out, mut inn) = (Vec::new(), Vec::new());
     while let Some(b) = wl.pop_front() {
         inq[b] = false;
-        let mut out = BTreeSet::new();
+        out.clear();
         for t in f.blocks[b].term.targets() {
-            out.extend(live_in[t.block as usize].iter().copied());
+            out.extend_from_slice(&vin[t.block as usize]);
             for a in &t.args {
-                out.insert(sp.idx(*a));
+                out.push(sp.idx(*a));
             }
         }
         // a computed goto has successors but carries no arguments
         for &s in &cfg.succs[b] {
-            out.extend(live_in[s as usize].iter().copied());
+            out.extend_from_slice(&vin[s as usize]);
         }
-        let mut inn = uses[b].clone();
-        inn.extend(out.iter().filter(|i| !defs[b].contains(i)).copied());
-        if out != live_out[b] {
-            live_out[b] = out;
+        out.sort_unstable();
+        out.dedup();
+        inn.clear();
+        inn.extend_from_slice(&uses[b]);
+        inn.extend(out.iter().copied().filter(|i| defs[b].binary_search(i).is_err()));
+        inn.sort_unstable();
+        inn.dedup();
+        if out != vout[b] {
+            vout[b].clear();
+            vout[b].extend_from_slice(&out);
         }
-        if inn != live_in[b] {
-            live_in[b] = inn;
+        if inn != vin[b] {
+            vin[b].clear();
+            vin[b].extend_from_slice(&inn);
             for &p in &cfg.preds[b] {
                 let p = p as usize;
                 if !inq[p] {
@@ -161,6 +203,10 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
                 }
             }
         }
+    }
+    for b in 0..n {
+        live_in[b] = vin[b].iter().copied().collect();
+        live_out[b] = vout[b].iter().copied().collect();
     }
 
     // A value crosses a call when it is live immediately before the call and
@@ -232,19 +278,27 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
         for &p in &f.blocks[bi].params {
             live.insert(sp.idx(p));
         }
+        // THE SET IS ORDERED, so the physical half is a range, not a filter.
+        // Virtual registers index below `nv` and physical ones above it, and this
+        // runs at every program point — walking the whole live set to reach the
+        // tail of it is the walk this ordering exists to avoid.
+        // A REGISTER SET IS A BITMASK, so what is live here is ONE mask and a
+        // virtual register takes it in one OR. Adding the physical registers one
+        // at a time, per live value, per program point, is a nested loop over two
+        // sets where a single word operation says the same thing.
         let mut record = |live: &BTreeSet<usize>, pc: &mut Vec<RegSet>| {
-            let phys: Vec<PReg> = live
-                .iter()
-                .filter(|&&x| x >= sp.nv)
-                .filter_map(|&x| sp.reg(x).preg())
-                .collect();
-            if phys.is_empty() {
+            let mut here = RegSet::default();
+            for &x in live.range(sp.nv..) {
+                if let Some(p) = sp.reg(x).preg() {
+                    here.add(p);
+                }
+            }
+            if here.gpr == 0 && here.fpr == 0 {
                 return;
             }
-            for &x in live.iter().filter(|&&x| x < sp.nv) {
-                for p in &phys {
-                    pc[x].add(*p);
-                }
+            for &x in live.range(..sp.nv) {
+                pc[x].gpr |= here.gpr;
+                pc[x].fpr |= here.fpr;
             }
         };
         record(&live, &mut phys_conflict);
@@ -256,13 +310,19 @@ pub fn compute(f: &MFunc, cfg: &Cfg) -> Liveness {
                     live.insert(sp.idx(*r));
                 }
             }
-            let dead: Vec<usize> = live
-                .iter()
-                .copied()
-                .filter(|&x| last[x] == Some(i))
-                .collect();
-            for x in dead {
-                live.remove(&x);
+            // WHAT DIES HERE IS AMONG WHAT THIS INSTRUCTION READS. `last_use_into`
+            // writes `at[x] = i` only for a register instruction `i` uses, so
+            // `last[x] == Some(i)` implies `x` is one of its operands — and the
+            // operands are already in hand. Scanning the whole live set instead
+            // costs the set's size at every program point, which is the shape
+            // this file's own doc-comment warns about.
+            for (r, c) in &ops {
+                if matches!(c, Constraint::Use | Constraint::UseFixed(_)) {
+                    let x = sp.idx(*r);
+                    if last[x] == Some(i) {
+                        live.remove(&x);
+                    }
+                }
             }
             record(&live, &mut phys_conflict);
         }
@@ -339,5 +399,11 @@ impl LastUse {
             self.at[i] = None;
         }
         self.touched.clear();
+    }
+    /// The entries this block actually wrote. A reader that walks the whole
+    /// value space instead pays for every value in the function at every block,
+    /// which is the quadratic this list exists to avoid.
+    pub fn touched(&self) -> &[usize] {
+        &self.touched
     }
 }

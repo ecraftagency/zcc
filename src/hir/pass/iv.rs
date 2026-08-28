@@ -848,7 +848,7 @@ fn plan_widen(
     // block and broke sqlite: `%79 used in bb18 but defined in bb6`.
     match bound {
         Operand::Imm(_) => {}
-        Operand::Val(v) if s.is_loop_invariant(v) => {}
+        Operand::Val(v) if s.is_loop_invariant(f, v) => {}
         _ => return None,
     }
     // Every use of the counter and of its step must be one of: the step itself,
@@ -1160,7 +1160,7 @@ fn plan_substitute(
                         _ => continue,
                     };
                     if let Some(v) = other.val() {
-                        if s.is_loop_invariant(v) {
+                        if s.is_loop_invariant(f, v) {
                             groups.entry(v).or_default().push(*dst);
                         }
                     }
@@ -1195,10 +1195,10 @@ fn plan_substitute(
     // bound and the widened start are both materialized in the entry block.
     match bound {
         Operand::Imm(_) => {}
-        Operand::Val(v) if s.is_loop_invariant(v) => {}
+        Operand::Val(v) if s.is_loop_invariant(f, v) => {}
         _ => return None,
     }
-    if !s.is_loop_invariant(shift) || f.ty_of(shift) != Ty::I32 {
+    if !s.is_loop_invariant(f, shift) || f.ty_of(shift) != Ty::I32 {
         return None;
     }
     // Every reader of the counter and of its step must be one this rewrite

@@ -1014,3 +1014,43 @@ is honest: 1× is not reachable by a grab on this surface.
 `scratchpad/patch.pl` against a fresh `zcc -S sqlite3.c` (slot number is
 build-specific — the pass will not be). **WHEN / WHERE.** 2026-08-27, M1 Pro
 under Docker, sqlite 3 amalgamation, gcc -O1 referee.
+
+## M22. The unroll budgets — how many copies of a loop are worth making
+
+**WHAT THIS IS.** `hir/pass/unroll.rs` fully unrolls a loop whose trip count is
+a small literal. Two numbers decide when: `max_trips` (how many copies at most)
+and `max_body` (how large the body may be, in HIR instructions). Neither the ISA
+nor the ABI has anything to say about either — no spec sentence sets them — so
+Article E's question ("the spec's number, or my convenience's number?") has only
+one honest answer available: measure. This is that measurement, and the row is
+cited from the code as `MEASURED M22`.
+
+**METHOD.** The 49-program taxonomy suite, each program compiled by both
+compilers and its output compared before any time was taken, best-of-3 twice per
+program with the fork+exec floor subtracted, gcc -O1 re-timed in the same rounds.
+The reported figure is the EXEC geomean over all 49 — no program excluded, no
+bucket. The budgets are read from the environment so a sweep costs no rebuild
+(`ZCC_UNROLL_TRIPS`, `ZCC_UNROLL_BODY`).
+
+| max_trips (body 24) | EXEC geomean | | max_body (trips 4) | EXEC geomean |
+|---|---|---|---|---|
+| 0 — pass off | 1.0261 | | 12 | 1.0212 |
+| 2 | 1.0210 | | **24** | **1.0181** |
+| **4** | **1.0181** | | 48 | 1.0184 |
+| 8 | 1.0196 | | | |
+
+**WHAT IT SAYS.** Trips has a real optimum at 4 and turns over after it: eight
+copies is measurably worse than four (1.0196 vs 1.0181), which is the point
+where the duplicated code stops paying for the branch and the register it saves.
+Body is flat above 24 — 48 buys nothing (1.0184 vs 1.0181) and 12 costs 0.3% —
+so 24 is the smallest value that gives up nothing, which is the one to hold.
+
+**WHY IT IS NOT A TUNING KNOB.** Both numbers move a geomean over 49 programs on
+one microarchitecture, which is the same narrow surface Law 3c warns about: they
+are the best available answer for THIS suite on THIS core, and a wider suite may
+move them. What the sweep does establish is the shape — a maximum near 4, and
+saturation in body — and that shape is what a re-measurement should be checked
+against.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, 49-program suite (42 taxonomy + the 7 database kernels).

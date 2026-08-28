@@ -68,8 +68,6 @@ pub struct LoopScev {
     pub preheader: Option<BlockId>,
     /// blocks of the loop, indexed by block id
     inloop: Vec<bool>,
-    /// definitions that dominate the preheader — the loop-invariant values
-    invariant: Vec<bool>,
     /// the BASIC induction variables: header parameters that advance by a
     /// constant on every latch edge
     pub ivs: HashMap<ValueId, AddRec>,
@@ -107,19 +105,11 @@ impl LoopScev {
         // preheader" — licm's rule, because licm must also have somewhere to
         // move code TO — would be wrong here, since a rotated loop is entered
         // straight from its guard and has no preheader at all.
-        let mut invariant = vec![false; f.values.len()];
-        for (v, info) in f.values.iter().enumerate() {
-            invariant[v] = match info.def {
-                Def::FuncParam(_) => true,
-                Def::Inst(b, _) | Def::Param(b, _) => !inloop[b as usize],
-            };
-        }
         let pre = preheader_of(f, c, dt, header);
         let mut s = LoopScev {
             header,
             preheader: pre,
             inloop,
-            invariant,
             ivs: HashMap::new(),
             trips: None,
             nowrap_signed: std::collections::HashSet::new(),
@@ -194,8 +184,15 @@ impl LoopScev {
     /// sum of two invariants. A caller that wants to move something out of the
     /// loop needs this one; asking the other put a `sext` of a header-defined
     /// value into the preheader and broke sqlite (§13l).
-    pub fn is_loop_invariant(&self, v: ValueId) -> bool {
-        self.invariant[v as usize]
+    /// ASKED, NOT TABULATED. A value is loop-invariant when its definition sits
+    /// outside the loop, which is one lookup — where building the answer for
+    /// every value in the function, once per loop, cost the whole value space per
+    /// loop and was read for a handful of them.
+    pub fn is_loop_invariant(&self, f: &Func, v: ValueId) -> bool {
+        match f.values[v as usize].def {
+            Def::FuncParam(_) => true,
+            Def::Inst(b, _) | Def::Param(b, _) => !self.inloop[b as usize],
+        }
     }
 
     /// Does the loop's own exit test prove this basic induction variable cannot
@@ -551,7 +548,7 @@ impl LoopScev {
     fn leaf(&self, f: &Func, o: Operand) -> Option<AddRec> {
         match o {
             Operand::Imm(k) => Some(AddRec { base: None, off: k, step: 0, ty: Ty::I64 }),
-            Operand::Val(v) if self.invariant[v as usize] => Some(AddRec {
+            Operand::Val(v) if self.is_loop_invariant(f, v) => Some(AddRec {
                 base: Some(v),
                 off: 0,
                 step: 0,

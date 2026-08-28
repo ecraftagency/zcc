@@ -413,28 +413,54 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
         for &p in &f.blocks[bi].params {
             live.insert(sp.idx(p));
         }
-        let mut probe = |live: &BTreeSet<usize>, at: String, note: &str| -> Result<(), String> {
-            let mut seen: Vec<(PReg, usize)> = Vec::new();
+        // THE MESSAGE IS BUILT ONLY WHEN THERE IS ONE TO BUILD, and the register
+        // already indexes its own slot.
+        //
+        // This check runs on every compile, not under a debug assertion, so its
+        // cost is the compiler's cost. The first cut rendered `{:?}` of every
+        // instruction into a `String` — for every instruction, on the path where
+        // nothing is wrong — and searched a growing `Vec` per live value, which is
+        // O(live²) at every program point. Neither is needed: `at` and `note` are
+        // read only inside the `Err` arm, so they arrive as closures, and a
+        // physical register is a class and a number, which is an index. Same first
+        // error, same message.
+        let mut seen = [usize::MAX; PHYS_SLOTS];
+        let mut probe = |live: &BTreeSet<usize>,
+                         seen: &mut [usize; PHYS_SLOTS],
+                         at: &dyn Fn() -> String,
+                         note: &dyn Fn() -> String|
+         -> Result<(), String> {
+            let mut touched: [u8; PHYS_SLOTS] = [0; PHYS_SLOTS];
+            let mut hit: Vec<usize> = Vec::new();
+            let mut out = Ok(());
             for &x in live.iter() {
                 let p = match color_of(&col.color, sp, x) {
                     Some(p) => p,
                     None => continue,
                 };
-                if let Some(&(_, y)) = seen.iter().find(|(q, _)| *q == p) {
-                    return Err(format!(
+                let s = phys_slot(p);
+                if touched[s] != 0 {
+                    let y = seen[s];
+                    out = Err(format!(
                         "{}: {:?} and {:?} are both live at {} and both hold {:?}{} ({})",
                         f.name,
                         sp.reg(y),
                         sp.reg(x),
-                        at,
+                        at(),
                         p.class,
                         p.num,
-                        note
+                        note()
                     ));
+                    break;
                 }
-                seen.push((p, x));
+                touched[s] = 1;
+                seen[s] = x;
+                hit.push(s);
             }
-            Ok(())
+            for s in hit {
+                seen[s] = usize::MAX;
+            }
+            out
         };
         // every colour must be one the allocator was allowed to hand out
         for &x in live.iter() {
@@ -447,7 +473,7 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
                 }
             }
         }
-        probe(&live, format!("bb{} head", bi), "block entry")?;
+        probe(&live, &mut seen, &|| format!("bb{} head", bi), &|| "block entry".to_string())?;
         for (i, inst) in f.blocks[bi].insts.iter().enumerate() {
             let mut ops = Vec::new();
             inst.visit(&mut |r, c| ops.push((r, c)));
@@ -471,7 +497,7 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
                     }
                 }
             }
-            probe(&live, format!("bb{}[{}]", bi, i), "before the definitions")?;
+            probe(&live, &mut seen, &|| format!("bb{}[{}]", bi, i), &|| "before the definitions".to_string())?;
             for (r, c) in &ops {
                 if matches!(c, Constraint::Def | Constraint::DefFixed(_)) {
                     live.insert(sp.idx(*r));
@@ -490,10 +516,23 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
             // register of an operand this very instruction consumes — `blr x0`
             // reads the target before the call writes the result into it — and
             // that reuse is the whole point of the coalescing hint.
-            probe(&live, format!("bb{}[{}]", bi, i), &format!("{:?}", inst))?;
+            probe(&live, &mut seen, &|| format!("bb{}[{}]", bi, i), &|| format!("{:?}", inst))?;
         }
     }
     Ok(())
+}
+
+/// One slot per physical register: three classes of at most 32 each. A register
+/// is a class and a number, so it indexes its own entry and no search is needed.
+const PHYS_SLOTS: usize = 96;
+
+fn phys_slot(p: PReg) -> usize {
+    let base = match p.class {
+        Class::Gpr => 0,
+        Class::Fpr => 32,
+        Class::Flags => 64,
+    };
+    base + p.num as usize
 }
 
 fn color_of(color: &[Option<PReg>], sp: Space, i: usize) -> Option<PReg> {

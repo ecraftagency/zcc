@@ -121,6 +121,31 @@ Then the HIR sites by their 27 % share, cheapest-high-value first (the exponenti
 | **CP2.8** | `licm` hoist scan | restart-scan per hoist | worklist, no restart | hoists×body→N | ⬜ |
 | **CP2.9** | `sroa` DF construction | `contains`-bitmap shipped; DF build still O(preds×domdepth) | Cytron IDF + bitset frontier | N²→~N | ⬜ |
 | **CP2.10** | `destruct` parallel-copy seq | `.position().any()` (spill.rs/destruct.rs ~498, 312) | Boissinot in-degree worklist sequencing | N²→N | ⬜ |
+### The witness this campaign needed, and did not have (2026-08-28)
+
+The byte-identical gate runs 58 small programs. Six `inline` rows passed it and
+sqlite's assembly still moved: the gate-passing compiler emits
+`c655fe3e83f79da3a1ddfa83c50e2c06` (289,478 lines) and the rows produced
+`4f1b49325f69ce5efcf0abe68d7da714`. Nothing in the corpus inlines the way a
+250,000-line translation unit does, so nothing in it could see the difference.
+
+Two lessons, both paid for:
+
+  * **A corpus proof is scoped to the corpus.** For a pass whose behaviour scales
+    with function size, a green gate on small programs is not evidence. The
+    reference `.s` for sqlite costs one slow run (5,332 s with the defect in
+    place) and then every candidate is a one-second `cmp`. Take it FIRST.
+  * **Never chain the baseline.** The hash the rows were compared against was set
+    by the first candidate, not by the reference — so the chain agreed with
+    itself while drifting away from the compiler it was supposed to reproduce.
+
+`cfg`'s branch-threading carries the same warning from the other direction: it
+was batched twice, and both times all 58 programs stayed identical while sqlite
+changed. The second attempt rebuilt the use-count table from scratch after every
+rewrite, which proves the cause is the interleaving of `run`'s six identities and
+not stale bookkeeping — that fixpoint is not confluent.
+
+| **CP2.11** ⭐ | `inline::run_module` — THE WALL, found 2026-08-28 | sqlite did not finish in 20 min against gcc -O1's 6 s. Five whole-program costs, all inside the per-splice `loop`: `live_across` (a whole-function dataflow) every splice; `has_loop` (CFG+domtree+loops of the CALLEE) and `body_size` and `inlinable` per CANDIDATE; `loop_blocks` (CFG+domtree+loops of the caller) every splice; and the site scan restarted from block 0 after every splice | (a) liveness asked LAST and only where it can win, at most once per splice; (b) per-callee facts memoised, invalidated only for the caller a splice rewrote; (c) `inloop` carried across splices — a splice appends, so the new blocks lie in exactly the loops `b` lies in; (d) the set is a **sparse set** (Briggs–Torczon, generation-stamped clear) not a `HashSet` and not a bitset — both of those are sized by how many values EXIST while the live set is a few dozen; (e) the scan RESUMES at the last site taken, since a refusal is a property of the callee and does not change | S×(N+V) → ~N | 🔬 **in flight — each step byte-identical (58 programs)** |
 
 **Overlap guard (already shipped, do NOT redo):** the `sroa` `ever/seen`-`contains` bitmap and the
 `licm` scoped `refresh_block_defs` landed in 3894fb5. CP2.9 is the REMAINING sroa work (the IDF/DF

@@ -47,14 +47,27 @@
 use super::*;
 use std::collections::HashMap;
 
-/// Two, three and four are the trip counts a C programmer writes for a fixed
-/// small vector; beyond that the copies stop paying for themselves in a cache
-/// this pass cannot measure. A number to revisit WITH a measurement, never on
-/// taste (Article E).
-const MAX_TRIPS: i64 = 4;
+/// MEASURED M22 — the unroll budgets, swept on the 49-program suite
+///
+/// Both are policy numbers, so Article E's question applies: the spec's number
+/// or the author's convenience? Neither ISA nor ABI has anything to say about
+/// how many copies of a loop are worth making, so the answer had to be measured
+/// rather than cited, and `MEASURED.md` M22 records the sweep that set them.
+/// Overridable at run time so the sweep needs no rebuild.
+fn max_trips() -> i64 {
+    static W: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("ZCC_UNROLL_TRIPS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    })
+}
 
-/// The body budget, in HIR instructions. `n7`'s loop is 6.
-const MAX_BODY: usize = 24;
+/// MEASURED M22 — the body budget, in HIR instructions (`n7`'s loop is 6)
+fn max_body() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("ZCC_UNROLL_BODY").ok().and_then(|v| v.parse().ok()).unwrap_or(24)
+    })
+}
 
 /// DEFAULT ON since 2026-08-28, on the measurement: over the 49-program suite,
 /// interleaved, EXEC geomean 1.0231 → 1.0181 with this row added to the
@@ -132,7 +145,7 @@ fn analyze(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest, li: usize) -> Option<Pl
     }
     let latch = l.latches[0];
     let body: Vec<BlockId> = l.body.clone();
-    if body.iter().map(|&b| f.blocks[b as usize].insts.len()).sum::<usize>() > MAX_BODY {
+    if body.iter().map(|&b| f.blocks[b as usize].insts.len()).sum::<usize>() > max_body() {
         return why("body-too-big");
     }
     // THE GUARD, wherever it sits. A rotated loop tests at the LATCH — `p+s < K`
@@ -222,6 +235,51 @@ fn analyze(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest, li: usize) -> Option<Pl
             }
         }
     }
+    // NOTHING THE LOOP DEFINES MAY BE READ OUTSIDE IT. HIR scopes a value by
+    // dominance, so a block after the loop can name a parameter or an
+    // instruction of the loop directly; after unrolling, the value that reaches
+    // that block is the LAST copy's, and every earlier exit would need its own
+    // version merged in — SSA reconstruction this row does not do. `20071029-1`
+    // is the case that proves the refusal is not theoretical: a counter read
+    // after its loop turned into copy 0's literal and the program aborted.
+    let inside: std::collections::HashSet<BlockId> = body.iter().copied().collect();
+    let mut defined: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+    for &bb in &body {
+        for prm in &f.blocks[bb as usize].params {
+            defined.insert(*prm);
+        }
+        for inst in &f.blocks[bb as usize].insts {
+            if let Some(d) = inst.dst() {
+                defined.insert(d);
+            }
+        }
+    }
+    let mut escapes = false;
+    for (bi, blk) in f.blocks.iter().enumerate() {
+        if inside.contains(&(bi as BlockId)) {
+            continue;
+        }
+        for inst in &blk.insts {
+            inst.uses(|o| {
+                if let Operand::Val(x) = o {
+                    if defined.contains(&x) {
+                        escapes = true;
+                    }
+                }
+            });
+        }
+        blk.term.uses(|o| {
+            if let Operand::Val(x) = o {
+                if defined.contains(&x) {
+                    escapes = true;
+                }
+            }
+        });
+    }
+    if escapes {
+        return why("value-read-after-the-loop");
+    }
+
     let (mut v, step) = (start?, step?);
     if step <= 0 || v >= limit {
         return why("start-or-step");
@@ -229,7 +287,7 @@ fn analyze(f: &Func, c: &dom::Cfg, lf: &dom::LoopForest, li: usize) -> Option<Pl
     let mut values = Vec::new();
     while v < limit {
         values.push(v);
-        if values.len() as i64 > MAX_TRIPS {
+        if values.len() as i64 > max_trips() {
             return None;
         }
         v += step;
@@ -272,10 +330,12 @@ fn apply(f: &mut Func, p: &Plan) {
     // edge.
     let mut headers = vec![p.header];
     let mut latches = vec![p.latch];
+    let mut owned = vec![p.body.clone()];
     for _ in 1..p.values.len() {
-        let (h, l) = clone_body(f, p);
+        let (h, l, blocks) = clone_body(f, p);
         headers.push(h);
         latches.push(l);
+        owned.push(blocks);
     }
     let last = p.values.len() - 1;
 
@@ -283,7 +343,7 @@ fn apply(f: &mut Func, p: &Plan) {
         let (h, latch) = (headers[c], latches[c]);
         // The counter is this copy's constant everywhere inside the copy.
         let param = f.blocks[h as usize].params[p.counter];
-        substitute(f, param, Operand::Imm(p.values[c]));
+        substitute(f, &owned[c], param, Operand::Imm(p.values[c]));
 
         match p.guard {
             // Unrotated: the header's test is decided (true — the analysis built
@@ -327,11 +387,20 @@ fn apply(f: &mut Func, p: &Plan) {
     }
 }
 
-/// Replace every use of `v` by `k`, everywhere. `v` is a header parameter whose
-/// value this copy has decided, and a parameter is in scope only inside the loop
-/// it heads, so a whole-function walk touches nothing else.
-fn substitute(f: &mut Func, v: ValueId, k: Operand) {
-    for b in f.blocks.iter_mut() {
+/// Replace every use of `v` by `k` INSIDE the given blocks.
+///
+/// The first cut walked the whole function on the claim that a header parameter
+/// is in scope only inside its loop. That claim is false: HIR scopes a value by
+/// DOMINANCE, so any block the header dominates may read the parameter, and the
+/// blocks after the loop are exactly such blocks. `gcc.c-torture` case
+/// `20071029-1` caught it — a counter read after its loop became copy 0's
+/// literal, and the program aborted where -O0 and gcc -O1 both returned 0.
+/// `analyze` now refuses a loop whose values are read outside it, and this walk
+/// is confined to the copy regardless: two fences, because the one that failed
+/// was an argument rather than a check.
+fn substitute(f: &mut Func, blocks: &[BlockId], v: ValueId, k: Operand) {
+    for bi in blocks.iter().map(|&b| b as usize) {
+        let b = &mut f.blocks[bi];
         for inst in b.insts.iter_mut() {
             inst.uses_mut(|o| {
                 if matches!(*o, Operand::Val(x) if x == v) {
@@ -404,8 +473,9 @@ fn retarget_latch(f: &mut Func, latch: BlockId, h: BlockId, next: Option<BlockId
 }
 
 /// One more copy of the loop's blocks, with fresh values. Returns the copy's
-/// header and latch.
-fn clone_body(f: &mut Func, p: &Plan) -> (BlockId, BlockId) {
+/// header, its latch, and the blocks it owns — the last so the constant
+/// substitution stays inside the copy that decided it.
+fn clone_body(f: &mut Func, p: &Plan) -> (BlockId, BlockId, Vec<BlockId>) {
     let mut bmap: HashMap<BlockId, BlockId> = HashMap::new();
     for &b in &p.body {
         let nb = f.new_block();
@@ -464,7 +534,9 @@ fn clone_body(f: &mut Func, p: &Plan) -> (BlockId, BlockId) {
         }
         f.blocks[nb as usize].term = t;
     }
-    (bmap[&p.header], bmap[&p.latch])
+    let mut owned: Vec<BlockId> = bmap.values().copied().collect();
+    owned.sort();
+    (bmap[&p.header], bmap[&p.latch], owned)
 }
 
 fn set_dst(inst: &mut Inst, nv: ValueId) {

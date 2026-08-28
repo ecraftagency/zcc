@@ -63,12 +63,13 @@ pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String
     // optimized when it is spliced in (its locals promoted, its constants
     // folded), and the caller must be re-optimized afterwards, because a call
     // replaced by a body is exactly the shape the other rows feed on.
-    if on("inline") && inline::run_module(m, pinned) {
+    if on("inline") && timed("inline", || inline::run_module(m, pinned)) {
         let ro = readonly(m);
         for f in m.funcs.iter_mut() {
             run_with(f, &ro);
         }
     }
+    report_ladder();
 }
 
 fn readonly(m: &Module) -> std::collections::HashSet<String> {
@@ -97,58 +98,58 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     for _ in 0..ROUNDS {
         let mut changed = false;
         if on("cfg") {
-            changed |= cfg::run(f);
+            changed |= timed("cfg", || cfg::run(f));
         }
         if on("sroa") {
-            changed |= sroa::run(f);
+            changed |= timed("sroa", || sroa::run(f));
         }
         if on("sccp") {
-            changed |= sccp::run(f);
+            changed |= timed("sccp", || sccp::run(f));
         }
         // AFTER sccp: a value the point lattice settles is an interval of one,
         // so the cheaper analysis goes first and this one reasons about what is
         // left. BEFORE gvn, which is what removes the comparisons this decides.
         if on("vrp") {
-            changed |= vrp::run(f);
+            changed |= timed("vrp", || vrp::run(f));
         }
         if on("gvn") {
             changed |= fold::canon(f);
             changed |= fold::narrow_mask(f);
-            changed |= gvn::run(f);
+            changed |= timed("gvn", || gvn::run(f));
         }
         if on("mem") {
-            changed |= mem::run(f);
+            changed |= timed("mem", || mem::run(f));
         }
         if on("ifconv") {
-            changed |= ifconv::run(f);
+            changed |= timed("ifconv", || ifconv::run(f));
         }
         // Rotation runs BEFORE licm, not after: a bottom-tested loop is what
         // makes "the loop runs at least once" structural rather than
         // arithmetic, and that is the fence licm's call hoist was refusing on.
         if on("rotate") {
-            changed |= rotate::run(f);
+            changed |= timed("rotate", || rotate::run(f));
         }
         // BEFORE licm and the IV rows: unrolling decides a guard and deletes a
         // back edge, so what it leaves is straight-line code those rows can see
         // through — and a loop it removes is one they no longer have to reason
         // about.
         if on("unroll") {
-            changed |= unroll::run(f);
+            changed |= timed("unroll", || unroll::run(f));
         }
         if on("licm") {
-            changed |= licm::run_with(f, ro);
+            changed |= timed("licm", || licm::run_with(f, ro));
         }
         // AFTER licm and rotation: the loop must already be in its final shape,
         // because the recurrence this reads is a property of that shape. Before
         // dce, which is what removes the address chain it replaces.
         if on("iv") {
-            changed |= iv::run(f);
+            changed |= timed("iv", || iv::run(f));
         }
         // Widening is a SEPARATE row from the pointer walk above and is ON: it
         // removes the per-iteration `sxtw` that stands between an `a[i]` loop
         // and gcc's (§13l).
         if on("widen") {
-            changed |= iv::widen(f);
+            changed |= timed("iv", || iv::widen(f));
         }
         // IV SUBSTITUTION is a third row again (§13q ii): `widen` removes a
         // `sxtw` from an `a[i]` loop, this removes the ADD that rebuilds
@@ -156,18 +157,18 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // `widen`, because a loop whose counter already feeds a `sext` belongs
         // to that row and this one refuses it.
         if on("subst") {
-            changed |= iv::substitute(f);
+            changed |= timed("iv", || iv::substitute(f));
         }
         // LAST of the IV rows, because it DESTROYS the index: once the loop
         // counts down, `widen` and `substitute` have nothing left to recognize.
         if on("countdown") {
-            changed |= iv::countdown(f);
+            changed |= timed("iv", || iv::countdown(f));
         }
         if on("sink") {
-            changed |= sink::run(f);
+            changed |= timed("sink", || sink::run(f));
         }
         if on("dce") {
-            changed |= dce::run(f);
+            changed |= timed("dce", || dce::run(f));
         }
         if !changed {
             break;
@@ -191,6 +192,50 @@ fn on(name: &str) -> bool {
         Ok(v) => !v.split(',').any(|x| x == name),
         Err(_) => true,
     }
+}
+
+/// WHAT EACH ROW OF THE LADDER COSTS, under `ZCC_TIME`.
+///
+/// Turning a row off and timing the difference does not answer this: a row that
+/// is off leaves more code for every row after it, so the deltas are confounded
+/// and can even come out negative (removing `cfg` makes this compile SLOWER).
+/// The honest instrument is a clock around each row, summed over every function.
+/// It is off unless `ZCC_TIME` is set, and the row below it reads the same
+/// environment variable the pipeline's stage timers already use.
+thread_local! {
+    static LADDER: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    if std::env::var_os("ZCC_TIME").is_none() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    let d = t.elapsed();
+    LADDER.with(|l| {
+        let mut l = l.borrow_mut();
+        match l.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, acc)) => *acc += d,
+            None => l.push((name, d)),
+        }
+    });
+    r
+}
+
+/// Print the per-row totals, worst first. Called once the module is done.
+pub fn report_ladder() {
+    if std::env::var_os("ZCC_TIME").is_none() {
+        return;
+    }
+    LADDER.with(|l| {
+        let mut rows = l.borrow().clone();
+        rows.sort_by_key(|(_, d)| std::cmp::Reverse(*d));
+        for (n, d) in rows {
+            eprintln!("[ladder] {:<10} {:>8.1} ms", n, d.as_secs_f64() * 1e3);
+        }
+    });
 }
 
 // ── shared plumbing every pass needs ───────────────────────────────────────

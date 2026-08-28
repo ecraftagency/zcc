@@ -158,6 +158,50 @@ fn cfg_simplify_keeps_a_labelled_block_addressable() {
     square(src, 7);
 }
 
+// ── unroll ─────────────────────────────────────────────────────────────────
+
+/// THE SQUARE `⟦f⟧ = ⟦unroll f⟧`, and its non-vacuity beside it.
+///
+/// A loop of two literal trips becomes two copies of its body with the counter
+/// substituted; the meaning is the iterations it replays, in the same order, so
+/// the answer may not move. The second half of the test is the one that keeps
+/// the first honest: a pass that fired on nothing would satisfy any equality,
+/// so the loop must actually be GONE — no back edge left in the function.
+#[test]
+fn unroll_replays_the_same_iterations() {
+    // 2 trips, one accumulator, and a body small enough for the budget
+    let src = "int f(int *a){int i,s=0;for(i=0;i<2;i++)s+=a[i]*(i+1);return s;}\
+               int main(void){int a[2];a[0]=5;a[1]=7;return f(a);}";
+    square(src, 19); // 5*1 + 7*2
+
+    let back_edges = |f: &Func| {
+        let c = super::dom::cfg(f);
+        let dt = super::dom::domtree(f, &c);
+        (0..f.blocks.len())
+            .filter(|&b| {
+                c.succs[b].iter().any(|&s| dt.dominates(s, b as BlockId))
+            })
+            .count()
+    };
+    let with = module(src, true);
+    assert_eq!(
+        back_edges(func(&with, "f")),
+        0,
+        "the loop survived: the square above would be vacuous"
+    );
+
+    // …and the shape the fence exists for. `gcc.c-torture` 20071029-1 found it:
+    // a value the loop defines, read AFTER the loop through HIR's dominance
+    // scoping rather than through an exit argument, became copy 0's version and
+    // the program aborted where -O0 and gcc -O1 both returned 0. A `goto` loop
+    // reproduces that scoping, and the answer is the whole assertion — whether
+    // the row unrolls this or refuses it, 59 is what it must print.
+    let escapes = "int f(int *a){int i=0,s=0,t=0;\
+                   loop: t=a[i]*3; s+=t; i++; if(i<2) goto loop; return s+t+i;}\
+                   int main(void){int a[2];a[0]=5;a[1]=7;return f(a);}";
+    square(escapes, 59); // (5+7)*3 + 7*3 + 2
+}
+
 // ── sccp ───────────────────────────────────────────────────────────────────
 
 #[test]

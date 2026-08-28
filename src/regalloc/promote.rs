@@ -45,6 +45,7 @@ const MIN_RELOADS: usize = 3;
 /// this off around its count, in the thread it runs in, rather than through an
 /// environment variable two parallel tests would share.
 thread_local! {
+    // THEORY A7 — instrument half, as `RECONSTRUCT` and `PRUNE` in `spill.rs`.
     static PROMOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 

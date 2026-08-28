@@ -60,7 +60,7 @@ pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
     for li in order {
         let body: Vec<BlockId> = lf.loops[li].body.clone();
         let header = lf.loops[li].header;
-        let pre = match preheader_of(f, &c, header) {
+        let pre = match preheader_of(f, &c, &dt, header) {
             Some(p) => p,
             None => continue,
         };
@@ -323,7 +323,12 @@ fn hoist_call(
     }
     f.blocks[b as usize].insts.remove(i);
     f.blocks[pre as usize].insts.push(inst);
-    refresh_defs(f);
+    // Only two blocks moved: `b`, whose instructions after `i` shifted down, and
+    // `pre`, which gained one at the end. The whole-function version costs O(N)
+    // per hoisted call inside a `while hoist_call(..)` loop — the same defect the
+    // scalar hoist above already had, and fixed the same way.
+    super::refresh_block_defs(f, b);
+    super::refresh_block_defs(f, pre);
     true
 }
 
@@ -450,8 +455,13 @@ fn hoistable(
 
 /// The block that falls into `header` from outside the loop, when there is
 /// exactly one such edge and its source has this header as its only successor.
-fn preheader_of(f: &Func, c: &dom::Cfg, header: BlockId) -> Option<BlockId> {
-    let dt = dom::domtree(f, c);
+///
+/// The dominator tree is HANDED IN rather than built. Building one here costs a
+/// whole-function analysis per loop, for a tree the caller already holds and
+/// which cannot have changed — `preheaders` runs before the loop below and
+/// nothing inside it touches the graph.
+fn preheader_of(f: &Func, c: &dom::Cfg, dt: &dom::DomTree, header: BlockId) -> Option<BlockId> {
+    let _ = f;
     let outside: Vec<BlockId> = c.preds[header as usize]
         .iter()
         .copied()

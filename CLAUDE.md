@@ -1,12 +1,12 @@
 # zcc — Project Charter
 
-zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external crates. Terminology stays English. This file is the constitution: the laws, then the supporting articles — each an amendment with detail offloaded to its own document. Only Laws 0–3 and **Law 3c** carry the word **law**; the rest are mechanisms.
+zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external crates. Terminology stays English. This file holds the project's standing rules: the laws first, then the articles that support them, each with its detail offloaded to its own document. Only Laws 0–3 and **Law 3c** carry the word **law**; the rest are mechanisms.
 
-> **⚠️ AWS OPERATIONAL SAFETY (2026-08-26, after a real incident) — READ BEFORE ANY `aws` / terraform COMMAND.** `ap-southeast-1` (Singapore) is the user's **PRODUCTION** region — many live servers run there (`da09-*` and others). **NEVER create, modify, stop, terminate, cancel, or destroy ANY resource in `ap-southeast-1`.** All zcc fuzz-box work lives ONLY in **`us-east-2`** (the cheapest Graviton `c7g` spot region — the user's deliberate choice). The `aws` CLI default region on this machine is `ap-southeast-1`, so **ALWAYS pass `--region us-east-2` explicitly** on every AWS/terraform command, and **verify tags AND region before ANY destructive call.** (Root cause of the incident: an unqualified `aws ec2` audit defaulted to `ap-southeast-1`, a persistent spot request there was mistaken for a zcc leftover, and a production `da09-dev` instance was wrongly terminated. Data volume survived; the instance did not.)
+**THIS FILE CARRIES NOTHING THAT CHANGES ACROSS A PHASE OR A MILESTONE.** That is the whole test, and it is a test about the line's LIFETIME, not its subject: if a milestone can make the line wrong, it belongs in a document the Index names, never here. Measurements, ratios, statuses, commits, tags, branch names, plan positions and date-stamped findings all fail it by construction — every one of them is true only on the day it was written, and a stale rule is worse than no rule because it is still obeyed. What stays is what remains true whatever the numbers do. A line that would need editing after a good session does not belong here.
 
-> **`[branch = `mir-rearch`]` BOOT OVERRIDE (2026-08-24, user re-plan) — READ THIS BEFORE THE PARAGRAPH BELOW.** On branch `mir-rearch` (the repository DEFAULT; `main` is frozen at tag `rc3` and is not to be touched), the plan of record is **`REARCH.md`**, not `OPT.md`. The whole layer below `src/ast.rs` was deleted and rewritten: `ir.rs`, `opt/`, `codegen/` no longer exist, and every reference to them in the paragraph below describes a DEAD architecture. **BOOT on this branch:** read `REARCH.md` §0, then resume at the first `⬜` in its §12 milestone ladder (R0–R5). The prompts "execute the plan" / "continue" / "resume" / "go R<n>" all mean THAT ladder; they do NOT mean `OPT.md §0`, whose spine row #25 `REARCH.md` supersedes. What still binds in full from the paragraph below and from the Laws and Articles above: Laws 1–3 (+ Law-4 exhaustion), Articles A–G, THE ULTIMATUM (1× vs gcc-O1 on BOTH size and speed, verification never traded for a number), the anti-fragmentation rule (edit the spine table IN PLACE; never author a new numbering), the NO-PIVOT contract, and the measurement method (paired INSN+EXEC, distribution not a single number, the gcc-zeroed bucket). What does NOT bind: the OPT.md lever spine, the #17→#24 grind, and "`main` **is** the optimizer".
+> **⚠️ AWS OPERATIONAL SAFETY only operation on **`us-east-2` region
 
-> **`[optimizer = `main`]` override (SUPERSEDED on `mir-rearch` by the block above; still governs `main`/`edu`) — the optimizer (formerly the `ssa-qbe` fork) was PROMOTED to `main` on 2026-08-24; the zcc-slim SEAL edu compiler is preserved verbatim on the `edu` branch. This override governs `main`; `edu` keeps the pre-optimizer body.** The two-fact model is literal: `[THEORY.md, SEMANTICS.md]` (Side I) ⊕ `[iso/os/arch/gnu specs]` (Side II) **is** the source of zcc; `src/*.rs` is its *compiled object*. `main` **is** the optimizer. **THE ULTIMATUM (FINAL GOAL): match `gcc -O1` on BOTH binary size AND exec speed (geo40) — 1× on BOTH axes is the STOPPING POINT (điểm dừng): not O2, not O3, and not stopping at one axis — with correctness-by-construction INTACT (every pass ships its commuting-square / translation-validation proof, Law 3; formal verification is never traded for a number).** No toy compiler has reached O1 parity on both; that is the finish line, after which the optimizer is DONE. The fork suspends two clauses of Article B — nothing else: "-O0 / no optimization pass" → SUSPENDED (the fork's purpose is `opt.rs` + `OPT.md`; every pass ships under the CbC gate of Law 3); **"LOC ceiling" → REMOVED entirely for this fork** — the hard LOC number is dropped (it caused doc/context churn with zero correctness value); minimal-LOC survives only as design taste, **never a tracked budget or number to re-count**. Laws 1–3, architecture, driver, extension, and the test gate remain in full force. **TARGET METRIC (2026-08-24 pivot): the finish-line is EXEC SPEED vs gcc-O1 = geomean over the 35-program taxonomy suite ("geo40"), NOT the 4-kernel number ("geo4", a best-case mirage); SIZE follows as a byproduct, it is not the goal.** The ONE plan + scoreboard: **`OPT.md §0` = THE SUPREME PLAN** (parallel to these Laws — a single numbered spine `[1…25]`, nuclear #25 LAST, each row tagged SIZE/SPEED/BOTH, status = the resume memory). **EXECUTION DISCIPLINE (mechanism, not a law — the anti-drift lock): the optimization plan is THE SUPREME PLAN in `OPT.md §0`. BOOT — the user prompt "execute the plan" (or continue/resume/grind) means: read §0, resume at the spine's first `⬜`, run the ONE iteration process (predict Δ on the cost-model → implement + ship its commuting-square/translation-validation inline test → FULL GATE cargo+torture+opt-parity+csmith300+yarpgen300 → re-measure geo40 → bank/quarantine → advance). AUTONOMOUS GRIND MODE (standing user directive): grind rows #17→#24 to completion across context resets WITHOUT checking in, push after each bank; HARD STOP only at #25 (nuclear — wait for the user to type "go nuclear"; never start it autonomously) or when no `⬜` remains. ANTI-FRAGMENTATION LAW: never author a new numbering in a new section (that drift — old `[0-9]`→Phases→batches — is why we lost the thread); to change the plan you EDIT THE SPINE TABLE IN PLACE. The NO-PIVOT contract binds: a low yield, a miscompile, or a BLOCKER NEVER authorizes a new direction. A blocker (wall on lever N — can't-green / won't-fire / needs-missing-infra) is QUARANTINED to lever N: one bounded Law-2 attempt, else revert-that-lever-to-green, mark `BLOCKED: <reason>`, bank any positive, ADVANCE to N+1. Coming back to ask the user "should we try another branch?" IS the collapse and is forbidden — a blocker produces only quarantine-mark-advance, never a request for a new direction. Proposing a new lever/re-sequence is forbidden without the user typing "re-plan". Bank every positive ≥0.5%; if real yield <20% of ceiling, exactly ONE review-push round, then advance. "Done" = the full gate green + number recorded + committed, never the AI's feel. Tripwire: user pastes `OPT.md lever N — stick or amend?` to force the AI back to the ledger.**
+> **⚠️ EVERY SCRIPT RUNS DETACHED, NOTIFIED ABLE, PROGRESS CHECKABLE, ON EITHER BOX — and NOTHING WATCHES IT. The completion notice is the signal; a second process that sleeps and greps competes with the run it is watching and quietly corrupts every timing taken beside it. To look in mid-run, read the output file once.
 
 ## Law 0 — PURITY IS THE PRECONDITION (standing order, 2026-08-26)
 
@@ -78,41 +78,33 @@ address or a loop-carried value when a one-cycle operation computes the same
 thing: `madd` on a strided address → `add`; `add …, w, sxtw` → `ldrsw` + `add`;
 `mul` by a constant → shift-and-add.
 
-**Measured, not asserted** — both halves of the claim, on this target:
-
-| case | instruction count | what actually differed | ratio vs gcc -O1 |
-|---|---|---|---|
-| `loops.c` | 24 → 22 | `mul`+`add` → `madd` on the master recurrence | 1.245 → **0.905** |
-| `matmul.c` | 7 → 7, **unchanged** | `madd` address → `add #1920` | 1.638 → **1.000** |
-
-matmul is the pure form: identical count, 64% slower, because a multiply stood
-at the head of a chain ending in a strided load. `MEASURED M1` and `MEASURED M9`
-are the facts; `REARCH.md` §13q is the derivation and R4.18 is the row that
-builds the model.
+**Measured, not asserted.** The law was not reasoned into this file; it
+was forced by a kernel that reached parity at an instruction count that did not
+change at all, because a multiply had stood at the head of a chain ending in a
+strided load. `MEASURED.md` holds that case and the latency table it rests on,
+and `REARCH.md` holds the derivation and the row that builds the model.
 
 **Law-4 dual (exhaustion).** A row is exhausted only when no remaining site
 trades chain length for instruction count. A residual measured on `cost = |MIR|`
 alone cannot see this class, so it does not discharge Law 4 for a codegen row.
 
-**WHAT MAY BE CLAIMED, and it is not what the number says** (user, 2026-08-26).
-THE ULTIMATUM names 1× against gcc -O1 as the stopping point. A measured 1× on
-the current surface does NOT establish it. The surface is 35 kernels that fit in
-L1i plus one real program, and it is narrow in nameable ways: no FP-heavy
-numerics, no large working sets, no deep call graphs or indirect dispatch, no
-varargs- or bitfield-heavy code, ONE microarchitecture, one input size per
-program, and `sqlite` is the only member with real register pressure. It is
-under a tenth of the spectrum, so a geomean over it is evidence about ITS
-members first.
+**WHAT MAY BE CLAIMED, and it is not what the number says.** Parity against
+gcc -O1 is the stopping point, and a measured parity on the suite of the day
+does NOT establish it. The suite is always narrower than the language: whole
+classes go unsampled — heavy floating point, working sets past cache, deep call
+graphs and indirect dispatch, varargs and bitfields — and it runs on ONE
+microarchitecture at one input size per program. A geomean over it is evidence
+about ITS members first.
 
-Therefore: **0.9× is the safe margin for claiming parity, and even then the
-claim is "matches gcc -O1 ON THIS SUITE, ON THIS CORE" — never "matches
-gcc -O1".** The margin is not padding; it is coverage insurance, the amount by
-which the sampled 10% must win before the unsampled 90% is unlikely to flip the
+Therefore parity is claimed only with a **margin**, and even then the claim
+names the suite and the core it was taken on — never "matches gcc -O1" plain.
+The margin is not padding; it is coverage insurance, the amount by which the
+sampled fraction must win before the unsampled remainder is unlikely to flip the
 sign. Compiler comparison is not a single number, and a compiler that announces
 parity from a narrow suite has mis-stated its own result, which is a Law-0
 failure (a claim bought at the cost of its provenance) rather than a small one.
 
-The surface is to be WIDENED — 100-200 programs — and the two instruments do
+The surface is to be WIDENED, and the two instruments do
 different jobs: **csmith finds CLIFFS** (run many, report only the tail where
 zcc/gcc exceeds a threshold; it is a discovery engine pointed at time instead of
 correctness, and it is already in the gate), while **real programs carry the
@@ -157,9 +149,9 @@ Extension logic lives in **`src/ext.rs`**; the core only calls `ext_*`. Unfactor
 - **Clean-input** — a green verdict is valid only with a mechanical evidence trail (N binaries + bytes + exit codes), never a bare pass/fail number. Abnormal timing is measured, not guessed.
 - **Numeric-provenance** — every number derives from a stated premise.
 - **Byte-identical gate** — pure code motion (file splits, helper extraction, renames) is proven by `md5(.s)` over a fixed corpus held unchanged: identical bytes *are* the commuting-square `⟦f⟧=⟦refactor f⟧`, confirming not discovering. `tests/refactor_gate.sh`; corpus + rationale in `tests/README.md`.
-- **Resource-fidelity** `[main]` (the dual of the commuting-square, for *performance*-theorems) — the commuting-square certifies a pass is *correctness*-faithful (`⟦f⟧=⟦f'⟧`); this gate certifies it is *realization*-faithful. A performance-pass (allocation, LICM, strength-reduction, scheduling) must declare (a) the hardware ultimate-fact it exploits, as a **spec citation** (e.g. AAPCS64 §6.1.1 register table), and (b) that it is instantiated over the **full** fact, not a convenient truncation. Every resource-constant (`k`, spill-threshold, issue-width) is either the **spec's number** or carries a dated justification for the gap. The mandatory question for each: **"is this the spec's number, or my convenience's number?"** — a truncation posing as a Side-II constant is a **Law-1 violation** (algorithm not faithfully realizing its side) catchable as a **Law-2 Side-II defect**, *not* a missing "improvement law": improvement stays inside Law 1's "faithfully realizes" clause, measured against the full ultimate-fact. (This is Law 3's "certify at the middle" extended from the correctness-theorem to the cost-theorem. Worked example — `GP_BUDGET.k=10` vs AAPCS64's ~18 leaf-usable GPRs — in `OPT.md`.)
-- **Determinism seal** `[mir-rearch]` — identical IR ⟹ identical bytes, checked by compiling each corpus program in several FRESH processes so a per-process hash seed cannot leak into the output: `tests/determinism.sh`. Distinct from the byte-identical refactor gate, which only compares across a refactor.
-- Full text of the correctness five + recorded traps: **`tests/README.md`**. Argument-offset lives in **two** byte-identical places `[mir-rearch]` — `isel/abi.rs` and the parser's `va_off` — edit both, then run `abi.sh`. (rc3 had a third, the codegen spill path; the parallel-copy call model removed it.)
+- **Resource-fidelity** (the dual of the commuting-square, for *performance*-theorems) — the commuting-square certifies a pass is *correctness*-faithful (`⟦f⟧=⟦f'⟧`); this gate certifies it is *realization*-faithful. A performance-pass must declare (a) the hardware ultimate-fact it exploits, as a **spec citation**, and (b) that it is instantiated over the **full** fact, not a convenient truncation. Every resource-constant is either the **spec's number** or carries a dated justification for the gap. The mandatory question for each: **"is this the spec's number, or my convenience's number?"** — a truncation posing as a Side-II constant is a **Law-1 violation** (algorithm not faithfully realizing its side) catchable as a **Law-2 Side-II defect**, *not* a missing "improvement law": improvement stays inside Law 1's "faithfully realizes" clause, measured against the full ultimate-fact. (This is Law 3's "certify at the middle" extended from the correctness-theorem to the cost-theorem.)
+- **Determinism seal** — identical IR ⟹ identical bytes, checked by compiling each corpus program in several FRESH processes so a per-process hash seed cannot leak into the output. Distinct from the byte-identical refactor gate, which only compares across a refactor.
+- Full text of the correctness five + recorded traps: **`tests/README.md`**, which also names every place a spec constant is duplicated and the gate that proves the copies agree.
 
 ## Article F — ABI
 
@@ -181,6 +173,7 @@ Every operation is subordinate to Laws 1–3 + THE ULTIMATUM and must leave CbC 
 - **`MEASURED.md`** — target facts with no spec to cite (no vendor optimization
   guide exists for this core): value, method, date, machine, and what reads it.
   Cited from code as `MEASURED M<n>`, exactly as spec is cited as `THEORY II-<n>`.
-- **`REARCH.md`** `[mir-rearch]` — **the plan of record on this branch**: §0 boot, §2 layer map, §3–§9 the layers, §10 proof map + cost model, §12 the R0–R5 milestone ladder (status lives THERE, edited in place), §13 rc3 baselines, §14 decision log, §16 the O2 headroom shelf, §17 the arm64 isel exhaustion checklist.
-- **`OPT.md`** `[main]` — the transient execution plan + work-booking: the SUPREME PLAN spine (§0) · scoreboard · done-ledger · next-gate · runner/harness/loop-engineering. Deleted at opt-end; durable theorems cook into `THEORY.md`/`SEMANTICS.md`.
+- **`REARCH.md`** — the plan of record: the layer map, the layers themselves, the
+  proof map and cost model, the milestone ladder whose status is edited in place,
+  the baselines and the decision log. Boot here and resume at its first open row.
 - **`src/ext.rs` + `grep 'EXT(' src/`** — the entire current deviation surface.
