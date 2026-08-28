@@ -60,7 +60,21 @@ fn same_side(src: &str, opt: bool) {
             "⟦mir_v⟧ = {} but ⟦mir_p⟧ = {}\n{}",
             a as i32, b as i32, src
         ),
-        (Err(_), _) => {}
+        // A TRAP ON THE LEFT USED TO PASS SILENTLY, and that is a green test
+        // that checked nothing: if `⟦mir_v⟧` never produced an answer, no
+        // equality was ever compared and the allocator could have emitted
+        // anything at all. The shape that produces it is an undefined callee —
+        // both interpreters trap, both sides "agree", the case is vacuous.
+        // Audited 2026-08-29 with the branch instrumented: ZERO of the battery's
+        // cases reach it, so making it a failure costs nothing today and stops
+        // the next case that would have been written this way from being
+        // counted as evidence (Law 0: a green that cannot distinguish correct
+        // from absent is not evidence).
+        (Err(e), _) => panic!(
+            "⟦mir_v⟧ trapped ({:?}) — this case proves nothing about the allocator.\n\
+             Define every callee the program names, so both sides produce a value.\n{}",
+            e, src
+        ),
         (Ok(a), Err(e)) => panic!("⟦mir_p⟧ trapped ({:?}), ⟦mir_v⟧ = {}\n{}", e, a as i32, src),
     }
 }
@@ -726,7 +740,14 @@ fn residency_carries_across_the_back_edge() {
 /// arguments are already the values the callee wants.
 #[test]
 fn abi_boundary_truncation_leaves_no_instruction() {
-    let src = "int h(int,int,int);\n\
+    // `h` is DEFINED, and defined with a loop: an undefined callee traps
+    // `⟦mir_v⟧` and makes `same` prove nothing, while a small defined one would
+    // be inlined by the ladder and dissolve the very ABI boundary this test
+    // exists to measure. A loop puts it past the inliner's size rule and leaves
+    // five real call sites (audited 2026-08-29).
+    let src = "int h(int x,int y,int z){int i,s=0;\n\
+               for(i=0;i<3;i++) s += (x^i) + (y*2) + (z>>1);\n\
+               return s;}\n\
                int main(void){\n\
                int a=3,b=5,c=7,s=0;\n\
                s+=h(a,b,c); s+=h(b,c,a); s+=h(c,a,b);\n\

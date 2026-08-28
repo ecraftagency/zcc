@@ -22,8 +22,17 @@ python3 tests/gen_decay.py "$D"
 cc -std=c99 -w -O0 "$D/decay_t.c" -o "$D/dc"
 "$D/dz" > "$D/out_zcc.txt"
 "$D/dc" > "$D/out_cc.txt"
+# CLEAN-INPUT LAW (MECHANISM.md Part A): two EMPTY outputs also compare equal.
+# If the generator ever stops emitting observations — a rewrite, a silent Python
+# failure, a filter that matches nothing — this gate would print PASS while
+# testing zero lvalue conversions. The count is what makes the verdict evidence.
+N=$(wc -l < "$D/out_cc.txt" | tr -d ' ')
+if [ "$N" -eq 0 ]; then
+    echo "DECAY FAIL: the generator produced NO observation — nothing was compared"
+    exit 1
+fi
 if diff -u "$D/out_cc.txt" "$D/out_zcc.txt" > "$D/d.txt"; then
-    echo "DECAY PASS ($(wc -l < "$D/out_cc.txt" | tr -d ' ') differential lines match)"
+    echo "DECAY PASS ($N differential lines match)"
 else
     head -40 "$D/d.txt"
     echo "DECAY FAIL"

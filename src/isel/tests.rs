@@ -54,6 +54,22 @@ fn equiv_side(src: &str, opt: bool) {
         }
         // A trap is ⊥ on both sides; the machine layer may refine it (A64 `sdiv`
         // by zero yields 0 where C says undefined), so only HIR trapping matters.
+        // ⊥ ON THE LEFT, AND WHICH KIND OF ⊥ DECIDES WHETHER THE CASE IS
+        // EVIDENCE. A trap the SOURCE earns — a division by zero, a null
+        // dereference, a run past the step budget — is ⊥ in the semantics and
+        // the machine layer is free to refine it (A64 `sdiv` by zero yields 0
+        // where C99 6.5.5p5 says undefined), so the pair proves what it can and
+        // the case stands. `NoSuchFunction` is not that: it says the PROGRAM
+        // NAMES A CALLEE THE TEST NEVER WROTE, so neither interpreter ran the
+        // code the case was about and no equality was ever compared. That is a
+        // green test that checks nothing, and it is indistinguishable from a
+        // passing one unless it is separated here (Law 0; the same audit found
+        // one in `regalloc::tests`, 2026-08-29).
+        (Err(crate::mem::Trap::NoSuchFunction(n)), _) => panic!(
+            "⟦hir⟧ trapped: no function `{}` — this case proves nothing about isel.\n\
+             Define every callee the program names.\n{}",
+            n, src
+        ),
         (Err(_), _) => {}
         (Ok(a), Err(e)) => panic!("⟦mir⟧ trapped ({:?}) where ⟦hir⟧ = {:?}\n{}", e, a, src),
     }

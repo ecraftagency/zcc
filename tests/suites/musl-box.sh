@@ -70,7 +70,21 @@ printf 'CC = %s\nCFLAGS += -D_POSIX_C_SOURCE=200809L\nLDLIBS += -lpthread -lm -l
     "$ZCC" > config.mak
 ZCC_SYSROOT="$INST" make -k -j"${JOBS:-$(nproc)}" >/dev/null 2>&1 || true
 LC_ALL=C sh -c 'find src -name "*.err" -size +0c | sort' > ZCC-FAILS.txt
-echo "LIBC-TEST: $(wc -l < ZCC-FAILS.txt) err-file (list: $LT/ZCC-FAILS.txt)"
+# CLEAN-INPUT LAW (MECHANISM.md Part A). The verdict below used to be reached by
+# counting FAILURES alone, and `make -k ... || true` swallows every error — so a
+# build that produced NOTHING left zero `.err` files and this gate printed
+# MUSL-BOX PASS. That is the exact shape Article E forbids: a green with no
+# evidence that any work happened. The positive artifact count is that evidence.
+# Measured 2026-08-29 on a passing run: 479 linked test binaries from 464 source
+# files, 73 non-empty `.err`. The gate refuses at ZERO — the question it answers
+# is "did the compiler build anything at all", which needs no threshold and so
+# carries no unprovenanced constant.
+BUILT=$(find src -name '*.exe' | wc -l | tr -d ' ')
+echo "LIBC-TEST: $BUILT test binaries linked, $(wc -l < ZCC-FAILS.txt) err-file (list: $LT/ZCC-FAILS.txt)"
+if [ "$BUILT" -eq 0 ]; then
+    echo "MUSL-BOX FAIL: zcc linked NO libc-test binary — the build did not run, so the empty failure list proves nothing"
+    exit 1
+fi
 
 # ---- 5. differential vs the musl-gcc referee (if already built — see MECHANISM.md Part A)
 REF="$S/libc-test-ref/REF-FAILS.txt"
@@ -81,4 +95,7 @@ if [ -f "$REF" ]; then
 else
     echo "(no musl-gcc referee yet: apt musl-tools + build libc-test-ref)"
 fi
-echo "MUSL-BOX PASS"
+# The verdict CARRIES ITS EVIDENCE, as every other gate's does (`torture ... 1694
+# cases`, `cts ... 220 cases`): `fullsuite` prints only this last line, so a
+# count that lives anywhere else is a count nobody reads.
+echo "MUSL-BOX PASS ($BUILT test binaries linked from $(find src -name '*.c' | wc -l | tr -d ' ') sources, $(wc -l < ZCC-FAILS.txt) err-file)"

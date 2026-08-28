@@ -19,7 +19,13 @@ N="${1:-8}"
 OUT="$(mktemp -d)"
 md5f(){ md5 -q "$1" 2>/dev/null || md5sum "$1" | awk '{print $1}'; }
 progs=0 bad=0
-for c in "$ROOT"/tests/cases/*.c "$ROOT"/tests/bench/*.c "$ROOT"/tests/refactor_gate/stress/*.c; do
+# `tests/bench/suite` was NOT in this list until 2026-08-29, so the ninety-six
+# programs the speed scoreboard is taken from — the largest and most varied C in
+# the repository, and the only functions here big enough to make the allocator
+# spill — were never checked for emission determinism. A gate that omits the
+# hardest inputs proves the least about them (Article E: the science gate is
+# EXPANDED, never contracted).
+for c in "$ROOT"/tests/cases/*.c "$ROOT"/tests/bench/*.c "$ROOT"/tests/bench/suite/*.c "$ROOT"/tests/refactor_gate/stress/*.c; do
   [ -e "$c" ] || continue
   b="$(basename "${c%.c}")"
   first=""

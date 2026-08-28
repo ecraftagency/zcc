@@ -3506,6 +3506,72 @@ gcc 14.2.0 -O1, glibc (both sides link the same libc; `-S` counts user code only
 
 ---
 
+### M39. The gates audited against themselves — four ways to be green while checking nothing
+
+**WHY THIS AUDIT.** Law 0 ranks purity above every number, and this session had
+spent itself on exec and size. The question it left unasked is the one that
+matters most: **can any gate report PASS without having checked anything?** A
+compiler whose verdicts are hollow is worse than one with no verdicts, because
+the hollow ones are believed. Four holes were found, all four closed, and the
+method that found them is worth more than the holes.
+
+**FOUND 1 — `determinism.sh` never saw the speed suite.** It scanned
+`tests/cases`, `tests/bench/*.c` and `refactor_gate/stress`, and NOT
+`tests/bench/suite/`. So the 96 programs the scoreboard is taken from — the
+largest and most varied C in the repository, and the only functions big enough
+to make the allocator spill — had never been checked for emission determinism.
+**91 programs → 187.** Still green, which is the good outcome: the property held,
+it simply was not being asked.
+
+**FOUND 2 — `regalloc::tests::same` passed silently on a left-hand trap.** The
+match arm was `(Err(_), _) => {}`: if `⟦mir_v⟧` produced no answer, no equality
+was ever compared and the allocator could have emitted anything. Instrumenting
+the arm found **one** live case — `abi_boundary_truncation_leaves_no_instruction`
+calls `h`, which the test never defined. The structural half of that test (no
+`x16` cycle-break, no narrow self-move) was real; its `same()` call proved
+nothing. `h` is now defined, and defined WITH A LOOP so the inliner cannot
+dissolve the ABI boundary the test exists to measure. The arm is now a panic.
+
+**FOUND 3 — the same arm in `isel::tests::equiv`, and here the comment defending
+it was half right.** A trap the SOURCE earns — division by zero, a null
+dereference, the step budget — is ⊥ in the semantics and the machine layer may
+refine it, so the case still stands. `NoSuchFunction` is not that: it means the
+program names a callee the test never wrote, so neither interpreter ran the code
+in question. The two are now separated; zero cases were relying on it.
+
+**FOUND 4 — `musl-box.sh` could pass having built NOTHING.** `make -k … || true`
+swallows every error and the verdict counted only `.err` FILES, so a build that
+produced nothing left an empty failure list and printed MUSL-BOX PASS. The one
+application gate in the project could be green with no application compiled.
+Fixed with the positive artifact count Article E asks for: **479 test binaries
+linked from 464 sources, 73 err-files**, and a refusal at zero. `decay.sh` had
+the same shape — two empty outputs also compare equal — and now refuses at zero
+observations. Both verdicts now CARRY their evidence, because `fullsuite` prints
+only the last line and a count that lives anywhere else is a count nobody reads.
+
+**THE METHOD, and it is the transferable part.** Every one of these was found by
+asking a gate to prove it had done work, never by reading it for correctness.
+The mechanical form: instrument the branch that means "nothing was compared" and
+count how often it is taken; require a POSITIVE artifact count, not the absence
+of failures; and put the count in the verdict line.
+
+**AND THE AUDIT'S OWN TOOL LIED TWICE, which is the lesson underneath.** `grep
+SQUARE` over `src/` reported that regalloc — 5,573 LOC — had no commuting square
+at all, and the conclusion "build translation validation for the allocator" was
+one step away. It is false: `regalloc/verify.rs` states the obligation in its
+header and `regalloc/tests.rs` discharges it by running BOTH interpreters. What
+regalloc lacks is the WORD, not the proof. Minutes later `cargo test regalloc` —
+a name filter — reported zero vacuous cases, and the full run found one. **The
+instrument that audits the gates is itself un-audited**, and both errors ran in
+the same direction: they made the compiler look worse and would have bought
+weeks of rebuilding what exists. Presumption-of-guilt (Part A) applies to the
+auditor too.
+
+**WHEN / WHERE.** 2026-08-29, `main`. Gate 15/0 at FUZZ_N=300, 355 s wall;
+cargo 208/0.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
