@@ -19,6 +19,39 @@
 //       blocks are always executed in sequence, and S's parameters take `a` on
 //       the one edge that exists — so substituting a for them and concatenating
 //       is the same run.
+//   (h) THE COMPARE MOVES WITH IT (2026-08-28). (e) and (g) both demand an
+//       INSTRUCTION-FREE S, and the shape they are aimed at rarely is one: C
+//       gives `if (cmp_helper(a,b) < 0)` a join carrying -1, 0 or 1 and then a
+//       block that COMPARES that parameter before branching, so S holds exactly
+//       one instruction. With the compare admitted, a predecessor passing a
+//       literal decides it outright (`-1 < 0` is a fact, not a computation) and
+//       one passing a value takes the compare with it — one instruction cloned
+//       into a predecessor that already jumps nowhere else.
+//
+//       Measured, `n1_btree_page`: the three-way compare of a b-tree cell is
+//       built as an integer, joined, and then re-tested twice per binary-search
+//       step, on the loop-carried recurrence. Threading the return sites straight
+//       to their successors was worth 10.3% of that program — a quarter of which
+//       a peephole on the `cset`/`cmp` pair can reach, and the rest of which is
+//       this.
+//
+//   (g) THE BRANCH MOVES TO THE PREDECESSOR (2026-08-28). Same S as in (e) —
+//       instruction-free, ending in `br p, X, Y` on its own parameter — but the
+//       edge passes a VALUE rather than a literal. A predecessor whose own
+//       terminator is `jmp S(a)` runs S immediately after itself and S does
+//       nothing but branch on `a[k]`, so the predecessor may take that branch
+//       itself: `jmp S(a)` becomes `br a[k], X', Y'` with S's parameters
+//       substituted exactly as in (e). One terminator replaces one terminator,
+//       so nothing is duplicated, and the state transition is the same pair of
+//       steps written as one.
+//
+//       This is what C's `&&` leaves behind when its result is TESTED rather
+//       than stored: `if (f() && g())` builds a join carrying 0 or the second
+//       relation, and without this the relation is materialized with `cset`,
+//       jumped over, and tested again — four instructions where the flags the
+//       compare already set would have done (`n7_nested_subq`, gcc -O1 emits
+//       `cbz` at both call sites).
+//
 //   (e) THREADING A KNOWN CONDITION (R4.5). If S is instruction-free and ends in
 //       `br p, X, Y` where `p` is one of S's own parameters, then a predecessor
 //       that passes a LITERAL for `p` already knows which edge S will take —
@@ -56,6 +89,7 @@ pub fn run(f: &mut Func) -> bool {
         changed |= drop_unreachable(f);
         changed |= thread(f);
         changed |= thread_known_condition(f);
+        changed |= thread_branch_into_pred(f);
         changed |= merge(f);
         any |= changed;
         if !changed {
@@ -94,6 +128,167 @@ fn fold_select_conditions(f: &mut Func) -> bool {
 
 /// (e) — a predecessor that passes a literal for the parameter a forwarding
 /// block branches on already knows which way that branch goes.
+/// (g) — the predecessor takes S's branch itself when it passes a value for the
+/// condition. Shares (e)'s side conditions: S is instruction-free, branches on
+/// its own parameter, and every parameter of S is read nowhere but that
+/// terminator, so the substitution below removes every occurrence.
+fn thread_branch_into_pred(f: &mut Func) -> bool {
+    let c = dom::cfg(f);
+    let pin = pinned(f);
+    let n = f.blocks.len();
+    let mut uses = vec![0u32; f.values.len()];
+    for b in &f.blocks {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    uses[v as usize] += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                uses[v as usize] += 1;
+            }
+        });
+    }
+    let mut changed = false;
+    for b in 0..n {
+        if !c.reachable(b as BlockId) {
+            continue;
+        }
+        // the predecessor must have exactly one successor: this rewrite replaces
+        // its whole terminator, it does not duplicate a block
+        let Term::Jmp(t) = f.blocks[b].term.clone() else { continue };
+        let s = t.block as usize;
+        if s == b || pin[s] || !f.blocks[s].labels.is_empty() {
+            continue;
+        }
+        let Term::Br(Operand::Val(v), x, y) = f.blocks[s].term.clone() else { continue };
+        // (h): S may hold the COMPARE that produces its own condition, and
+        // nothing else. It is cloned into the predecessor below.
+        let cmp = match f.blocks[s].insts.as_slice() {
+            [] => None,
+            [Inst::Cmp { dst, op, ty, a, b: cb }] if *dst == v => Some((*op, *ty, *a, *cb)),
+            _ => continue,
+        };
+        let Some(k) = (match cmp {
+            None => f.blocks[s].params.iter().position(|p| *p == v),
+            // with a compare in the way the branch reads its result, and the
+            // PARAMETER is whichever side of the compare is one
+            Some((_, _, a, cb)) => {
+                let par = |o: Operand| {
+                    o.val().and_then(|x| f.blocks[s].params.iter().position(|p| *p == x))
+                };
+                par(a).or_else(|| par(cb))
+            }
+        }) else {
+            continue;
+        };
+        if x.block as usize == s || y.block as usize == s {
+            continue;
+        }
+        // every parameter of S read only inside S — by its terminator, and by
+        // the compare when there is one, since both travel to the predecessor
+        let mut here = vec![0u32; f.blocks[s].params.len()];
+        let mut tally = |o: Operand, here: &mut Vec<u32>| {
+            if let Operand::Val(v) = o {
+                if let Some(j) = f.blocks[s].params.iter().position(|p| *p == v) {
+                    here[j] += 1;
+                }
+            }
+        };
+        f.blocks[s].term.uses(|o| tally(o, &mut here));
+        if let Some((_, _, a, cb)) = cmp {
+            tally(a, &mut here);
+            tally(cb, &mut here);
+        }
+        // the compare's own result counts as a use of nothing, but the parameter
+        // it reads must not escape S by any other route
+        if cmp.is_some() && uses[v as usize] != 1 {
+            continue;
+        }
+        if f.blocks[s].params.iter().zip(&here).any(|(p, m)| uses[*p as usize] != *m) {
+            continue;
+        }
+        // The condition this predecessor will branch on. Without a compare it is
+        // the argument itself; with one it is the compare re-evaluated on the
+        // arguments — decided outright when they are literals, and otherwise
+        // cloned into the predecessor.
+        let arg = match t.args.get(k) {
+            Some(o) => *o,
+            None => continue,
+        };
+        let mut clone_cmp: Option<Inst> = None;
+        let cond = match cmp {
+            None => match arg {
+                Operand::Val(cv) => Operand::Val(cv),
+                _ => continue, // a literal is (e)'s case, already handled
+            },
+            Some((op, ty, a, cb)) => {
+                let subst = |o: Operand| -> Operand {
+                    match o.val() {
+                        Some(x) => match f.blocks[s].params.iter().position(|p| *p == x) {
+                            Some(j) => t.args.get(j).copied().unwrap_or(o),
+                            None => o,
+                        },
+                        None => o,
+                    }
+                };
+                let (na, nb) = (subst(a), subst(cb));
+                // any parameter left behind names a value the threaded path
+                // never defines
+                let free = |o: Operand| {
+                    o.val().is_none_or(|x| !f.blocks[s].params.contains(&x))
+                };
+                if !free(na) || !free(nb) {
+                    continue;
+                }
+                match super::fold::fold_inst(&Inst::Cmp { dst: v, op, ty, a: na, b: nb }) {
+                    Some(o) => o,
+                    None => {
+                        let nv = f.new_value(f.ty_of(v), Def::Inst(b as BlockId, 0));
+                        clone_cmp = Some(Inst::Cmp { dst: nv, op, ty, a: na, b: nb });
+                        Operand::Val(nv)
+                    }
+                }
+            }
+        };
+        let params = f.blocks[s].params.clone();
+        let subst = |dest: &Target| -> Option<Target> {
+            let mut d = dest.clone();
+            for a in d.args.iter_mut() {
+                if let Operand::Val(v) = *a {
+                    if let Some(j) = params.iter().position(|p| *p == v) {
+                        *a = *t.args.get(j)?;
+                    }
+                }
+            }
+            // a half-substituted argument would name a value the threaded path
+            // never defines
+            d.args
+                .iter()
+                .all(|a| !matches!(a, Operand::Val(v) if params.contains(v)))
+                .then_some(d)
+        };
+        let (Some(nx), Some(ny)) = (subst(&x), subst(&y)) else { continue };
+        // the two edges must stay distinguishable: one predecessor naming one
+        // successor twice with different arguments is an edge `Cfg` would dedup
+        if nx.block == ny.block && nx.args != ny.args {
+            continue;
+        }
+        if let Some(ci) = clone_cmp {
+            f.blocks[b].insts.push(ci);
+        }
+        f.blocks[b].term = match cond {
+            // a decided compare needs no branch at all
+            Operand::Imm(k) => Term::Jmp(if k != 0 { nx } else { ny }),
+            _ => Term::Br(cond, nx, ny),
+        };
+        changed = true;
+    }
+    changed
+}
+
 fn thread_known_condition(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let pin = pinned(f);

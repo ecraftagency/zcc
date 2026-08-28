@@ -905,6 +905,7 @@ fn generalized_carry_cuts_switch_reloads() {
         hir::pass::run_module(&mut h);
         let p = crate::compile::backend(&h).unwrap();
         super::spill::set_reconstruct(super::spill::RECON_LOOPS);
+        super::promote::set_enabled(true);
         let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
         f.blocks
             .iter()
@@ -986,12 +987,17 @@ fn loop_header_carry_keeps_the_accumulator_in_a_register() {
     same(&src);
 
     let count = |level: u8| -> (usize, usize) {
+        // The measurement is about the SPILLER's carry, so the promotion pass —
+        // which runs after it and would remove the same frame traffic by another
+        // route — is out of the way for it.
+        super::promote::set_enabled(false);
         super::spill::set_reconstruct(level);
         let ast = frontend(&src);
         let mut h = hir::build::build(&ast);
         hir::pass::run_module(&mut h);
         let p = crate::compile::backend(&h).unwrap();
         super::spill::set_reconstruct(super::spill::RECON_LOOPS);
+        super::promote::set_enabled(true);
         let f = p.funcs.iter().find(|f| f.name == "hot").unwrap();
         use crate::mir::MInst;
         let it = || f.blocks.iter().flat_map(|b| b.insts.iter());
@@ -1281,6 +1287,7 @@ fn the_carry_budget_reaches_a_doubly_nested_header() {
         hir::pass::run_module(&mut h);
         let _ = crate::compile::backend(&h).unwrap();
         super::spill::set_reconstruct(super::spill::RECON_LOOPS);
+        super::promote::set_enabled(true);
         super::spill::set_prune(true);
         super::spill::take_phi_tally()
     };

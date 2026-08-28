@@ -171,8 +171,11 @@ fn sccp_meets_a_join_parameter_both_edges_agree_on() {
     let f = func(&after, "f");
     assert_eq!(count(f, |i| matches!(i, Inst::Cmp { .. })), 0, "t==7 must fold");
     square(src, 42);
-    // and the same shape when the disagreement is real: nothing may be folded
-    let live = "int f(int n){if((n?7:8)==7)return 42;return 9;}int main(void){return f(0);}";
+    // …and the same shape when the disagreement is real: nothing may be folded.
+    // One arm is an EXPRESSION rather than a literal, because two disagreeing
+    // literals are no longer a live test of sccp — cfg identity (h) decides such
+    // a join edge by edge and removes the compare on its own (2026-08-28).
+    let live = "int f(int n){if((n?n+1:8)==7)return 42;return 9;}int main(void){return f(0);}";
     assert!(count(func(&module(live, true), "f"), |i| matches!(i, Inst::Cmp { .. })) >= 1);
     square(live, 9);
 }
@@ -1174,8 +1177,11 @@ fn scev_reads_an_address_as_base_plus_stride() {
     // recurrence over the invariant base `p` with the element size as its step.
     // The bound is a LITERAL, and it has to be: seeing through the widening is
     // what needs the trip count (`stays_in_range`).
-    let src = "int f(int *p){int i,s=0;for(i=0;i<3;i++)s+=p[i];return s;}\
-               int main(void){int a[3];a[0]=20;a[1]=15;a[2]=7;return f(a);}";
+    // (the bound is 12 rather than 3 only so `unroll` leaves the loop standing —
+    // a literal trip count of at most four is straight-line code by the time
+    // scev would see it)
+    let src = "int f(int *p){int i,s=0;for(i=0;i<12;i++)s+=p[i];return s;}\
+               int main(void){int a[12];int k;for(k=0;k<12;k++)a[k]=k*3;return f(a);}";
     with_scev(&src, "f", |f, s, _c| {
         let mut strides: Vec<i64> = Vec::new();
         for b in &f.blocks {
@@ -1245,12 +1251,14 @@ fn scev_counts_the_trips_of_a_literal_loop() {
 
 #[test]
 fn scev_counts_a_stride_that_does_not_divide_the_range() {
-    // 0,3,6,9 — four trips, not three: `ceil((10-0)/3)`. An off-by-one here is
-    // written straight into the program by final-value, so it is pinned.
-    let src = "int f(void){int i,s=0;for(i=0;i<10;i+=3)s+=i;return s;}\
+    // 0,3,…,27 — ten trips, not nine: `ceil((30-0)/3)`. An off-by-one here is
+    // written straight into the program by final-value, so it is pinned. (Ten
+    // and not four, which was the original bound, because a loop of at most four
+    // literal trips is unrolled before scev is asked.)
+    let src = "int f(void){int i,s=0;for(i=0;i<30;i+=3)s+=i;return s;}\
                int main(void){return f();}";
     with_scev(&src, "f", |_f, s, c| {
-        let _ = c; assert_eq!(s.trips, Some(4));
+        let _ = c; assert_eq!(s.trips, Some(10));
     });
 }
 
@@ -1777,11 +1785,15 @@ fn vrp_bounds_a_masked_value() {
     super::vrp::set_vrp(None);
 }
 
-/// EFFECT (2) — THE DIVISION. `x / 4` on a dividend proven non-negative is a
-/// shift; on one that is not, it is the three-instruction rounding dance, and
-/// the pass must leave it alone. Both halves are asserted, because a rewrite
-/// that fired on the second would be a miscompile and one that fired on neither
-/// would be a vacuous green.
+/// EFFECT (2) — THE DIVISION, in its two forms. `x / 4` on a dividend proven
+/// non-negative is ONE shift. On a dividend that may be negative it is the
+/// biased sequence (2026-08-28): flooring and C's truncation differ only for a
+/// negative dividend, and adding `2^k - 1` there is exactly the difference — so
+/// the division still goes, but it costs three instructions instead of one and
+/// the ROUNDING has to be checked, which the squares below do on both signs.
+/// The remainder has no such identity here and must be left alone; a rewrite of
+/// it would be a miscompile, and a pass that fired on nothing would be a vacuous
+/// green, so both are asserted.
 #[test]
 fn vrp_reduces_a_signed_division_only_where_the_dividend_is_proven_non_negative() {
     let sdiv = |f: &Func| {
@@ -1795,10 +1807,25 @@ fn vrp_reduces_a_signed_division_only_where_the_dividend_is_proven_non_negative(
         0,
         "a non-negative dividend still divides"
     );
+    // the unproven fixture holds one SDiv and one SRem; the division is reduced
+    // by the bias sequence and the remainder is not touched
+    assert_eq!(
+        sdiv(func(&vrp_module(unproven, false), "g")),
+        2,
+        "the unproven fixture no longer has both a division and a remainder"
+    );
     assert_eq!(
         sdiv(func(&vrp_module(unproven, true), "g")),
-        sdiv(func(&vrp_module(unproven, false), "g")),
-        "a dividend that may be negative was rewritten: the rounding is not the same"
+        1,
+        "the biased reduction did not fire, or it ate the remainder with it"
+    );
+    let shifts = |f: &Func| {
+        count(f, |i| matches!(i, Inst::Bin { op: BinOp::AShr | BinOp::LShr, .. }))
+    };
+    assert!(
+        shifts(func(&vrp_module(unproven, true), "g"))
+            > shifts(func(&vrp_module(unproven, false), "g")),
+        "the division was removed without the shifts that replace it"
     );
     super::vrp::set_vrp(Some(true));
     square(proven, 58); // 232/4 = 58, 232%8 = 0

@@ -38,9 +38,23 @@ use std::collections::{HashMap, HashSet};
 /// first count that clears it with margin.
 const MIN_RELOADS: usize = 3;
 
+/// THE SEAM ANOTHER PASS'S MEASUREMENT NEEDS. This pass runs last and can hide
+/// the frame traffic a SPILLER row was measuring — the loop-header carry's
+/// A/B test saw its difference vanish the moment this one learned to promote a
+/// loop-carried slot. A battery that measures the layer below therefore turns
+/// this off around its count, in the thread it runs in, rather than through an
+/// environment variable two parallel tests would share.
+thread_local! {
+    static PROMOTE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(super) fn set_enabled(on: bool) {
+    PROMOTE.with(|c| c.set(on));
+}
+
 /// THEORY A7  SQUARE promote_moves_a_spilled_value_out_of_memory — a wholly-free register is the residency
 pub fn run(f: &mut MFunc) {
-    if std::env::var("ZCC_NOPROMOTE").is_ok() {
+    if std::env::var("ZCC_NOPROMOTE").is_ok() || !PROMOTE.with(|c| c.get()) {
         return;
     }
     // 1. Every physical register the function already mentions.
@@ -90,32 +104,38 @@ pub fn run(f: &mut MFunc) {
         class: Class,
         store_at: Option<(u32, usize)>,
         reload_at: Vec<(u32, usize)>,
+        /// every access's width; a slot read at two widths is not one register
+        widths: Vec<Width>,
     }
     let mut info: HashMap<SlotId, Slot> = HashMap::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
             match i {
-                MInst::Spill { slot, src, .. } => {
+                MInst::Spill { slot, src, w } => {
                     let e = info.entry(*slot).or_insert_with(|| Slot {
                         stores: 0,
                         reloads: 0,
                         class: class_of_reg(f, *src),
                         store_at: None,
                         reload_at: Vec::new(),
+                        widths: Vec::new(),
                     });
                     e.stores += 1;
                     e.store_at = Some((bi as u32, ii));
+                    e.widths.push(*w);
                 }
-                MInst::Reload { slot, dst, .. } => {
+                MInst::Reload { slot, dst, w } => {
                     let e = info.entry(*slot).or_insert_with(|| Slot {
                         stores: 0,
                         reloads: 0,
                         class: class_of_reg(f, *dst),
                         store_at: None,
                         reload_at: Vec::new(),
+                        widths: Vec::new(),
                     });
                     e.reloads += 1;
                     e.reload_at.push((bi as u32, ii));
+                    e.widths.push(*w);
                 }
                 _ => {}
             }
@@ -128,6 +148,19 @@ pub fn run(f: &mut MFunc) {
     // reloads so the hottest slot claims the first free register.
     let cfg = crate::mir::verify::cfg(f);
     let dt = DomTree::new(&cfg, f.entry);
+    // A RELOAD IN A LOOP IS NOT ONE RELOAD. `MIN_RELOADS` weighs the promotion
+    // against the prologue save it adds, and that comparison is about executions,
+    // not about instructions in the listing: `n7_nested_subq`'s inner-loop
+    // counter is ONE static reload and one static store, paid 2,400 times per
+    // outer iteration, and the static count refused it while two callee-saved
+    // registers sat unused. Depth is the only frequency this layer has, so a
+    // reload counts 10^depth — the same estimate the spiller's own next-use
+    // weighting uses, capped where the number stops meaning anything.
+    let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+    let weight = |b: u32| -> usize {
+        let d = lf.depth.get(b as usize).copied().unwrap_or(0).min(3);
+        10usize.pow(d)
+    };
     let dominates_all = |s: &Slot| -> bool {
         let (sb, si) = match s.store_at {
             Some(x) => x,
@@ -141,15 +174,47 @@ pub fn run(f: &mut MFunc) {
             }
         })
     };
-    let mut cand: Vec<(SlotId, usize, Class)> = info
+    // THE SLOT IS THE REGISTER, and the single-store rule was never what the
+    // theorem required (2026-08-28). A spill slot is addressed by nothing but
+    // its own `Spill` and `Reload` instructions — no C object lives there, its
+    // address is never taken — so a register that appears NOWHERE ELSE in the
+    // function can stand in for the slot wholesale: every store to the slot
+    // writes the register, every load reads it, and the two are then the same
+    // location under two names. That holds for ANY number of stores, in any
+    // order, on any path; dominance was needed only for the copy propagation
+    // below, which treats the register as an invariant, and that half stays
+    // behind the old test.
+    //
+    // WHAT ASKED FOR IT. `n7_nested_subq`'s inner loop counter is stored and
+    // reloaded on EVERY iteration — a loop-carried value, so it has one store
+    // per round and the old filter refused it — while x27 and x28 sat unused
+    // across the whole function. The allocator had spilled a value it had two
+    // free registers for.
+    //
+    // One condition the width adds: a slot written and read at one width is one
+    // register; a slot accessed at two is not, since a 32-bit write zeroes the
+    // upper half (DDI 0487 B1.2.1) and a 64-bit read would then see that zero
+    // rather than the stack bytes.
+    let one_width = |s: &Slot| s.widths.windows(2).all(|w| w[0] == w[1]);
+    let hotness = |s: &Slot| -> usize {
+        s.reload_at.iter().map(|&(b, _)| weight(b)).sum::<usize>()
+            + s.store_at.map(|(b, _)| weight(b)).unwrap_or(0)
+    };
+    let mut cand: Vec<(SlotId, usize, Class, bool)> = info
         .iter()
-        .filter(|(_, s)| s.stores == 1 && s.reloads >= MIN_RELOADS && dominates_all(s))
-        .map(|(id, s)| (*id, s.reloads, s.class))
+        .filter(|(_, s)| s.stores >= 1 && s.reloads >= 1 && hotness(s) >= MIN_RELOADS && one_width(s))
+        .map(|(id, s)| (*id, hotness(s), s.class, s.stores == 1 && dominates_all(s)))
         .collect();
     cand.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
+    // The invariant ones — a single store that dominates every reload — are also
+    // the only ones the propagation below may rewrite.
+    let mut invariant: HashSet<SlotId> = HashSet::new();
     let mut bind: HashMap<SlotId, PReg> = HashMap::new();
-    for (id, _, class) in cand {
+    for (id, _, class, inv) in cand {
+        if inv {
+            invariant.insert(id);
+        }
         let pool = if class == Class::Gpr { &mut free_gpr } else { &mut free_fpr };
         if let Some(r) = pool.pop() {
             bind.insert(id, r);
@@ -180,7 +245,11 @@ pub fn run(f: &mut MFunc) {
     // once `dst` is set to `r` and neither is written again before `dst`'s use,
     // the use reads `r` directly; if `dst` is redefined later in the block it does
     // not escape, so the `mov dst, r` is dead and dropped.
-    let promoted: HashSet<PReg> = bind.values().copied().collect();
+    let promoted: HashSet<PReg> = bind
+        .iter()
+        .filter(|(id, _)| invariant.contains(id))
+        .map(|(_, r)| *r)
+        .collect();
     for b in f.blocks.iter_mut() {
         propagate_block(b, &promoted);
     }

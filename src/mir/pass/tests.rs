@@ -58,7 +58,9 @@ fn callee_saved_preservation_is_realized_by_the_prologue() {
     // The callee carries a loop so the size heuristic does not inline it — with
     // it inlined, `main` has no call, nothing is live across one, and the
     // assertion below would be testing a function with no frame at all.
-    let src = "int f(int x){int i,s=0;for(i=0;i<x;i++)s+=i;return s;}\
+    // (and enough body that a one-instruction change to the inliner's budget
+    // cannot flip it — the call is what this test needs to exist at all)
+    let src = "int f(int x){int i,s=0;for(i=0;i<x;i++)s+=i*3+x;return s^(s>>3);}\
                int main(void){int a=3;return f(a)+a;}";
     let ast = frontend(src);
     let mut h = hir::build::build(&ast);
@@ -585,9 +587,12 @@ fn a_constant_already_materialized_is_not_materialized_again() {
     // re-materializing costs one instruction. Shipped without this, thirteen
     // csmith programs failed to allocate ("11 call-crossing Gpr values live but
     // only 10 callee-saved").
+    // `g` keeps a loop of more than four literal trips so it stays a CALL: a
+    // shorter one is unrolled, `g` becomes small enough to inline, and `f` then
+    // has no call for the re-materialization rule to be asked about.
     let src = "int g(int);\
                int f(int x){int a=g(x+1000003);int b=g(a+1000003);return a+b;}\
-               int g(int x){int i,s=0;for(i=0;i<3;i++)s+=x+i;return s;}\
+               int g(int x){int i,s=0;for(i=0;i<9;i++)s+=x+i;return s;}\
                int main(void){return f(1)&255;}";
     same(src);
     let ast = frontend(src);

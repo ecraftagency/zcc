@@ -156,9 +156,12 @@ fn spill_and_color(f: &mut MFunc) -> Result<(color::Coloring, live::Liveness), S
         // check must eventually pass; the convergence is the None branch's below.
         match spill::check_pressure(f) {
             Ok(()) => {}
-            Err(spill::PressureErr::OverCross(_)) if cross_cap > 0 => {
+            Err(spill::PressureErr::OverCross(ref w)) if cross_cap > 0 => {
                 let cur = if cross_cap == usize::MAX { cs_gpr } else { cross_cap };
                 cross_cap = cur.saturating_sub(1);
+                if std::env::var("ZCC_XCAP").is_ok() {
+                    eprintln!("XCAP {} cross_cap -> {} ({})", f.name, cross_cap, w);
+                }
                 forced.clear();
                 *f = snapshot.clone();
                 continue;

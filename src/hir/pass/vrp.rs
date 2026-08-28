@@ -197,6 +197,7 @@ pub fn run(f: &mut Func) -> bool {
             }
         }
     }
+    changed |= reduce_signed_division(f);
     if map.iter().any(|x| x.is_some()) {
         rewrite_values(f, &map);
     }
@@ -508,4 +509,79 @@ fn swap(op: CmpOp) -> CmpOp {
         CmpOp::Uge => CmpOp::Ule,
         other => other,
     }
+}
+
+/// SIGNED DIVISION BY A POWER OF TWO, without a range to lean on.
+///
+/// The narrowing above needs the dividend proven non-negative, because C99
+/// 6.5.5p6 truncates toward zero while an arithmetic shift floors: `-1 / 2` is
+/// `0`, `-1 >> 1` is `-1`. Where the proof is not available the identity is
+/// still exact once the dividend is BIASED first — add `2^k - 1` when it is
+/// negative and nothing when it is not, which is what turns flooring into
+/// truncation:
+///
+///     q = (x + ((x >>ₐ (W-1)) >>ₗ (W-k))) >>ₐ k
+///
+/// `x >>ₐ (W-1)` is all-ones exactly when `x < 0`, so the second shift is
+/// `2^k - 1` for a negative dividend and `0` otherwise; for k = 1 the two shifts
+/// collapse into one, `x >>ₗ (W-1)`, which is the sign bit as 0 or 1. Both forms
+/// are the standard Hacker's-Delight §10-1 sequence.
+///
+/// COMMUTING SQUARE. For `x >= 0` the bias is zero and `x >>ₐ k` is `x / 2^k`
+/// exactly (both floor a non-negative number). For `x < 0`, writing
+/// `x = -m` with `m > 0`, C requires `-(m / 2^k)` truncated; the biased shift
+/// computes `floor((x + 2^k - 1) / 2^k)`, and those agree for every negative `x`
+/// — adding `2^k - 1` before flooring IS rounding toward zero. The dividend
+/// `INT_MIN` is included: the bias makes the sum wrap to `INT_MIN + 2^k - 1`,
+/// whose arithmetic shift is `INT_MIN / 2^k`, and division of `INT_MIN` by a
+/// positive divisor is defined. Division by zero cannot reach here (the divisor
+/// is a positive literal), and `x / 1` is folded earlier.
+///
+/// WHY IT IS A ROW AND NOT A PEEPHOLE (Law 3c). `(lo + hi) / 2` is the middle of
+/// every binary search, and A64's `sdiv` is ~12 cycles and unpipelined, sitting
+/// at the head of the search's own recurrence: compare → bounds → mid → address
+/// → load → compare. `n1_btree_page` measured 1.298 against 1.387 for exactly
+/// this exchange — THREE instructions replacing ONE, and 6.4% faster.
+/// THEORY A7b  SQUARE vrp_reduces_signed_division_by_a_power_of_two — bias, then shift
+fn reduce_signed_division(f: &mut Func) -> bool {
+    let mut changed = false;
+    for b in 0..f.blocks.len() {
+        let mut out: Vec<Inst> = Vec::with_capacity(f.blocks[b].insts.len());
+        let insts = std::mem::take(&mut f.blocks[b].insts);
+        for inst in insts {
+            let (dst, ty, a, k) = match inst {
+                Inst::Bin { dst, op: BinOp::SDiv, ty, a, b: Operand::Imm(k) }
+                    if k > 1 && (k as u64).is_power_of_two() && matches!(ty, Ty::I32 | Ty::I64) =>
+                {
+                    (dst, ty, a, k)
+                }
+                other => {
+                    out.push(other);
+                    continue;
+                }
+            };
+            let w = ty.bits() as i64;
+            let sh = (k as u64).trailing_zeros() as i64;
+            let mut mint = |op: BinOp, x: Operand, y: Operand, out: &mut Vec<Inst>| -> Operand {
+                let v = f.new_value(ty, Def::Inst(b as BlockId, out.len() as u32));
+                out.push(Inst::Bin { dst: v, op, ty, a: x, b: y });
+                Operand::Val(v)
+            };
+            // the bias: `2^k - 1` when x is negative, 0 when it is not
+            let bias = if sh == 1 {
+                mint(BinOp::LShr, a, Operand::Imm(w - 1), &mut out)
+            } else {
+                let all = mint(BinOp::AShr, a, Operand::Imm(w - 1), &mut out);
+                mint(BinOp::LShr, all, Operand::Imm(w - sh), &mut out)
+            };
+            let sum = mint(BinOp::Add, a, bias, &mut out);
+            out.push(Inst::Bin { dst, op: BinOp::AShr, ty, a: sum, b: Operand::Imm(sh) });
+            changed = true;
+        }
+        f.blocks[b].insts = out;
+    }
+    if changed {
+        refresh_defs(f);
+    }
+    changed
 }

@@ -64,6 +64,37 @@ pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
             Some(p) => p,
             None => continue,
         };
+        // THE LOAD FENCE (2026-08-28). A load is not `Effect::Pure`, so the scalar
+        // hoist above never moved one — and an invariant load is what a dispatch
+        // loop pays most for: `n7_nested_subq` re-reads the same two entries of a
+        // static function-pointer table on every iteration, and gcc -O1 holds one
+        // of them in a register for the whole loop.
+        //
+        // Two conditions make the motion sound, and both are the ones the pure-call
+        // hoist already states for the same reasons:
+        //
+        //   MEMORY-CLEAN — nothing in the loop writes memory, the calls in it
+        //   being read-only (`pass/purity.rs`). A load is a function OF the memory
+        //   state, so a fixed state is what makes iteration n's result iteration
+        //   0's result.
+        //
+        //   GUARANTEED EXECUTION — the load's block dominates every latch and the
+        //   loop runs at least once, so the address is one the original program
+        //   dereferenced anyway. Without it a hoisted load is a speculated
+        //   dereference, which is a fault the source never had.
+        let mut inloop = vec![false; f.blocks.len()];
+        for &b in &body {
+            inloop[b as usize] = true;
+        }
+        let clean = body.iter().all(|&b| {
+            f.blocks[b as usize].insts.iter().all(|inst| match inst.effect() {
+                Effect::Pure | Effect::Read => true,
+                _ => matches!(inst,
+                    Inst::Call { callee: Callee::Direct(n), sret: None, .. } if readonly.contains(n)),
+            })
+        });
+        let latches = lf.loops[li].latches.clone();
+        let entered = clean && enters_body(f, &c, pre, header, &inloop);
         loop {
             let mut moved = None;
             'scan: for &b in &body {
@@ -74,8 +105,12 @@ pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
                 if b == pre || !dt.dominates(header, b) {
                     continue;
                 }
+                // a load may leave only from a block the first iteration must
+                // pass through on its way to the back edge
+                let loads_ok =
+                    entered && (b == header || latches.iter().all(|&l| dt.dominates(b, l)));
                 for i in 0..f.blocks[b as usize].insts.len() {
-                    if hoistable(f, &f.blocks[b as usize].insts[i], pre, &dt, &def_blk) {
+                    if hoistable(f, &f.blocks[b as usize].insts[i], pre, &dt, &def_blk, loads_ok) {
                         moved = Some((b, i));
                         break 'scan;
                     }
@@ -377,9 +412,14 @@ fn hoistable(
     pre: BlockId,
     dt: &dom::DomTree,
     def_blk: &dyn Fn(&Func, ValueId) -> Option<BlockId>,
+    loads_ok: bool,
 ) -> bool {
-    if inst.effect() != Effect::Pure {
-        return false;
+    match inst.effect() {
+        Effect::Pure => {}
+        // a non-volatile load, under the caller's two fences (C99 6.7.3: a
+        // volatile access may not be moved at all)
+        Effect::Read if loads_ok && matches!(inst, Inst::Load { vol: false, .. }) => {}
+        _ => return false,
     }
     // (3) the only pure instruction that can fault
     if let Inst::Bin { op, b, .. } = inst {

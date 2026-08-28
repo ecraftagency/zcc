@@ -33,7 +33,99 @@ use std::collections::{HashMap, HashSet};
 /// than that cannot make the program bigger, which is why this bound is derived
 /// from the ABI rather than picked — there is no threshold to tune.
 fn call_cost(sig: &Sig) -> usize {
-    sig.params.len() + 2
+    // One instruction to place each argument, the `bl`, one to take the result,
+    // and the callee's own `ret` — which the first cut forgot, and which the
+    // inlined body does not have.
+    sig.params.len() + 3
+}
+
+/// WHAT THE CALL COSTS THE CALLER, which the sequence length above does not say.
+///
+/// AAPCS64 §6.1.1: a call may destroy x0–x18 and v0–v7/v16–v31. Every value the
+/// caller holds ACROSS the call must therefore be in a callee-saved register —
+/// which the caller then has to save and restore — or in a stack slot. That is a
+/// real, countable cost, it is paid per call SITE rather than per callee, and
+/// inlining removes all of it.
+///
+/// So the budget a body is measured against is the call sequence plus the number
+/// of values live across the site. It is a count taken FROM THE PROGRAM, not a
+/// threshold picked by an author (Article E), and it is why a three-instruction
+/// byte-pair reader inside a binary search is worth inlining while the same
+/// function called once at the top of `main` is not: `n1_btree_page` holds nine
+/// values across that call and pays for all nine.
+fn live_across(f: &Func) -> Vec<Vec<usize>> {
+    // block-level liveness, backwards to a fixed point
+    let c = dom::cfg(f);
+    let n = f.blocks.len();
+    let mut out: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    let mut live_in: Vec<HashSet<ValueId>> = vec![HashSet::new(); n];
+    for _ in 0..n + 1 {
+        let mut changed = false;
+        for b in (0..n).rev() {
+            let mut cur: HashSet<ValueId> = HashSet::new();
+            for &s in &c.succs[b] {
+                for v in live_in[s as usize].iter() {
+                    cur.insert(*v);
+                }
+            }
+            if cur != out[b] {
+                out[b] = cur.clone();
+                changed = true;
+            }
+            f.blocks[b].term.uses(|o| {
+                if let Operand::Val(v) = o {
+                    cur.insert(v);
+                }
+            });
+            for inst in f.blocks[b].insts.iter().rev() {
+                if let Some(d) = inst.dst() {
+                    cur.remove(&d);
+                }
+                inst.uses(|o| {
+                    if let Operand::Val(v) = o {
+                        cur.insert(v);
+                    }
+                });
+            }
+            for p in &f.blocks[b].params {
+                cur.remove(p);
+            }
+            if cur != live_in[b] {
+                live_in[b] = cur;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // walk each block forwards, counting what is live ACROSS each instruction
+    let mut per_site: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for b in 0..n {
+        // live at the end of the block
+        let mut live: HashSet<ValueId> = out[b].clone();
+        f.blocks[b].term.uses(|o| {
+            if let Operand::Val(v) = o {
+                live.insert(v);
+            }
+        });
+        let mut counts = vec![0usize; f.blocks[b].insts.len()];
+        for (i, inst) in f.blocks[b].insts.iter().enumerate().rev() {
+            if let Some(d) = inst.dst() {
+                live.remove(&d);
+            }
+            // what is live here is what survives the instruction; the call's own
+            // arguments are counted by `call_cost`, not here
+            counts[i] = live.len();
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    live.insert(v);
+                }
+            });
+        }
+        per_site.push(counts);
+    }
+    per_site
 }
 
 /// THEORY A7b — a fixpoint bound: termination insurance, not a policy
@@ -75,6 +167,7 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
         for ci in 0..m.funcs.len() {
             loop {
                 let inloop = loop_blocks(&m.funcs[ci]);
+                let across = live_across(&m.funcs[ci]);
                 let site = m.funcs[ci].blocks.iter().enumerate().find_map(|(b, blk)| {
                     blk.insts.iter().enumerate().find_map(|(i, inst)| match inst {
                         Inst::Call { callee: Callee::Direct(n), sret: None, args, .. } => {
@@ -128,7 +221,26 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                                 && (g.is_static
                                     || (inloop.get(b).copied().unwrap_or(false)
                                         && !has_loop(g)));
-                            let want = called_once || body_size(g) <= call_cost(&g.sig);
+                            // The live-across term is charged INSIDE A LOOP only.
+                            // The cost is real wherever the call is, but outside
+                            // a loop it is paid once, and paying it once is what
+                            // a call is for; in a loop it is paid every
+                            // iteration, which is the case worth trading code
+                            // size for (the same fence `e2_many_args` already
+                            // uses for the called-once rule).
+                            // …and only for a LOOP-FREE callee. A body with a
+                            // loop of its own is not a few instructions standing
+                            // in for a call sequence: its cost is paid per ITS
+                            // OWN iterations, which the saving at the call site
+                            // says nothing about.
+                            let hot = inloop.get(b).copied().unwrap_or(false) && !has_loop(g);
+                            let budget = call_cost(&g.sig)
+                                + if hot {
+                                    across.get(b).and_then(|v| v.get(i)).copied().unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                            let want = called_once || body_size(g) <= budget;
                             if gi != ci && want && !cyclic.contains(&gi) && inlinable(g) {
                                 Some((b, i, gi))
                             } else {

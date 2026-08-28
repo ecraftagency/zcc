@@ -28,6 +28,7 @@ mod tests;
 pub mod sccp;
 pub mod sink;
 pub mod sroa;
+pub mod unroll;
 pub mod vrp;
 
 use super::*;
@@ -126,6 +127,13 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // arithmetic, and that is the fence licm's call hoist was refusing on.
         if on("rotate") {
             changed |= rotate::run(f);
+        }
+        // BEFORE licm and the IV rows: unrolling decides a guard and deletes a
+        // back edge, so what it leaves is straight-line code those rows can see
+        // through — and a loop it removes is one they no longer have to reason
+        // about.
+        if on("unroll") {
+            changed |= unroll::run(f);
         }
         if on("licm") {
             changed |= licm::run_with(f, ro);

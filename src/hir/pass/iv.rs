@@ -93,6 +93,34 @@ fn enabled() -> bool {
     *W.get_or_init(|| ENABLED || std::env::var("ZCC_IV").is_ok())
 }
 
+/// The CONSUMER-BLIND half (`ZCC_IVX`, default off while it is measured).
+///
+/// The load-site scan below asks "which LOADS have an affine address"; the
+/// measurement that opened this asks a different question. An address rebuilt
+/// with a multiply costs the same cycles whatever reads it — a store's base, a
+/// call's argument, a pointer written into a structure — and two hand edits
+/// measured exactly that: `n7_nested_subq` passes `&inner[j]` to a predicate
+/// through a function pointer (1.751 → 1.622 when the address walks instead),
+/// and `m3_dict_rehash` builds `&pool[i]` with `madd x9,x9,#24,x22` for a pair
+/// of stores (1.301 → 1.254). Neither address is a load, so neither is a site
+/// the scan above can see.
+///
+/// So this half strengthens the ADDRESS VALUE rather than the access: any value
+/// defined in the loop whose evolution is affine with a step no addressing mode
+/// reaches, and whose every use is an instruction inside the loop, is replaced
+/// by the walking header parameter. The commuting square is the same one — the
+/// parameter holds `base + off + step·n`, which is what the multiply computed —
+/// and it is now discharged at the value rather than at the access, which is
+/// where it always belonged.
+/// DEFAULT ON since 2026-08-28, on the measurement: over the 49-program suite,
+/// interleaved, EXEC geomean 1.0281 → 1.0231 with this row alone, and
+/// `n7_nested_subq` 1.759 → 1.589, `k1_dispatch` 1.323 → 1.215,
+/// `k2_live_pressure` 1.216 → 1.144. `ZCC_NOIVX=1` turns it off.
+fn consumer_blind() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_NOIVX").is_err())
+}
+
 /// THEORY A7b  SQUARE a_strided_load_walks_a_pointer — the AddRec IS the address it replaces
 pub fn run(f: &mut Func) -> bool {
     walk(f, enabled())
@@ -165,6 +193,40 @@ fn affine(s: &scev::LoopScev, f: &Func, addr: Operand) -> Option<(Vec<ValueId>, 
     }
     bases.sort();
     Some((bases, r.off.wrapping_add(inv.off), r.step))
+}
+
+/// Does the address `v` own the multiply that builds it — i.e. is there a `mul`
+/// in its computation whose only reader is on the path to `v`, so that replacing
+/// `v` kills the multiply rather than leaving it live beside the new pointer?
+///
+/// Two levels are enough for every shape this fires on: `v = base + i*S` and
+/// `v = (base + off) + i*S`. Deeper chains are refused, which costs an
+/// opportunity and never a wrong answer.
+fn owns_its_multiply(f: &Func, v: ValueId, uses_total: &HashMap<ValueId, usize>) -> bool {
+    fn is_mul(f: &Func, m: ValueId) -> bool {
+        matches!(def_inst(f, m), Some(Inst::Bin { op: BinOp::Mul, .. }))
+    }
+    let sole = |m: ValueId| uses_total.get(&m).copied().unwrap_or(0) <= 1;
+    let mut here = vec![v];
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for x in here.drain(..) {
+            if is_mul(f, x) && sole(x) {
+                return true;
+            }
+            if let Some(Inst::Bin { op: BinOp::Add, a, b, .. }) = def_inst(f, x) {
+                for o in [*a, *b] {
+                    if let Some(y) = o.val() {
+                        if sole(y) {
+                            next.push(y);
+                        }
+                    }
+                }
+            }
+        }
+        here = next;
+    }
+    here.into_iter().any(|m| is_mul(f, m) && sole(m))
 }
 
 /// The instruction that defines a value, when one does.
@@ -271,6 +333,33 @@ fn strengthen(
             groups.entry((bases, off, step)).or_default().push((b, i));
         }
     }
+    // The CONSUMER-BLIND half, and it runs INSTEAD of the site scan above when
+    // it is on: an address value it rewrites carries its loads with it, since a
+    // load's address operand is one of the uses being replaced.
+    if consumer_blind() {
+        let vals = value_candidates(f, &s, lf, li);
+        if !vals.is_empty() {
+            let mut keys: Vec<Key> = vals.keys().cloned().collect();
+            keys.sort();
+            for k in keys {
+                let group = &vals[&k];
+                let q = make_param(f, c, dt, header, k);
+                for &b in &lf.loops[li].body {
+                    for inst in f.blocks[b as usize].insts.iter_mut() {
+                        inst.uses_mut(|o| {
+                            if let Operand::Val(v) = *o {
+                                if group.contains(&v) {
+                                    *o = Operand::Val(q);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            refresh_defs(f);
+            return true;
+        }
+    }
     if groups.is_empty() {
         return false;
     }
@@ -286,6 +375,176 @@ fn strengthen(
     true
 }
 
+/// The address VALUES this loop rebuilds with a multiply, grouped by recurrence.
+///
+/// A candidate is a value defined inside the loop, of pointer width, affine in
+/// the loop's counter with a step no addressing mode reaches, and used ONLY by
+/// instructions inside the loop. The last condition is what makes the rewrite a
+/// substitution rather than a code motion: every reader of the old value is
+/// replaced, so the old computation is dead and `dce` removes it, and nothing
+/// after the loop can observe the difference.
+///
+/// A use in a TERMINATOR disqualifies the value outright. A branch argument is a
+/// use whose replacement would have to follow the edge into the successor's
+/// parameter, which is a different rewrite; refusing it costs the pass nothing
+/// measured and keeps the substitution local to one block's instruction list.
+fn value_candidates(
+    f: &Func,
+    s: &scev::LoopScev,
+    lf: &dom::LoopForest,
+    li: usize,
+) -> HashMap<Key, Vec<ValueId>> {
+    use std::collections::HashSet;
+    let body: HashSet<BlockId> = lf.loops[li].body.iter().copied().collect();
+
+    // The access size of every load or store that reads a value AS ITS ADDRESS.
+    // A step equal to it rides A64's scaled index for free (DDI 0487 C6.2.130),
+    // so there is no multiply to remove — MEASURED M2 again, asked at the value.
+    let mut acc_of: HashMap<ValueId, i64> = HashMap::new();
+    for &b in &lf.loops[li].body {
+        for inst in &f.blocks[b as usize].insts {
+            let (addr, sz) = match inst {
+                Inst::Load { addr, ty, .. } => (*addr, (ty.bits() / 8) as i64),
+                Inst::Store { addr, ty, .. } => (*addr, (ty.bits() / 8) as i64),
+                _ => continue,
+            };
+            if let Some(v) = addr.val() {
+                let e = acc_of.entry(v).or_insert(sz);
+                *e = (*e).min(sz);
+            }
+        }
+    }
+
+    // Where each value is read: inside the loop's instructions, or anywhere else
+    // (another block, or any terminator) — the second kind disqualifies it.
+    let mut read_in_loop: HashMap<ValueId, usize> = HashMap::new();
+    let mut escapes: HashSet<ValueId> = HashSet::new();
+    let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
+    for b in f.blocks.iter() {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    *uses_total.entry(v).or_insert(0) += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                *uses_total.entry(v).or_insert(0) += 1;
+            }
+        });
+    }
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let inside = body.contains(&(bi as BlockId));
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    if inside {
+                        *read_in_loop.entry(v).or_insert(0) += 1;
+                    } else {
+                        escapes.insert(v);
+                    }
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                escapes.insert(v);
+            }
+        });
+    }
+
+    // A probe, while the gate is being measured (`ZCC_IVXCALL`): fire only in a
+    // loop that CALLS. A call forces every live value into a callee-saved
+    // register or a slot anyway, so the walking pointer competes for a register
+    // the multiply's inputs were already paying for — the pressure argument
+    // above does not apply there.
+    // AND THE LOOP MUST BE LONG ENOUGH TO AMORTIZE THE SETUP. The walking
+    // pointer costs a header parameter and a preheader computation — one add per
+    // invariant term, and a multiply of its own where the start value is itself
+    // strided. `n2_varint_record` pays that on a blob-compare loop of a handful
+    // of bytes nested inside the record loop, and lost 13%: the multiply moved
+    // into the preheader instead of dying, which the static count showed
+    // exactly (19 multiplies before, 19 after). A trip count SCEV can bound, and
+    // bound above 32, is the evidence that the loop runs often enough for the
+    // exchange to pay. A loop whose bound is a runtime length has no such
+    // evidence and is refused — a residual to measure under Law 4, not a
+    // theorem's limit.
+    match s.trips {
+        Some(t) if t >= 32 => {}
+        _ => {
+            residual("trip-count-unproven-or-short");
+            return HashMap::new();
+        }
+    }
+    if std::env::var("ZCC_IVXCALL").is_ok() {
+        let calls = lf.loops[li].body.iter().any(|&b| {
+            f.blocks[b as usize]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { .. }))
+        });
+        if !calls {
+            return HashMap::new();
+        }
+    }
+    let mut out: HashMap<Key, Vec<ValueId>> = HashMap::new();
+    for &b in &lf.loops[li].body {
+        for inst in &f.blocks[b as usize].insts {
+            let v = match inst {
+                Inst::Bin { dst, ty: Ty::I64, .. } => *dst,
+                _ => continue,
+            };
+            // TWO uses at least, and the reason is what the first measurement
+            // said. The pointer is a value live across the whole loop body, so
+            // it costs a register where the multiply cost none: on
+            // `k1_dispatch` and `k2_live_pressure` — the two programs in the
+            // suite whose loops are already at the pressure limit — the rewrite
+            // ADDED spill traffic (42 → 47 and 72 → 75 stack references) and
+            // both got slower. A single-use address pays the register and buys
+            // one instruction; an address read twice or more amortizes it, which
+            // is `n7_nested_subq`'s shape (one `&inner[j]` handed to two
+            // predicates) and where the win was measured.
+            if escapes.contains(&v)
+                || read_in_loop.get(&v).copied().unwrap_or(0) < 2
+                || s.ivs.contains_key(&v)
+            {
+                continue;
+            }
+            let (bases, off, step) = match affine(s, f, Operand::Val(v)) {
+                Some(a) => a,
+                None => continue,
+            };
+            if step == 0 || bases.is_empty() {
+                continue;
+            }
+            let acc = acc_of.get(&v).copied().unwrap_or(0);
+            if step.unsigned_abs().is_power_of_two() || step.unsigned_abs() == acc.unsigned_abs() {
+                residual("no-multiply-to-remove");
+                continue;
+            }
+            // AND THE MULTIPLY MUST ACTUALLY DIE. `n2_varint_record` measured
+            // this one: the rewrite fired, the pointer was built, and the
+            // multiply count did not move — because the same product also feeds
+            // something that is not an address, so it stays live and the loop
+            // pays for both. The pass then costs 7 instructions for nothing and
+            // the program lost 12%. A candidate therefore has to own its
+            // multiply: some `mul` in the address's own computation must have
+            // this value as its ONLY reader.
+            if !owns_its_multiply(f, v, &uses_total) {
+                residual("multiply-shared");
+                continue;
+            }
+            out.entry((bases, off, step)).or_default().push(v);
+        }
+    }
+    for g in out.values_mut() {
+        g.sort();
+        g.dedup();
+    }
+    out
+}
+
 /// Add the header parameter that walks `base + off + step*n`, and point every
 /// site at it.
 fn introduce(
@@ -296,6 +555,20 @@ fn introduce(
     k: Key,
     sites: &[(BlockId, usize)],
 ) {
+    let q = make_param(f, c, dt, header, k);
+    for &(b, i) in sites {
+        match &mut f.blocks[b as usize].insts[i] {
+            Inst::Load { addr, .. } => *addr = Operand::Val(q),
+            _ => unreachable!("a site is a load"),
+        }
+    }
+}
+
+/// The header parameter that walks `base + off + step·n`: entry edges supply the
+/// start value, latch edges the step. Shared by both halves of the pass — the
+/// load-site rewrite and the consumer-blind value substitution — because the
+/// recurrence is the same theorem either way.
+fn make_param(f: &mut Func, c: &dom::Cfg, dt: &dom::DomTree, header: BlockId, k: Key) -> ValueId {
     let (bases, off, step) = k;
     let idx = f.blocks[header as usize].params.len() as u32;
     let q = f.new_value(Ty::I64, Def::Param(header, idx));
@@ -327,12 +600,7 @@ fn introduce(
             }
         }
     }
-    for &(b, i) in sites {
-        match &mut f.blocks[b as usize].insts[i] {
-            Inst::Load { addr, .. } => *addr = Operand::Val(q),
-            _ => unreachable!("a site is a load"),
-        }
-    }
+    q
 }
 
 /// Append an instruction to a block and return the value it defines.
