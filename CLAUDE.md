@@ -4,8 +4,9 @@ A strict-C99 compiler (C89 ⊂ C99) in Rust, no external crates, AArch64 ELF.
 
 **Only what stays true across every milestone belongs here.** Measurements,
 ratios, statuses, commits, tags, branch names and dated findings do not — a
-stale rule is worse than no rule, because it is still obeyed. Read this and act;
-it cites other documents, it does not depend on them.
+stale rule is worse than no rule, because it is still obeyed. **Every rule below
+is complete as written**: act on it without opening anything. The citations say
+where a derivation lives, for a reader who wants one.
 
 **Operating:** run one thing, wait, report it — detach only on request, and say
 so. Parallel work makes it cheap to start things and expensive to stay aimed.
@@ -52,7 +53,8 @@ Every intermediate artifact carries the theorem that certifies it, so always ask
 compiler of `src/`; it is a prover.
 
 - **Correctness** — a pass ships its commuting square `⟦IR⟧ = ⟦IR'⟧` (translation
-  validation for backend passes). Generators only confirm, never discover.
+  validation for backend passes). **On this axis** a generator only confirms; it
+  never discovers, because the square already decided the question.
 - **Cost** — instruction count is a fold over the IR, written independently of
   the lowering; the square `cost(f) ≡ len(codegen(f))` certifies the backend
   realizes it. A mismatch is a Law-2 defect at one instruction, never a mystery
@@ -82,8 +84,9 @@ of times the same as one in a cold arm. Rank a row by executions.
 one microarchitecture at one input size. **Name the suite and the core, or say
 nothing.** Claim parity only with a margin — how far the sampled fraction must
 win before the unsampled remainder is unlikely to flip the sign. Parity announced
-from a narrow suite is a Law-0 failure. Widen the surface: generators find
-cliffs, real programs carry the geomean.
+from a narrow suite is a Law-0 failure. Widen the surface, and note that a
+generator's role INVERTS here: on the correctness axis it only confirms, on this
+one it discovers — it finds the cliffs, while real programs carry the geomean.
 
 ## Articles
 

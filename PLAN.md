@@ -21,157 +21,29 @@ dismantled on 2026-08-28.
 
 ---
 
-## THE GRIND: what is left of the register copy, after C0 measured it
+## THE GRIND: the tail of a suite that is now ninety programs wide
 
-**C0 IS DISCHARGED and it moved the ground.** The attribution table is
-`MECHANISM.md` Part F `M26-correction`; the refusal census is `M27`. Two things
-this campaign was built on turned out to be instrument defects, so the rows below
-are the ones that survive:
+**THE SUITE WAS WIDENED and the number went up seven points** (`M35`): EXEC
+1.020 → **1.0916**, INSN 1.0701 → **1.0892**, 29 of 90 above 1.1×. Nothing got
+slower — the measurement caught up with the compiler, because every row shipped
+before this was measured on the 49 programs it was tuned against.
 
-- the copy family is **44% of the gap, not 70%** — 289 of the suite's 518
-  "block-edge copies" are `mov wN, wzr`, a constant zero gcc pays one instruction
-  for as well;
-- the hint refusals are **not occupancy** (3 of 488 on the suite, 136 of 14,640
-  on sqlite) — they are the AAPCS64 half and the zero register. **C2 as written
-  is retired**: eviction and priority colouring aim at a bucket that is not there.
+**The compiler held.** Forty-one new programs written against documented blind
+spots, never tuned for, spread 0.918–5.045, median 1.038, and **zcc beats gcc -O1
+on eight of them**.
 
-**BANKED.** C0-ROW-1, partner-aware half selection (`ZCC_CSBIAS`, default 1):
-sqlite runtime 0.9740 interleaved, sqlite −467 instructions, suite −6, EXEC
-unchanged, gate 15/0.
+**⭐ START HERE: `x1_goto_cleanup`, 5.045× — three times worse than anything this
+project has measured**, and it is not exotic: it is the `goto out;` cleanup
+ladder, C's only error mechanism, in every kernel driver and every library entry
+point. Its CFG is a fan-in, many early exits converging on one block with values
+live across all of it. Nothing in the old suite had that shape. Next after it:
+`z2_rle` 1.61, `u4_popcnt64` (INSN 2.88), `q2_deep_rec` 1.41, `o2_fp_stencil`
+1.41, `o3_fp_mixed` 1.40.
 
-**WHAT IS LEFT, and it is 203 instructions of a 953 gap on the suite.**
-
-**C1 — the residual FREE.** 203 pairs on the suite, 4,965 on sqlite, where both
-ends are virtual and the argument dies on the edge, so the merge is legal.
-`ZCC_CSBIAS` addresses the ABI-banned share (72 / 1,554). The remainder is 77
-genuinely occupied and 42 where the transitive walk reached a different partner
-first. Re-take `ZCC_HINT` with the row default-on before proposing anything: the
-denominator has moved.
-
-**C4 — ABI argument placement.** A separate front and, on sqlite, the larger one:
-`ZCC_MOVKIND` counts 24,374 marshalling copies against 7,791 edge copies, and
-x0–x7 traffic is 22,813 against gcc's 14,626. Do not fold it into C1's
-measurement.
-
-**MEASURED AND CLOSED THIS SESSION** (`M28`): the IVX trip-count gate is not the
-binding one — removing it changes the suite by zero instructions — and SCEV's own
-coverage is 78% of that pass's residual. Do not spend a session on the gate.
-
-**AND THE ROW C0 UNCOVERED, which is not a copy row at all.** `M26-correction`
-inverted the constant-materialization column: zcc emits **951 against gcc's 790,
-+161**, where the old table read −182 and was taken as proof the constant-sharing
-row worked. It is now the second-largest family in the gap and nothing has ever
-been aimed at it. First question, unanswered: `isa::mov_chain` knows
-`movz`/`movn`/`movk` and does NOT consider `orr wd, wzr, #imm`, though
-`isa::logical_imm` — the encodability test — already exists and is used only for
-ALU operands. Count the constants whose chain is ≥2 and which `logical_imm`
-accepts before writing anything.
-
-**BANKED — four rows, and the shape of the day is that the geomean is the wrong
-scoreboard.** Suite EXEC **1.0204**, INSN **1.0688**, gate 15/0. But 11 of 49
-programs are still above 1.1× and the worst is 1.44, so the 2% left in the
-geomean is not where the work is.
-
-| row | what it was | effect |
-|---|---|---|
-| `ZCC_CSBIAS` | partner-aware callee-saved bias (`M27`) | sqlite runtime 0.9740 |
-| `promote::sink_stores` | the latch store, sunk into its producer (`M29`) | n7 1.370 → **1.195** |
-| `cost::weighted` + `ZCC_WCOST` | the executions model (`M30`) | the instrument, not a row |
-| isel commutative-immediate swap | `97 + x` lowered as `add x, #97` (`M30`) | EXEC −0.002, INSN −0.0018, both pairs |
-
-**THE METHOD THAT PRODUCED ALL OF IT, and it is repeatable:** rank the failing
-program's blocks by `ZCC_WEIGHTS=1 ZCC_WCOST=1`, read the top two against gcc's
-same loop, hand-edit the `.s`, verify the output, time it with alternating
-best-of-N — and only then touch the compiler. n7's win was 13% of a program for
-0.0008 of the INSN geomean; m1's two hottest blocks are 58% of that program and
-the static count ranks them nineteenth.
-
-**BANKED — the switch-arm order** (`M31`, `isel::order_switch_arms`): staying
-arms first, following `v` through a `Select` as well as an edge (that second half
-matters — `ifconv` turns `if (--want==0) st = S_CR;` into a select, which is
-exactly where the hot arm's old state hides). **m2_http_parse 1.318 → 1.229**,
-INSN unchanged, gate 15/0.
-
-**AND ITS RESIDUAL IS A PROFILE, chased to the end.** Identification is solved —
-5 of m1's 6 arms and 7 of m2's 9 now qualify — so what is left is RANKING, and
-nothing static separates them: hand-ordering m2's hot arm first measures 0.8198
-(→ **1.008**), a `{4,5,6,7}`-cycle rule measures 0.8927 (→ 1.097) but its premise
-is false because `S_DONE → S_METHOD` makes all nine states one SCC. Which arm is
-hot is a property of the INPUT. **Do not build another static rule here** — it is
-the project's first row whose answer is PGO, worth ~0.11 of the suite's 0.97 log
-mass.
-
-**OPEN, MEASURED, AND THE CHEAP FIX IS REFUTED** (`M32`): the inliner refuses
-`n1_btree_page`'s four-instruction `get2` at all **seventeen** call sites where
-gcc inlines it everywhere. Inlining it in the SOURCE measures **0.9567**
-(n1 1.312 → 1.255) and thirteen instructions FEWER. It is upstream of n1's
-constant row: the calls are what make all ten callee-saved registers live, which
-is why the loop-invariant LCG constants are rebuilt eight instructions per
-iteration in a block worth 54% of the program.
-
-The diagnosis stands — `body_size` counts HIR nodes, `call_cost` counts machine
-instructions, and the mismatch is systematic against inlining. The obvious fix
-(subtract zero-extensions, DDI 0487 B1.2.1) did NOT admit `get2` and DID admit
-others: INSN 1.0688 → 1.0739, reverted. What the row needs is
-`args + 3 + |live across the site|`, and HIR has no general liveness. **Build the
-liveness or leave the row** — every substitute is a threshold somebody picked,
-which is what `call_cost`'s own comment refuses.
-
-**BANKED — the instrument can now measure the compiler** (`M33`). `ZCC_WEIGHTS`
-used to turn on `freq::annotate` AND its two consumers, both measured losses, so
-`ZCC_WCOST` had to choose between weights of 1 and a compiler that is not the one
-under test. It now means "compute the annotation" alone: **codegen-neutral on
-49/49 programs, byte-identical**.
-
-**AND THE OBVIOUS NEXT STEP IS REFUTED.** Feeding SCEV's trip counts into
-`freq::estimate` was built (byte-identical 49/49) and **did not move the ranking**:
-SCEV bounds a loop only when its count is a compile-time constant, and m1's setup
-loop runs `3 + k%9` times while its parse loop runs `n`. Both fall back to
-`TRIPS = 10`. Reverted.
-
-**BANKED — the jump table a dense forty-arm switch was refused** (`M34`).
-`isel::jump_table` trampolines an ARM that carries edge copies but refused the
-whole switch when the DEFAULT edge did. `k1_dispatch`: forty dense arms, past
-`MIN_CASES`, and no table — `ZCC_JT=2` still produced none, so it was never the
-count. Fixed by the mechanism already there. k1 **1.151 → 1.105** (0.9603,
-interleaved), `cmp`-against-immediate 41 → 2. Suite geomean does NOT move (two
-pairs split) and INSN costs 0.13%; it ships as a structural defect removed, on
-the tail argument. `ZCC_NOJTDFLT=1` is the seam.
-
-**AND THE ROW THIS FIRST NAMED AS NEXT DOES NOT EXIST.** `sqlite3VdbeExec`
-ALREADY gets its jump table — `arms=183 span=185 ACCEPTED`. The claim that it did
-not came from reading `ZCC_JTDBG` through `sort -rn | head -12`, which ranks by
-frequency: the one accepted 183-arm switch appears once, the small refused ones
-repeat, and the only line that mattered was cut off by the command reading it.
-sqlite is unchanged by the fix because it needed nothing. The remaining refusals
-are all SPAN and all on sqlite's compile-time paths (parser, expression coder,
-JSON reader), so they are a size row at best.
-
-**⭐ TWO ROWS THIS SESSION TERMINATED AT THE SAME ANSWER, AND IT IS PGO.**
-`M31` cannot rank a state machine's switch arms — which one is hot is a property
-of the INPUT. `M33` cannot rank two loops — the bound is a runtime value. Neither
-is a missing analysis. A counter per block, dumped at exit and read on a second
-compile, answers both AND turns `mir::cost::weighted` from an estimate into an
-instrument. Before building it, weigh it against Article C: a two-pass build is a
-change to the `CC=zcc` drop-in contract, so it is a milestone, not a row.
-
-**THE SCOREBOARD IS THE TAIL, NOT THE GEOMEAN.** Σln(rᵢ) ≈ 0.97 over 49
-programs, and essentially all of the positive mass is the 11–13 programs above
-1.1× (m1 0.35, n1 0.28, m2 0.22, n7 0.18, k1 0.17, …≈1.8 between them), offset by
-the programs already below 1.0 (a1 −0.13, n4 −0.06). Take that tail to parity and
-Σln ≈ −0.83, i.e. geomean ≈ **0.983 — sub-1×**. So the path is NOT seventeen
-0.2% levers; it is eleven programs each needing a 10–40% PROGRAM-level win, which
-is the size of the two taken today. Count programs leaving the tail, not geomean
-deltas.
-
-**REFUTED THE SAME SESSION** (`M28`): the sign-extended index. zcc emits 141
-memory operands of the form `[base, wN, sxtw]` against gcc's 11, 78 in
-`k1_dispatch` alone — and rewriting 73 of them by hand, output identical and
-instruction count identical, bought **0.5%** (0.9946, best-of-40 alternating; a
-first best-of-10 said 0.9798 and was noise). The extension is free inside an
-addressing mode on this core, which is a correction to `M1`'s SCOPE: that 2-cycle
-fact is about an ALU operand. Do not open induction-variable widening on the
-strength of this count.
+**Method, unchanged and it is what found everything:** rank the program's blocks
+by executions (`ZCC_WEIGHTS=1 ZCC_WCOST=1`), read the top two against gcc's same
+loop, hand-edit the `.s` and verify the output, time it with alternating
+best-of-N — and only then touch the compiler.
 
 **The gate every row owes:** a commuting square, both axes, and for EXEC an
 interleaved A/B in ONE box session (`tests/bench/abpair.sh`). Two `realprog.sh`

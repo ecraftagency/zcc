@@ -3186,6 +3186,53 @@ compile-time one, not a speed one, and it is not opened on this evidence.
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee.
 
+### M35. The suite widened to ninety, and the number went UP by seven points
+
+**WHY IT WAS WIDENED.** Every row shipped this session was measured on the
+49-program suite, which is the definition of tuning to a benchmark, and Law 3c
+names the classes that suite does not sample: heavy floating point, working sets
+past cache, deep call graphs and indirect dispatch, varargs, bitfields. Forty-one
+programs were written against exactly those names plus the shapes real C is made
+of — strings, 64-bit arithmetic, allocation, unions, error ladders, sorting,
+codecs, graphs.
+
+**THE RESULT, and it is the honest kind:**
+
+| | 49 programs | 90 programs |
+|---|---|---|
+| EXEC geomean | 1.020 | **1.0916** |
+| INSN geomean | 1.0701 | **1.0892** |
+| above 1.1× | 11 | **29** |
+| worst | 1.44 | **5.05** |
+
+**Seven points of EXEC appeared the moment the surface stopped being the one the
+rows were tuned on.** That is not a regression — nothing got slower — it is the
+measurement catching up with the compiler, and it is why Law 3c says the surface
+is to be widened rather than defended.
+
+**THE COMPILER DID NOT FALL OVER, which is the other half.** Forty-one programs
+written to hit documented blind spots, none of them ever tuned for, and the
+spread is 0.918 to 5.045 with a median of 1.038. **zcc BEATS gcc -O1 on eight of
+them** — `y3_radix` 0.918, `q3_callback` 0.924, `y2_heap` 0.955, `r2_va_mixed`
+0.966, `z4_matmul_int` 0.976, `o4_fp_fft` 0.987, `o6_fp_poly` 0.995,
+`z1_crc32` 1.004 — and the memory-bound ones sit near or below parity because a
+stalled machine does not care about an instruction. An overfitted compiler does
+not do that.
+
+**THE ONE THAT MATTERS.** `x1_goto_cleanup` — **5.045×**, by a factor of three
+the worst thing this project has measured, and it is not an exotic kernel: it is
+the `goto out;` cleanup ladder, C's only error-handling mechanism, the shape of
+every kernel driver, every parser and every library entry point. Its CFG is a
+fan-in — many early exits converging on one block, values live across all of it.
+The 49-program suite had nothing of the kind. `z2_rle` (1.61) and
+`u4_popcnt64` (INSN 2.88) are the next two.
+
+**WHAT THIS RETIRES.** Any statement of zcc's speed taken before this entry. The
+number to quote is 1.09 over ninety programs, and the tail is 29 of them.
+
+**WHEN / WHERE.** 2026-08-29, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee, `tests/bench/exectime.sh`.
+
 **BUILT, and it wins at the heuristic strength predicted.** `isel::order_switch_arms`
 (`ZCC_NOARMORD=1` is the seam) partitions the arms STABLY, staying arms first.
 
