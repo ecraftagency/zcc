@@ -1172,7 +1172,18 @@ measurement, not code.
 
 ---
 
-### §0 THE FINDING (`MEASURED M26`, 2026-08-28, commit `5e03858`)
+> **⚠ §0 AND §2 BELOW ARE SUPERSEDED.** `MEASURED M26-correction` and
+> `MEASURED M27` (Part F) re-took both on the same day and both headline numbers
+> moved: the copy family is 44% of the gap rather than 70%, and the reachable
+> coalescing ceiling on the suite is **203 instructions of 953**, because 289 of
+> the 518 "block-edge copies" are `mov wN, wzr` — a constant zero, which gcc
+> materializes with one instruction of its own. C0 is DISCHARGED; the attribution
+> table it asked for is in `M26-correction`, and the refusal census that retires
+> the eviction row is in `M27`. What is left of this campaign is FREE = 203 on the
+> suite / 4,965 on sqlite, minus the 72 / 1,554 the shipped `ZCC_CSBIAS` row
+> addresses.
+
+### §0 THE FINDING (`MEASURED M26`, 2026-08-28, commit `5e03858`) — SUPERSEDED
 
 The 49-program taxonomy suite, compiled by both compilers, every mnemonic
 counted and the spellings combined:
@@ -2583,6 +2594,137 @@ one measured a loss. The 70% family was not touched by any of them.
 
 **WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
 zcc, gcc -O1 referee, the 49-program taxonomy suite, both compilers at `-S`.
+
+**⚠ TWO OF THE ROWS ABOVE ARE WRONG. Read `M26-correction` before using this
+table.** The `+667` and the `−182` are the same instructions counted twice with
+opposite signs.
+
+### M26-correction. The zero register is not a copy, and it broke both headline rows
+
+**THE DEFECT WAS IN THE INSTRUMENT** — Law 2's measurement exception, claimed
+only after two independent formulations converged on the same answer.
+
+`M26` classified a `mov` by whether its second operand begins with `#` or a
+digit. `mov w9, wzr` begins with neither, so every one of them landed in the
+register→register row. **gcc never emits that form**: it writes `mov w9, 0`,
+which landed in the register→immediate row. One activity — materializing a
+constant zero — was charged to zcc as coalescer excess and to gcc as constant
+materialization, once each, and it is exactly the trap the paragraph above it
+warns about, one spelling further down.
+
+Re-counted with `[wx]zr` excluded from the copy row and folded into the constant
+row, same corpus, same day:
+
+| family | zcc | gcc | Δ | was reported as |
+|---|---|---|---|---|
+| register→register copy (true copy) | 712 | 295 | **+417** (44% of the gap) | +667, 70% |
+| constant materialization (`movz`/`movk`/`mov #imm`/`mov …, zr`) | 951 | 790 | **+161** | −182 |
+
+So zcc materializes **more** constants than gcc, not fewer; the sentence claiming
+the constant-sharing row is proven by that column is withdrawn.
+
+**THE SECOND ANGLE, which is what allows the claim.** The compiler's own
+counters do not read assembly at all. `regalloc::coalesce_report`
+(`ZCC_COALESCE`) classifies every SSA-destruction pair at the moment it is
+created, and `destruct::movkind_report` (`ZCC_MOVKIND`) counts what the
+sequentializer emits. Their columns close exactly — 203 + 26 + 289 = 518 edge
+pairs on the suite, 4,965 + 222 + 2,604 = 7,791 on sqlite — and the third column
+is the one that names the cause: **every pair with a physical end has the ZERO
+REGISTER as its argument. 289 of 289 on the suite, 2,604 of 2,604 on sqlite.**
+Not one is a call result. A constant zero passed along an edge, nothing else.
+
+**THE CORRECTED ATTRIBUTION** of the suite's 518 block-edge "copies":
+
+| bucket | n | share | what it is |
+|---|---|---|---|
+| `mov wN, wzr` | 289 | 56% | a constant, not a copy. gcc pays one instruction for the same thing |
+| FREE | 203 | 39% | both ends virtual, the argument dies on the edge: the merge was legal and biased colouring missed it. **The whole reachable ceiling** |
+| BOUND | 26 | 5% | the two names genuinely coexist; no colouring removes it |
+| permutation cycle | 3 | 0.6% | a swap. Costs copies however it is coloured |
+
+**WHAT THIS RETIRES.** "Half the entire gap is phi copies coalescing never
+removed" (a factor of nine, 519 against 56) is withdrawn: the reachable coalescing
+ceiling on this suite is **203 instructions of a 953 gap, 21%**, and the copy
+family as a whole is 44% rather than 70%. It also retires the recorded conclusion
+that the hint refusals need eviction — see `M27`.
+
+**AND THE 67 SELF-COPIES ARE NOT FREE EITHER.** `ZCC_R42RES` classifies the
+survivors: 61 `wide-read`, 1 `unknown-form`, 0 `no-abi-reader`. A `wide-read`
+survivor has a reader that genuinely looks past 32 bits, so `mov w10, w10` IS the
+zero-extension that reader needs and deleting it is a miscompile. gcc reaches
+zero by not NEEDING the extension, which is a row in `ext.rs`/HIR, not a
+peephole in the emitter. The `M26` paragraph suggesting the fact be restated at
+full width stands, but it buys an extension-elimination row, not 67 free
+instructions.
+
+### M27. The coalescing hint is refused by the ABI, not by an occupant
+
+**WHAT WAS BELIEVED.** The recorded conclusion from the sqlite hint census was
+"14,615 hints refused because the register was already OCCUPIED ⟹ this needs
+EVICTION or priority colouring". Three ordering fixes were then tried against it
+and refuted.
+
+**WHY IT WAS WRONG.** `free(p, occ)` is a conjunction of four clauses —
+allocatable, unoccupied, no physical conflict, and the AAPCS64 §6.1.1 half — and
+the instrument counted every failure of the conjunction under the word
+"occupied". Split by clause, on the same corpora:
+
+| refusal cause (PHYSICAL partner) | suite | sqlite |
+|---|---|---|
+| register not allocatable (it is `xzr`) | 269 | 1,567 |
+| ABI: value crosses a call, hint is caller-saved | 116 | 8,147 |
+| physical conflict | 100 | 4,790 |
+| **genuinely occupied** | **3** | **136** |
+
+**Occupancy is 0.6% of the refusals on the suite and 0.9% on sqlite.** Eviction
+and priority colouring are aimed at a bucket that is not there, which is why the
+three ordering fixes measured nothing.
+
+The virtual-partner twin (`ZCC_VHINT`, the pairs the physical instrument could
+not see, and where `M26-correction`'s FREE column lives) says the same thing one
+register class over: of 191 refusals on the suite and 2,447 on sqlite, the
+AAPCS64 half accounts for 72 and 1,554 — the largest single cause on both.
+
+**THE CAUSE IS THE ALLOCATION ORDER, and it is doing its job.** `GPR_ORDER`
+offers the caller-saved half first so that short-lived values do not squat in the
+callee-saved registers that call-crossing values have no alternative to. The
+side effect is that a short-lived value which is the COPY PARTNER of a
+call-crossing value takes a register the partner may never join, and SSA
+destruction pays a `mov` on that edge for ever.
+
+**THE ROW: partner-aware half selection** (`color::assign`, `ZCC_CSBIAS`,
+default 1). A value that does not itself cross a call, but has an uncoloured copy
+partner that does, is offered the callee-saved half FIRST — and only registers
+the function has ALREADY committed to, because a fresh one costs a prologue save
+and an epilogue restore, two instructions to buy a merge worth one.
+
+| | suite insn | suite EXEC | sqlite insn | sqlite runtime |
+|---|---|---|---|---|
+| baseline | 7,551 | 1.0238 | 171,743 | 1.000 |
+| level 1 (shipped) | 7,545 | 1.0255 | 171,276 | **0.9740** |
+| level 2 (measured, not shipped) | 7,569 | — | 170,542 | 0.9937 of level 1 |
+
+The suite EXEC difference is 0.0017 against a ±0.007 session spread — a wash, not
+a loss. The sqlite runtime figure is the one that carries the row: an
+**interleaved A/B of the two zcc builds inside ONE box session**, best-of-5 over
+the 11 `tests/bench/sql` phases, geomean 0.9740. Taken as two separate
+`realprog.sh` runs it read 1.1298 then 1.1590 — and the gcc side, which cannot
+have changed, moved 7.6% between them. That is the ±0.007 trap at real-program
+scale, and it is why the ratio against gcc is not the instrument for a row this
+size.
+
+Level 2 widens "already committed" from the register to the half. It is a further
+0.9937 on sqlite runtime and costs the suite +18 instructions; a deterministic
+regression on the size axis is not bought with 0.6% sitting near the noise of the
+axis above it.
+
+**LAW-4 RESIDUAL.** The row fires only where a partner is uncoloured at the
+moment of the decision, and 203 FREE pairs remain on the suite — of which the
+ABI clause explained 72. The rest are 77 genuinely occupied and 42 where the
+transitive walk reached a different partner first. Neither is discharged.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee. Gate `fullsuite.sh all`: 15 PASS / 0 RED.
 
 ---
 

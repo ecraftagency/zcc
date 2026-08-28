@@ -406,14 +406,31 @@ fn width_of(f: &MFunc, r: Reg) -> Width {
 /// The point of the split is that the `.s` cannot make it: there, all four are
 /// the letters `mov`, and treating the total as one coalescing opportunity is
 /// how a step gets aimed at the wrong layer.
-fn movkind_report(f: &MFunc, edge: usize, abi: usize, wide: usize, narrow: usize, fp: usize) {
+///
+/// C0 (2026-08-28) adds a sixth column, `cyc`: the number of moves the windmill
+/// emitted only because the remaining pairs formed a CYCLE and one source had
+/// to be parked in the scratch register. A permutation costs copies however it
+/// is coloured, so this column is NOT a coalescing failure and subtracting it
+/// is what keeps the ceiling honest (`MECHANISM.md` Part E §5, the last trap).
+fn movkind_report(
+    f: &MFunc,
+    edge: usize,
+    abi: usize,
+    wide: usize,
+    narrow: usize,
+    fp: usize,
+    cyc: usize,
+) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("ZCC_MOVKIND").is_some()) {
         return;
     }
     if edge + abi + wide + narrow + fp > 0 {
-        eprintln!("MOVKIND {} {} {} {} {} {}", f.name, edge, abi, wide, narrow, fp);
+        eprintln!(
+            "MOVKIND {} {} {} {} {} {} {}",
+            f.name, edge, abi, wide, narrow, fp, cyc
+        );
     }
 }
 
@@ -456,13 +473,14 @@ pub fn sequentialize(f: &mut MFunc, edge_pairs: usize) {
         }
     };
     let (mut edge, mut wide, mut narrow, mut fp) = (0usize, 0usize, 0usize, 0usize);
+    let mut cyc = 0usize;
     for b in f.blocks.iter_mut() {
         let insts = std::mem::take(&mut b.insts);
         let mut out = Vec::with_capacity(insts.len());
         for i in insts {
             match i {
                 MInst::ParallelCopy(pairs) => {
-                    let seq = seq_copy(pairs, &nop);
+                    let seq = seq_copy_counting(pairs, &nop, &mut cyc);
                     edge += seq.len();
                     out.extend(seq);
                 }
@@ -481,13 +499,25 @@ pub fn sequentialize(f: &mut MFunc, edge_pairs: usize) {
         }
         b.insts = out;
     }
-    movkind_report(f, edge_pairs, edge.saturating_sub(edge_pairs), wide, narrow, fp);
+    movkind_report(f, edge_pairs, edge.saturating_sub(edge_pairs), wide, narrow, fp, cyc);
 }
 
 /// The windmill: emit a copy whose destination is not still needed as a source;
 /// when every remaining copy is in a cycle, route one through the scratch
 /// register and continue. Terminates because each step removes one pair.
 fn seq_copy(pairs: Vec<(Reg, Reg, Width)>, nop: &dyn Fn(Reg, Reg, Width) -> bool) -> Vec<MInst> {
+    let mut sink = 0usize;
+    seq_copy_counting(pairs, nop, &mut sink)
+}
+
+/// The windmill proper. `cyc` counts the moves emitted ONLY because a cycle had
+/// to be broken through the scratch register — the C0 column that separates a
+/// genuine permutation from a coalescing failure.
+fn seq_copy_counting(
+    pairs: Vec<(Reg, Reg, Width)>,
+    nop: &dyn Fn(Reg, Reg, Width) -> bool,
+    cyc: &mut usize,
+) -> Vec<MInst> {
     // the same rule as above: a same-register pair is only droppable when the
     // move would not have truncated
     let mut todo: Vec<(Reg, Reg, Width)> =
@@ -503,6 +533,7 @@ fn seq_copy(pairs: Vec<(Reg, Reg, Width)>, nop: &dyn Fn(Reg, Reg, Width) -> bool
                 out.push(mov(d, s, w));
             }
             None => {
+                *cyc += 1;
                 // a pure cycle: park one source in the scratch register and
                 // rewrite the copy that reads it
                 let (_, s, w) = todo[0];

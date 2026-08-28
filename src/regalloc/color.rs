@@ -560,6 +560,33 @@ pub static HINT_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 pub static HINT_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_SPARE_SUM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// C0 (2026-08-28) — WHICH CLAUSE of `free` refused the hint. `HINT_OCCUPIED`
+/// counts every refusal together, and the four causes want opposite work: a
+/// register genuinely HELD is an eviction question, while the AAPCS64 §6.1.1
+/// caller-saved ban is a FUNDAMENTAL limit (Law-4 category (a)) that no
+/// colouring reaches. Reporting them as one number is how a ceiling gets
+/// overstated. MEASURED M11 — the instrument, not a resource constant.
+pub static HINT_R_OCC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static HINT_R_ABI: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static HINT_R_CONF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static HINT_R_MASK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// C0 — the VIRTUAL-partner twin of the above. MEASURED M11 — instrument.
+pub static VHINT_WANTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static VHINT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static VHINT_R_OCC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static VHINT_R_ABI: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static VHINT_R_CONF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static VHINT_R_MASK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// MEASURED M11 — the instrument, not a resource constant
+pub static VHINT_R_OTHER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 thread_local! {
     /// MEASURED M11 — the instrument, not a resource constant.
     /// (block, occupant value index, class) for each ABI refusal whose occupant
@@ -669,6 +696,31 @@ pub static HINT_OCC_UNKNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic:
 /// MEASURED M11 — the instrument, not a resource constant
 pub static HINT_NO_SPARE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// C0-ROW-1 level. DEFAULT 1 — measured 2026-08-28 against a paired baseline in
+/// one box session (`MECHANISM.md` Part E, `MEASURED M27`): sqlite runtime
+/// geomean 0.9740 of the baseline over 11 interleaved phases, sqlite −467
+/// instructions, the 49-program suite −6 instructions and its EXEC geomean
+/// unchanged inside the ±0.007 band. Nothing measured regressed.
+///
+/// `ZCC_CSBIAS=0` turns it off; `=2` widens "already committed" from the
+/// register to the half. Level 2 is measured and NOT shipped: it is a further
+/// 0.9937 on sqlite runtime but costs the suite +18 instructions, and a
+/// deterministic regression on the size axis is not bought with a 0.6% that sits
+/// near the noise of the axis above it (Law 0 ranks exec first, but only where
+/// the reading is real).
+fn csbias() -> bool {
+    csbias_level() > 0
+}
+
+fn csbias_level() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("ZCC_CSBIAS")
+            .ok()
+            .map_or(1, |v| v.parse().unwrap_or(1))
+    })
+}
+
 pub fn hint_stats_wanted() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("ZCC_HINT").is_ok())
@@ -701,6 +753,25 @@ pub fn hint_report() {
         if sp > 0 { ss as f64 / sp as f64 } else { 0.0 },
         ns,
         if o > 0 { 100.0 * sp as f64 / o as f64 } else { 0.0 }
+    );
+    eprintln!(
+        "[hint] refusal cause: occupied={} abi-banned={} phys-conflict={} not-allocatable={}",
+        HINT_R_OCC.load(Relaxed),
+        HINT_R_ABI.load(Relaxed),
+        HINT_R_CONF.load(Relaxed),
+        HINT_R_MASK.load(Relaxed),
+    );
+    let vw = VHINT_WANTED.load(Relaxed);
+    eprintln!(
+        "[vhint] wanted={} taken={} ({:.1}%) | occupied={} abi-banned={} phys-conflict={} not-allocatable={} other-partner={}",
+        vw,
+        VHINT_TAKEN.load(Relaxed),
+        if vw > 0 { 100.0 * VHINT_TAKEN.load(Relaxed) as f64 / vw as f64 } else { 0.0 },
+        VHINT_R_OCC.load(Relaxed),
+        VHINT_R_ABI.load(Relaxed),
+        VHINT_R_CONF.load(Relaxed),
+        VHINT_R_MASK.load(Relaxed),
+        VHINT_R_OTHER.load(Relaxed),
     );
     let (lo, gl, un) = (
         HINT_OCC_LOCAL.load(Relaxed),
@@ -853,6 +924,40 @@ fn assign(
         }
         wave = next;
     }
+    // ZCC_VHINT=1 (C0, 2026-08-28) — the SAME question one register class over,
+    // for the partner the physical instrument cannot see. `ZCC_HINT`'s `want` is
+    // the first PHYSICAL partner, so every virtual/virtual pair — which is where
+    // `ZCC_COALESCE`'s FREE column lives, 203 of the suite's 518 edge copies and
+    // 4,965 of sqlite's 7,791 — was measured by nothing at all. Here the wanted
+    // colour is the first DIRECT partner that already has one, and the refusal
+    // is split by the same four causes so the two families can be compared.
+    if hint_stats_wanted() {
+        let want: Option<PReg> = partners[v as usize].iter().find_map(|q| match q {
+            Reg::V(_) => phys_of(color, sp, *q).filter(|h| h.class == class),
+            _ => None,
+        });
+        if let Some(w) = want {
+            VHINT_WANTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if hint == Some(w) {
+                VHINT_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let ctr = if isa::alloc_mask(w.class) & (1 << w.num) == 0 {
+                    &VHINT_R_MASK
+                } else if avoid_caller_saved && !isa::is_callee_saved(w) {
+                    &VHINT_R_ABI
+                } else if conflict.has(w) {
+                    &VHINT_R_CONF
+                } else if occ.taken(w) {
+                    &VHINT_R_OCC
+                } else {
+                    // free, yet a DIFFERENT colour was taken: the transitive walk
+                    // reached another partner first
+                    &VHINT_R_OTHER
+                };
+                ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
     // ZCC_HINT=1 — is there a CARD TO PLAY? Before building eviction machinery,
     // measure whether eviction is even possible: at each refusal, how many
     // registers of the right class are FREE. A refusal with zero free registers
@@ -871,6 +976,21 @@ fn assign(
                 HINT_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else if !free(w, occ) {
                 HINT_OCCUPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // C0 — which clause said no. Checked in the order that makes the
+                // FUNDAMENTAL one win: a caller-saved register denied to a value
+                // live across a call is refused by the ABI whatever the
+                // occupancy, so counting it as "occupied" would put it inside a
+                // ceiling no eviction scheme can reach.
+                let ctr = if isa::alloc_mask(w.class) & (1 << w.num) == 0 {
+                    &HINT_R_MASK
+                } else if avoid_caller_saved && !isa::is_callee_saved(w) {
+                    &HINT_R_ABI
+                } else if conflict.has(w) {
+                    &HINT_R_CONF
+                } else {
+                    &HINT_R_OCC
+                };
+                ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let spare = isa::alloc_order(class)
                     .iter()
                     .map(|&n| PReg { class, num: n })
@@ -919,12 +1039,63 @@ fn assign(
             }
         }
     }
+    // C0-ROW-1 — PARTNER-AWARE HALF SELECTION (`ZCC_CSBIAS`, 2026-08-28).
+    //
+    // `GPR_ORDER` offers the CALLER-saved half first, so an unhinted value takes
+    // x8 and the callee-saved half stays empty for the values that need it
+    // (AAPCS64 §6.1.1). That is right when the value stands alone and WRONG when
+    // it is the copy-partner of a value that crosses a call: the partner may then
+    // only be coloured callee-saved, this one has just taken a register it can
+    // never join, and SSA destruction pays a `mov` on that edge for ever.
+    //
+    // Measured before it was written (C0, `MECHANISM.md` Part E): of the virtual
+    // copy-partner hints that biased colouring REFUSED, the refusal was this ABI
+    // ban 1,554 times of 2,447 on sqlite and 72 of 191 on the 49-program suite —
+    // the largest single cause on both corpora, and the one no eviction scheme
+    // reaches, because the occupant is not in the way; the ABI is.
+    //
+    // So when a value does NOT cross a call but a partner of it DOES, offer the
+    // callee-saved half first and fall back to the full order. Correctness is
+    // untouched: this only reorders the SEARCH, `free` still refuses an occupied,
+    // conflicting or ABI-illegal register, and a wrong guess costs a `mov`, never
+    // a value. It can raise callee-saved pressure, which is why it falls back
+    // rather than restricting, and why `spill_and_color`'s retry stands behind it.
     let pick = hint
         .or_else(|| {
-            isa::alloc_order(class)
-                .iter()
-                .map(|&n| PReg { class, num: n })
-                .find(|p| free(*p, occ))
+            let order = isa::alloc_order(class);
+            let reg = |n: u8| PReg { class, num: n };
+            let partner_crosses = csbias()
+                && !avoid_caller_saved
+                && partners[v as usize].iter().any(|q| match q {
+                    Reg::V(qv) => {
+                        color[*qv as usize].is_none() && lv.crosses_call[*qv as usize]
+                    }
+                    Reg::P(_) => false,
+                });
+            // …and only into a callee-saved register the function has ALREADY
+            // committed to. A fresh one is not free: AAPCS64 §6.1.1 makes the
+            // prologue save and the epilogue restore it, two instructions, where
+            // the merge this buys is worth one. Measured 2026-08-28: without
+            // this clause the suite lost 9 copies and gained 17 instructions —
+            // the row was paying two to save one.
+            // Level 2 widens "already committed" from the exact register to the
+            // HALF: once the function saves any callee-saved register at all it
+            // has paid for the `stp`/`ldp` pair, so the second of that pair is
+            // free too. Level 1 is the strict form.
+            if partner_crosses {
+                let lvl = csbias_level();
+                let committed = |p: PReg| {
+                    used.has(p) || (lvl >= 2 && used.iter().any(isa::is_callee_saved))
+                };
+                if let Some(p) = order
+                    .iter()
+                    .map(|&n| reg(n))
+                    .find(|p| isa::is_callee_saved(*p) && committed(*p) && free(*p, occ))
+                {
+                    return Some(p);
+                }
+            }
+            order.iter().map(|&n| reg(n)).find(|p| free(*p, occ))
         });
     match pick {
         Some(p) => {

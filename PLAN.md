@@ -21,42 +21,49 @@ dismantled on 2026-08-28.
 
 ---
 
-## THE GRIND: the register copy that is half the instruction gap
+## THE GRIND: what is left of the register copy, after C0 measured it
 
-The facts are `MECHANISM.md` Part E. Measured there: `mov reg,reg` is **70% of
-zcc's entire instruction excess** over gcc -O1, and **519 of those sit at a block
-edge against gcc's 56** — half the total gap on its own. sqlite says the same
-independently (+10,464 of a 20,264 gap).
+**C0 IS DISCHARGED and it moved the ground.** The attribution table is
+`MECHANISM.md` Part F `M26-correction`; the refusal census is `M27`. Two things
+this campaign was built on turned out to be instrument defects, so the rows below
+are the ones that survive:
 
-**C0 — attribute the copies before touching anything.** The census counts what
-reaches the assembler; it does not say which mechanism minted each copy. Three
-sources want opposite fixes: SSA destruction colouring a phi's two ends
-differently; a parallel copy that is a genuine permutation (costs copies however
-it is coloured — NOT a coalescing failure); and a `Copy` minted by
-`mir/pass/ext.rs` that colouring never erased. Instrument `regalloc/destruct.rs`
-and `regalloc/color.rs` with counters under `ZCC_TIME`, over the suite and over
-sqlite, and produce the table. **No code is written before it exists.** Three
-rows were lost on 2026-08-28 by inverting this order.
+- the copy family is **44% of the gap, not 70%** — 289 of the suite's 518
+  "block-edge copies" are `mov wN, wzr`, a constant zero gcc pays one instruction
+  for as well;
+- the hint refusals are **not occupancy** (3 of 488 on the suite, 136 of 14,640
+  on sqlite) — they are the AAPCS64 half and the zero register. **C2 as written
+  is retired**: eviction and priority colouring aim at a bucket that is not there.
 
-**C1 — the identity copy.** 67 copies name the same register at both ends (gcc:
-none); `k1_dispatch` ends every switch arm with `mov w10, w10`. Not soundly
-removable in `emit.rs`: a `w`-form write zeroes bits 63:32, and at `Width::W32`
-the lattice in `ext.rs` proves a fact about the low half only. Restate the fact
-at full width there instead.
+**BANKED.** C0-ROW-1, partner-aware half selection (`ZCC_CSBIAS`, default 1):
+sqlite runtime 0.9740 interleaved, sqlite −467 instructions, suite −6, EXEC
+unchanged, gate 15/0.
 
-**C2 — eviction / priority colouring.** 14,615 hints were refused on sqlite
-because the register was OCCUPIED, not because they were absent or misordered;
-three ordering fixes are already refuted. Needs C0 first: a refusal whose
-occupant is a hinted phi is a different problem from one whose occupant is a
-reload.
+**WHAT IS LEFT, and it is 203 instructions of a 953 gap on the suite.**
 
-**C3 — split the PARAMETER at the terminator**, not the web. `evict_params`
-strips `has_def`, so a loop-header phi can never carry an accumulator. Judge
-against the 1.10× sqlite floor, not 1.0.
+**C1 — the residual FREE.** 203 pairs on the suite, 4,965 on sqlite, where both
+ends are virtual and the argument dies on the edge, so the merge is legal.
+`ZCC_CSBIAS` addresses the ABI-banned share (72 / 1,554). The remainder is 77
+genuinely occupied and 42 where the transitive walk reached a different partner
+first. Re-take `ZCC_HINT` with the row default-on before proposing anything: the
+denominator has moved.
 
-**C4 — ABI argument placement.** +98 copies on the suite, 40% of sqlite's size
-gap on its own. A separate front; do not fold it into C2's measurement.
+**C4 — ABI argument placement.** A separate front and, on sqlite, the larger one:
+`ZCC_MOVKIND` counts 24,374 marshalling copies against 7,791 edge copies, and
+x0–x7 traffic is 22,813 against gcc's 14,626. Do not fold it into C1's
+measurement.
 
-**The gate every row owes:** a commuting square, both axes (EXEC before size,
-Law 0), interleaved pairs inside one box session for EXEC, and the deterministic
-INSN geomean for any size claim.
+**AND THE ROW C0 UNCOVERED, which is not a copy row at all.** `M26-correction`
+inverted the constant-materialization column: zcc emits **951 against gcc's 790,
++161**, where the old table read −182 and was taken as proof the constant-sharing
+row worked. It is now the second-largest family in the gap and nothing has ever
+been aimed at it. First question, unanswered: `isa::mov_chain` knows
+`movz`/`movn`/`movk` and does NOT consider `orr wd, wzr, #imm`, though
+`isa::logical_imm` — the encodability test — already exists and is used only for
+ALU operands. Count the constants whose chain is ≥2 and which `logical_imm`
+accepts before writing anything.
+
+**The gate every row owes:** a commuting square, both axes, and for EXEC an
+interleaved A/B in ONE box session (`tests/bench/abpair.sh`). Two `realprog.sh`
+runs are not a comparison: on 2026-08-28 the gcc side moved 7.6% between two of
+them.

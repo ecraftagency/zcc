@@ -82,25 +82,98 @@ pub fn allocate(f: &mut MFunc) -> Result<(), String> {
 ///
 /// A prediction taken from the first two columns alone would be an over-claim,
 /// which is exactly what §13n's "classify before building" is there to prevent.
+///
+/// C0 (2026-08-28) adds the two columns the first draft SKIPPED in silence, and
+/// they are the reason its three columns summed to 229 where `destruct` emitted
+/// 518 edge copies. A pair only entered the count when BOTH ends were virtual;
+/// a pair with a physical end — an ABI-pinned argument or result that isel
+/// wrote into a block argument, or a parameter the spiller pinned — fell out
+/// through a bare `continue` and was invisible. It is a different question, not
+/// a smaller one: a physical end cannot be RECOLOURED, so no colouring-side
+/// coalescer reaches it, and counting it inside the ceiling would overstate the
+/// row. Split so the ratio decides which front the campaign opens on:
+///
+///   PSAME — a physical pair that already agrees; the copy is gone,
+///   PDIFF — a physical pair that disagrees; only argument TARGETING (C4) or a
+///           split (C3) moves it, never biased colouring.
 fn coalesce_report(f: &MFunc, lv: &live::Liveness, col: &color::Coloring) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("ZCC_COALESCE").is_some()) {
         return;
     }
+    let phys = |r: Reg| -> Option<PReg> {
+        match r {
+            Reg::P(p) => Some(p),
+            Reg::V(v) => col.color.get(v as usize).copied().flatten(),
+        }
+    };
     let (mut same, mut free, mut bound) = (0usize, 0usize, 0usize);
+    let (mut psame, mut pdiff) = (0usize, 0usize);
+    // which END is the pinned one: the PARAMETER (C3's subject) or the
+    // ARGUMENT (C4's), counted separately because they are opposite fixes
+    let (mut ppar, mut parg) = (0usize, 0usize);
+    // of PDIFF, the subset the ABI FORBIDS rather than the colourer missing
+    let mut pabi = 0usize;
+    // of PDIFF, the subset whose argument is the ZERO REGISTER: a constant
+    // materialization wearing a register move's spelling
+    let mut pzr = 0usize;
     for b in 0..f.blocks.len() {
         for (ti, t) in f.blocks[b].term.targets().iter().enumerate() {
             let _ = ti;
             let succ = t.block as usize;
             for (k, arg) in t.args.iter().enumerate() {
-                let p = match f.blocks[succ].params.get(k).and_then(|p| p.vreg()) {
-                    Some(p) => p,
+                let praw = match f.blocks[succ].params.get(k) {
+                    Some(p) => *p,
                     None => continue,
                 };
-                let a = match arg.vreg() {
-                    Some(a) => a,
-                    None => continue,
+                let (p, a) = match (praw.vreg(), arg.vreg()) {
+                    (Some(p), Some(a)) => (p, a),
+                    // at least one end is ABI-pinned and cannot be recoloured
+                    _ => {
+                        match (phys(praw), phys(*arg)) {
+                            (Some(x), Some(y)) if x == y => psame += 1,
+                            _ => {
+                                pdiff += 1;
+                                if praw.vreg().is_none() {
+                                    ppar += 1;
+                                }
+                                if arg.vreg().is_none() {
+                                    parg += 1;
+                                }
+                                // Why the hint was unreachable. A parameter that
+                                // is live across a call may take only a
+                                // callee-saved colour (AAPCS64 §6.1.1), and the
+                                // physical argument it is partnered with is a
+                                // call RESULT in the caller-saved half — so the
+                                // merge is forbidden by the ABI, not missed by
+                                // the colourer. That is Law-4 category (a),
+                                // FUNDAMENTAL, and it must be told apart from a
+                                // pair the colourer could have merged.
+                                let banned = praw.vreg().is_some_and(|p| {
+                                    lv.crosses_call[p as usize]
+                                }) && arg.vreg().is_none()
+                                    && matches!(*arg, Reg::P(x) if !isa::is_callee_saved(x));
+                                if banned {
+                                    pabi += 1;
+                                }
+                                // …and the one that is not a COPY at all. An
+                                // edge carrying the constant zero passes
+                                // `Reg::P(ZR)` as its argument, and SSA
+                                // destruction emits `mov wN, wzr` for it — which
+                                // materializes a constant, exactly as gcc's
+                                // `mov w0, 0` does in the same place. It reaches
+                                // the `.s` spelled like a register move and is
+                                // what made the first census read it as
+                                // coalescer excess on zcc's side and as constant
+                                // materialization on gcc's, once each.
+                                if matches!(*arg, Reg::P(x) if x == isa::ZR) {
+                                    pzr += 1;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                 };
                 let cp = col.color.get(p as usize).copied().flatten();
                 let ca = col.color.get(a as usize).copied().flatten();
@@ -114,8 +187,11 @@ fn coalesce_report(f: &MFunc, lv: &live::Liveness, col: &color::Coloring) {
             }
         }
     }
-    if same + free + bound > 0 {
-        eprintln!("COALESCE {} {} {} {}", f.name, same, free, bound);
+    if same + free + bound + psame + pdiff > 0 {
+        eprintln!(
+            "COALESCE {} {} {} {} {} {} {} {} {} {}",
+            f.name, same, free, bound, psame, pdiff, ppar, parg, pabi, pzr
+        );
     }
 }
 
