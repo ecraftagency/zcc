@@ -503,6 +503,7 @@ fn an_alloca_size_is_extended_to_the_full_register() {
 /// survives and the first assertion fails.
 #[test]
 fn a_by_value_struct_argument_does_not_block_inlining() {
+    crate::hir::pass::set_inline(true);
     let src = "struct V{ int a,b,c,d; };\n\
                long sum(struct V v){ return (long)v.a + v.b - v.c + v.d; }\n\
                int main(void){ long s=0; int k;\n\
@@ -536,4 +537,5 @@ fn a_by_value_struct_argument_does_not_block_inlining() {
         "a recursive composite-argument callee was inlined into itself"
     );
     check(rec, 15);
+    crate::hir::pass::set_inline(false);
 }

@@ -1054,3 +1054,41 @@ against.
 
 **WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
 zcc, gcc -O1 referee, 49-program suite (42 taxonomy + the 7 database kernels).
+
+## M23. What the interprocedural row costs, and what it buys
+
+**WHAT THIS IS.** `hir/pass/inline.rs` is off by default. That is a POLICY, and a
+policy needs a number rather than a preference, so this is the measurement it was
+decided on. Cited from `hir/pass/mod.rs`.
+
+**THE ROW IS NOT SLOW ITSELF.** Its own time on the sqlite amalgamation is about
+two seconds — splicing 1.1 s over 7,968 splices, plus 0.5 s of liveness rebuilds.
+What it does is GROW every function it touches, and the passes below it are
+superlinear in function size, so it multiplies their cost. sqlite goes from
+237,846 to 289,478 lines of assembly, +22%, and the growth concentrates in the
+functions that were already largest.
+
+| | with the row | without it |
+|---|---|---|
+| sqlite compile (gcc -O1: 6.4 s) | 22.2 s | 4.7 s |
+| 60 cached yarpgen tests, vs gcc | 5.19× | 3.84× |
+| taxonomy suite EXEC geomean | 1.0184 | 1.0784 |
+| taxonomy suite INSN geomean | — | 1.0768 |
+
+**WHAT IT COSTS TO TURN OFF.** About six points of exec geomean over the 49
+programs, and the damage is concentrated rather than spread: `e3_struct_byval`
+is 1.985, a by-value-struct callee the row used to erase entirely.
+
+**WHY IT IS OFF ANYWAY.** The fuzzing campaigns are how miscompiles are found,
+and they are gated on compile time: at 5.19× a 300-seed local gate does not fit
+in the ten minutes it is meant to, and a 10,000-seed campaign is about six hours
+of compiling. A correctness gate that cannot be run often is not a gate. The row
+waits for the passes it feeds, not the other way round.
+
+**WHAT TURNS IT BACK ON.** `spill` (7.7 s of the 22) and `cfg` (~3 s) growing
+faster than linearly in function size. Make those proportional and the row's cost
+falls to roughly its code growth — about +22%, not +370% — and the six points
+come back with it.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.

@@ -63,7 +63,14 @@ pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String
     // optimized when it is spliced in (its locals promoted, its constants
     // folded), and the caller must be re-optimized afterwards, because a call
     // replaced by a body is exactly the shape the other rows feed on.
-    if on("inline") && timed("inline", || inline::run_module(m, pinned)) {
+    // OFF BY DEFAULT (2026-08-28). This row is not slow itself — it costs about
+    // two seconds — but it GROWS every function it touches, and the passes below
+    // it are superlinear in function size, so it multiplies their cost: sqlite
+    // compiles in 22 s with it and 4.7 s without, against gcc -O1's 6.4 s. The
+    // fuzzing campaigns are how miscompiles are found, and they are gated on
+    // compile time, so the row waits until the passes it feeds can absorb what it
+    // produces. `ZCC_INLINE=1`, or `set_inline(true)` in a battery, turns it on.
+    if inline_wanted() && on("inline") && timed("inline", || inline::run_module(m, pinned)) {
         let ro = readonly(m);
         for f in m.funcs.iter_mut() {
             run_with(f, &ro);
@@ -187,12 +194,38 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
 /// question is which theorem's square is false, and answering it by rebuilding
 /// the compiler six times is the slow path Law 2 warns about. No shipped
 /// configuration reads it.
+/// Is the interprocedural row wanted? Off by default — see `run_module_with`.
+///
+/// A battery that MEASURES inlining asks for it in the thread it runs in, not
+/// through the environment: `cargo test` runs tests in parallel in one process,
+/// so an environment variable is shared by every test at once and one battery
+/// would silently decide another's input. Same reason `regalloc::promote` keeps
+/// its switch this way.
+thread_local! {
+    /// THEORY A7b — the interprocedural row's switch, and an instrument half in
+    /// the sense `promote.rs` carries: a battery that MEASURES inlining turns it
+    /// on in its own thread. The default is a POLICY recorded in
+    /// `run_module_with` above, not a spec constant — it is off because the
+    /// passes this row feeds are superlinear in function size (`MEASURED M23`).
+    static INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn inline_wanted() -> bool {
+    INLINE.with(|c| c.get()) || std::env::var_os("ZCC_INLINE").is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn set_inline(on: bool) {
+    INLINE.with(|c| c.set(on));
+}
+
 fn on(name: &str) -> bool {
     match std::env::var("ZCC_NOPASS") {
         Ok(v) => !v.split(',').any(|x| x == name),
         Err(_) => true,
     }
 }
+
 
 /// WHAT EACH ROW OF THE LADDER COSTS, under `ZCC_TIME`.
 ///
@@ -203,6 +236,10 @@ fn on(name: &str) -> bool {
 /// It is off unless `ZCC_TIME` is set, and the row below it reads the same
 /// environment variable the pipeline's stage timers already use.
 thread_local! {
+    /// THEORY A7b — instrument half, as `RECONSTRUCT` and `PRUNE` in `spill.rs`.
+    /// It records where the ladder's time went and decides nothing; a row that
+    /// is not measured is a row optimized by guess, and this session spent
+    /// itself proving that on/off deltas confound one pass with the next.
     static LADDER: std::cell::RefCell<Vec<(&'static str, std::time::Duration)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }

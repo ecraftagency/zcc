@@ -236,6 +236,7 @@ fn sccp_kills_the_arm_a_constant_makes_unreachable() {
         "the unreachable arm and its multiply must be gone"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -289,6 +290,7 @@ fn gvn_respects_dominance() {
     // so numbering must not reuse it — the whole point of the dominator scope.
     let src = "int f(int c,int a,int b){int t=0;if(c){t=a/b;}return t+a/b;}int main(void){return f(0,84,2);}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 // ── sroa + mem2reg ─────────────────────────────────────────────────────────
@@ -324,6 +326,7 @@ fn sroa_splits_a_struct_field_by_field() {
         "both fields must be promoted"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -346,6 +349,7 @@ fn an_escaped_local_bounds_the_escape_to_its_own_object() {
         "only the escaped object keeps a stack address"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -354,6 +358,7 @@ fn a_type_punned_slot_is_not_promoted() {
     // would lose the other's bytes. The union below is the C spelling of it.
     let src = "union U{int i;char c[4];};int main(void){union U u;u.i=0x2a;return u.c[0];}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -362,6 +367,7 @@ fn a_variably_indexed_array_stays_in_memory() {
     // that object — and the object is the whole array, so none of it promotes.
     let src = "int main(void){int a[4];int i;for(i=0;i<4;i++)a[i]=i*i;return a[0]+a[1]+a[2]+a[3]+28;}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -417,6 +423,7 @@ fn sccp_finds_a_constant_around_a_loop() {
     // The loop ITSELF survives: deleting a counted loop with no effect needs a
     // final-value/loop-DCE theorem, which is R2.4's row, not sccp's.
     square(src, 42);
+    super::set_inline(false);
 }
 
 // ── load_elim / dse ────────────────────────────────────────────────────────
@@ -429,6 +436,7 @@ fn a_stored_value_is_forwarded_to_the_load() {
     assert_eq!(count(f, |i| matches!(i, Inst::Load { .. })), 0, "the reload of *p is redundant");
     assert_eq!(count(f, |i| matches!(i, Inst::Store { .. })), 1, "but the store is observable");
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -437,6 +445,7 @@ fn a_second_read_of_the_same_place_is_the_first() {
     let after = module(src, true);
     assert_eq!(count(func(&after, "f"), |i| matches!(i, Inst::Load { .. })), 1);
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -449,6 +458,7 @@ fn an_overwritten_store_is_dead() {
         "only the last store to a location is observable"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -462,6 +472,7 @@ fn a_call_between_the_store_and_the_load_blocks_forwarding() {
         "an opaque call must invalidate the table"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -472,6 +483,7 @@ fn a_volatile_access_is_never_forwarded_or_removed() {
     assert_eq!(count(f, |i| matches!(i, Inst::Load { vol: true, .. })), 1);
     assert_eq!(count(f, |i| matches!(i, Inst::Store { vol: true, .. })), 1);
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -486,6 +498,7 @@ fn disjoint_objects_do_not_kill_each_other() {
         "g2's store cannot touch g1"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 // ── dce ────────────────────────────────────────────────────────────────────
@@ -501,6 +514,7 @@ fn dce_removes_an_unused_computation_but_not_a_call() {
     assert_eq!(count(f, |i| matches!(i, Inst::Call { .. })), 1, "a call is never dead");
     assert_eq!(count(f, |i| matches!(i, Inst::Bin { op: BinOp::Mul, .. })), 0);
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -513,12 +527,14 @@ fn dce_keeps_a_volatile_access() {
         "C99 6.7.3: a volatile read may not be deleted"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
 fn dce_drops_a_dead_block_parameter() {
     let src = "int main(void){int i;int s=0;int unused=0;for(i=0;i<5;i++){s+=i;unused+=i*i;}return s+32;}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 // ── licm ───────────────────────────────────────────────────────────────────
@@ -543,6 +559,7 @@ fn licm_hoists_an_invariant_expression_out_of_the_loop() {
         .count();
     assert_eq!(in_loop, 0, "a*b is invariant and must leave the body");
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -576,6 +593,7 @@ fn licm_refuses_a_division_that_could_trap() {
 fn licm_leaves_a_variant_expression_alone() {
     let src = "int f(int a,int n){int i,s=0;for(i=0;i<n;i++)s+=a*i;return s;}               int main(void){return f(2,7);}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 // ── the ladder as a whole ──────────────────────────────────────────────────
@@ -613,6 +631,7 @@ fn ladder_is_idempotent_at_the_fixpoint() {
 
 #[test]
 fn inline_substitutes_a_static_callee_called_once() {
+    super::set_inline(true);
     let src = "static int helper(int a,int b){int t=a*b;return t+t;}\
                int main(void){return helper(3,7);}";
     let after = module(src, true);
@@ -622,6 +641,7 @@ fn inline_substitutes_a_static_callee_called_once() {
         "a static callee with no remaining call site is dead and must not be emitted"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -636,6 +656,7 @@ fn inline_refuses_a_recursive_callee() {
         "the recursive call must survive"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -647,6 +668,7 @@ fn inline_refuses_a_variadic_callee() {
     let after = module(src, true);
     assert!(after.funcs.iter().any(|f| f.name == "sum"), "a variadic callee stays a call");
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -669,6 +691,7 @@ fn inline_preserves_the_value_through_a_branchy_callee() {
     let src = "static int pick(int c,int a,int b){if(c)return a;return b;}\
                int main(void){int s=0;s+=pick(1,40,0);s+=pick(0,0,2);return s;}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -685,6 +708,7 @@ fn an_aliased_global_is_one_object_under_two_names() {
     let stores = count(f, |i| matches!(i, Inst::Store { .. }));
     assert!(stores >= 1, "the increment through the alias is observable");
     square(src, 42);
+    super::set_inline(false);
 }
 
 // ── if_convert ─────────────────────────────────────────────────────────────
@@ -698,6 +722,7 @@ fn ifconv_turns_a_diamond_into_a_select() {
     assert_eq!(count(f, |i| matches!(i, Inst::Select { .. })), 1, "the diamond must become a select");
     assert_eq!(nlive_blocks(f), 1, "and the branch must be gone");
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -711,6 +736,7 @@ fn ifconv_refuses_a_side_effecting_arm() {
         "the store must stay, and stay conditional"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -726,6 +752,7 @@ fn ifconv_refuses_a_faulting_arm() {
         "the division must stay behind its branch"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -735,6 +762,7 @@ fn ifconv_leaves_a_float_diamond_to_the_branch() {
     let src = "double f(int c,double a,double b){double r;if(c)r=a;else r=b;return r;}\
                int main(void){return (int)f(1,42.0,0.0);}";
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -785,6 +813,7 @@ fn sink_moves_a_computation_to_the_block_that_needs_it() {
         "the product is needed on one path only and must move there"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -808,6 +837,7 @@ fn sink_does_not_move_a_computation_into_a_loop() {
     });
     assert!(!in_loop, "the product must stay outside the loop");
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]
@@ -1031,6 +1061,7 @@ fn purity_survives_recursion() {
         "a recursive read-only callee is still read-only"
     );
     square(src, 42);
+    super::set_inline(false);
 }
 
 #[test]

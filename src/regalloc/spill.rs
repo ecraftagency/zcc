@@ -204,8 +204,8 @@ pub fn spill_with(
     forced: &BTreeSet<VReg>,
     cross_cap: usize,
 ) -> Result<usize, String> {
-    let remat = crate::compile::phase("    remat", || rematerializable(f));
-    let web = crate::compile::phase("    webs", || webs(f));
+    let remat = rematerializable(f);
+    let web = webs(f);
     // CP2.3 (compile-speed): `spilled` is membership-tested on the per-operand
     // hot path of `simulate` and never iterated in order, so a dense `Vec<bool>`
     // over the (fixed) vreg index replaces the `BTreeSet<VReg>` — O(1) contains,
@@ -319,8 +319,8 @@ pub fn spill_with(
                 fell_back = true;
                 prev_exit = vec![Vec::new(); f.blocks.len()];
             }
-            let lv = crate::compile::phase("    lv", || live::compute(f, &cfg));
-            match crate::compile::phase("    simulate", || simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat))? {
+            let lv = live::compute(f, &cfg);
+            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat)? {
                 Sim::Plan(p) => {
                     // SPEND A ROUND ONLY IF IT CAN BUY SOMETHING. The seeding is
                     // worth another walk while it is still finding NEW block
@@ -948,9 +948,9 @@ fn simulate(
         }
         d
     };
-    let base = crate::compile::phase("      base", || linear_positions(f, cfg));
-    let uses = crate::compile::phase("      uses", || use_positions(f, lv, cfg, &base));
-    let trace = crate::compile::phase("      trace", || Trace::new(f, lf, &base, &uses, lv, web));
+    let base = linear_positions(f, cfg);
+    let uses = use_positions(f, lv, cfg, &base);
+    let trace = Trace::new(f, lf, &base, &uses, lv, web);
     // Once the function contains a call the register file is PARTITIONED: a value
     // live across a call may use only the callee-saved half (AAPCS64 §6.1.1, and
     // `color.rs` applies it per VALUE over its whole range), and a value that is

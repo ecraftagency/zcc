@@ -522,9 +522,11 @@ pub fn check(f: &MFunc, lv: &Liveness, col: &Coloring) -> Result<(), String> {
     Ok(())
 }
 
-/// One slot per physical register: three classes of at most 32 each. A register
-/// is a class and a number, so it indexes its own entry and no search is needed.
-const PHYS_SLOTS: usize = 96;
+/// One slot per physical register — the file `live::Space` already indexes, so
+/// the size is ITS fact rather than a second copy of it (THEORY II-3, the
+/// AAPCS64 register table). A register is a class and a number, so it indexes
+/// its own entry and no search is needed.
+use super::live::PHYS as PHYS_SLOTS;
 
 fn phys_slot(p: PReg) -> usize {
     let base = match p.class {
