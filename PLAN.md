@@ -117,6 +117,21 @@ others: INSN 1.0688 → 1.0739, reverted. What the row needs is
 liveness or leave the row** — every substitute is a threshold somebody picked,
 which is what `call_cost`'s own comment refuses.
 
+**BANKED — the instrument can now measure the compiler** (`M33`). `ZCC_WEIGHTS`
+used to turn on `freq::annotate` AND its two consumers, both measured losses, so
+`ZCC_WCOST` had to choose between weights of 1 and a compiler that is not the one
+under test. It now means "compute the annotation" alone: **codegen-neutral on
+49/49 programs, byte-identical**.
+
+**NEXT, and three separate findings point at it:** the estimate is DEPTH-based.
+It ranked m1's doubly-nested setup loops at 58% while the single-nested parse
+loop beside them runs 60× more, and two hand edits went to the wrong place.
+Feed SCEV's `s.trips` — already computed, already read by the IVX gate — into
+`freq::estimate`. That is also what would let `ZCC_HOIST` fire only in hot loops
+instead of everywhere, which is the whole of why it loses (+17 instructions for
+0.5% on m1, and it is the SAME defect in n7, n1 and m1: a loop-invariant constant
+rebuilt every iteration where gcc hoists it).
+
 **THE SCOREBOARD IS THE TAIL, NOT THE GEOMEAN.** Σln(rᵢ) ≈ 0.97 over 49
 programs, and essentially all of the positive mass is the 11–13 programs above
 1.1× (m1 0.35, n1 0.28, m2 0.22, n7 0.18, k1 0.17, …≈1.8 between them), offset by

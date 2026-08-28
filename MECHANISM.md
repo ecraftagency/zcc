@@ -3046,6 +3046,45 @@ Build the liveness or leave the row.
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee, 49-program taxonomy suite.
 
+### M33. The annotation is not a consumer — the instrument could not measure the compiler
+
+**THE DEFECT WAS IN A SWITCH.** `ZCC_WEIGHTS` turned on `freq::annotate` AND
+both of its consumers (`layout`'s block chaining, the spiller's eviction
+ranking). Both consumers are measured losses — EXEC 1.0206 → 1.0873 when the
+pair shipped — so the annotation was off by default, which left `MBlock.weight`
+at 1 everywhere and `mir::cost::weighted` reading a constant.
+
+That left the instrument with no valid reading available: weights of 1 from the
+compiler under test, or real weights from a compiler that is **not** the one
+under test. It read the 1s, and three separate findings in one session traced
+back to it — `M29`'s ranking, `M30`'s worklist, and the `ZCC_HOIST` policy
+question, which needs to know which loop is hot and cannot ask.
+
+**THE FIX.** `ZCC_WEIGHTS` now means exactly "compute the annotation", and each
+consumer opts in by its own name. Nothing reads `weight` unless a consumer is
+named, so the annotation is codegen-neutral **by construction** — and that is
+checkable rather than argued:
+
+```
+ZCC_WEIGHTS=1 is codegen-neutral on 49/49 programs, 0 differ
+```
+
+Byte-identical across the whole suite, which is Article E's refactor gate applied
+to an instrument seam. The batteries get a thread-local `set_consumers` twin of
+`set_weights`, because two tests running in parallel share the environment.
+
+**WHAT IT DOES NOT FIX.** The estimate is still DEPTH-based, so it ranked
+`m1_resp_parse`'s two doubly-nested setup loops at 58% of the program while the
+single-nested parse loop beside them runs sixty times more often; two hand edits
+aimed there measured 0.997 and 0.999. Making it accurate means feeding SCEV's
+trip counts into `estimate` — `s.trips` already exists and the IVX gate already
+reads it. That is the next row, and it is what would let `ZCC_HOIST` be gated on
+"this loop is hot" instead of hoisting into cold paths, which is the whole of why
+it loses at +17 instructions for 0.5%.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, 49-program taxonomy suite.
+
 **BUILT, and it wins at the heuristic strength predicted.** `isel::order_switch_arms`
 (`ZCC_NOARMORD=1` is the seam) partitions the arms STABLY, staying arms first.
 

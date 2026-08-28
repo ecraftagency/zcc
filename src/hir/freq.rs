@@ -113,22 +113,50 @@ fn env_weights() -> bool {
 /// R5.1 IS TWO CONSUMERS UNDER ONE SWITCH, and the first measurement said the
 /// pair loses — EXEC 1.0206 → 1.0873, INSN 1.0719 → 1.0880 on the 42-program
 /// taxonomy suite (2026-08-28, this machine). A pair that loses says nothing
-/// about which half lost, so each consumer gets its own seam: `ZCC_WEIGHTS`
-/// still turns both on, and `ZCC_WEIGHTS_LAYOUT` / `ZCC_WEIGHTS_SPILL` turn on
-/// exactly one. This is Law 2's "locate mechanically first" applied to a
-/// performance defect rather than a correctness one.
+/// about which half lost, so each consumer has its own seam.
+///
+/// **THE ANNOTATION IS NOT A CONSUMER, and conflating them cost this project a
+/// measurement** (`MEASURED M33`). `ZCC_WEIGHTS` used to turn both consumers on
+/// as well, so there was no way to compute the frequencies WITHOUT changing
+/// codegen — and `mir::cost::weighted`, the instrument that ranks blocks by
+/// executions, therefore had a choice between reading weights of 1 in a default
+/// build and reading real weights from a compiler that is no longer the one
+/// under test. It read 1s, ranked `m1_resp_parse`'s two setup loops at 58% of
+/// the program, and sent two hand edits at loops the parse loop beside them
+/// outruns sixty times over.
+///
+/// So `ZCC_WEIGHTS` now means exactly "compute the annotation", which is
+/// codegen-neutral by construction — nothing reads `weight` unless a consumer is
+/// named — and each consumer opts IN by name. That is also the right default
+/// independently: both consumers are measured losses, and a switch that turns on
+/// a known regression as a side effect of asking a question is not a seam.
 pub fn layout_wanted() -> bool {
-    weights_wanted() && sub("ZCC_WEIGHTS_SPILL", "ZCC_WEIGHTS_LAYOUT")
+    weights_wanted() && consumer("ZCC_WEIGHTS_LAYOUT")
 }
 
 /// The same, for the spiller's eviction ranking.
 pub fn spill_wanted() -> bool {
-    weights_wanted() && sub("ZCC_WEIGHTS_LAYOUT", "ZCC_WEIGHTS_SPILL")
+    weights_wanted() && consumer("ZCC_WEIGHTS_SPILL")
 }
 
-/// A consumer is on unless the OTHER consumer was named alone.
-fn sub(other: &str, own: &str) -> bool {
-    std::env::var_os(own).is_some() || std::env::var_os(other).is_none()
+thread_local! {
+    // THEORY A7b — instrument half, the twin of `WEIGHTS`. A battery must be
+    // able to turn the CONSUMERS on without touching the environment, which two
+    // tests running in parallel share.
+    static CONSUMERS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Force both consumers on or off for the CURRENT THREAD, or hand the decision
+/// back to the environment with `None`.
+pub fn set_consumers(on: Option<bool>) {
+    CONSUMERS.with(|c| c.set(on));
+}
+
+fn consumer(name: &str) -> bool {
+    match CONSUMERS.with(|c| c.get()) {
+        Some(v) => v,
+        None => std::env::var_os(name).is_some(),
+    }
 }
 
 /// Stamp every block with its estimated frequency, so the layers BELOW HIR can

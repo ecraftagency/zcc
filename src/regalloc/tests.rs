@@ -1632,6 +1632,9 @@ fn frequency_weights_move_the_code_and_not_the_answer() {
     let ast = frontend(&src);
     let build = |on: bool| -> (i64, i64, String) {
         hir::freq::set_weights(Some(on));
+        // the ANNOTATION and its CONSUMERS are separate seams (`MEASURED M33`);
+        // this battery is about the consumers, so it names them
+        hir::freq::set_consumers(Some(on));
         let mut h = hir::build::build(&ast);
         hir::pass::run_module(&mut h);
         for f in h.funcs.iter_mut() {
@@ -1643,6 +1646,7 @@ fn frequency_weights_move_the_code_and_not_the_answer() {
         let after = mi::new_machine(&p, &ast).call("main", &[], &[]).expect("⟦mir_p⟧ trapped");
         let text = crate::emit::emit(&ast, &p);
         hir::freq::set_weights(None);
+        hir::freq::set_consumers(None);
         (before as i32 as i64, after as i32 as i64, text)
     };
     let (voff, poff, off) = build(false);
