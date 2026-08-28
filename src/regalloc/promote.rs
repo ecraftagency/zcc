@@ -246,11 +246,25 @@ pub fn run(f: &mut MFunc) {
     // once `dst` is set to `r` and neither is written again before `dst`'s use,
     // the use reads `r` directly; if `dst` is redefined later in the block it does
     // not escape, so the `mov dst, r` is dead and dropped.
-    let promoted: HashSet<PReg> = bind
-        .iter()
-        .filter(|(id, _)| invariant.contains(id))
-        .map(|(_, r)| *r)
-        .collect();
+    //
+    // THE INVARIANT FILTER WAS THE PROPAGATION'S SIDE CONDITION, NOT THE
+    // THEOREM'S (2026-08-28). What the rename needs is that `r` still holds the
+    // copied value at the use it is being moved to — and for an invariant slot
+    // that is true for the whole function, which is why the filter was written
+    // this way. For a LOOP-CARRIED slot it is true too, just not everywhere:
+    // it holds from the reload until the next STORE, and the store is a `Copy`
+    // into `r` the scan below can see. So the filter comes off and the scan
+    // stops at a definition of `r` instead.
+    //
+    // WHAT ASKED FOR IT. `n7_nested_subq`'s inner loop, which this same pass
+    // promoted on the same day: the counter's reload and store became
+    // `mov x8, x28` … `mov x28, x8` around a `sub`, three instructions of
+    // shuttling executed 5,760,000 times, and the invariant filter refused to
+    // touch any of them. Hand-editing the loop to keep the counter in `x28`
+    // throughout measured **0.8669** on the program — at ONE static instruction
+    // fewer, because the two copies live in a block the static count weighs the
+    // same as a cold arm.
+    let promoted: HashSet<PReg> = bind.values().copied().collect();
     for b in f.blocks.iter_mut() {
         propagate_block(b, &promoted);
     }
@@ -258,6 +272,158 @@ pub fn run(f: &mut MFunc) {
     // 6. The function now writes these registers, so the prologue must save them.
     for r in bind.values() {
         f.saved.add(*r);
+    }
+
+    // 7. SINK THE STORE INTO ITS PRODUCER — the other half of 5b, across the
+    // one edge 5b cannot see.
+    //
+    // `split_critical_edges` gives a loop latch its own little block, and SSA
+    // destruction is long finished by the time this pass turns a spill into a
+    // register, so the store lands there ALONE: `mov r, d ; b header`. The
+    // producer of `d` is the last instruction of the latch, `d` dies at the
+    // store, and nothing else reads either name — so the producer can simply
+    // write `r`, the copy goes, and the latch branches straight back. The block
+    // is then unreachable and `layout` deletes it.
+    //
+    // WHY IT IS WORTH A DATAFLOW CHECK. On `n7_nested_subq` this is two executed
+    // instructions and one taken branch out of a fifteen-instruction inner loop
+    // that runs 5,760,000 times: hand-edited, **0.8585**, at an instruction
+    // count that does not move at all until `layout` collects the dead block
+    // (`MEASURED M29`).
+    // The static cost model is blind to it by construction — one copy in a
+    // latch weighs exactly what one copy in a cold arm weighs — which is the
+    // same blindness Law 3c names for chains, here for FREQUENCY.
+    //
+    // THE THREE SIDE CONDITIONS, and each is a real miscompile without it:
+    //   * `r` must be DEAD on the latch's other edge. Writing the producer into
+    //     `r` clobbers the slot on the loop-EXIT path too, where the old value
+    //     would otherwise survive — sound only if nothing reads it there.
+    //   * `d` must be dead after the store, or the uses left behind read a name
+    //     nothing writes any more.
+    //   * the producer must define `d` and nothing else, plainly. A `Call`, an
+    //     `Asm` or a fixed-def form is refused: its destination is the ABI's
+    //     choice, not ours.
+    sink_stores(f, &promoted);
+}
+
+/// Step 7 — see `run`. Read-write, and every edit is guarded by the liveness of
+/// the two physical registers involved.
+fn sink_stores(f: &mut MFunc, promoted: &HashSet<PReg>) {
+    let cfg = crate::mir::verify::cfg(f);
+    let lv = super::live::compute(f, &cfg);
+    let sp = lv.sp;
+    // (latch, its instruction index, the split block, its target, r, d)
+    let mut work: Vec<(usize, usize, usize, MBlockId, PReg, PReg)> = Vec::new();
+    for b in 0..f.blocks.len() {
+        let blk = &f.blocks[b];
+        let (r, d) = match (blk.insts.len(), blk.insts.first()) {
+            (1, Some(MInst::Copy { dst: Reg::P(r), src: Reg::P(d), .. }))
+                if promoted.contains(r) && r != d =>
+            {
+                (*r, *d)
+            }
+            _ => continue,
+        };
+        let target = match blk.term {
+            MTerm::B(MTarget { block, ref args }) if args.is_empty() => block,
+            _ => continue,
+        };
+        if cfg.preds[b].len() != 1 {
+            continue;
+        }
+        let p = cfg.preds[b][0] as usize;
+        if p == b {
+            continue;
+        }
+        // The producer: the last instruction of the latch that defines `d`.
+        // It need not be the final one — `n7_nested_subq`'s latch decrements
+        // the counter and then bumps two pointers — but everything AFTER it
+        // must leave both `d` and `r` alone, or moving the definition onto `r`
+        // would either clobber a live `r` or read a `d` that no longer exists.
+        let pi = match f.blocks[p]
+            .insts
+            .iter()
+            .rposition(|i| {
+                let mut hit = false;
+                i.visit(&mut |rr, c| {
+                    if matches!(c, Constraint::Def | Constraint::DefFixed(_)) && rr == Reg::P(d) {
+                        hit = true;
+                    }
+                });
+                hit
+            }) {
+            Some(i) => i,
+            None => continue,
+        };
+        let tail_clear = f.blocks[p].insts[pi + 1..].iter().all(|i| {
+            let mut clear = true;
+            i.visit(&mut |rr, _| {
+                if rr == Reg::P(d) || rr == Reg::P(r) {
+                    clear = false;
+                }
+            });
+            clear
+        });
+        if !tail_clear {
+            continue;
+        }
+        let mut defs: Vec<Reg> = Vec::new();
+        let mut fixed = false;
+        f.blocks[p].insts[pi].visit(&mut |rr, c| match c {
+            Constraint::Def => defs.push(rr),
+            Constraint::DefFixed(_) => {
+                defs.push(rr);
+                fixed = true;
+            }
+            _ => {}
+        });
+        if fixed || defs.len() != 1 || defs[0] != Reg::P(d) {
+            continue;
+        }
+        // `r` dead on every OTHER edge out of the latch, and `d` dead after the
+        // store — both asked of the successors, which is where a value that
+        // survives this block would have to appear.
+        let ri = sp.idx(Reg::P(r));
+        let di = sp.idx(Reg::P(d));
+        //
+        // AND `d` MUST DIE AT THE STORE ON EVERY EDGE, not only on the one that
+        // reaches the store. The first cut asked it of `target` alone and three
+        // allocator batteries answered with `⟦mir_v⟧ ≠ ⟦mir_p⟧`: a loop-carried
+        // ACCUMULATOR is read on the loop's EXIT edge, so renaming its
+        // definition onto `r` left the exit reading a `d` nothing writes any
+        // more. Law 3 at the middle, doing exactly its job.
+        let other_succs = || cfg.succs[p].iter().filter(|&&s| s as usize != b);
+        let r_safe = other_succs().all(|&s| !lv.live_in[s as usize].contains(&ri));
+        let d_safe = other_succs().all(|&s| !lv.live_in[s as usize].contains(&di))
+            && !lv.live_in[target as usize].contains(&di);
+        if !r_safe || !d_safe {
+            continue;
+        }
+        // One latch, one rewrite: two split blocks can share a predecessor, and
+        // the second edit would be computed from a scan the first invalidated.
+        if work.iter().any(|&(q, ..)| q == p) {
+            continue;
+        }
+        work.push((p, pi, b, target, r, d));
+    }
+    for (p, pi, b, target, r, d) in work {
+        f.blocks[p].insts[pi].visit_mut(&mut |rr, c| {
+            if matches!(c, Constraint::Def) && *rr == Reg::P(d) {
+                *rr = Reg::P(r);
+            }
+        });
+        f.blocks[p].term.visit_mut(&mut |rr, c| {
+            if matches!(c, Constraint::Use) && *rr == Reg::P(d) {
+                *rr = Reg::P(r);
+            }
+        });
+        let mut term = f.blocks[p].term.clone();
+        for t in term.targets_mut() {
+            if t.block as usize == b {
+                t.block = target;
+            }
+        }
+        f.blocks[p].term = term;
     }
 }
 
@@ -289,11 +455,18 @@ fn propagate_block(b: &mut MBlock, promoted: &HashSet<PReg>) {
         // dropped. Track both.
         let mut redefined = false;
         let mut fixed_use = false;
+        // …and `r` itself may be REDEFINED, by the store that ends this slot's
+        // current value (a `Copy` into `r`). Past that point `r` no longer holds
+        // what `dst` holds, so the rename must stop — reads before writes, so
+        // the defining instruction's OWN uses are still renamed and the stop
+        // takes effect after it.
+        let mut r_redefined = false;
         for j in (i + 1)..n {
-            if redefined {
+            if redefined || r_redefined {
                 break;
             }
             let mut defs_dst = false;
+            let mut defs_r = false;
             b.insts[j].visit_mut(&mut |rr, c| match c {
                 Constraint::Use => {
                     if *rr == Reg::P(dst) {
@@ -309,16 +482,22 @@ fn propagate_block(b: &mut MBlock, promoted: &HashSet<PReg>) {
                     if *rr == Reg::P(dst) {
                         defs_dst = true;
                     }
+                    if *rr == Reg::P(r) {
+                        defs_r = true;
+                    }
                 }
             });
             if defs_dst {
                 redefined = true;
             }
+            if defs_r {
+                r_redefined = true;
+            }
         }
         // The terminator (a conditional branch) never redefines a register, so
         // its plain use of dst is this value ONLY if no earlier instruction
-        // redefined it.
-        if !redefined {
+        // redefined it — and only while `r` still carries it.
+        if !redefined && !r_redefined {
             b.term.visit_mut(&mut |rr, c| {
                 if matches!(c, Constraint::Use) && *rr == Reg::P(dst) {
                     *rr = Reg::P(r);

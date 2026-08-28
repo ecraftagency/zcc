@@ -2809,6 +2809,67 @@ The narrow peephole underneath (a `sxtw` whose source is the immediately
 preceding 32-bit ALU result) is 30 instructions on the suite, is a size row
 rather than a time one, and is not worth a pass on its own either.
 
+### M29. The weighted count, and the copy the static model could not see
+
+**THE PROGRAM.** `n7_nested_subq` is the suite's cleanest anomaly: 162
+instructions against gcc's 154 (+5%), the SAME number of conditional branches on
+both sides once the spellings are combined, and an EXEC ratio of **1.370**.
+Nothing in the static picture accounts for it.
+
+**WHAT IT WAS.** Its inner loop runs 5,760,000 times and carries a counter that
+the allocator spilled and `promote` then bound to `x28`. Because `promote` runs
+AFTER SSA destruction, the slot's reload and store came back as ordinary moves
+that nothing coalesces, and the store sat alone in the block
+`split_critical_edges` had made for the latch:
+
+```
+.Lmain_7:  mov x8, x28 ; sub x8, x8, #1 ; add … ; cbnz x8, .Lmain_67
+.Lmain_67: mov x28, x8 ; b .Lmain_6
+```
+
+Three executed instructions and one extra taken branch, in a fifteen-instruction
+body. Hand-edited to `sub x28, x28, #1 ; cbnz x28, .Lmain_6`: **0.8585**, at an
+instruction count that does not move — 161 both sides, because the trampoline
+block stays in the listing as dead code.
+
+Measured apart, on the same build:
+
+| edit | Δ static insn | ratio |
+|---|---|---|
+| propagate the reload (`sub x8, x28, #1`) | −1 | 0.996 |
+| move the split block next to the latch, keeping the copies | +1 | 0.983 |
+| sink the store into its producer, branch straight back | 0 | **0.8585** |
+
+**THE LESSON, and it is about the instrument.** `cost(f) = |MIR(f)|` is exact for
+SIZE and Law 3c already names its blindness to dependence CHAINS. This is a
+third blindness and a simpler one: **a static count weighs an instruction in a
+latch executed 5.76M times exactly as it weighs one in a cold arm.** The INSN
+geomean moved 1.0714 → 1.0706 for a change that moved this program 1.370 → 1.195.
+zcc already computes the frequencies (`hir::freq::annotate`, carried into
+`MBlock.weight`), so the weighted count `Σ_b weight(b)·|insts(b)|` is available
+and is the cost model an EXEC claim should be predicted on. It is not built.
+
+**THE ROW, banked.** `promote::sink_stores` (step 7) with the three side
+conditions the batteries forced: the promoted register dead on the latch's other
+edges, the produced register dead on ALL of them (the first cut asked only about
+the edge it followed, and three allocator batteries answered `⟦mir_v⟧ ≠ ⟦mir_p⟧`
+because a loop-carried ACCUMULATOR is read on the loop's exit edge), and a
+producer that defines that register and nothing else, plainly. Plus the step-5b
+half: the invariant filter on the copy propagation was the propagation's side
+condition, not the theorem's, and comes off once the scan stops at a definition
+of the promoted register.
+
+| | suite EXEC | suite INSN | n7 | k1_dispatch | k2_live_pressure |
+|---|---|---|---|---|---|
+| before | 1.0235 | 1.0714 | 1.370 | 1.178 | 1.119 |
+| after | **1.0210** | 1.0706 | **1.195** | 1.175 | 1.112 |
+
+Gate `fullsuite.sh all`: 15 PASS / 0 RED. Battery:
+`promotion_sinks_the_latch_store_into_its_producer`, both halves.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee, 49-program taxonomy suite.
+
 ---
 
 # Part G — the pipeline, layer by layer

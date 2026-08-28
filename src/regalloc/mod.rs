@@ -96,6 +96,12 @@ pub fn allocate(f: &mut MFunc) -> Result<(), String> {
 ///   PSAME — a physical pair that already agrees; the copy is gone,
 ///   PDIFF — a physical pair that disagrees; only argument TARGETING (C4) or a
 ///           split (C3) moves it, never biased colouring.
+fn free_why() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ZCC_FREEWHY").is_some())
+}
+
 fn coalesce_report(f: &MFunc, lv: &live::Liveness, col: &color::Coloring) {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -177,12 +183,26 @@ fn coalesce_report(f: &MFunc, lv: &live::Liveness, col: &color::Coloring) {
                 };
                 let cp = col.color.get(p as usize).copied().flatten();
                 let ca = col.color.get(a as usize).copied().flatten();
-                if cp.is_some() && cp == ca {
+                let cls = if cp.is_some() && cp == ca {
                     same += 1;
+                    "SAME"
                 } else if lv.live_in[succ].contains(&lv.sp.idx(Reg::V(a))) {
                     bound += 1;
+                    "BOUND"
                 } else {
                     free += 1;
+                    "FREE"
+                };
+                if free_why() {
+                    eprintln!(
+                        "FREEWHY {} {} b{}->b{} p=v{}:{:?} a=v{}:{:?} xcall={}/{} w={}",
+                        cls, f.name, b, succ, p, cp, a, ca,
+                        lv.crosses_call[p as usize] as u8,
+                        lv.crosses_call[a as usize] as u8,
+                        f.blocks[b].weight,
+                    );
+                }
+                if false {
                 }
             }
         }

@@ -1084,8 +1084,20 @@ fn assign(
             // free too. Level 1 is the strict form.
             if partner_crosses {
                 let lvl = csbias_level();
+                // Level 3 drops the "already committed" test entirely, and the
+                // argument for doing so is that the test asks the wrong
+                // question. The partner CROSSES A CALL, so the partner is going
+                // to occupy a callee-saved register whatever happens here; when
+                // the merge then succeeds the pair SHARES that one register and
+                // the prologue grows by nothing. `used` cannot see that, because
+                // colouring builds it forward and the partner is coloured later
+                // — which is exactly why levels 1 and 2 do not fire on
+                // `n7_nested_subq`, whose every hot FREE pair is a
+                // call-crossing parameter against a non-crossing argument.
                 let committed = |p: PReg| {
-                    used.has(p) || (lvl >= 2 && used.iter().any(isa::is_callee_saved))
+                    lvl >= 3
+                        || used.has(p)
+                        || (lvl == 2 && used.iter().any(isa::is_callee_saved))
                 };
                 if let Some(p) = order
                     .iter()

@@ -67,6 +67,21 @@ been aimed at it. First question, unanswered: `isa::mov_chain` knows
 ALU operands. Count the constants whose chain is ≥2 and which `logical_imm`
 accepts before writing anything.
 
+**BANKED, and it is the session's largest win.** `promote::sink_stores`
+(`MEASURED M29`): a loop-carried slot promoted to a register left its store alone
+in the latch's split block, three executed instructions and a taken branch in a
+fifteen-instruction body running 5.76M times. **n7_nested_subq 1.370 → 1.195**,
+suite EXEC 1.0235 → 1.0210, gate 15/0.
+
+**THE INSTRUMENT THIS EXPOSED, and it is the next thing to build.** The INSN
+geomean moved 1.0714 → 1.0706 for that. A static count weighs a latch executed
+5.76M times exactly as it weighs a cold arm, so **`cost = |MIR|` cannot rank a
+codegen row by time** — a third blindness beside Law 3c's chains. zcc already
+carries the frequencies (`hir::freq::annotate` → `MBlock.weight`): build
+`Σ_b weight(b)·|insts(b)|` and rank the remaining rows on it. Every 1.3–1.4×
+program left (m1 1.433, n1 1.316, m2 1.318, a2/a3 ~1.11) should be re-read with
+that number in hand rather than by eye.
+
 **REFUTED THE SAME SESSION** (`M28`): the sign-extended index. zcc emits 141
 memory operands of the form `[base, wN, sxtw]` against gcc's 11, 78 in
 `k1_dispatch` alone — and rewriting 73 of them by hand, output identical and

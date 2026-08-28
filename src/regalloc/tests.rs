@@ -225,6 +225,112 @@ fn promote_moves_a_spilled_value_out_of_memory() {
 }
 
 #[test]
+fn promotion_sinks_the_latch_store_into_its_producer() {
+    // THE MEANING half of step 7. A loop-carried slot promoted to a register
+    // leaves its store alone in the split block SSA destruction made for the
+    // latch; sinking it into the producer rewrites a definition and REDIRECTS an
+    // edge, so an error here is a wrong answer rather than a slow one. The first
+    // cut of this row checked only that the source register died on the edge it
+    // followed and not on the loop's EXIT edge, and these three programs — every
+    // one of them a loop whose carried value is READ after the loop — are what
+    // caught it.
+    same_all(&[
+        "int e(int a,int b){return a-b;}\
+         int hot(int n){int s=0,i;for(i=0;i<n;i++)s+=e(s,i)+e(i,n);return s;}\
+         int main(void){return hot(9)&255;}",
+        "int e(int x){return x*3+1;}\
+         int hot(int n){int a=0,b=1,i;for(i=0;i<n;i++){int t=a+e(b);a=b;b=t;}return a+b;}\
+         int main(void){return hot(11)&255;}",
+        "int e(int x){return x^7;}\
+         int hot(int n){int s=0,i,j;for(i=0;i<n;i++)for(j=0;j<n;j++)s+=e(i+j);return s;}\
+         int main(void){return hot(7)&255;}",
+    ]);
+
+    // THE EFFECT half — the meaning half stays green for a pass that sinks
+    // nothing. A latch whose last definition feeds a lone `Copy` into the
+    // promoted register in a single-predecessor split block: the copy must be
+    // gone, the producer must write the promoted register itself, and the latch
+    // must branch straight to the header.
+    use crate::mir::*;
+    let blk = |insts: Vec<MInst>, term: MTerm| MBlock {
+        params: Vec::new(),
+        insts,
+        term,
+        weight: 1,
+        labels: Vec::new(),
+    };
+    let to = |b: MBlockId| MTarget { block: b, args: Vec::new() };
+    let g = |n: u8| Reg::P(PReg::gpr(n));
+    let mut f = MFunc {
+        name: "hot".into(),
+        blocks: vec![
+            // 0: entry — seed the slot
+            blk(
+                vec![
+                    MInst::MovImm { w: Width::W64, dst: g(0), imm: 5 },
+                    MInst::Spill { slot: 0, src: g(0), w: Width::W64 },
+                ],
+                MTerm::B(to(1)),
+            ),
+            // 1: header — read the slot and use it
+            blk(
+                vec![
+                    MInst::Reload { slot: 0, dst: g(1), w: Width::W64 },
+                    MInst::Alu { op: AluOp::Add, w: Width::W64, dst: g(2), a: g(1), b: Rhs::Imm(1), flags: None },
+                ],
+                MTerm::B(to(2)),
+            ),
+            // 2: latch — produce the next value, then branch to the split block
+            blk(
+                vec![
+                    MInst::Reload { slot: 0, dst: g(3), w: Width::W64 },
+                    MInst::Alu { op: AluOp::Sub, w: Width::W64, dst: g(4), a: g(3), b: Rhs::Imm(1), flags: None },
+                ],
+                MTerm::Cbz { w: Width::W64, reg: g(4), zero: false, t: to(3), f: to(4) },
+            ),
+            // 3: the split block SSA destruction left behind — the store, alone
+            blk(vec![MInst::Spill { slot: 0, src: g(4), w: Width::W64 }], MTerm::B(to(1))),
+            // 4: exit — reads NEITHER g(4) nor the slot
+            blk(Vec::new(), MTerm::Ret),
+        ],
+        vregs: Vec::new(),
+        slots: vec![StackSlot { size: 8, align: 8, kind: SlotKind::Spill, off: 0 }],
+        entry: 0,
+        is_static: false,
+        is_weak: false,
+        order: Vec::new(),
+        laid_out: false,
+        frame_size: 0,
+        saved: RegSet::default(),
+        dyn_stack: false,
+        has_vla: false,
+        outgoing: 0,
+        fp_slot: 0,
+        cs_saves: Vec::new(),
+        physical: true,
+    };
+    super::promote::run(&mut f);
+
+    let r = match f.blocks[2].insts.last() {
+        Some(MInst::Alu { dst: Reg::P(p), .. }) => *p,
+        other => panic!("the latch's producer was not rewritten: {:?}", other.is_some()),
+    };
+    assert!(
+        isa::is_callee_saved(r),
+        "the producer does not write the promoted callee-saved register"
+    );
+    assert!(
+        f.blocks[3].insts.is_empty() || !f.blocks[3].insts.iter().any(|i| matches!(i, MInst::Spill { .. })),
+        "the split block still stores to memory"
+    );
+    let straight = match &f.blocks[2].term {
+        MTerm::Cbz { t, f: e, .. } => t.block == 1 || e.block == 1,
+        _ => false,
+    };
+    assert!(straight, "the latch does not branch straight to the header");
+}
+
+#[test]
 fn high_pressure_forces_the_spiller() {
     // More simultaneously live values than k = 26 general registers, so the
     // spiller must fire and the coloring must still succeed.
