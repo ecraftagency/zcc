@@ -2931,6 +2931,64 @@ for 0.0008 of the INSN geomean.
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee, 49-program taxonomy suite.
 
+### M31. The switch-arm ORDER is the biggest single lever left, and it is free
+
+**THE SHAPE.** A byte-at-a-time protocol parser is a `switch` on a state inside
+the read loop. zcc lowers a switch too sparse for a jump table to a LINEAR
+compare chain in the arms' source order, so a state tested late costs one
+`cmp`+`b.eq` pair per byte for every arm ahead of it. The two worst programs in
+the suite are both this shape and nothing else:
+
+| | arms | chain length | EXEC |
+|---|---|---|---|
+| `m1_resp_parse` | 6 | 6 | 1.44 |
+| `m2_http_parse` | 9 | 9 | 1.32 |
+
+`n3_vdbe_loop` has no such chain, and `d1_switch` is a jump table.
+
+**WHAT IT IS WORTH,** hand-edited into the `.s`, output verified identical, best
+of 21 alternating runs, and **at an instruction count that does not move**:
+
+| edit | m1 | m2 |
+|---|---|---|
+| hot arm tested FIRST | **0.9308** | **0.7754** |
+| self-transition arms first, source order among them | — | **0.8566** |
+| balanced binary search over the sorted case values | — | 1.0741 |
+
+m2 at 0.7754 is **1.318 → 1.02**; at the profile-free heuristic, 1.318 → 1.13.
+
+**THE BINARY SEARCH LOSES, which confirms `M4` from the other side.** `cmp #3 ;
+b.eq ; b.lt` over `{0..5}` costs 7.4% MORE than the linear chain: the split adds
+an unconditional branch on every path and buys nothing when the hot arm can
+simply be first. gcc reaches the same place by a different route — it tests the
+median for equality first and that median happens to be `m1`'s hot state.
+
+**THE PROFILE-FREE SIGNAL, and it is structural.** The hot arm of a state
+machine is the one that STAYS: `S_BULK` consumes payload bytes and `S_HVALUE`
+consumes a header value, and each re-enters itself until a delimiter. In SSA that
+is visible without any profile — the arm's edge back to the loop header passes
+the switch's OWN operand as the state parameter, unchanged. Ordering those arms
+first, keeping source order among them, is what the 0.8566 row measures.
+
+**WHAT IS NOT SETTLED.** The heuristic recovers 14.3% of m2's available 22.5%
+because m2 has FOUR self-transition arms and the two hot ones are third and
+fourth among them. m1 has four as well and its hot arm is fourth, so the
+heuristic is expected to buy little there while the ideal order buys 6.9%.
+Ranking WITHIN the self-transition set needs something this measurement does not
+have. The row is therefore worth building at the heuristic strength and
+measuring on the whole suite; the gap to ideal is a Law-4 residual, not a
+failure.
+
+**WHERE IT SITS.** `isel::lower`, `Term::Switch` — the chain is built from the
+HIR arms in order, so the reordering belongs in an HIR pass ahead of it, where
+the loop header and its parameters are still visible. Reordering the arms of a
+switch is semantics-preserving by construction (the cases are mutually exclusive
+equality tests on one value), so the commuting square is trivial and the effect
+assertion is the chain's position of the self-transition arm.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee.
+
 ---
 
 # Part G — the pipeline, layer by layer

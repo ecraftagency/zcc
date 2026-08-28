@@ -86,12 +86,24 @@ best-of-N — and only then touch the compiler. n7's win was 13% of a program fo
 0.0008 of the INSN geomean; m1's two hottest blocks are 58% of that program and
 the static count ranks them nineteenth.
 
-**NEXT, in order, and each is one program not one percent:** `m1_resp_parse`
-1.44 (its two hot blocks still hold a loop-invariant `movz #26` and a redundant
-second induction variable, both visible in the listing above), `n1_btree_page`
-1.33, `m2_http_parse` 1.32. Split `ZCC_WEIGHTS` from its two consumers first —
-`freq::annotate` is off by default because R5.1's layout and spill consumers
-lost, which leaves `MBlock.weight` at 1 and the weighted count degenerate.
+**NEXT, AND IT IS MEASURED, NOT GUESSED** (`M31`): **the switch-arm order.**
+zcc lowers a sparse switch to a linear compare chain in SOURCE order, so a state
+tested late costs a `cmp`+`b.eq` per byte for every arm ahead of it. The suite's
+two worst programs are both exactly this and nothing else — `m1_resp_parse` 1.44
+(6 arms) and `m2_http_parse` 1.32 (9 arms). Hand-edited, output identical,
+instruction count unchanged:
+
+| edit | m1 | m2 |
+|---|---|---|
+| hot arm first | **0.9308** | **0.7754** (1.318 → **1.02**) |
+| self-transition arms first, source order among them | — | **0.8566** (→ 1.13) |
+| balanced binary search | — | 1.0741 — LOSES, confirming `M4` |
+
+The profile-free signal is structural: the hot arm is the one that STAYS, and in
+SSA its edge back to the loop header passes the switch's OWN operand as the state
+parameter. Build it as an HIR pass ahead of `isel::lower`'s `Term::Switch`;
+reordering mutually exclusive equality tests is semantics-preserving by
+construction. Ranking WITHIN the self-transition set is the Law-4 residual.
 
 **REFUTED THE SAME SESSION** (`M28`): the sign-extended index. zcc emits 141
 memory operands of the form `[base, wN, sxtw]` against gcc's 11, 78 in
