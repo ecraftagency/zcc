@@ -3442,6 +3442,70 @@ gcc 14.2.0 -O1. Gate 15/0 at FUZZ_N=300 (356 s wall), cargo 208/0.
 
 ---
 
+### M38. How much the ninety-program suite can actually be trusted, measured
+
+**THE QUESTION Law 3c forces and nobody had answered with a number:** a suite is
+always narrower than the language, so what is the ERROR BAR on the geomean it
+prints? Four statistics over the 90-program table (EXEC 1.0688, INSN 1.0794):
+
+| test | result | what it settles |
+|---|---|---|
+| drop-one (jackknife) | worst shift **0.009** EXEC / 0.012 INSN | no single program steers the number any more — on the 49-program suite `x1` alone was worth 0.018 |
+| split-half, 2000 random 45/45 splits | median \|geo(A)−geo(B)\| **0.025**, p90 0.059 | **a suite of ~45–49 resolves to ±0.03 at best**, so the old suite's 1.020 was never trustworthy to a percent |
+| bootstrap, 4000 resamples | 95% CI **[1.033, 1.105]**, width 0.072 | the honest statement of zcc's speed is **1.07 ± 0.04**, not 1.0688 |
+| prefix convergence | a random subset of 10/20/30/45/60 misses the full geomean by 0.035/0.020/0.017/0.012/0.009 | ~60 programs is where the number settles; past that, only NEW SHAPES pay |
+
+**THE DISTINCTION THAT KEEPS THIS FROM BEING MISREAD.** The ±0.04 is the error
+of *"how much slower is zcc than gcc -O1 on C in general"* — it is about
+generalizing to programs not in the suite. It is NOT the error of an A/B: when
+the same 96 programs are compiled twice, each program is its own control, so a
+0.006 move on the deterministic INSN axis is real. Two different questions, two
+different error bars, and conflating them would either sink every row or
+validate every row.
+
+**corr(INSN, EXEC) = 0.196.** On ninety programs the two axes are very nearly
+independent. The `geo40`-era reading — 1.75 against 1.77, "they track, NOT
+decoupled" — was an artifact of a suite narrow enough for the two to coincide.
+The consequence is structural: **ranking rows by static instruction count ranks
+them on an axis that barely predicts time**, which is exactly the pattern this
+session produced — `delabel` won both axes, `fmov #imm` won INSN with EXEC flat,
+the licm header-load row won neither while being correct.
+
+**WHAT WAS MISSING, and it was not more kernels.** Comparing the suite against
+sqlite on shape rather than score:
+
+| | suite (90) | sqlite |
+|---|---|---|
+| functions > 200 instructions | 3 | 154 |
+| functions > 1000 instructions | 0 | 18 |
+| instructions touching `[sp` | 710 | 21,331 |
+
+**The register allocator — over half the measured size gap — had never been
+sampled by a timed program.** In a function that small, thirty-one registers are
+always enough and the allocator never decides anything. That is the whole of why
+the suite reads 1.079 where sqlite reads 1.108.
+
+**SIX PROGRAMS ADDED (90 → 96),** each for a shape with no sample, not for
+volume: `aa1_spill_interp` (48-arm dispatch over sixteen locals — 452
+instructions, spills), `aa2_wide_live` (forty live words through four mixing
+rounds — 989 instructions, zcc spills 306 against gcc's 322 and is still 6%
+slower), `ab1_setjmp` (C99 7.13.2.1 non-local exit), `ab2_format` (the snprintf
+digit loop: division by a constant on a real hot path), `ab3_volatile_mmio`
+(C99 6.7.3p6 — a fence no pass may cross, and the question of whether the code
+AROUND it still gets optimized), `ac1_huffman` (a bitstream with two loop-carried
+recurrences and variable shifts).
+
+They score 0.883, 0.956, 1.067, 1.162, 1.402, 1.504 — **zcc wins two of the six**,
+which is the sign the set was chosen by shape and not by where zcc looks good.
+Suite 96: **EXEC 1.0720, INSN 1.0753**. `ac1_huffman` at 1.504 over 76 ms is now
+the second-largest single contributor to the suite's log mass, and its INSN ratio
+is 1.068 — another program where the count cannot see the cost.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu,
+gcc 14.2.0 -O1, glibc (both sides link the same libc; `-S` counts user code only).
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
