@@ -18,7 +18,12 @@ facts) and `README.md`. `CLAUDE.md` stands above all five as the charter.
 - **Part B — purity**, the precondition Law 0 names, and what checks it.
 - **Part C — compile speed**, the profile and the fixes that were banked.
 - **Part D — the spiller**, its ladder, and the two rows its own ceiling refused.
-- **Part E — the copy census**, the family worth seventy percent of the gap.
+- **Part E — the copy census**, the family worth seventy percent of the gap
+  (⚠ superseded — read `M26-correction`).
+- **Part G §G0 — WHERE THE DEFECTS LIVE**, a layer-by-layer field guide: the
+  shape of defect each layer produces, the measurement that exposed it, and the
+  method, in order. Start here when a program is slow and the reason is not
+  obvious.
 - **Part F — MEASURED**, the facts that have no spec to cite. This is the
   citation namespace: code says `MEASURED M<n>` and `tests/provenance.sh`
   resolves it here.
@@ -2989,12 +2994,198 @@ assertion is the chain's position of the self-transition arm.
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee.
 
+**BUILT, and it wins at the heuristic strength predicted.** `isel::order_switch_arms`
+(`ZCC_NOARMORD=1` is the seam) partitions the arms STABLY, staying arms first.
+
+The predicate took three cuts, and the two that failed are the interesting part:
+
+1. *"the arm's edge to the header passes `v` itself"* — fired on NOTHING. Every
+   arm of a state machine merges into the same join before the back edge, so the
+   value the header receives is one value for all of them.
+2. *"…or a value transitively fed by `v`"* — fired on EVERYTHING, for the same
+   reason from the other side: that one join parameter has `v` among its inputs,
+   so every arm reaching it qualifies.
+3. *"this arm's own region carries `v` forward on some edge"* — discriminates.
+   An arm that stays hands the OLD state along; one that transitions hands a
+   fresh one.
+
+| | before | after |
+|---|---|---|
+| `m2_http_parse` | 1.318 | **1.242** |
+| `m1_resp_parse` | 1.44 | 1.42 |
+| suite EXEC | 1.0204 | **1.0185** |
+| suite INSN | 1.0688 | 1.0688 (a pure reordering) |
+
+Interleaved A/B, two pairs in one box session: off 1.0216 / 1.0211, on 1.0215 /
+1.0196 — on wins both, and the margin is small because the geomean divides one
+program's 5.8% by 49. That ratio is the point rather than a caveat: **the
+scoreboard to watch is how many programs LEAVE the tail**, not the geomean delta.
+Gate: 15 PASS / 0 RED (provenance re-run after a comment-only citation fix).
+
+The residual is unchanged and now measured on the shipped rule: the predicate
+finds three of m1's staying arms and misses `S_BULK`, and finds three of m2's and
+misses `S_HVALUE`, which is why m2 reaches 1.242 rather than the hand-edited
+1.02. Ranking WITHIN the staying set is the Law-4 residual.
+
 ---
 
 # Part G — the pipeline, layer by layer
 
 The architecture and the seam between each layer. Section numbers here are
 `§G<n>`; `src/` cites them by that name.
+
+### §G0 WHERE THE DEFECTS LIVE — a layer-by-layer field guide
+
+**Read this before hunting.** zcc is an educational compiler, and the most
+transferable thing a session produces is not the patch but WHERE the defect
+turned out to live. Every row below was found and paid for; each names the layer,
+the SHAPE of the defect that layer produces, and the measurement that exposed it.
+The pattern across all of them is that **the layer where a defect HURTS is almost
+never the layer where it is VISIBLE**.
+
+---
+
+**LAYER 0 — the instrument.** The most expensive defects are in the measurement,
+because everything downstream inherits them.
+
+*Shape:* a classifier that splits on SYNTAX when the question is about SEMANTICS.
+The whole-suite census classified a `mov` by whether its second operand started
+with `#` or a digit. `mov w9, wzr` starts with neither and landed in the
+register-copy column; gcc writes `mov w9, 0` for the same thing and landed in the
+constant column. One activity, charged twice with opposite signs, and it
+overstated the coalescing campaign's target by 1.6× and inverted the sign of the
+constant-materialization row (`M26-correction`).
+
+*Second shape:* a conjunction reported by the name of one conjunct. `free(p, occ)`
+tests four things — allocatable, unoccupied, no physical conflict, and the AAPCS64
+half — and the instrument counted every failure as "occupied". Genuine occupancy
+turned out to be 3 of 488 refusals on the suite and 136 of 14,640 on sqlite,
+which retired an eviction row three earlier fixes had already been aimed at
+(`M27`).
+
+*The lesson, and it is the general one:* **a count is a hypothesis about a
+partition.** Before trusting one, ask what ELSE could land in each bucket, and
+find a second instrument that answers from the other side. Here the compiler's
+own counters (`ZCC_COALESCE`, `ZCC_MOVKIND`) close arithmetically — 203 + 26 +
+289 = 518 — and never read a character of assembly.
+
+---
+
+**LAYER 1 — the cost model.** A model is exact for what it measures and blind to
+everything else BY CONSTRUCTION, and the blindness is not a bug to fix but a
+scope to state.
+
+`cost(f) = |MIR(f)|` is exact for SIZE — one `MInst` is one machine instruction.
+It has two named blindnesses:
+
+* **chains** (Law 3c, `M10`): matmul at 1.638× with an IDENTICAL instruction
+  count, because a multiply stood in front of a load;
+* **frequency** (`M29`): a static count weighs an instruction in a latch executed
+  5,760,000 times exactly as it weighs one in a cold arm. Removing two executed
+  instructions from `n7_nested_subq`'s inner loop moved that program 1.370 →
+  1.195 and the suite's INSN geomean 0.0008.
+
+*The lesson:* **when a program is slow at parity instruction count, the model is
+being asked a question it cannot answer.** Both duals are built —
+`mir::cost::recurrence` for chains and `mir::cost::weighted` for frequency — and
+a codegen row should be ranked on the one that matches its claim.
+
+---
+
+**LAYER 2 — the HIR passes.** Target-independent, and the defects here are about
+COVERAGE rather than correctness.
+
+*Shape:* a gate that refuses a great deal and binds on nothing. The
+consumer-blind IV row refuses any loop whose trip count SCEV cannot bound above
+32 — 653 sites on the suite, its own comment classing it a Law-4 convenience
+truncation. Removing it changes the suite by **zero** instructions, because every
+one of those sites is refused again by a later condition. The frontier was SCEV's
+own coverage, 78% of the residual (`M28`).
+
+*The lesson:* **measure a gate by what changes when you remove it, not by how
+much it refuses.** A residual counter placed before the other conditions
+attributes to the first gate everything the later ones would have caught anyway.
+
+---
+
+**LAYER 3 — isel, the lowering.** The defects here are the cheapest to fix and
+the easiest to overlook, because the IR is right and only the ENCODING choice is
+wrong.
+
+* **The immediate on the wrong side** (`M30`). A64 has `add wd, wn, #k` and no
+  mirror form, and `binop` offered only its right operand to the immediate
+  encoder. `'a' + i % 26` — the ordinary way to write it in C — therefore
+  materialized 97 into a register and added two registers. Two instructions where
+  the ISA has one, inside whatever loop the expression sits in. The fix is to
+  commute, and commutativity is exact for `+ * & ^ |` (ISO 9899 6.5).
+* **Source order taken as a policy** (`M31`). A sparse `switch` becomes a linear
+  compare chain in the arms' source order, so a state tested late costs a
+  `cmp`+`b.eq` per byte for every arm ahead of it. The two worst programs in the
+  suite are exactly this and nothing else.
+
+*The lesson:* **every place the IR has an order and the machine has a preference
+is a lowering decision, and an unexamined one defaults to whatever the front end
+happened to build.** Grep for the places a lowering reads its operands or its
+arms in sequence.
+
+---
+
+**LAYER 4 — regalloc.** Two distinct defect families, and they want opposite
+work.
+
+* **Policy** — the allocation ORDER is a cost argument, and a correct one can
+  still be wrong for a neighbour. `GPR_ORDER` offers the caller-saved half first
+  so short-lived values do not squat in the callee-saved registers that
+  call-crossing values have no alternative to. Correct in itself; the side effect
+  is that a short-lived value which is the copy PARTNER of a call-crossing value
+  takes a register the partner may never join, and SSA destruction pays a `mov`
+  on that edge for ever (`M27`).
+* **Ordering in the PIPELINE** — a pass that runs after SSA destruction cannot
+  have its copies coalesced, because the coalescer has already run. `promote`
+  turns a spill slot into a register and its former store and reload come back as
+  ordinary moves that nothing removes; on `n7_nested_subq` that was three
+  executed instructions and a taken branch in a fifteen-instruction inner loop
+  (`M29`).
+
+*The lesson:* **ask what has already run.** A pass placed after the machinery
+that would have cleaned up after it must clean up after itself.
+
+---
+
+**LAYER 5 — emit.** By charter `emit.rs` makes no decisions and re-parses
+nothing, so a defect that reaches it is a defect from above wearing a different
+spelling. The 67 `mov r, r` self-copies look like an emitter oversight and are
+not: 61 of them have a reader that genuinely looks past 32 bits, so the
+instruction IS the zero-extension that reader needs and deleting it miscompiles.
+gcc reaches zero by not NEEDING the extension — an `ext.rs`/HIR row (`M26-
+correction`).
+
+*The lesson, and it is the charter's rule restated:* **a peephole in the emitter
+is a defect being treated at the layer where it is visible instead of the layer
+where it is decided.**
+
+---
+
+**THE METHOD THAT FOUND ALL OF THEM,** in the order it must be run:
+
+1. Rank the failing program's blocks by EXECUTIONS
+   (`ZCC_WEIGHTS=1 ZCC_WCOST=1`), never by static count.
+2. Read the top two blocks against gcc's SAME loop, instruction by instruction.
+3. Hand-edit the `.s`, link it, verify the output is identical, and time it with
+   ALTERNATING best-of-N — never two separate sessions.
+4. Only then touch the compiler, and let the batteries answer.
+
+Step 4 is not a formality. The first cut of `promote::sink_stores` was refused by
+three allocator batteries with `⟦mir_v⟧ ≠ ⟦mir_p⟧` because it clobbered a
+loop-carried accumulator on the loop's EXIT edge — a wrong answer, caught at the
+middle exactly as Law 3 intends, before any suite ran.
+
+And step 1 is not a formality either: `ZCC_WCOST` uses `hir::freq`'s DEPTH-based
+estimate, which ranked `m1_resp_parse`'s two setup loops at 58% of the program
+when the parse loop beside them runs sixty times more often. Two hand edits on
+the setup loops measured 0.997 and 0.999. **A frequency estimate that cannot see
+trip counts cannot rank two loops at the same depth**, and the ranking is a
+starting point for reading, not a verdict.
 ### §G1 Ground rules — what dies, what survives
 
 | category | items | rule |

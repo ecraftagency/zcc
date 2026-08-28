@@ -23,6 +23,13 @@ use crate::mir::*;
 /// The A/B seam for the commutative-immediate swap in `binop`. ON by default;
 /// `ZCC_NOCOMMUTE=1` turns it off, which is the only way to take the paired
 /// EXEC reading the ±0.007 session spread demands (`MECHANISM.md` Part E §6).
+/// The A/B seam for the switch-arm ordering (`MEASURED M31`). ON by default;
+/// `ZCC_NOARMORD=1` turns it off.
+fn armord() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_NOARMORD").is_err())
+}
+
 fn commute() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("ZCC_NOCOMMUTE").is_err())
@@ -1026,6 +1033,102 @@ impl<'a> L<'a> {
             }
         }
         Rhs::Reg(self.reg(o, t))
+    }
+
+    /// `MEASURED M31` — put the arms that STAY in the state ahead of the rest,
+    /// keeping source order within each group.
+    ///
+    /// The switch operand `v` is the state. It is a PARAMETER of some block `H`
+    /// — the loop header, since a state machine's state is exactly the value the
+    /// loop carries — and an arm keeps the machine in its own state precisely
+    /// when the arm's region hands `v` itself back to `H` at `v`'s own parameter
+    /// index. Every other arm computes a new state and hands that back instead.
+    ///
+    /// The walk is bounded and forward-only: from the arm's target, follow
+    /// successors until `H` is reached or the budget runs out. A budget rather
+    /// than a fixpoint because this decides an ORDER and nothing else — being
+    /// wrong costs a compare, never a value — and because an arm whose return to
+    /// the header is eight blocks away is not the arm consuming a run of bytes.
+    fn order_switch_arms(
+        &self,
+        c: Operand,
+        arms: &[(i64, hir::Target)],
+    ) -> Vec<(i64, hir::Target)> {
+        let mut out: Vec<(i64, hir::Target)> = arms.to_vec();
+        if !armord() {
+            return out;
+        }
+        let v = match c {
+            Operand::Val(v) => v,
+            _ => return out,
+        };
+        // where `v` is a parameter, and at which index
+        let mut home: Option<(hir::BlockId, usize)> = None;
+        for (bi, b) in self.h.blocks.iter().enumerate() {
+            if let Some(i) = b.params.iter().position(|&p| p == v) {
+                home = Some((bi as hir::BlockId, i));
+                break;
+            }
+        }
+        let (hblk, idx) = match home {
+            Some(x) => x,
+            None => return out,
+        };
+        // THE QUESTION IS ABOUT THIS ARM, NOT ABOUT THE JOIN. Two earlier cuts
+        // asked what value reaches the loop header and both fired on nothing:
+        // every arm of a state machine merges into the SAME join before the back
+        // edge, so the argument the header receives is one value for all of them
+        // and the test cannot tell the arms apart. What distinguishes the arm
+        // that STAYS is what it contributes to that join — it hands the OLD
+        // state along, where an arm that transitions hands a fresh one.
+        //
+        // So: does this arm's own region carry `v` forward on any edge? `case
+        // S_BULK: if (--want == 0) st = S_CR;` does, on the path where the
+        // delimiter has not arrived. `case S_LF: st = want > 0 ? S_BULK :
+        // S_TYPE;` never does. The walk stays inside the arm — it stops at the
+        // header — and is bounded, because being wrong costs a compare and never
+        // a value.
+        /// MEASURED M31 — how far inside an arm to look for the edge that
+        /// carries the old state on. It is a SEARCH bound, not a resource
+        /// constant: the rule decides an ORDER, so a budget that stops early
+        /// costs one `cmp` on a cold path and never a value. Eight covers the
+        /// arms of both parsers that motivated the row (`m1_resp_parse` and
+        /// `m2_http_parse`, four and six blocks deep); an arm whose return to
+        /// the header is further away than that is not the arm consuming a run
+        /// of bytes.
+        const BUDGET: usize = 8;
+        let stays = |t: &hir::Target| -> bool {
+            if t.args.iter().any(|a| *a == Operand::Val(v)) {
+                return true;
+            }
+            let mut seen: Vec<hir::BlockId> = Vec::new();
+            let mut wave: Vec<hir::BlockId> = vec![t.block];
+            for _ in 0..BUDGET {
+                let mut next: Vec<hir::BlockId> = Vec::new();
+                for b in wave {
+                    if b == hblk || seen.contains(&b) {
+                        continue;
+                    }
+                    seen.push(b);
+                    for e in self.h.blocks[b as usize].term.targets() {
+                        if e.args.iter().any(|a| *a == Operand::Val(v)) {
+                            return true;
+                        }
+                        next.push(e.block);
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                wave = next;
+            }
+            false
+        };
+        let _ = idx;
+        // STABLE partition: the staying arms first, source order kept in both
+        // halves, so a program with no such arm is compiled exactly as before.
+        let (a, b): (Vec<_>, Vec<_>) = out.drain(..).partition(|(_, t)| stays(t));
+        a.into_iter().chain(b).collect()
     }
 
     fn dst_of(&self, v: ValueId) -> Reg {
@@ -2527,6 +2630,32 @@ impl<'a> L<'a> {
                     return;
                 }
                 let mut next = dflt;
+                // THE ARM THAT STAYS GOES FIRST (`MEASURED M31`).
+                //
+                // A linear chain tests its arms in order, so an arm at position
+                // `i` costs `i` `cmp`+`b.eq` pairs on every byte that lands in
+                // it. Source order is therefore a policy, and it is the wrong
+                // one for the shape that dominates protocol parsing: a `switch`
+                // on a state inside a read loop, where ONE state consumes runs —
+                // a payload, a header value — and re-enters itself until a
+                // delimiter arrives.
+                //
+                // That state is identifiable without a profile. Its arm's edge
+                // back to the loop header passes the switch's OWN operand as the
+                // state parameter, unchanged; every other arm passes a different
+                // value. `stays_in_state` asks exactly that, and the partition
+                // below is STABLE, so arms that tie keep source order.
+                //
+                // Measured by hand-editing the `.s`, output identical and
+                // instruction count unchanged: `m2_http_parse` 0.8566 (1.318 →
+                // 1.13) with this rule, 0.7754 with the ideal order — the gap is
+                // the Law-4 residual, since ranking WITHIN the staying arms needs
+                // something a static rule does not have. A balanced binary search
+                // over the same arms measured 1.0741, which is `MEASURED M4`
+                // arriving from the other side: the split costs an unconditional
+                // branch on every path and buys nothing once the hot arm is
+                // first.
+                let arms = self.order_switch_arms(*c, arms);
                 let arms: Vec<(i64, MTarget)> = arms
                     .iter()
                     .map(|(k, t)| (*k, self.target(t)))

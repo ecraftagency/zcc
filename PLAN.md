@@ -86,24 +86,22 @@ best-of-N — and only then touch the compiler. n7's win was 13% of a program fo
 0.0008 of the INSN geomean; m1's two hottest blocks are 58% of that program and
 the static count ranks them nineteenth.
 
-**NEXT, AND IT IS MEASURED, NOT GUESSED** (`M31`): **the switch-arm order.**
-zcc lowers a sparse switch to a linear compare chain in SOURCE order, so a state
-tested late costs a `cmp`+`b.eq` per byte for every arm ahead of it. The suite's
-two worst programs are both exactly this and nothing else — `m1_resp_parse` 1.44
-(6 arms) and `m2_http_parse` 1.32 (9 arms). Hand-edited, output identical,
-instruction count unchanged:
+**BANKED — the switch-arm order** (`M31`, `isel::order_switch_arms`): a sparse
+switch becomes a linear compare chain in SOURCE order, so a state tested late
+costs a `cmp`+`b.eq` per byte for every arm ahead of it. Staying arms go first.
+**m2_http_parse 1.318 → 1.242**, suite EXEC 1.0204 → **1.0185**, INSN unchanged,
+gate 15/0. Residual: the predicate finds three of each parser's staying arms and
+misses the hottest one, which is why m2 reaches 1.242 and not the hand-edited
+1.02. Ranking WITHIN the staying set is the open half.
 
-| edit | m1 | m2 |
-|---|---|---|
-| hot arm first | **0.9308** | **0.7754** (1.318 → **1.02**) |
-| self-transition arms first, source order among them | — | **0.8566** (→ 1.13) |
-| balanced binary search | — | 1.0741 — LOSES, confirming `M4` |
-
-The profile-free signal is structural: the hot arm is the one that STAYS, and in
-SSA its edge back to the loop header passes the switch's OWN operand as the state
-parameter. Build it as an HIR pass ahead of `isel::lower`'s `Term::Switch`;
-reordering mutually exclusive equality tests is semantics-preserving by
-construction. Ranking WITHIN the self-transition set is the Law-4 residual.
+**THE SCOREBOARD IS THE TAIL, NOT THE GEOMEAN.** Σln(rᵢ) ≈ 0.97 over 49
+programs, and essentially all of the positive mass is the 11–13 programs above
+1.1× (m1 0.35, n1 0.28, m2 0.22, n7 0.18, k1 0.17, …≈1.8 between them), offset by
+the programs already below 1.0 (a1 −0.13, n4 −0.06). Take that tail to parity and
+Σln ≈ −0.83, i.e. geomean ≈ **0.983 — sub-1×**. So the path is NOT seventeen
+0.2% levers; it is eleven programs each needing a 10–40% PROGRAM-level win, which
+is the size of the two taken today. Count programs leaving the tail, not geomean
+deltas.
 
 **REFUTED THE SAME SESSION** (`M28`): the sign-extended index. zcc emits 141
 memory operands of the form `[base, wN, sxtw]` against gcc's 11, 78 in
