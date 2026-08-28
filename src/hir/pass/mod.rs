@@ -54,6 +54,13 @@ pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String
     // handed to the per-function ladder rather than rediscovered inside it. It
     // is recomputed after inlining, which changes both the call graph and the
     // set of functions.
+    // FIRST, because it is what unfences the rows below: a block carrying a C
+    // label is refused by cfg_simplify's threading and merging identities and by
+    // the inliner, and on a function with no `&&label`, no `goto *e` and no VLA
+    // that label is unobservable (cfg.rs, SQUARE labels_are_not_observable).
+    if on("delabel") {
+        timed("delabel", || cfg::delabel(m, pinned));
+    }
     let ro = readonly(m);
     for f in m.funcs.iter_mut() {
         run_with(f, &ro);

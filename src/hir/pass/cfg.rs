@@ -755,3 +755,51 @@ fn merge(f: &mut Func, c0: &dom::Cfg, pin0: &[bool]) -> bool {
         }
     }
 }
+
+/// THEORY A7b  SQUARE labels_are_not_observable — ⟦f⟧ = ⟦delabel f⟧
+///
+/// A C label is a name for a block, and `Block::labels` says exactly who can
+/// read that name: C99 6.8.6.1 (a `goto` leaving a VLA's scope deallocates back
+/// to the frame base, which the emitter keys on the label) and EXT(gcc)
+/// `&&label`, whose address a static initializer or a `goto *e` may hold. A
+/// function with none of those three has labels that no run can observe — they
+/// reach the emitter as text and nothing else — yet every pass that would merge,
+/// thread or splice a block refuses one that carries a label, because the name
+/// might be one of those two things. So the name is a fence with nothing behind
+/// it, and dropping it is meaning-preserving by the same reading that put it
+/// there.
+///
+/// This is not a cosmetic row. `goto out;` is C's only cleanup mechanism, so the
+/// fence stood in front of the error ladder of every driver, parser and library
+/// entry point: `x1_goto_cleanup` ran 4.90x gcc -O1 with the labels and 1.51x
+/// with the identical program written as nested `if`s, because the labelled
+/// callee was refused by the inliner (`inline.rs::inlinable`) and its ladder was
+/// refused by identities (c), (d), (e) and (g) above.
+///
+/// `pinned` is the caller's set of every symbol a static initializer names
+/// (`compile.rs::pinned_symbols`); a label's symbol is spelled
+/// `lg_<function>.<label>` by the parser, so a prefix match over that set is the
+/// whole of the data-segment question.
+pub fn delabel(m: &mut Module, pinned: &std::collections::HashSet<String>) {
+    for f in m.funcs.iter_mut() {
+        if f.has_vla {
+            continue; // C99 6.8.6.1: the label is where sp returns to.
+        }
+        let addressed = f.blocks.iter().any(|b| {
+            matches!(b.term, Term::GotoPtr(..))
+                || b.insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::SymAddr { sym: Sym::Label(_), .. }))
+        });
+        if addressed {
+            continue; // EXT(gcc) `&&label` / `goto *e` — the index is a datum.
+        }
+        let prefix = format!("lg_{}.", f.name);
+        if pinned.iter().any(|s| s.starts_with(&prefix)) {
+            continue; // EXT(gcc) `&&label` taken by a STATIC initializer.
+        }
+        for b in f.blocks.iter_mut() {
+            b.labels.clear();
+        }
+    }
+}

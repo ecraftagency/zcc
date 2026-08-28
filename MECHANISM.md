@@ -3308,6 +3308,66 @@ finds three of m1's staying arms and misses `S_BULK`, and finds three of m2's an
 misses `S_HVALUE`, which is why m2 reaches 1.242 rather than the hand-edited
 1.02. Ranking WITHIN the staying set is the Law-4 residual.
 
+### M36. The worst program in the project was a FENCE, not a codegen defect
+
+**M35 named `x1_goto_cleanup` at 5.045× and asked what codegen shape the `goto`
+ladder needs. It needs none.** The program was not compiled badly; it was not
+compiled at all past the frontend. `Block::labels` — the C labels landing on a
+block — pinned every one of them, and five separate places refuse a pinned
+block: `inline.rs::inlinable` (the whole callee), and cfg_simplify's threading,
+merging and two known-condition identities (`cfg.rs` (c), (d), (e), (g)), plus
+`ifconv.rs` and `layout.rs`. So a function containing one `goto` lost the
+interprocedural row and most of the control-flow row at once.
+
+**THE MEASUREMENT THAT SETTLED IT, before any patch** (Law 2 — locate
+mechanically, classify after). The same program, same semantics, the ladder
+rewritten as nested `if`s instead of `goto`, both compiled by the unmodified
+compiler:
+
+| | zcc µs | ratio vs gcc -O1 |
+|---|---|---|
+| `goto` ladder | 19,330 | **4.90×** |
+| identical nested `if`s | 5,941 | **1.51×** |
+
+Two thirds of the worst number this project has measured was one `bool` in a
+refusal predicate. No `.s` was read to find it and no codegen row was needed.
+
+**WHY THE FENCE WAS THERE, and why it is not needed.** `Block::labels`'s own
+comment names its two readers exactly: C99 6.8.6.1 (a `goto` leaving a VLA's
+scope deallocates back to the frame base at the label) and EXT(gcc) `&&label`,
+whose address a static initializer or `goto *e` may hold. A function with no VLA,
+no `SymAddr(Sym::Label)` and no label named in the data segment has labels that
+no run can observe — they reach the emitter as text and nothing else. `cfg.rs`'s
+`delabel` (SQUARE `labels_are_not_observable`) drops exactly those, first in the
+module ladder, and the three refusals are its battery.
+
+**MEASURED, interleaved pairs on one box session, 90-program suite:**
+
+| | before | after |
+|---|---|---|
+| `x1_goto_cleanup` EXEC | 5.014 | **1.469** |
+| `x1_goto_cleanup` INSN | 1.630 | **1.239** |
+| suite EXEC geomean | 1.0871 | **1.0715** |
+| suite INSN geomean | 1.0892 | **1.0854** |
+| sqlite binary bytes | 1,151,312 | **1,139,744** |
+
+`k1_dispatch` (INSN 1.185 → 1.123) and `k2_live_pressure` (1.330 → 1.255) come
+along for the same reason. `x2_nested_break` pays 4.5% of INSN for threading its
+one label and its EXEC does not move (1.055 → 1.056), which is the tail-
+duplication trade M11 already records. sqlite's runtime is UNCHANGED — two
+interleaved pairs read 1.1698/1.1395 before and 1.1337/1.1722 after, a ±0.02
+spread that swallows the difference, and the single non-interleaved pair that
+first read it as a 2.9% loss is the measurement lying exactly as Law 2 warns.
+Compile time pays 3.7% for the inlining the row unfences.
+
+**THE RESIDUAL.** `x1` is 1.47×, not 1.0 — the nested-`if` form measures the same
+1.51, so what is left is a shape the frontend produces either way and is a real
+codegen question, unlike the fence. Whether other refusal predicates in the
+compiler are fences of the same kind is now the open question this row raises;
+`has_vla` and `!b.params.is_empty()` are the two that guard the most sites.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
@@ -3601,6 +3661,7 @@ Order mirrors gcc -O1 (`-ftree-*`). Bounded fixpoint over the sequence, max 3 ro
 
 | # | pass | file | theorem (THEORY A7 row) | proof |
 |---|---|---|---|---|
+| 0 | delabel | `pass/cfg.rs` | an unaddressed C label is not observable, so the block it pins is free (M36). Runs ONCE, before everything: it is what unfences rows 1 and 7 on any function containing a `goto` | battery + 3 refusals |
 | 1 | cfg_simplify | `pass/cfg.rs` | block merge, unreachable elim, jump threading of trivial blocks | `⟦f⟧=⟦P f⟧` battery |
 | 2 | sroa + mem2reg | `pass/sroa.rs` | non-escaping aggregate → scalar allocas → Braun promotion | battery + alias oracle |
 | 3 | sccp | `pass/sccp.rs` | Wegman-Zadeck lattice over reachability | battery |

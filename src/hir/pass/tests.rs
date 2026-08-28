@@ -627,6 +627,72 @@ fn ladder_is_idempotent_at_the_fixpoint() {
     }
 }
 
+// ── delabel: the fence in front of C's cleanup ladder ──────────────────────
+
+#[test]
+fn delabel_drops_a_label_no_run_can_observe() {
+    // NON-VACUITY, and the point of the row: with the label present the ladder
+    // is refused by cfg_simplify's threading identities and by the inliner, so
+    // the STRUCTURAL consequence is that the labelled blocks are gone from the
+    // caller and no `Call` survives.
+    super::set_inline(true);
+    let src = "static int step(int v,int *acc){int r=-1;\
+               if(v&1) goto out; *acc+=v; r=0;\
+               out: return r;}\
+               int main(void){int a=0;int k=step(2,&a);return a+k+40;}";
+    let after = module(src, true);
+    assert_eq!(count(func(&after, "main"), |i| matches!(i, Inst::Call { .. })), 0);
+    assert!(
+        after.funcs.iter().all(|f| f.blocks.iter().all(|b| b.labels.is_empty())),
+        "no label here is addressed, so none may survive to fence a pass"
+    );
+    square(src, 42);
+    super::set_inline(false);
+}
+
+#[test]
+fn delabel_keeps_a_label_whose_address_is_taken() {
+    // EXT(gcc) `&&label`: the block INDEX is a datum, so the name must reach the
+    // emitter and the block must stay pinned.
+    let src = "int main(void){void *p=&&done;int s=42;goto *p;s=0;done: return s;}";
+    let after = module(src, true);
+    assert!(
+        after.funcs.iter().any(|f| f.blocks.iter().any(|b| !b.labels.is_empty())),
+        "an addressed label must survive"
+    );
+    square(src, 42);
+    super::set_inline(false);
+}
+
+#[test]
+fn delabel_keeps_a_label_a_static_initializer_names() {
+    // Same datum as above, but taken in the DATA SEGMENT, where the function
+    // body shows nothing. `pinned_symbols` is the only witness, and the row
+    // reads it by the `lg_<function>.<label>` spelling the parser gives it.
+    let src = "int main(void){static void *j[1]={&&done};goto *j[0];return 0;\
+               done: return 42;}";
+    let after = module(src, true);
+    assert!(
+        after.funcs.iter().any(|f| f.blocks.iter().any(|b| !b.labels.is_empty())),
+        "a label named by a static initializer must survive"
+    );
+}
+
+#[test]
+fn delabel_keeps_a_label_in_a_function_with_a_vla() {
+    // C99 6.8.6.1: a `goto` may leave a VLA's scope, and the emitter returns sp
+    // to the frame base AT THE LABEL. Dropping the name drops the deallocation.
+    let src = "int main(void){int n=4;int v[n];int i;for(i=0;i<n;i++)v[i]=i;\
+               if(v[3]==3) goto out; return 0; out: return 42;}";
+    let after = module(src, true);
+    assert!(
+        after.funcs.iter().any(|f| f.has_vla && f.blocks.iter().any(|b| !b.labels.is_empty())),
+        "a VLA function's label is where sp returns to"
+    );
+    square(src, 42);
+    super::set_inline(false);
+}
+
 // ── inline ─────────────────────────────────────────────────────────────────
 
 #[test]
