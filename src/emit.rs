@@ -566,9 +566,18 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
                 ExtOp::Sxtw => "sxtw",
                 ExtOp::Uxtb => "uxtb",
                 ExtOp::Uxth => "uxth",
+                // the `w`-form move IS the zero-extension
+                ExtOp::Uxtw => "mov",
             };
-            // the source of every extend is named in its w-form
-            let _ = writeln!(s, "\t{} {}, {}", m, reg(*dst, *w), reg(*src, Width::W32));
+            // The source of every extend is named in its w-form. The
+            // DESTINATION follows the instruction: `sxtw` writes an x-register
+            // and says so, while the 32-bit zero-extension IS a `w`-form move —
+            // `mov w0, w0` — and naming an x-register there would not assemble.
+            let dw = match op {
+                ExtOp::Uxtw => Width::W32,
+                _ => *w,
+            };
+            let _ = writeln!(s, "\t{} {}, {}", m, reg(*dst, dw), reg(*src, Width::W32));
         }
         MInst::Load { op, dst, mem, .. } => {
             let _ = writeln!(

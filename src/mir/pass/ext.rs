@@ -112,6 +112,7 @@ fn record(i: &MInst, known: &mut HashMap<VReg, Known>, width: &dyn Fn(Reg) -> Wi
                 ExtOp::Sxtw => (32, false),
                 ExtOp::Uxtb => (8, true),
                 ExtOp::Uxth => (16, true),
+                ExtOp::Uxtw => (32, true),
             };
             if let Reg::V(v) = dst {
                 let k = Known { bits, zero, w32: false };
@@ -169,6 +170,7 @@ fn redundant(i: &MInst, known: &HashMap<VReg, Known>) -> Option<MInst> {
         ExtOp::Sxtw => (32, false),
         ExtOp::Uxtb => (8, true),
         ExtOp::Uxth => (16, true),
+        ExtOp::Uxtw => (32, true),
     };
     // A ZERO-extension is satisfied by a value already known zero above a
     // narrower point. A SIGN-extension is satisfied either by the same sign

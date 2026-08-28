@@ -628,7 +628,7 @@ fn max_read(f: &MFunc, cand: &[Cand], drop: &[bool]) -> Vec<u32> {
                     match op {
                         ExtOp::Sxtb | ExtOp::Uxtb => 1,
                         ExtOp::Sxth | ExtOp::Uxth => 2,
-                        ExtOp::Sxtw => 4,
+                        ExtOp::Sxtw | ExtOp::Uxtw => 4,
                     },
                 ),
                 MInst::Store { op, src, .. } => (vec![*src], op.bytes()),

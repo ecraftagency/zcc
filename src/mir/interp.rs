@@ -445,6 +445,7 @@ impl<'a> Machine<'a> {
                     ExtOp::Sxtw => x as u32 as i32 as i64 as u64,
                     ExtOp::Uxtb => x & 0xff,
                     ExtOp::Uxth => x & 0xffff,
+                    ExtOp::Uxtw => x & 0xffff_ffff,
                 };
                 self.set(fr, *dst, trunc(v, *w));
             }

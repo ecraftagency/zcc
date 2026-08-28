@@ -342,6 +342,19 @@ pub enum ExtOp {
     Sxtw,
     Uxtb,
     Uxth,
+    /// 32 → 64 ZERO-extension. It emits as a `w`-form move, which is what makes
+    /// it free (DDI 0487 B1.2.1: a 32-bit write clears the upper half) — but it
+    /// is an EXTENSION, not a copy, and the difference is load-bearing.
+    ///
+    /// Lowering it as `Copy { w: W32 }` is what it used to be, and that made the
+    /// compiler hold two rules that are each sound alone and contradictory
+    /// together: "an extension needs no instruction, because the move that
+    /// stands for it clears the top half", and "a move whose ends share a
+    /// register is redundant and may be deleted". The first makes the move
+    /// load-bearing; the second deletes it. `long f(long x){int t=(int)x;
+    /// unsigned u=(unsigned)t; return (long)u;}` returned its own argument.
+    /// Naming it here means no rule about copies can reach it.
+    Uxtw,
 }
 
 /// Load/store access width and extension — `ldrb/ldrsb/ldrh/ldrsh/ldrsw/ldr`.

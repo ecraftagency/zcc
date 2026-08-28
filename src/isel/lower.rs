@@ -1453,9 +1453,11 @@ impl<'a> L<'a> {
                     (hir::Ty::I32, CvtOp::Sext) => Some(ExtOp::Sxtw),
                     (hir::Ty::I8, _) => Some(ExtOp::Uxtb),
                     (hir::Ty::I16, _) => Some(ExtOp::Uxth),
-                    // zero-extending w→x is free: a `w`-form move already clears
-                    // the upper half (DDI 0487 B1.2.1)
-                    (hir::Ty::I32, _) => None,
+                    // Zero-extending w→x emits a `w`-form move, which is what
+                    // makes it free (DDI 0487 B1.2.1) — but it is named as the
+                    // extension it is, so that no rule about redundant copies
+                    // can delete the thing the freedom depends on.
+                    (hir::Ty::I32, _) => Some(ExtOp::Uxtw),
                     _ => unreachable!(),
                 };
                 match e {
