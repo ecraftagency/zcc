@@ -468,6 +468,19 @@ pub enum MInst {
         dst: Reg,
         imm: i64,
     },
+    /// Materialize a floating constant WITHOUT touching the general file
+    /// (`fmov Sd, #imm8` — DDI 0487 C7 `VFPExpandImm`). The 8-bit form covers
+    /// sign · 2^e · (1 + m/16) for a 3-bit exponent and 4-bit mantissa, which is
+    /// where 1.0, 0.5 and every other small round constant live; `isa::fp_imm8`
+    /// decides membership and isel emits this only when it says yes. Without it
+    /// the same constant costs a `movz` chain into a GPR plus an `fmov` ACROSS
+    /// the register files, and that crossing sits on the dependence chain of
+    /// whatever compares against it (MECHANISM.md M37).
+    FMovImm {
+        w: Width,
+        dst: Reg,
+        bits: u64,
+    },
     /// `ubfx`/`sbfx` — take `width` bits starting at bit `lsb` and place them at
     /// the bottom, zero- or sign-extended (DDI 0487 C6.2.398/C6.2.317). One
     /// instruction for what C spells as a shift and a mask, which is how every
@@ -927,7 +940,7 @@ impl MInst {
                 visit_rhs!(b, g);
                 g(flags, Constraint::Def);
             }
-            MInst::MovImm { dst, .. } => g(dst, Constraint::Def),
+            MInst::MovImm { dst, .. } | MInst::FMovImm { dst, .. } => g(dst, Constraint::Def),
             MInst::Ext { dst, src, .. } | MInst::Copy { dst, src, .. } => {
                 g(src, Constraint::Use);
                 g(dst, Constraint::Def);
@@ -1072,7 +1085,7 @@ impl MInst {
                 visit_rhs!(b, f);
                 f(flags, Constraint::Def);
             }
-            MInst::MovImm { dst, .. } => f(dst, Constraint::Def),
+            MInst::MovImm { dst, .. } | MInst::FMovImm { dst, .. } => f(dst, Constraint::Def),
             MInst::Ext { dst, src, .. } | MInst::Copy { dst, src, .. } => {
                 f(src, Constraint::Use);
                 f(dst, Constraint::Def);

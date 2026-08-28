@@ -3383,6 +3383,65 @@ compiler are fences of the same kind is now the open question this row raises;
 
 ---
 
+### M37. A spec table was written, tested, and never wired to the compiler
+
+**THE SITE.** `isa::fp_imm8` transcribes DDI 0487 C7 `VFPExpandImm` — the 8-bit
+`fmov` immediate, sign · 2^e · (1 + m/16) — and `mir/tests.rs` checks it against
+1.0, 0.5, −2.0, 31.0 and three refusals. `isel/imm.rs` wraps it as
+`fp_is_imm8`, with a comment explaining exactly when to prefer it. **Nothing
+called it.** Every floating constant in every program zcc has ever compiled went
+through a general register: `movz` chain, then `fmov d, x` ACROSS the register
+files, two instructions and a crossing where the ISA offers one instruction and
+no crossing.
+
+This is the Law-1 failure in its cleanest form. The table is on the spec side of
+the decomposition, correct and cited; the algorithm side simply did not read it.
+No measurement was needed to know it was wrong — only to know what it cost.
+
+**WHAT IT COST, hand-edited first** (`o3_fp_mixed`, whose inner loop rebuilds
+1.0f before an `fcmp` and 0.5f in the other arm, both on the dependence chain):
+
+| | µs | vs gcc -O1 |
+|---|---|---|
+| gcc -O1 | 17,435 | — |
+| zcc | 24,116 | 1.388 |
+| zcc, two lines rewritten to `fmov #imm` | 20,053 | **1.151** |
+
+**BUILT** (`MInst::FMovImm`, one instruction, verified against `fp_imm8` in
+`mir::verify` so an unrepresentable constant cannot reach the emitter; shared by
+`const_share` on the same key as `MovImm`):
+
+| | before | after |
+|---|---|---|
+| suite INSN geomean (deterministic) | 1.0854 | **1.0794** |
+| suite EXEC geomean | 1.0729 | 1.0705 (inside the noise band) |
+| `o3_fp_mixed` | 1.377 | **1.199** |
+| `f2_double_poly` | 1.000 | **1.070** |
+| sqlite | byte-identical | byte-identical |
+
+**THE RESIDUAL HAS A NAME, AND IT BELONGS TO THE SCHEDULER.**
+`f2_double_poly` receives TEN FEWER INSTRUCTIONS (59 → 49) and runs 6% SLOWER,
+4,977 µs → 5,275 µs, reproducible across interleaved pairs. Every instruction it
+receives is correct and cheaper; what changed is which pipe they occupy. Horner
+evaluation is a chain of dependent `fmul`/`fadd` — the FP pipe is the bottleneck
+— and the old `movz` sat in the GENERAL pipe, executing for free beside it.
+`fmov #imm` moves that work into the pipe that is already full. In `o3` the
+opposite holds: the constant is ON the chain feeding `fcmp`, so removing the
+crossing is a straight win.
+
+**Law 3c, sharper than the usual statement.** It is not only that fewer
+instructions can be slower; it is that an instruction's cost depends on WHICH
+EXECUTION RESOURCE it competes for, and a count cannot see a resource. Keeping
+isel at two instructions to hide this would be treating a scheduling problem in
+the selector, which Article B forbids — the row is wired at the layer that owns
+the ISA table, and `f2` is left as a named, reproducible test case for the
+scheduler: a program where the better instruction sequence loses.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-musl,
+gcc 14.2.0 -O1. Gate 15/0 at FUZZ_N=300 (356 s wall), cargo 208/0.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer

@@ -48,6 +48,10 @@ use std::collections::HashMap;
 #[derive(PartialEq, Eq, Hash)]
 enum Key {
     Imm(u8, i64),
+    /// A floating constant in the `fmov #imm8` form. Its bits and its width are
+    /// what identify it, exactly as `Imm` above — a different width is a
+    /// different register class's value, so the two never share.
+    Fimm(u8, u64),
     Sym(Sym, bool),
 }
 
@@ -157,6 +161,9 @@ fn visit(
             MInst::MovImm { w, dst: Reg::V(d), imm } => {
                 (Key::Imm(*w as u8, *imm), Reg::V(*d), *w)
             }
+            MInst::FMovImm { w, dst: Reg::V(d), bits } => {
+                (Key::Fimm(*w as u8, *bits), Reg::V(*d), *w)
+            }
             MInst::Adrp { dst: Reg::V(d), sym, got } => {
                 (Key::Sym(sym.clone(), *got), Reg::V(*d), Width::W64)
             }
@@ -175,6 +182,7 @@ fn visit(
                 table.insert(key, (dst, w, *calls));
                 undo.push(Some(match &f.blocks[b as usize].insts[i] {
                     MInst::MovImm { w, imm, .. } => Key::Imm(*w as u8, *imm),
+                    MInst::FMovImm { w, bits, .. } => Key::Fimm(*w as u8, *bits),
                     MInst::Adrp { sym, got, .. } => Key::Sym(sym.clone(), *got),
                     _ => unreachable!(),
                 }));

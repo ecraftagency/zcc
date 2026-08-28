@@ -205,6 +205,15 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
                 return Err(format!("integer ALU at width {:?}", w));
             }
         }
+        MInst::FMovImm { w, dst, bits } => {
+            want(*dst, Class::Fpr, "dst")?;
+            if !matches!(w, Width::S | Width::D) {
+                return Err(format!("fmov immediate at width {:?}", w));
+            }
+            if !crate::mir::isa::fp_imm8(*bits, *w) {
+                return Err("fmov immediate outside the 8-bit form".to_string());
+            }
+        }
         MInst::Bfx { w, dst, src, lsb, width, .. } => {
             want(*dst, Class::Gpr, "dst")?;
             want(*src, Class::Gpr, "src")?;

@@ -488,6 +488,42 @@ fn count(f: &crate::mir::MFunc, p: impl Fn(&crate::mir::MInst) -> bool) -> usize
 }
 
 #[test]
+fn a_representable_float_constant_needs_no_general_register() {
+    use crate::mir::{MInst, Width};
+    // DDI 0487 C7 `VFPExpandImm` covers 1.0 and 0.5, so `fmov s, #imm` is the
+    // whole materialization: no `movz` chain and no crossing between the
+    // register files. `isa::fp_imm8` decides membership and this asserts that
+    // isel ASKS it — the table had been written, tested and left unwired
+    // (MECHANISM.md M37).
+    let f = mir_of(
+        "float g(float x){ return x > 1.0f ? x * 0.5f : x; }          int main(void){ return (int)g(4.0f); }",
+        "g",
+    );
+    assert_eq!(count(&f, |i| matches!(i, MInst::FMovImm { w: Width::S, .. })), 2);
+    assert_eq!(
+        count(&f, |i| matches!(i, MInst::MovImm { .. })),
+        0,
+        "a constant the 8-bit form covers must not reach a general register"
+    );
+    equiv("float g(float x){ return x > 1.0f ? x * 0.5f : x; }            int main(void){ return (int)g(4.0f); }");
+}
+
+#[test]
+fn a_float_constant_outside_the_eight_bit_form_still_goes_through_a_gpr() {
+    use crate::mir::MInst;
+    // The refusal half: 3.14159 is not sign · 2^e · (1 + m/16), so the bit
+    // pattern takes the general path. Without this the battery above would pass
+    // on a rule that had simply stopped checking.
+    let f = mir_of(
+        "double g(double x){ return x * 3.14159; } int main(void){ return (int)g(2.0); }",
+        "g",
+    );
+    assert_eq!(count(&f, |i| matches!(i, MInst::FMovImm { .. })), 0);
+    assert!(count(&f, |i| matches!(i, MInst::MovImm { .. })) >= 1);
+    equiv("double g(double x){ return x * 3.14159; } int main(void){ return (int)g(2.0); }");
+}
+
+#[test]
 fn a_sign_extending_load_needs_no_extension() {
     use crate::mir::{MInst, MemOp};
     // `ldrsh w0,[x0]`, not `ldrh w0,[x0]` + `sxth w0,w0` (DDI 0487 C6.2.192).

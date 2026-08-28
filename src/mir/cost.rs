@@ -59,7 +59,7 @@ pub fn latency(inst: &MInst, src: Reg) -> u32 {
         MInst::Load { .. } | MInst::Pair { load: true, .. } => 3,
         MInst::Cmp { .. } | MInst::CSel { .. } | MInst::CSet { .. } => 1,
         MInst::Ext { .. } | MInst::Bfx { .. } => 1,
-        MInst::MovImm { .. } | MInst::Adrp { .. } | MInst::AddLo12 { .. } => 1,
+        MInst::MovImm { .. } | MInst::FMovImm { .. } | MInst::Adrp { .. } | MInst::AddLo12 { .. } => 1,
         MInst::Copy { .. } => 1,
         // Unmeasured: the FP forms and the call. A call is not a latency, it is
         // a whole function, and a loop containing one is not recurrence-bound in

@@ -559,6 +559,15 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
                 let _ = writeln!(s, "\t<mov v{}, #{}>", v, imm);
             }
         },
+        MInst::FMovImm { w, dst, bits } => {
+            // The assembler takes the VALUE, not the encoding; printing it with
+            // enough digits to round-trip is what makes the two agree.
+            let v = match w {
+                Width::S => f32::from_bits(*bits as u32) as f64,
+                _ => f64::from_bits(*bits),
+            };
+            let _ = writeln!(s, "\tfmov {}, #{:?}", reg(*dst, *w), v);
+        }
         MInst::Ext { op, w, dst, src } => {
             let m = match op {
                 ExtOp::Sxtb => "sxtb",

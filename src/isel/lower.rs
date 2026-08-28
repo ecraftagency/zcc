@@ -962,6 +962,11 @@ impl<'a> L<'a> {
                         dst: d,
                         src: Reg::P(isa::ZR),
                     });
+                } else if imm::fp_is_imm8(bits, w) {
+                    // DDI 0487 C7 `VFPExpandImm` covers it, so the constant needs
+                    // neither a GPR nor a crossing between the register files
+                    // (MECHANISM.md M37).
+                    self.push(MInst::FMovImm { w, dst: d, bits });
                 } else {
                     let gw = if w == Width::S { Width::W32 } else { Width::W64 };
                     let g = self.tmp(gw);

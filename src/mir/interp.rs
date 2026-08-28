@@ -437,6 +437,13 @@ impl<'a> Machine<'a> {
                 let v = trunc(*imm as u64, *w);
                 self.set(fr, *dst, v);
             }
+            MInst::FMovImm { w, dst, bits } => {
+                let v = match w {
+                    Width::S => *bits & 0xffff_ffff,
+                    _ => *bits,
+                };
+                self.set(fr, *dst, v);
+            }
             MInst::Ext { op, w, dst, src } => {
                 let x = self.get(fr, *src);
                 let v = match op {
