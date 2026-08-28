@@ -1057,9 +1057,14 @@ zcc, gcc -O1 referee, 49-program suite (42 taxonomy + the 7 database kernels).
 
 ## M23. What the interprocedural row costs, and what it buys
 
-**WHAT THIS IS.** `hir/pass/inline.rs` is off by default. That is a POLICY, and a
+**SUPERSEDED BY M24 (2026-08-28, the same day).** Every number below is a correct
+reading of the row as it stood, and the conclusion drawn from them — park the row
+— was wrong, because the measurement was taken of the ROW when the cost belonged
+to ONE OF ITS THREE RULES. M24 attributes it. The row is on by default again.
+
+**WHAT THIS IS.** `hir/pass/inline.rs` was off by default. That is a POLICY, and a
 policy needs a number rather than a preference, so this is the measurement it was
-decided on. Cited from `hir/pass/mod.rs`.
+decided on.
 
 **THE ROW IS NOT SLOW ITSELF.** Its own time on the sqlite amalgamation is about
 two seconds — splicing 1.1 s over 7,968 splices, plus 0.5 s of liveness rebuilds.
@@ -1092,3 +1097,78 @@ come back with it.
 
 **WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
 zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.
+
+
+## M24. Which of the three inlining rules was the growth, and what it bought
+
+**WHAT THIS IS.** M23 measured the interprocedural row and parked it. This
+attributes that measurement to the individual rule responsible, which reverses
+the decision. Cited from `hir/pass/inline.rs` and `hir/pass/mod.rs`.
+
+**THE THREE RULES.** A site was admitted if the callee is called once (and either
+has internal linkage, or the site is in a loop and the callee has none of its
+own); or if the body is no larger than the call sequence it replaces; or — the
+third rule — if the site is in a loop, the callee is loop-free, and the body is no
+larger than the call sequence PLUS the number of values live across the site.
+
+The first two cannot make the program bigger. The first moves a body that is then
+deleted; the second substitutes something smaller than what it removes. Only the
+third can grow code, by up to the live-across count per site, and it is the only
+one that fires at many sites for the same callee.
+
+**ATTRIBUTION, sqlite amalgamation**, counted at the chosen site:
+
+| rule | splices | instructions added |
+|---|---|---|
+| called-once | 523 | +24,376 (bodies then deleted) |
+| body ≤ call sequence | 3,592 | +9,288 (each ≤ what it replaced) |
+| live-across | 4,555 | **+62,520** |
+
+**WHAT THE THIRD RULE COST**, with the row on both times:
+
+| | all three rules | first two only |
+|---|---|---|
+| sqlite compile | 24,235 ms | 7,006 ms |
+| sqlite assembly | 219,461 insn | 174,730 insn |
+| `cfg` row | 6,285 ms | 675 ms |
+| `spill` | 8,155 ms | 1,809 ms |
+| the inline row itself | 2,708 ms | 198 ms |
+
+Code grew 28.1% while the function COUNT fell 30%, so the average function grew
+83% — that, not the 28%, is what the superlinear passes below were charging for.
+
+**WHAT THE THIRD RULE BOUGHT.** Three interleaved pairs of the 49-program
+taxonomy suite, alternating within one session because the geomean's spread
+across sessions is ±0.007:
+
+| | all three | first two |
+|---|---|---|
+| EXEC geomean | 1.0236 / 1.0227 / 1.0218 | 1.0254 / 1.0252 / 1.0247 |
+
+0.24%, consistent in sign across all three pairs, and it is one program:
+`n1_btree_page` 1.314 → 1.244, the byte-pair reader inside a binary search that
+the rule was written for.
+
+**WHY IT WAS REMOVED, and it is not a compile-speed argument.** The file already
+carries the criterion: dropping `is_static` was refused at 16% size for 7% speed
+as failing THE ULTIMATUM's both-axes clause. This rule is 26% size for 0.24%
+speed. And its compile cost is what parked the WHOLE row, so it was spending 4.9
+points of exec geomean to buy 0.24 — an exec-for-exec trade, decided on the axis
+Law 0 ranks first among the two, not on compile speed.
+
+**WHAT THE ROW IS WORTH WITHOUT IT**, measured on the shipped default:
+
+| | row off | row on |
+|---|---|---|
+| taxonomy suite EXEC geomean | 1.0741 | 1.0220 |
+| sqlite compile (gcc -O1: 6,544–6,814 ms) | 4,829 ms | 6,687–6,808 ms |
+| sqlite assembly (gcc -O1: 157,074) | 171,287 | 174,730 |
+| `fullsuite.sh all` | 4m00s | 5m55s |
+
+Compile time is at gcc -O1 parity with the row on. The 1.45× is against zcc's own
+no-inline build, which is faster than the referee.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.
+The off/on geomeans in the last table are from different box sessions; only the
+three-pair table above is interleaved, and it is the one the removal rests on.

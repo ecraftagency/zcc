@@ -17,6 +17,25 @@
 // return becomes a jump to the continuation block, whose parameter is the call's
 // result — exactly the meaning ⟦hir⟧ gives `Term::Ret` inside a call frame.
 //
+// THE REFUSED THIRD RULE (2026-08-28, `MEASURED M24`). A third rule stood here
+// for a while: a site inside a loop, with a loop-free callee, admitted when the
+// body is no larger than the call sequence PLUS the number of values live across
+// the site — the argument being that a call forces every value live across it
+// into a callee-saved register or a stack slot (AAPCS64 §6.1.1), which inlining
+// removes. The budget was taken from the program rather than picked, so it was
+// admissible; it was removed because of what it MEASURED. It was the only rule
+// that can grow code, and on the sqlite amalgamation it grew it by 62,520
+// instructions over 4,555 splices while the other two rules together added 3,443
+// net. That is 26% more assembly, and since the function COUNT falls at the same
+// time the average function grew 83%, which the superlinear passes below this one
+// charge for: sqlite compiled in 24.2 s with the rule and 7.0 s without it. What
+// it bought, over three interleaved pairs of the 49-program suite, was 0.24% of
+// exec geomean, all of it one program (`n1_btree_page`, the byte-pair reader in a
+// binary search this rule was written for). The file already refuses this shape:
+// dropping `is_static` was refused below at 16% size for 7% speed. And the
+// compile cost was what parked the whole row, which is worth 4.9 points — so the
+// trade was exec for exec, not compile speed for exec.
+//
 // What is REFUSED, each for a reason that is a property of the IR and not a
 // heuristic: a variadic callee (its `va_list` is built from a frame layout that
 // only exists as a real call), a callee that takes a block address or performs a
@@ -37,188 +56,6 @@ fn call_cost(sig: &Sig) -> usize {
     // and the callee's own `ret` — which the first cut forgot, and which the
     // inlined body does not have.
     sig.params.len() + 3
-}
-
-/// WHAT THE CALL COSTS THE CALLER, which the sequence length above does not say.
-///
-/// AAPCS64 §6.1.1: a call may destroy x0–x18 and v0–v7/v16–v31. Every value the
-/// caller holds ACROSS the call must therefore be in a callee-saved register —
-/// which the caller then has to save and restore — or in a stack slot. That is a
-/// real, countable cost, it is paid per call SITE rather than per callee, and
-/// inlining removes all of it.
-///
-/// So the budget a body is measured against is the call sequence plus the number
-/// of values live across the site. It is a count taken FROM THE PROGRAM, not a
-/// threshold picked by an author (Article E), and it is why a three-instruction
-/// byte-pair reader inside a binary search is worth inlining while the same
-/// function called once at the top of `main` is not: `n1_btree_page` holds nine
-/// values across that call and pays for all nine.
-fn live_across(f: &Func) -> Vec<Vec<usize>> {
-    // block-level liveness, backwards to a fixed point
-    let c = dom::cfg(f);
-    let n = f.blocks.len();
-    // A block's set is stored as the values it holds, sorted so two of them
-    // compare elementwise; `cur` is the one working set, and it is the only
-    // structure sized by the value space.
-    let mut out: Vec<Vec<ValueId>> = vec![Vec::new(); n];
-    let mut live_in: Vec<Vec<ValueId>> = vec![Vec::new(); n];
-    let mut cur = Live::new(f.values.len());
-    // A PREDECESSOR WORKLIST, not a sweep bounded by the block count. Liveness is
-    // backwards and monotone with a unique least fixpoint, so the visit order
-    // decides only how many visits it takes, never the answer — a block is
-    // recomputed when a successor's `live_in` grew, and its predecessors are
-    // queued when its own does. Seeded in reverse RPO, the order the sweep was
-    // already using. The same trick `regalloc::live` carries, for the same reason.
-    let mut inq = vec![true; n];
-    let mut wl: std::collections::VecDeque<usize> =
-        c.rpo.iter().rev().map(|&b| b as usize).collect();
-    while let Some(b) = wl.pop_front() {
-        {
-            inq[b] = false;
-            cur.clear();
-            for &s in &c.succs[b] {
-                for &v in &live_in[s as usize] {
-                    cur.insert(v);
-                }
-            }
-            if cur.differs(&out[b]) {
-                out[b] = cur.sorted();
-            }
-            f.blocks[b].term.uses(|o| {
-                if let Operand::Val(v) = o {
-                    cur.insert(v);
-                }
-            });
-            for inst in f.blocks[b].insts.iter().rev() {
-                if let Some(d) = inst.dst() {
-                    cur.remove(d);
-                }
-                inst.uses(|o| {
-                    if let Operand::Val(v) = o {
-                        cur.insert(v);
-                    }
-                });
-            }
-            for p in &f.blocks[b].params {
-                cur.remove(*p);
-            }
-            if cur.differs(&live_in[b]) {
-                live_in[b] = cur.sorted();
-                for &p in &c.preds[b] {
-                    let p = p as usize;
-                    if !inq[p] {
-                        inq[p] = true;
-                        wl.push_back(p);
-                    }
-                }
-            }
-        }
-    }
-    // walk each block forwards, counting what is live ACROSS each instruction
-    let mut per_site: Vec<Vec<usize>> = Vec::with_capacity(n);
-    for b in 0..n {
-        // live at the end of the block
-        cur.clear();
-        for &v in &out[b] {
-            cur.insert(v);
-        }
-        f.blocks[b].term.uses(|o| {
-            if let Operand::Val(v) = o {
-                cur.insert(v);
-            }
-        });
-        let mut counts = vec![0usize; f.blocks[b].insts.len()];
-        for (i, inst) in f.blocks[b].insts.iter().enumerate().rev() {
-            if let Some(d) = inst.dst() {
-                cur.remove(d);
-            }
-            // what is live here is what survives the instruction; the call's own
-            // arguments are counted by `call_cost`, not here
-            counts[i] = cur.len();
-            inst.uses(|o| {
-                if let Operand::Val(v) = o {
-                    cur.insert(v);
-                }
-            });
-        }
-        per_site.push(counts);
-    }
-    per_site
-}
-
-/// A SPARSE SET over the value space — the structure this dataflow wants.
-///
-/// The first cut used a `HashSet<ValueId>` per block, cloned once per block per
-/// round; the second used one bit per value. Both are sized by how many values
-/// EXIST, and the two numbers here are far apart: inlining mints values with
-/// every splice, so a large function reaches tens of thousands of them, while
-/// the set that is live at any one point stays a few dozen. Anything that walks
-/// the whole space per block visit therefore pays a thousandfold for what it
-/// carries — and this analysis is run again after every splice.
-///
-/// So membership is a stamp per value and the contents are a list: insert,
-/// remove and test are each O(1), the count is the list's length, and CLEARING —
-/// which happens once per block visit and was the whole cost of the word array —
-/// is an increment of the generation. Only the two index arrays are sized by the
-/// value space, they are written once, and nothing is cleared by walking them.
-/// Briggs and Torczon's sparse set, with the generation trick that removes the
-/// initialization.
-///
-/// The dataflow above keeps its order, its round bound and its break condition,
-/// so it reaches the same fixpoint by the same steps and every count it reports
-/// — and every inlining decision taken from one — is unchanged.
-struct Live {
-    /// the generation at which a value was inserted; equal to `era` means present
-    stamp: Vec<u32>,
-    /// where a present value sits in `list`
-    at: Vec<u32>,
-    list: Vec<ValueId>,
-    era: u32,
-}
-
-impl Live {
-    fn new(values: usize) -> Self {
-        // generations start at 1, so the zeroed stamps read as absent
-        Live { stamp: vec![0; values], at: vec![0; values], list: Vec::new(), era: 1 }
-    }
-    fn clear(&mut self) {
-        self.era += 1;
-        self.list.clear();
-    }
-    fn contains(&self, v: ValueId) -> bool {
-        self.stamp[v as usize] == self.era
-    }
-    fn insert(&mut self, v: ValueId) {
-        if !self.contains(v) {
-            self.stamp[v as usize] = self.era;
-            self.at[v as usize] = self.list.len() as u32;
-            self.list.push(v);
-        }
-    }
-    fn remove(&mut self, v: ValueId) {
-        if self.contains(v) {
-            let i = self.at[v as usize] as usize;
-            self.list.swap_remove(i);
-            if i < self.list.len() {
-                self.at[self.list[i] as usize] = i as u32;
-            }
-            self.stamp[v as usize] = 0;
-        }
-    }
-    fn len(&self) -> usize {
-        self.list.len()
-    }
-    /// Sorted, so a stored set is comparable elementwise.
-    fn sorted(&self) -> Vec<ValueId> {
-        let mut v = self.list.clone();
-        v.sort_unstable();
-        v
-    }
-    /// Does this set differ from a stored one? Answered without sorting in the
-    /// common case, where the sizes already settle it.
-    fn differs(&self, stored: &[ValueId]) -> bool {
-        self.list.len() != stored.len() || stored.iter().any(|&v| !self.contains(v))
-    }
 }
 
 /// THEORY A7b — a fixpoint bound: termination insurance, not a policy
@@ -292,34 +129,6 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
             // it introduces lies ahead of this point and is still reached.
             let mut from = 0usize;
             let _ = &from;
-            // WHAT IS LIVE ACROSS EACH SITE, computed once for this caller.
-            //
-            // Splicing does not disturb it. A call is replaced by the callee's
-            // body, which reads the same argument values at the same place and
-            // defines the same result there, so the use-def structure outside the
-            // spliced region is the one that was already measured — and inside
-            // it, the blocks are new and the count is read through `unwrap_or(0)`,
-            // which is the answer a call with nothing proven live across it gets
-            // anyway. Recomputing per splice is what a whole-function dataflow
-            // per inlined site costs, and it is the last of the five.
-            // WHAT IS LIVE ACROSS EACH SITE — kept, and invalidated exactly as far
-            // as a splice reaches.
-            //
-            // Recomputing it per splice is correct and costs a whole-function
-            // dataflow every time: 467 s on the sqlite amalgamation. Computing it
-            // once per caller is fast and WRONG — it answers with counts the
-            // splices have already invalidated, and sqlite's assembly moved while
-            // all 58 corpus programs stayed identical.
-            //
-            // Neither is necessary. A splice replaces a call by the callee's body,
-            // which reads the same argument values at the same place and defines
-            // the same result there, so no value's live range changes OUTSIDE the
-            // region it touched: every block but the one it split keeps its
-            // counts. So the table is carried, the split block is truncated at the
-            // call, the appended blocks are marked unknown, and the whole thing is
-            // rebuilt only when a query actually lands in code that inlining just
-            // created.
-            let mut across: Option<Vec<Vec<usize>>> = None;
             loop {
                 let hl = |gi: usize| match hasloop[gi].get() {
                     Some(v) => v,
@@ -345,28 +154,12 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                         v
                     }
                 };
-                // THE EXPENSIVE RULE IS ASKED LAST, AND ONLY WHERE IT COULD WIN.
-                //
-                // Three rules admit a site: called-once, a body no larger than
-                // the call sequence, and — only for a loop-resident call with a
-                // loop-free callee — a body no larger than the sequence plus what
-                // is live across it. The third needs `live_across`, a whole
-                // function dataflow, and this scan runs again after every splice
-                // on a function that splicing is growing. Running it whenever any
-                // site merely REACHED the third rule is what left sqlite
-                // compiling for twenty minutes: one hot call sitting just over
-                // budget early in `sqlite3VdbeExec` paid for the analysis on
-                // every scan, however the chosen site was finally admitted.
-                //
-                // So the scan stops at the first site the two cheap rules admit
-                // and remembers, in order, the loop-resident candidates it passed
-                // on the way. Every one of those sits BEFORE that site, so if any
-                // is admitted by the third rule it is the earlier — and the first
-                // such one is the answer. Nothing before it was admitted by any
-                // rule, so this is the same site the single scan chose, and the
-                // dataflow is computed only when such a candidate exists at all.
+                // TWO RULES ADMIT A SITE, and neither can make the program
+                // bigger: called-once, and a body no larger than the call
+                // sequence it replaces. So the scan stops at the first site
+                // either of them admits — there is no later rule whose answer
+                // could be earlier, and no dataflow to compute.
                 let mut cheap: Option<(usize, usize, usize)> = None;
-                let mut hots: Vec<(usize, usize, usize)> = Vec::new();
                 let mut consider = |b: usize, i: usize, inst: &Inst| -> bool {
                     match inst {
                         Inst::Call { callee: Callee::Direct(n), sret: None, args, .. } => {
@@ -426,26 +219,10 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                             let called_once = once
                                 && (g.is_static
                                     || (inloop.get(b).copied().unwrap_or(false) && !hl(gi)));
-                            // The live-across term is charged INSIDE A LOOP only.
-                            // The cost is real wherever the call is, but outside
-                            // a loop it is paid once, and paying it once is what
-                            // a call is for; in a loop it is paid every
-                            // iteration, which is the case worth trading code
-                            // size for (the same fence `e2_many_args` already
-                            // uses for the called-once rule).
-                            // …and only for a LOOP-FREE callee. A body with a
-                            // loop of its own is not a few instructions standing
-                            // in for a call sequence: its cost is paid per ITS
-                            // OWN iterations, which the saving at the call site
-                            // says nothing about.
-                            let hot = inloop.get(b).copied().unwrap_or(false) && !hl(gi);
                             let base = call_cost(&g.sig);
                             if called_once || bs(gi) <= base {
                                 cheap = Some((b, i, gi));
-                                return true; // the cheap rules admit it: the scan stops
-                            }
-                            if hot {
-                                hots.push((b, i, gi));
+                                return true; // a rule admits it: the scan stops
                             }
                             false
                         }
@@ -459,31 +236,7 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                         }
                     }
                 }
-                let mut hot_site = None;
-                for &(b, i, gi) in &hots {
-                    if across.is_none() {
-                        across = Some(live_across(&m.funcs[ci]));
-                    }
-                    let here = match across.as_ref().unwrap().get(b).and_then(|v| v.get(i)) {
-                        Some(&n) => n,
-                        // the query landed in code a splice created: rebuild once
-                        None => {
-                            across = Some(live_across(&m.funcs[ci]));
-                            across
-                                .as_ref()
-                                .unwrap()
-                                .get(b)
-                                .and_then(|v| v.get(i))
-                                .copied()
-                                .unwrap_or(0)
-                        }
-                    };
-                    if bs(gi) <= call_cost(&m.funcs[gi].sig) + here {
-                        hot_site = Some((b, i, gi));
-                        break;
-                    }
-                }
-                let site = hot_site.or(cheap);
+                let site = cheap;
                 match site {
                     Some((b, i, gi)) => {
                         let callee_loops = hl(gi);
@@ -496,14 +249,6 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                         match callee_loops {
                             true => inloop = loop_blocks(&m.funcs[ci]),
                             false => inloop.resize(m.funcs[ci].blocks.len(), inloop[b]),
-                        }
-                        // the call is gone from `b`, and everything after it now
-                        // lives in blocks this splice appended
-                        if let Some(a) = across.as_mut() {
-                            if b < a.len() {
-                                a[b].truncate(i);
-                            }
-                            a.resize(m.funcs[ci].blocks.len(), Vec::new());
                         }
                         // the call is gone and what replaced it lies ahead
                         from = b;

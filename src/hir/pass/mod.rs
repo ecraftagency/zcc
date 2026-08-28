@@ -63,13 +63,13 @@ pub fn run_module_with(m: &mut Module, pinned: &std::collections::HashSet<String
     // optimized when it is spliced in (its locals promoted, its constants
     // folded), and the caller must be re-optimized afterwards, because a call
     // replaced by a body is exactly the shape the other rows feed on.
-    // OFF BY DEFAULT (2026-08-28). This row is not slow itself — it costs about
-    // two seconds — but it GROWS every function it touches, and the passes below
-    // it are superlinear in function size, so it multiplies their cost: sqlite
-    // compiles in 22 s with it and 4.7 s without, against gcc -O1's 6.4 s. The
-    // fuzzing campaigns are how miscompiles are found, and they are gated on
-    // compile time, so the row waits until the passes it feeds can absorb what it
-    // produces. `ZCC_INLINE=1`, or `set_inline(true)` in a battery, turns it on.
+    // ON BY DEFAULT. It was off for one day (2026-08-28) because it multiplied
+    // the cost of the superlinear passes below it — sqlite 22 s against 4.7 s
+    // without — and the fuzzing campaigns that find miscompiles are gated on
+    // compile time. The growth was not the row's: it was one of the row's three
+    // rules, and that rule is gone (`inline.rs`, REFUSED THIRD RULE). What is
+    // left grows sqlite by 2.0% and costs 2.2 s, so the row pays for itself
+    // again. `ZCC_NOPASS=inline` turns it off.
     if inline_wanted() && on("inline") && timed("inline", || inline::run_module(m, pinned)) {
         let ro = readonly(m);
         for f in m.funcs.iter_mut() {
@@ -202,16 +202,16 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
 /// would silently decide another's input. Same reason `regalloc::promote` keeps
 /// its switch this way.
 thread_local! {
-    /// THEORY A7b — the interprocedural row's switch, and an instrument half in
-    /// the sense `promote.rs` carries: a battery that MEASURES inlining turns it
-    /// on in its own thread. The default is a POLICY recorded in
-    /// `run_module_with` above, not a spec constant — it is off because the
-    /// passes this row feeds are superlinear in function size (`MEASURED M23`).
-    static INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// THEORY A7b — the interprocedural row's switch, an instrument half in the
+    /// sense `promote.rs` carries: a battery that measures a row WITHOUT
+    /// inlining turns it off in its own thread, so a single-function square is
+    /// read on the function it was written for. The row itself is on by
+    /// default (`run_module_with` above).
+    static INLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 fn inline_wanted() -> bool {
-    INLINE.with(|c| c.get()) || std::env::var_os("ZCC_INLINE").is_some()
+    INLINE.with(|c| c.get())
 }
 
 #[cfg(test)]
