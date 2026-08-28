@@ -1,4 +1,4 @@
-// purity — the interprocedural READ-ONLY predicate (REARCH §13c row 1).
+// purity — the interprocedural READ-ONLY predicate (MECHANISM.md Part F row 1).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // This is an ANALYSIS, not a transform: it adds no instruction and so carries no
@@ -75,7 +75,7 @@ fn writes(f: &Func, local: &[bool], ro: &HashSet<String>) -> bool {
                 // A call through a pointer names no body to inspect.
                 Inst::Call { callee: Callee::Indirect(_), .. } => true,
                 // `alloca` moves the stack pointer and the builtin surface is
-                // opaque by construction (REARCH §3.1) — neither is inspectable,
+                // opaque by construction (MECHANISM.md §G3.1) — neither is inspectable,
                 // so neither is read-only.
                 Inst::Alloca { .. } | Inst::Intrinsic { .. } => true,
                 _ => false,

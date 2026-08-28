@@ -1,4 +1,4 @@
-// Instruction selection: HIR → MIR (REARCH.md §6).
+// Instruction selection: HIR → MIR (MECHANISM.md §G6).
 // THEORY A5 — instruction selection
 //
 // The layer is split along the Law-1 seam. `abi.rs` is Side II — the AAPCS64

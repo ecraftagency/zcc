@@ -1,4 +1,4 @@
-// AST → HIR lowering (REARCH.md §12 R0.3).
+// AST → HIR lowering (MECHANISM.md §G3).
 // THEORY A6 — HIR construction; THEORY A4 — the conversions C99 requires
 //
 // The frontend hands the backend an arena of `Node`s whose every convergence
@@ -1807,7 +1807,7 @@ fn build_func(ast: &Ast, af: &ast::Func) -> Func {
         // frame slot goes through the same bridge every other store does. HIR
         // must not mean two different things by `PTy::LDouble` on the two sides
         // of a call: it did, and ⟦hir⟧ could not run a long-double function at
-        // all as a result (REARCH §15).
+        // all as a result (MECHANISM.md §G15).
         if matches!(ast.tt.tys[t as usize], ast::Ty::LDouble) {
             b.ld_store(a, Operand::Val(v));
             continue;

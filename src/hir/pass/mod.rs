@@ -1,4 +1,4 @@
-// The HIR pass ladder (REARCH.md §4) — the tree-SSA half of gcc -O1, re-realized
+// The HIR pass ladder (MECHANISM.md §G4) — the tree-SSA half of gcc -O1, re-realized
 // THEORY A7b — optimization, and what proving each pass requires
 // on this architecture.
 //

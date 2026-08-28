@@ -1,4 +1,4 @@
-// sroa + mem2reg (REARCH §4 row 2) — the pass the R1 ground metric points at.
+// sroa + mem2reg (MECHANISM.md §G4 row 2) — the pass the R1 ground metric points at.
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // §13a measured `add` at 28.2% of sqlite's instructions and `ldr` at 19.2%, and
@@ -10,7 +10,7 @@
 // THE OBSTACLE, AND WHY IT IS GONE. The parser reports `Node::Var(off)` — an
 // offset, not an identity — so HIR sees one slot with accesses scattered through
 // it. An offset alone cannot tell where a local ENDS, so an escaped `&x` had to
-// be assumed to reach the whole frame, and nothing was promotable (REARCH §14).
+// be assumed to reach the whole frame, and nothing was promotable (MECHANISM.md §G14).
 // The fix is not an analysis but a FACT: `alloc_local` already computed each
 // object's extent, and `ast::Func::objs` now exports it. With extents in hand,
 // C99 6.5.6p8 — pointer arithmetic is defined only WITHIN an object — bounds an

@@ -1,4 +1,4 @@
-// The frame/layout battery (REARCH.md §10 row "frame / layout", added by the
+// The frame/layout battery (MECHANISM.md §G10 row "frame / layout", added by the
 // R0.9 audit — until then these two passes rode on the register allocator's
 // square, which is not a proof of either).
 //
@@ -186,7 +186,7 @@ fn slots_do_not_overlap_and_respect_alignment() {
     }
 }
 
-// frame_fold (REARCH.md §13o, R4.15) — the frame adjust folded into the first /
+// frame_fold (MECHANISM.md §G8, R4.15) — the frame adjust folded into the first /
 // last callee-save pair as a pre/post-indexed writeback.
 fn count_framewb(f: &crate::mir::MFunc) -> usize {
     f.blocks
@@ -353,7 +353,7 @@ fn legalization_of_out_of_range_frame_offsets() {
     );
 }
 
-// auto_inc (REARCH.md §8, R3.2) — the pre-allocation post-index fold. Its square
+// auto_inc (MECHANISM.md §G8, R3.2) — the pre-allocation post-index fold. Its square
 // is `⟦mir_v⟧ = ⟦autoinc(mir_v)⟧`: the fold moves a pointer bump into the load,
 // changing no value. The test also asserts the pass FIRES on the canonical
 // pointer-walk shape (Law 4 — a pass that never fires is worse than absent), and
@@ -409,7 +409,7 @@ fn auto_inc_fires_and_preserves_meaning() {
     );
 }
 
-// shrink_wrap (REARCH.md §8, R3.3) — the prologue/epilogue move off the fast
+// shrink_wrap (MECHANISM.md §G8, R3.3) — the prologue/epilogue move off the fast
 // path. Proven on the firing configuration (the HIR ladder must run first, or g
 // stays a call and the shape is different): `⟦mir_p⟧ = ⟦mir_final⟧` with the
 // pass active, the value is the oracle's, and the saves DID move — the entry

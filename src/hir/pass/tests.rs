@@ -878,7 +878,7 @@ fn sink_keeps_a_faulting_computation_where_it_was() {
     square(ok, 42);
 }
 
-// ── the invariant pure-call hoist (REARCH §13c row 1) ──────────────────────
+// ── the invariant pure-call hoist (MECHANISM.md Part F row 1) ──────────────────────
 
 /// Calls left anywhere inside a loop body — the structure the hoist removes.
 fn calls_in_loops(f: &Func) -> usize {
@@ -1104,7 +1104,7 @@ fn a_break_before_the_call_keeps_it_in() {
     square(&src, 12);
 }
 
-// ── loop rotation (REARCH §13c row 2, shipped default-OFF — see §13e) ──────
+// ── loop rotation (MECHANISM.md Part F row 2, shipped default-OFF — see §13e) ──────
 
 /// Build, promote locals, then rotate by hand. `module(src, true)` cannot reach
 /// this pass because it ships disabled, and a disabled theorem still owes its
@@ -1208,7 +1208,7 @@ fn rotation_is_not_applied_twice() {
     }
 }
 
-// ── scalar evolution (REARCH §13f — the prerequisite for pointer-IV / LFTR) ──
+// ── scalar evolution (MECHANISM.md Part F — the prerequisite for pointer-IV / LFTR) ──
 
 /// The optimized module plus the scev of its first loop in `name`.
 fn scev_of(src: &str, name: &str) -> (Module, Option<usize>) {

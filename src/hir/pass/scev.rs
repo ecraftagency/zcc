@@ -1,4 +1,4 @@
-// scev — scalar evolution for affine induction variables (REARCH §13f).
+// scev — scalar evolution for affine induction variables (MECHANISM.md Part F).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // An ANALYSIS, like `purity.rs`: it rewrites nothing and so carries no commuting

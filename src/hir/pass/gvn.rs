@@ -1,4 +1,4 @@
-// gvn — dominator-scoped global value numbering (REARCH §4 row 4).
+// gvn — dominator-scoped global value numbering (MECHANISM.md §G4 row 4).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // This one pass absorbs four classical ones, which is why the ladder has no

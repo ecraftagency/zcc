@@ -1,10 +1,10 @@
-// dce — dead-code elimination by the effect table (REARCH §4 row 6).
+// dce — dead-code elimination by the effect table (MECHANISM.md §G4 row 6).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // The whole pass is one rule, and the rule is a TABLE LOOKUP, not a hand-written
 // opcode list: `Inst::effect()` classifies every instruction, and an instruction
 // whose class is `Pure` or `Read` and whose result nothing needs is deleted.
-// That is the point of carrying `Effect` in the IR (REARCH §3.1) — adding an
+// That is the point of carrying `Effect` in the IR (MECHANISM.md §G3.1) — adding an
 // opcode can never silently make this pass unsound, because a new opcode must
 // declare its class before it compiles.
 //

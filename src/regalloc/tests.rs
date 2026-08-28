@@ -1,4 +1,4 @@
-// The register-allocator battery (REARCH.md §7.6, §10 row "regalloc").
+// The register-allocator battery (MECHANISM.md §G7.6, §10 row "regalloc").
 //
 // The obligation is a RENAMING BISIMULATION: allocation renames values and may
 // route some of them through memory, but it must not change what the function
@@ -132,7 +132,7 @@ fn switch_chains() {
     ]);
 }
 
-// promote (REARCH.md §13p, R4.16) — region-resident spill: a memory-resident
+// promote (MECHANISM.md §G7, R4.16) — region-resident spill: a memory-resident
 // value a wholly-free callee-saved register could hold goes back to a register.
 #[test]
 fn promote_moves_a_spilled_value_out_of_memory() {
@@ -255,7 +255,7 @@ fn parallel_copy_cycles_are_broken_with_the_scratch_register() {
     ]);
 }
 
-/// The spiller's TWO ceilings (REARCH §7.2/§7.3), both of which the colourer
+/// The spiller's TWO ceilings (MECHANISM.md §G7.2/§7.3), both of which the colourer
 /// depends on and neither of which is visible in a small function:
 ///
 ///   1. total pressure ≤ k at every point, where a call's clobber set counts as

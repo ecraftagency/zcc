@@ -1,4 +1,4 @@
-// The HIR battery (REARCH.md §12 R0.4, §10 row "AST → HIR").
+// The HIR battery (MECHANISM.md §G3, §10 row "AST → HIR").
 //
 // Law 3, at the earliest layer where the question is decidable: each case below
 // is a C program whose value is fixed by the STANDARD (an independent oracle,
@@ -46,7 +46,7 @@ fn run(src: &str) -> Result<i64, Trap> {
 /// `src` must evaluate to `want` — the value C99 assigns it — AND the pass
 /// ladder must not change that.
 ///
-/// The second half is the commuting square ⟦f⟧ = ⟦P f⟧ of REARCH §10, applied to
+/// The second half is the commuting square ⟦f⟧ = ⟦P f⟧ of MECHANISM.md §G10, applied to
 /// EVERY program in this file rather than to a separate handful: each case was
 /// written to pin one C construct against the standard, so running it on both
 /// sides turns the whole battery into the ladder's proof corpus at no extra
@@ -203,7 +203,7 @@ fn verifier_accepts_every_shape() {
     assert_eq!(m.funcs.len(), 3);
 }
 
-// ── R1 lowering batteries (REARCH §15) ─────────────────────────────────────
+// ── R1 lowering batteries (MECHANISM.md §G15) ─────────────────────────────────────
 // R1 shipped its features validated by differential testing alone. These are
 // the squares that were owed: each states the value C99 assigns and checks
 // ⟦hir⟧ produces it, so csmith/yarpgen go back to CONFIRMING (Law 3).

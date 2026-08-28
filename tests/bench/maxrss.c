@@ -1,6 +1,6 @@
 /* maxrss — run a command and report its wall time and PEAK resident set.
  *
- * REARCH.md §19 needs both axes of both sides: how long the compiler takes and
+ * PLAN.md needs both axes of both sides: how long the compiler takes and
  * how much memory it holds, then the same for the program it produced. The box
  * has no `time(1)` and no busybox, and polling /proc/<pid>/status races the
  * child's own peak, so the measurement is taken the only exact way there is:

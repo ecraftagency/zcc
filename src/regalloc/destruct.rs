@@ -1,4 +1,4 @@
-// SSA destruction and the parallel-copy sequentializer (REARCH.md §7.5).
+// SSA destruction and the parallel-copy sequentializer (MECHANISM.md §G7.5).
 // THEORY A7 — out-of-SSA translation (Boissinot et al. 2009)
 //
 // With block parameters the whole of SSA destruction is: each edge's arguments

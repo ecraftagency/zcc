@@ -1,5 +1,5 @@
 // SSA reconstruction — putting a value back together where several definitions
-// of it reach one point (REARCH allocator-splitting spec §4.1).
+// of it reach one point (MECHANISM.md allocator-splitting spec §4.1).
 // THEORY A7 — register allocation ON SSA
 //
 // Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau, "Simple and Efficient

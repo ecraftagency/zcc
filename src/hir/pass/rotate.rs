@@ -1,4 +1,4 @@
-// rotate — loop rotation / header copying (REARCH §13c row 2).
+// rotate — loop rotation / header copying (MECHANISM.md Part F row 2).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // gcc calls this `-ftree-ch`, "copy loop headers", and enables it at -O1. It

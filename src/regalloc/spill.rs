@@ -1,6 +1,6 @@
 // Spilling: reduce register pressure to ≤ k so that chordal colouring cannot
 // THEORY A7 — Belady-based spilling (Braun & Hack 2009)
-// fail (REARCH.md §7.2) — Braun & Hack 2009, "Register Spilling and Live-Range
+// fail (MECHANISM.md §G7.2) — Braun & Hack 2009, "Register Spilling and Live-Range
 // Splitting for SSA-Form Programs".
 //
 // WHY THIS IS THE REAL ALGORITHM NOW, AND WHAT MEASURED IT. R0/R1 shipped the
@@ -61,7 +61,7 @@
 // Residency therefore restarts each iteration. That is a truncation of the
 // theorem, not a limit of it — lifting it needs a fixpoint over the loop — and
 // under Law 4 it is measured rather than assumed: `ZCC_SPILLCEIL=1` prints the
-// residual, and REARCH §13n records what it says.
+// residual, and MECHANISM.md Part F records what it says.
 //
 // POST-CONDITION (what the colourer relies on): at every program point the
 // number of virtual values of a class that are live, plus the allocatable
@@ -70,7 +70,7 @@ use super::live;
 use crate::mir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// R4-capstone (REARCH allocator-splitting spec §4.2/§4.4) — is the back-edge
+/// R4-capstone (MECHANISM.md allocator-splitting spec §4.2/§4.4) — is the back-edge
 /// carry ON?
 ///
 /// THEORY A7: a residency crosses an edge only where the reaching definition
@@ -450,7 +450,7 @@ pub fn spill_with(
 /// R4.1 CEILING MEASUREMENT (`ZCC_SPILLCEIL=1`) — read-only, changes nothing.
 ///
 /// A reload's fresh register is used only inside the block that made it (the
-/// deliberate deviation recorded at the head of this file and in REARCH §14), so
+/// deliberate deviation recorded at the head of this file and in MECHANISM.md §G14), so
 /// a value wanted in five blocks is reloaded five times: once per BLOCK-RESIDENCY
 /// instead of once per program REGION. Before writing a line of Braun 2013 SSA
 /// reconstruction, this asks the corpus how many reloads such a reconstruction
@@ -608,7 +608,7 @@ impl PressureErr {
     }
 }
 
-/// The spiller's POST-CONDITION, checked rather than trusted (REARCH §7.6a):
+/// The spiller's POST-CONDITION, checked rather than trusted (MECHANISM.md §G7.6a):
 /// at every program point the virtual values of a class that are live, plus the
 /// allocatable physical registers spoken for there, are at most `isa::k(class)`;
 /// and the call-crossing ones are at most the callee-saved count. The colourer's

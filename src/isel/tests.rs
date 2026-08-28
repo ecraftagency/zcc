@@ -1,4 +1,4 @@
-// The isel battery (REARCH.md §10 row "isel", §12 R0.6) — TRANSLATION
+// The isel battery (MECHANISM.md §G10 row "isel", §12 R0.6) — TRANSLATION
 // VALIDATION, not a value table.
 //
 // The obligation of instruction selection is `⟦hir⟧ = ⟦mir_v⟧`: whatever the C
@@ -203,7 +203,7 @@ fn block_arguments_survive_selection() {
 }
 
 
-// ── R1 selection rules (REARCH §15) ────────────────────────────────────────
+// ── R1 selection rules (MECHANISM.md §G15) ────────────────────────────────────────
 // These were vacuous until `hir::interp` learned the intrinsics: a variadic or
 // long-double function trapped on the HIR side, so `equiv` compared nothing.
 

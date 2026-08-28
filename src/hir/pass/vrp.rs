@@ -1,4 +1,4 @@
-// vrp — VALUE RANGE PROPAGATION (REARCH §16 ★2; Patterson 1995).
+// vrp — VALUE RANGE PROPAGATION (MECHANISM.md §G16 ★2; Patterson 1995).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // `sccp` answers "is this value THE constant k?". Most of what a program knows

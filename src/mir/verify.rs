@@ -1,4 +1,4 @@
-// The MIR well-formedness checker (REARCH.md §5.4). One function, two
+// The MIR well-formedness checker (MECHANISM.md §G5.4). One function, two
 // THEORY A6b — MIR's well-formedness; THEORY A8 — certify at the middle
 // obligations, selected by `MFunc.physical`:
 //

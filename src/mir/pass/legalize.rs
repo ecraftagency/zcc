@@ -1,4 +1,4 @@
-// Frame-offset legalization (REARCH.md §8, post-frame).
+// Frame-offset legalization (MECHANISM.md §G8, post-frame).
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // `pass/frame.rs` is the first place a stack object has a NUMBER, and A64's
@@ -7,7 +7,7 @@
 // than that is not an error and not a special case — it is an operand that must
 // be legalized, and the legalization is an ordinary MIR rewrite: compute the
 // address into the reserved second scratch (IP1, x17 — reserved exactly so a
-// spill address can have a register, REARCH §5.1) and address through it.
+// spill address can have a register, MECHANISM.md §G5.1) and address through it.
 //
 // Doing this HERE rather than in `emit` is what keeps Article B's rule intact:
 // the emitter makes no decisions and re-parses nothing. It is also what keeps

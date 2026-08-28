@@ -1,4 +1,4 @@
-// The MIR battery (REARCH.md §12 R0.5). Two obligations are provable here with
+// The MIR battery (MECHANISM.md §G5). Two obligations are provable here with
 // no other layer present:
 //   (a) the Side-II encodability predicates of `isa.rs` against the A64 spec,
 //       case by case — a wrong predicate is a Law-2 Side-II defect that would

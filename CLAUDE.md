@@ -82,8 +82,8 @@ thing: `madd` on a strided address → `add`; `add …, w, sxtw` → `ldrsw` + `
 **Measured, not asserted.** The law was not reasoned into this file; it
 was forced by a kernel that reached parity at an instruction count that did not
 change at all, because a multiply had stood at the head of a chain ending in a
-strided load. `MECHANISM.md` Part F holds that case and the latency table it rests
-on, and `REARCH.md` holds the derivation and the row that builds the model.
+strided load. `MECHANISM.md` Part F holds that case and the latency table it
+rests on, and `ARM64.md` holds the leverage table the model is built from.
 
 **Law-4 dual (exhaustion).** A row is exhausted only when no remaining site
 trades chain length for instruction count. A residual measured on `cost = |MIR|`
@@ -116,8 +116,8 @@ software, so a geomean over it would be a number about csmith).
 
 ## Article A — the two supreme requirements (every decision reduces to these)
 
-1. **Strict C99 compliance** — semantics exactly per spec; extensions (C11/vendor) only when real software demands, marked `EXT(...)`. Status of the remaining C99 items: `MILESTONES.md`.
-2. **Minimal LOC** — no feature before a real `.c` demands it, no anticipatory abstraction, zero external crates; the compiler is the theorem and must stay readable. Ceiling + budget: `MILESTONES.md`.
+1. **Strict C99 compliance** — semantics exactly per spec; extensions (C11/vendor) only when real software demands, marked `EXT(...)`. Status of the remaining C99 items: `README.md`.
+2. **Minimal LOC** — no feature before a real `.c` demands it, no anticipatory abstraction, zero external crates; the compiler is the theorem and must stay readable. Ceiling + budget: `README.md`.
 
 When they conflict, **compliance wins over LOC.**
 
@@ -129,7 +129,7 @@ main.rs (driver) → lexer → parser → AST (arena + NodeId(u32)) → compile.
                  → MIR (physical) → frame/layout → emit.rs → .s text
 ```
 - **Frontend/backend boundary = `src/ast.rs`** (AST + TyTab). Frontend builds, backend only reads; no cross-import. Layout size/align live in TyTab (LP64 locked — parameterize TyTab, don't scatter conditionals).
-- **`src/compile.rs` is the single door** (`compile(&Ast) -> String`); every layer below it is private to the pipeline. Layer map and the rationale for each seam: `REARCH.md` §2.
+- **`src/compile.rs` is the single door** (`compile(&Ast) -> String`); every layer below it is private to the pipeline. Layer map and the rationale for each seam: `MECHANISM.md` §G2.
 - **Layered, not one module per target** `[mir-rearch]`. The old rule ("one module per target under `src/codegen/`") was written when the backend was a single AST→asm emitter; it does not survive a pipeline whose seams are LAYERS, and `src/codegen/` no longer exists. The invariant it protected does survive, restated: **all target knowledge — ABI, register file, encodability, sections, asm syntax — lives in `src/mir/isa.rs` (Side-II tables), `src/isel/abi.rs` (the AAPCS64 automaton) and `src/emit.rs` (sections/relocations)**, and nothing above `isel` may name a machine register. HIR is target-independent by construction (closed scalar `Ty`, no TyTab lookup); MIR is AArch64-specific by design, and a second target adds a second MIR + isel, not a conditional. **ELF-only** (AArch64 Linux; x86_64 deferred; macOS is the clang oracle only).
 - **A pass is a pass, never a text peephole.** A machine optimization is an `MIR→MIR` pass shipping its commuting square; `emit.rs` makes no decisions and re-parses nothing. This is the rc3 defect written into the architecture so it cannot recur.
 - Single crate, no workspace.
@@ -176,15 +176,21 @@ one.
   the copy census (E), and the facts with no spec to cite (F, cited from code as
   `MEASURED M<n>` exactly as spec is cited as `THEORY II-<n>`). Everything in it
   carries the date and the commit it was measured on.
-- **`ARM64.md`** — the target's own facts and the ledger of what has beaten
-  gcc -O1 on it. *(Stage 2: still `src/arm64_elf.md`.)*
-- **`README.md`** — what zcc is and how to build it. *(Stage 2: absorbs
-  `MILESTONES.md`.)*
+- **`ARM64.md`** — the target's own facts, the ledger of what has beaten gcc -O1
+  on it, and the isel exhaustion checklist (Law 4 applied to the munch table).
+- **`README.md`** — what zcc is, how to build it, and the milestone ladder with
+  the C99 remainder and the debt.
 
-**`PLAN.md` is not one of the five and is not a document.** It holds what is NOT
-proven, is capped at 100 lines, may not be cited from `src/`, and a row leaves it
-only by being baked into `MECHANISM.md` (it won) or written into Part F as a
-refutation (it lost).
+**`PLAN.md` is not one of the five and is not a document.** It holds **the ONE
+grind in progress** — not a list of campaigns — is capped at 100 lines, may not
+be cited from `src/`, and is EMPTIED when that grind closes, every row leaving by
+one of two doors: baked into `MECHANISM.md` because it won, or written into its
+Part F as a refutation because it lost. An open row of a campaign that has
+already closed is not a plan but a fact about what was not built, and it lives in
+that campaign's status table, never here. The cap and the one-grind rule are the
+whole mechanism: `REARCH.md` reached 3,194 lines by accumulating every
+campaign's plan beside every campaign's results until no reader could tell which
+lines were true of the compiler that was green.
 
 **A citation is a NAME, not a fetch.** A comment must say enough *why* to fix the
 line it sits on without opening any document; the citation names where the full
@@ -192,7 +198,4 @@ derivation lives, for a reader who wants it and for `tests/provenance.sh`, which
 checks this direction and can check no other — a document that points back at
 `file.rs:412` is stale at the next refactor and nothing catches it.
 
-- **`REARCH.md`** — the battlefield, being dismantled: 3,194 lines and the one
-  document `src/` is still allowed to point into while stage 2 runs. It is not a
-  sixth document; it is a queue that empties.
 - **`src/ext.rs` + `grep 'EXT(' src/`** — the entire current deviation surface.

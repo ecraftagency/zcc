@@ -1,4 +1,4 @@
-// frame_fold (REARCH.md §13o, R4.15) — the frame adjust, folded into the save
+// frame_fold (MECHANISM.md §G8, R4.15) — the frame adjust, folded into the save
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // pair.
 //

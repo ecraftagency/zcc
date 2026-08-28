@@ -1,5 +1,5 @@
 #!/bin/bash
-# Emission determinism seal (CLAUDE.md Article E, "Byte-identical gate" + REARCH §9).
+# Emission determinism seal (CLAUDE.md Article E, "Byte-identical gate" + MECHANISM.md §G9).
 #
 # The refactor gate proves md5(.s) is unchanged ACROSS A REFACTOR. This proves
 # something the repo did not check at all: that ONE binary, run repeatedly on

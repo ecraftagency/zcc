@@ -1,4 +1,4 @@
-// cfg_simplify (REARCH §4 row 1) — the four control-flow identities.
+// cfg_simplify (MECHANISM.md §G4 row 1) — the four control-flow identities.
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // Each is a commuting square proven by inspection of ⟦hir⟧'s terminator rule,

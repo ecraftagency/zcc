@@ -1,4 +1,4 @@
-// Frame lowering (REARCH.md §8, post-allocation).
+// Frame lowering (MECHANISM.md §G8, post-allocation).
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // Assign a byte offset to every stack object and materialize the prologue and
@@ -321,7 +321,7 @@ fn same_tail(a: &[MInst], b: &[MInst]) -> bool {
 /// THE MEASUREMENT. sqlite holds **1,042 frame slots that are STORED AND NEVER
 /// LOADED — 1,090 dead stores, 0.63% of the whole program** and 5.4% of its size
 /// gap against gcc -O1. They exist because the spiller places a store at the
-/// value's DEFINITION whether or not any path later reloads it (REARCH §13o):
+/// value's DEFINITION whether or not any path later reloads it (MECHANISM.md Part F):
 /// the value stays in its register, the slot is written for nothing, and in
 /// `sqlite3VdbeExec` alone 102 slots are written exactly once and read never.
 ///

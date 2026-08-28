@@ -1,5 +1,5 @@
 #!/bin/sh
-# zlib.sh — REARCH.md §19, second real program: zlib 1.3.1 on the clock.
+# zlib.sh — PLAN.md, second real program: zlib 1.3.1 on the clock.
 #
 # WHY A SECOND ONE. sqlite is the only member of the measured surface with real
 # register pressure, and Law 3c's note on what may be claimed names the gaps in

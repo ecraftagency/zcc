@@ -1,4 +1,4 @@
-// Block layout (REARCH.md §8, post-allocation).
+// Block layout (MECHANISM.md §G8, post-allocation).
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // Choose the order the blocks are printed in, so that as many branches as

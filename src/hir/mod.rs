@@ -1,8 +1,8 @@
-// HIR — the target-independent SSA layer (REARCH.md §3).
+// HIR — the target-independent SSA layer (MECHANISM.md §G3).
 // THEORY A6 — HIR, the target-independent SSA layer
 //
 // Three design decisions carry the whole layer, and every file below depends on
-// them (REARCH §3.1 / §14):
+// them (MECHANISM.md §G3.1 / §14):
 //   1. SSA from birth. `build.rs` lowers the AST straight into SSA (Braun et al.
 //      2013, on-the-fly, no dominance frontiers). There is NO out-of-SSA in HIR.
 //   2. Block parameters instead of φ instructions. `jmp bb(a, b)` makes the edge
@@ -425,7 +425,7 @@ pub struct AsmOperand {
 }
 
 /// Effect class — the single table DCE / CSE / GVN / LICM / sinking consult
-/// (REARCH §3.1). No pass carries a hand-written opcode list.
+/// (MECHANISM.md §G3.1). No pass carries a hand-written opcode list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Effect {
     Pure,

@@ -1,4 +1,4 @@
-// if_convert (REARCH §4 row 10) — a side-effect-free diamond becomes `select`.
+// if_convert (MECHANISM.md §G4 row 10) — a side-effect-free diamond becomes `select`.
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // The shape is the one mem2reg produces from every `x = c ? a : b` and every

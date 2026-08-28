@@ -407,7 +407,7 @@ pub struct Func {
     // same pair `alloc_local` computed, in allocation order. `params` and
     // `Node::Var(off)` give an offset but not an EXTENT, and without an extent a
     // backend cannot tell one local from the next, so it must treat the whole
-    // frame as one aliasing blob (REARCH §14's stated reason for deferring
+    // frame as one aliasing blob (MECHANISM.md §G14's stated reason for deferring
     // promotion). Exporting the layout the parser ALREADY computed is what lets
     // `hir::pass::sroa` bound an escaped pointer to its own object (C99 6.5.6p8:
     // pointer arithmetic is defined only within the object) and promote the rest.

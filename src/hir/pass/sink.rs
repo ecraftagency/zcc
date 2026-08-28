@@ -1,4 +1,4 @@
-// sink (REARCH §16 ★, pulled forward because §13b ranked it) — move a pure
+// sink (MECHANISM.md §G16 ★, pulled forward because §13b ranked it) — move a pure
 // THEORY A7b — optimization: this pass ships its commuting square
 // instruction down to the block that uses it.
 //

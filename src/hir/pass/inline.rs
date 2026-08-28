@@ -1,4 +1,4 @@
-// inline (REARCH §4 row 7) — β-reduction on the call graph.
+// inline (MECHANISM.md §G4 row 7) — β-reduction on the call graph.
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // POLICY, dated and cited rather than tuned. gcc -O1 enables

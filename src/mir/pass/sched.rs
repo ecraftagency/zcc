@@ -1,4 +1,4 @@
-// sched — BASIC-BLOCK LIST SCHEDULING (REARCH §16 #9; Gibbons & Muchnick 1986).
+// sched — BASIC-BLOCK LIST SCHEDULING (MECHANISM.md §G16 #9; Gibbons & Muchnick 1986).
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // Law 3c is the reason this pass exists at all: `cost(f) = |MIR(f)|` is exact

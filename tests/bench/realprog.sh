@@ -1,5 +1,5 @@
 #!/bin/sh
-# realprog.sh — REARCH.md §19: a REAL PROGRAM on the clock, both axes, both sides.
+# realprog.sh — PLAN.md: a REAL PROGRAM on the clock, both axes, both sides.
 #
 # WHY THIS EXISTS. The 35-program taxonomy suite times 18 of its 35 programs and
 # is structurally blind to three things: instruction-cache pressure (every kernel

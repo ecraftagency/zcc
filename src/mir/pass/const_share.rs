@@ -1,4 +1,4 @@
-// const_share (REARCH.md §13n row (c), R4.6) — the constant that was already
+// const_share (MECHANISM.md §G8, R4.6) — the constant that was already
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // materialized.
 //

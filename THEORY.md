@@ -128,7 +128,7 @@ target file (Side II); everything else is Side I.
 | Machine operands are FIRST CLASS | addressing modes (`[base,#imm]`, `[base,idx,ext #k]`, pre/post-index), shifted and extended register operands, condition codes. **This is the correction of rc3's architectural defect**: none of these were expressible in the old IR, so every machine optimization had to be a string peephole on `.s`, where nothing can be verified | `mir/mod.rs` (`AddrMode`, `Rhs`, `CC`) |
 | NZCV as a register class of size k=1 | flags are a value with a definition and uses. Compare-elimination becomes a value-numbering over flag definitions; "two live compares" becomes an ordinary interference the allocator resolves by rematerializing the compare (always legal — a compare is pure) | `mir/mod.rs` (`Class::Flags`) |
 | The operand visitor is the ONLY access path | liveness, the allocator, the verifier and the interpreter reach registers only through `visit`/`visit_mut` and memory only through `effect()`. No component outside `isa.rs` matches on an opcode — which is what keeps a new instruction from needing edits in five places | `mir/mod.rs` |
-| Cost = instruction count, exactly (REARCH §10) | one `MInst` is one machine instruction after frame/layout, so `cost(f) = \|MIR_final(f)\|` needs no separate cost model and Δinsn of any transform is computed BEFORE emitting anything. The one expansion, `MovImm`, reports its length via `isa::mov_chain().len()` | `mir/mod.rs`, `emit.rs` |
+| Cost = instruction count, exactly (`MECHANISM.md` §G10) | one `MInst` is one machine instruction after frame/layout, so `cost(f) = \|MIR_final(f)\|` needs no separate cost model and Δinsn of any transform is computed BEFORE emitting anything. The one expansion, `MovImm`, reports its length via `isa::mov_chain().len()` | `mir/mod.rs`, `emit.rs` |
 | Well-formedness verifier, two modes | VIRTUAL: SSA + dominance + edge arity + register-class agreement per instruction form. PHYSICAL: no vreg survives, every ABI-fixed operand satisfied | `mir/verify.rs` |
 | Emission determinism | identical MIR ⟹ identical bytes. Sealed by a gate that compiles each program in several FRESH processes, so a per-process hash seed leaking into the output is caught | `tests/determinism.sh` |
 
@@ -191,7 +191,7 @@ target file (Side II); everything else is Side I.
 | Dominance / dominator tree | A dom B; the basis of GVN, LICM, and of the colouring order itself |
 | **Chordal graphs / perfect elimination order** | the SSA colouring theorem (A7); replaces "graph colouring is NP-hard" as the operative fact |
 
-**The HIR pass ladder (REARCH §4, gcc `-ftree-*` order):** ✅ shipped —
+**The HIR pass ladder (`MECHANISM.md` §G4, gcc `-ftree-*` order):** ✅ shipped —
 `cfg_simplify` (`pass/cfg.rs`) · `sroa+mem2reg` (Braun 2013, `pass/sroa.rs`) · `sccp`
 (Wegman-Zadeck, `pass/sccp.rs`) · `gvn` (absorbing CSE, copy-prop, constant folding, algebraic
 normalization, `pass/gvn.rs`) · `load_elim/dse` (gated by the alias oracle, `pass/mem.rs`) · `dce`
@@ -208,7 +208,7 @@ the memory state, and the call must be proven to run on the first iteration anyw
 does not imply termination, `licm::hoist_call`).
 ⬜ remaining — `iv/pointer-iv/LFTR`, `rotate / final-value` (`pass/iv.rs`).
 
-**The MIR pass ladder (REARCH §8):** pre-allocation on SSA — ✅ `cmp_elim` (value numbering over flag
+**The MIR pass ladder (`MECHANISM.md` §G8):** pre-allocation on SSA — ✅ `cmp_elim` (value numbering over flag
 definitions: `subs`/`ands` for a following `cmp #0`, fusing only where the condition code survives —
 `cmp d,#0` sets C=1,V=0 by definition, so only codes reading N/Z alone carry, and `lt`/`ge` are
 rewritten to `mi`/`pl`; `mir/pass/cmpelim.rs`), ✅ `ext_lattice` (forward known-width dataflow — ONE
@@ -472,3 +472,59 @@ backend).
 rule is kept in CLAUDE.md, keep this one." And: "covering 250+ applications is easy;
 passing csmith/yarpgen is the hard part — dozens of compilers of the same size still
 fail." Further entries are merged into the appropriate Part/Branch/Table as they arise.*
+
+---
+
+## Appendix — techniques not yet realized, and the theorems behind them
+
+### §16 The O2 headroom shelf — techniques beyond O1, ranked, with the names behind them
+
+Every row is a theorem to realize on THIS architecture (HIR or MIR as noted) under Law 3 — each ships
+its commuting square. Rank = expected effect on the measured arm64 gap ÷ proof cost. ★ = cheap enough
+to ship inside R2/R3 because the §3/§5 hooks (aclass, weight, effects(), tail) already exist.
+
+| rank | technique | layer | gcc flag (level) | origin / big name | proof shape |
+|---|---|---|---|---|---|
+| ★1 | type-based alias analysis (TBAA) feeding load-elim/DSE/LICM | HIR alias oracle | `-fstrict-aliasing` (O2) | Diwan, McKinley, Moss 1998; C99 6.5p7 effective-type rule | oracle soundness vs C99 6.5p7 + battery |
+| ★2 | value-range propagation + branch folding + unsigned-shift/`udiv` narrowing | HIR | `-ftree-vrp` (O2) | Patterson 1995 (range analysis); Harrison 1977 | lattice pass, `⟦f⟧=⟦Pf⟧` |
+| ★3 | sibling/tail-call optimization | MIR `Call.tail` | `-foptimize-sibling-calls` (O2) | Steele 1977 ("Lambda: the ultimate GOTO"); Clinger 1998 | ABI condition table + TV |
+| ★4 | static branch prediction → block weights → layout + spill weighting | HIR `Block.weight` | `-fguess-branch-probability` (O1), `-freorder-blocks` (O1/O2) | Ball & Larus 1993; Pettis & Hansen 1990 (code positioning) | layout TV; weights are advisory (no semantic obligation) |
+| 5 | partial redundancy elimination / lazy code motion (global CSE across paths, loop-invariant load hoisting) | HIR | `-ftree-pre`, `-fgcse`, `-fcode-hoisting` (O2) | Morel & Renvoise 1979; Knoop, Rüthing, Steffen 1992 (LCM); Chow, Chan, Kennedy et al. 1997 (SSAPRE); Kennedy et al. 1999 | availability/anticipability dataflow + battery |
+| 6 | global code motion + GVN unified (schedule pure ops to the cheapest dominating block) | HIR | (GCC has no single flag; LLVM GVN+hoist/sink) | Cliff Click 1995 ("Global Code Motion / Global Value Numbering") | dominance + loop-depth placement, `⟦f⟧=⟦Pf⟧` |
+| 7 | interprocedural constant propagation + scalar-replacement of args + identical-code folding | HIR module | `-fipa-cp`, `-fipa-sra`, `-fipa-icf` (O2) | Callahan, Cooper, Kennedy, Torczon 1986 (IPCP); Jan Hubička (GCC IPA) | call-graph lattice; per-callee `⟦f⟧` equality |
+| 8 | inlining policy beyond called-once: small-function + partial + indirect | HIR | `-finline-small-functions`, `-fpartial-inlining`, `-findirect-inlining` (O2) | Ayers, Gottlieb, Schooler 1997; Hubička | β-reduction battery (existing) |
+| 9 | instruction scheduling (list scheduling on the basic block; critical-path priority; generic in-order latency table) | MIR (post-RA) | `-fschedule-insns2` (O2) | Gibbons & Muchnick 1986; Rau & Fisher (VLIW era); Muchnick 1997 ch.17 | dependence preservation via `effects()` + `⟦m⟧=⟦Pm⟧` |
+| 10 | store merging + strlen/memcpy idiom recognition | HIR | `-fstore-merging`, `-foptimize-strlen` (O2) | GCC (Jakub Jelínek); Muchnick | battery |
+| 11 | switch conversion (dense case bodies → table loads) + tail-merge/cross-jumping | HIR / MIR layout | `-ftree-switch-conversion`, `-fcrossjumping`, `-ftree-tail-merge` (O2) | GCC | battery / TV |
+| 12 | loop unrolling (counted, small bodies) + peeling + unswitching | HIR | `-funroll-loops` (not default), `-fpeel-loops`, `-funswitch-loops` (O3) | Dongarra & Hinds 1979; Allen & Kennedy 2001 | SCEV trip count + battery |
+| 13 | SLP / loop vectorization (NEON) — needs `Ty::V128` in HIR + vector ops in MIR (FPR class already holds v-regs) | HIR + MIR | `-ftree-vectorize` (O2 since GCC 12, very-cheap cost model) | Allen & Kennedy 1987/2001; Larsen & Amarasinghe 2000 (SLP); Nuzman & Zaks (GCC) | dependence proof + battery; largest surface |
+| 14 | alignment of loops/functions/jumps (a SIZE cost gcc pays at O2 — track, do not copy blindly) | MIR layout | `-falign-loops` etc. (O2) | Pettis & Hansen; microarchitecture SWOGs | none (layout only) |
+| 15 | rematerialization + live-range splitting refinements in RA (already structural in §7; the O2 delta is spill-slot coloring + region splitting) | MIR RA | `-flra-remat`, IRA regions (O2) | Briggs 1992 (remat); Cooper & Simpson 1998 (live-range splitting); Makarov 2007 (IRA); Olesen 2011 (LLVM greedy); Wimmer & Franz 2010 (SSA linear scan) | RA verifier (§7.6) |
+| 16 | superoptimization / e-graph peephole search for the isel pattern table | isel | — | Massalin 1987; Bansal & Aiken 2006; Tate et al. 2009 (equality saturation) | each found pattern = a battery row |
+
+Books that cover the whole shelf: Rastello & Bouchez Tichadou (eds.) 2022 *SSA-based Compiler Design*
+(the single best reference for §3–§7); Muchnick 1997 *Advanced Compiler Design and Implementation*;
+Cooper & Torczon *Engineering a Compiler*; Allen & Kennedy 2001 *Optimizing Compilers for Modern
+Architectures*; Appel *Modern Compiler Implementation*.
+
+Out of scope even for headroom: polyhedral loop-nest optimization (Graphite/Pluto — Bondhugula 2008),
+LTO, PGO instrumentation. They would not move the arm64 O1 gap and their proof surface is enormous.
+
+---
+
+### §18 Reading list (theorems to realize — cite in code comments as `THEORY <ref>`)
+
+- Braun, Buchwald, Hack, Leißa, Mallon, Zwinkau 2013 — Simple and Efficient Construction of SSA Form (CC'13).
+- Hack 2007 — Register Allocation for Programs in SSA Form (PhD, Karlsruhe): chordality, dominance
+  preorder as perfect elimination order, constraint handling by local parallel copies.
+- Braun & Hack 2009 — Register Spilling and Live-Range Splitting for SSA-Form Programs (CC'09): the
+  Belady-based spiller used in §7.2.
+- Boissinot, Darte, Rastello, Dinechin, Guillon 2009 — Revisiting Out-of-SSA Translation (CGO'09).
+- Boissinot, Hack, Grund, Dinechin, Rastello 2008 — Fast Liveness Checking for SSA-Form Programs.
+- Cooper, Harvey, Kennedy 2001 — A Simple, Fast Dominance Algorithm.
+- Wegman & Zadeck 1991 — SCCP. Rosen/Wegman/Zadeck 1988 + Briggs/Cooper/Simpson — value numbering.
+- Aho/Ganapathi/Tjiang 1989 — BURS/maximal munch instruction selection.
+- QBE (`qbe/*.c`: `ssa.c`, `spill.c`, `rega.c`, `isel.c`, `abi.c`) and Cranelift `regalloc2` — the
+  two reference implementations of exactly this architecture (read for algorithms, not structure).
+- ARM AAPCS64 (IHI 0055) §6.1.1 register use, §6.4–6.8 parameter passing; ARMv8-A ARM (DDI 0487) A64
+  instruction encodings; AArch64 ELF (IHI 0056) relocations.

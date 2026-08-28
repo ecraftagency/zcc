@@ -1,4 +1,4 @@
-// sccp — Sparse Conditional Constant Propagation (REARCH §4 row 3).
+// sccp — Sparse Conditional Constant Propagation (MECHANISM.md §G4 row 3).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // Wegman & Zadeck 1991, "Constant Propagation with Conditional Branches". The

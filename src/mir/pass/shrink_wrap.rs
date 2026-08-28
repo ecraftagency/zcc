@@ -1,4 +1,4 @@
-// shrink_wrap (REARCH.md §8, gcc `-fshrink-wrap`) — save the callee-saved
+// shrink_wrap (MECHANISM.md §G8, gcc `-fshrink-wrap`) — save the callee-saved
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // registers only on the path that uses them.
 //

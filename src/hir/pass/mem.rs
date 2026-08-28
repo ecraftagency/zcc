@@ -1,4 +1,4 @@
-// load_elim / dse (REARCH §4 row 5) — the memory that SROA could not promote.
+// load_elim / dse (MECHANISM.md §G4 row 5) — the memory that SROA could not promote.
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // mem2reg removes a local's memory entirely when the local is a private cell.
@@ -7,7 +7,7 @@
 // become a value" but "does this access have to happen at all", and answering it
 // needs an ALIAS ORACLE.
 //
-// THE ORACLE (REARCH §3.3 B1, the conservative base — TBAA is §16 ★1 and reads
+// THE ORACLE (MECHANISM.md §G3.3 B1, the conservative base — TBAA is §16 ★1 and reads
 // the `aclass` field this IR already carries). Two locations are DISJOINT when
 // the C standard says they are different objects:
 //   * two stack pieces whose byte ranges do not overlap (C99 6.2.4: distinct
@@ -20,7 +20,7 @@
 // new transform but a bigger BLOCK to reason over — see "ACROSS ONE EDGE" below.
 // A block is where the oracle is exact enough to be worth the walk; the fully
 // general versions (`-ftree-fre`, `-ftree-dse` over arbitrary control flow) need
-// a memory SSA and stay a residual in REARCH §12 rather than half-built here.
+// a memory SSA and stay a residual in MECHANISM.md §G12 rather than half-built here.
 //   * STORE→LOAD FORWARDING — a load of a location whose value was just stored
 //     is that value. ⟦·⟧: memory is a function, and reading what was written
 //     returns it.

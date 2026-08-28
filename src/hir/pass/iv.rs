@@ -1,4 +1,4 @@
-// iv — pointer induction variables (REARCH §13f item 5; gcc's strength
+// iv — pointer induction variables (MECHANISM.md Part F item 5; gcc's strength
 // THEORY A7b — optimization: this pass ships its commuting square
 // reduction over addresses, `-fivopts`' core case).
 //
@@ -625,7 +625,7 @@ fn append(f: &mut Func, b: BlockId, mut inst: Inst) -> Operand {
     Operand::Val(v)
 }
 
-// ── induction-variable WIDENING (REARCH §13l) ──────────────────────────────
+// ── induction-variable WIDENING (MECHANISM.md Part F) ──────────────────────────────
 //
 // THE MEASUREMENT. After §13j, `mycopy`'s inner loop is six instructions against
 // gcc's five, and the extra one is a `sxtw` — every iteration, widening a 32-bit

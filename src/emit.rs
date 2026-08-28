@@ -1,11 +1,11 @@
-// MIR(final) → AArch64-ELF assembly text (REARCH.md §9; THEORY II-4 for the
+// MIR(final) → AArch64-ELF assembly text (MECHANISM.md §G9; THEORY II-4 for the
 // THEORY II-4 — ELF sections and relocations; THEORY II-5 — A64 syntax
 // ELF/relocation side).
 //
 // This file makes NO decisions. Every instruction was already chosen, every
 // register already assigned, every offset already computed; printing is a
 // one-to-one function from `MInst` to a line of text. That is the property the
-// cost model depends on (REARCH §10): `cost(f) = |MIR_final(f)|` needs no
+// cost model depends on (MECHANISM.md §G10): `cost(f) = |MIR_final(f)|` needs no
 // separate model precisely because nothing here expands, folds or fixes
 // anything — the single exception is `MovImm`, whose `movz/movk` chain length
 // `isa::mov_chain` reports before emission.
@@ -193,7 +193,7 @@ fn adjust_sp(s: &mut String, delta: i64) {
 
 /// `add dst, base, #n` when the immediate fits, otherwise the two-add or
 /// `movz/movk`+`add` form. The count is what `isa::add_imm`/`isa::mov_chain`
-/// predict, which is why `SlotAddr` stays a computable cost (REARCH §10).
+/// predict, which is why `SlotAddr` stays a computable cost (MECHANISM.md §G10).
 fn add_imm_to(s: &mut String, dst: String, base: &str, n: i64) {
     match isa::add_imm(n) {
         Some((v, 0)) => {
@@ -362,7 +362,7 @@ fn addr(ast: &Ast, f: &MFunc, m: &AddrMode) -> String {
         AddrMode::SymLo12 { base, sym } => {
             format!("[{}, #:lo12:{}]", reg(*base, Width::W64), sym_text(ast, sym, &f.name))
         }
-        // The folded frame adjust (REARCH §13o R4.15). `delta < 0` is the prologue
+        // The folded frame adjust (MECHANISM.md Part F R4.15). `delta < 0` is the prologue
         // pre-index `stp …, [sp, #-N]!` (allocate, then store at the new sp);
         // `delta > 0` the epilogue post-index `ldp …, [sp], #N` (load, then free).
         // The slot rides at offset 0, so [sp] IS its address after the writeback.
@@ -790,7 +790,7 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
         MInst::SpAddr { dst, off } => {
             add_imm_to(s, reg(*dst, Width::W64), "sp", *off as i64);
         }
-        // The frame adjust, now an ordinary instruction (REARCH §13o R4.15) rather
+        // The frame adjust, now an ordinary instruction (MECHANISM.md Part F R4.15) rather
         // than something `emit` invents from `frame_size`. `adjust_sp` prints the
         // `sub`/`add` (and, for a frame past imm12, the scratch-register form whose
         // length the cost model already predicts).
@@ -923,7 +923,7 @@ fn emit_term(
         }
         // A dense switch: `adrp`/`add` the table, read the entry for the index,
         // and branch to `table + entry`. IP0/IP1 (x16/x17) are reserved exactly
-        // so a sequence like this needs no allocated register (REARCH §5.1), and
+        // so a sequence like this needs no allocated register (MECHANISM.md §G5.1), and
         // a terminator is the one place both are certainly free.
         MTerm::Switch { idx, table, .. } => {
             let label = format!(".Ljt_{}_{}", name, tables.len());

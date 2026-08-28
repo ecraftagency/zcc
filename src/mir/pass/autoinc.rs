@@ -1,4 +1,4 @@
-// auto_inc (REARCH.md §8, gcc's `-fauto-inc-dec`) — fold a pointer
+// auto_inc (MECHANISM.md §G8, gcc's `-fauto-inc-dec`) — fold a pointer
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // post-increment into the load that reads through it.
 //

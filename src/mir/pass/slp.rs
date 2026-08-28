@@ -1,4 +1,4 @@
-// slp — SUPERWORD-LEVEL PARALLELISM (REARCH §16 #13; Larsen & Amarasinghe 2000).
+// slp — SUPERWORD-LEVEL PARALLELISM (MECHANISM.md §G16 #13; Larsen & Amarasinghe 2000).
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // Two neighbouring scalar operations that do the same thing to adjacent memory

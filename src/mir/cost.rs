@@ -1,4 +1,4 @@
-// cost — the TIME dual of `cost = |MIR|` (REARCH R4.18, Law 3c).
+// cost — the TIME dual of `cost = |MIR|` (MECHANISM.md R4.18, Law 3c).
 //
 // WHY THIS EXISTS, in one line each:
 //

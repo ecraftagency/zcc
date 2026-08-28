@@ -1,4 +1,4 @@
-// licm — loop-invariant code motion (REARCH §4 row 8).
+// licm — loop-invariant code motion (MECHANISM.md §G4 row 8).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // UNCONDITIONAL, per §4: no register-pressure guard. The allocator owns pressure
@@ -135,7 +135,7 @@ pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
     changed
 }
 
-// ── the invariant PURE-CALL hoist (REARCH §13c row 1) ──────────────────────
+// ── the invariant PURE-CALL hoist (MECHANISM.md Part F row 1) ──────────────────────
 //
 // COMMUTING SQUARE. Moving `x = g(a₁…aₙ)` from a loop body to its preheader
 // preserves ⟦f⟧ when four things hold, and none of them is assumed:

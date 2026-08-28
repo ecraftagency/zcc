@@ -1,4 +1,4 @@
-// The allocator's own obligations (REARCH.md §7.6). Structural properties that
+// The allocator's own obligations (MECHANISM.md §G7.6). Structural properties that
 // THEORY A7 — the allocator's obligations; THEORY A8 — certify at the middle
 // are decidable on the physical MIR alone; the semantic obligation
 // `⟦mir_v⟧ = ⟦mir_p⟧` is discharged by the battery, which runs both.

@@ -1,4 +1,4 @@
-// cmp_elim (REARCH.md §8, gcc's `-fcompare-elim`) — the compare an arithmetic
+// cmp_elim (MECHANISM.md §G8, gcc's `-fcompare-elim`) — the compare an arithmetic
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 // instruction has already performed.
 //

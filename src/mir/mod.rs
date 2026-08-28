@@ -1,4 +1,4 @@
-// MIR — the load-bearing machine layer (REARCH.md §5).
+// MIR — the load-bearing machine layer (MECHANISM.md §G5).
 // THEORY A6b — MIR, the machine layer
 //
 // One type, two lifecycle states (exactly LLVM's "MIR"):
@@ -256,7 +256,7 @@ pub enum AddrMode {
     /// A callee-save pair/single at frame offset 0 whose access ALSO carries the
     /// frame adjustment: `[sp, #delta]!` (pre-index store, `delta < 0`) or
     /// `[sp], #delta` (post-index load, `delta > 0`). Introduced by `frame_fold`
-    /// (REARCH §13o R4.15) from `SpAdj` + the adjacent save/restore pair. `slot`
+    /// (MECHANISM.md Part F R4.15) from `SpAdj` + the adjacent save/restore pair. `slot`
     /// is the object at offset 0 the abstract semantics reads/writes (so `⟦·⟧`
     /// resolves it exactly as `Slot { slot, off: 0 }` — the interpreter's frame is
     /// already established, and the sp writeback is the no-op `SpAdj` also is);
@@ -462,7 +462,7 @@ pub enum MInst {
     /// chain is a read-modify-write of one register and so is not expressible in
     /// SSA. Its cost is not hidden: `isa::mov_chain(imm).len()` gives the exact
     /// instruction count before anything is emitted, which is what the cost
-    /// square (REARCH §10) needs.
+    /// square (MECHANISM.md §G10) needs.
     MovImm {
         w: Width,
         dst: Reg,
@@ -605,7 +605,7 @@ pub enum MInst {
         clobbers: RegSet,
         /// bytes of outgoing stack arguments (AAPCS64 NSAA)
         stack_bytes: u32,
-        /// sibling call: `b` after the epilogue instead of `bl` (REARCH §16 ★3)
+        /// sibling call: `b` after the epilogue instead of `bl` (MECHANISM.md §G16 ★3)
         tail: bool,
     },
     /// Register-to-register move, the coalescing candidate.
@@ -631,7 +631,7 @@ pub enum MInst {
     /// this is a COST EXCEPTION: `add dst, base, #off` covers an imm12 (or one
     /// shifted by 12), and a larger frame offset needs the `movz/movk` chain
     /// first. `isa::add_imm` and `isa::mov_chain` give the exact count before
-    /// anything is emitted, so the cost square stays computable (REARCH §10).
+    /// anything is emitted, so the cost square stays computable (MECHANISM.md §G10).
     SlotAddr {
         dst: Reg,
         slot: SlotId,
@@ -641,7 +641,7 @@ pub enum MInst {
     SpAddr { dst: Reg, off: u32 },
     /// The single frame adjustment (`sub sp, sp, #N` when `delta < 0`; `add sp`
     /// when `delta > 0`), made an ORDINARY MIR instruction so a pass can fold it
-    /// into the first/last callee-save pair (`frame_fold`, REARCH §13o R4.15) —
+    /// into the first/last callee-save pair (`frame_fold`, MECHANISM.md Part F R4.15) —
     /// `emit` no longer invents it from `frame_size`. Like `MovImm`/`SlotAddr`
     /// this is a COST EXCEPTION: a `delta` beyond imm12(<<12) needs a `movz/movk`
     /// chain into the scratch register first, and `isa::add_imm`/`isa::mov_chain`

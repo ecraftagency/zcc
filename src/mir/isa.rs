@@ -63,7 +63,7 @@ pub const GPR_ORDER: [u8; 26] = [
 /// THEORY II-3 — AAPCS64 §6.1.2, the full allocatable table
 /// v0–v7 (arguments), v16–v30 (temporary), then the callee-saved v8–v15.
 /// AAPCS64 §6.1.2: only the low 64 bits of v8–v15 are preserved, which is exactly
-/// what zcc stores (no NEON values yet, REARCH §16 row 13).
+/// what zcc stores (no NEON values yet, MECHANISM.md §G16 row 13).
 pub const FPR_ORDER: [u8; 31] = [
     0, 1, 2, 3, 4, 5, 6, 7, //
     16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, //

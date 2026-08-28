@@ -1,5 +1,5 @@
 // unroll — FULL unrolling of a loop whose trip count is a small literal
-// (REARCH §12 R5.9, the `#12` row; gcc's `-fcunroll` case).
+// (MECHANISM.md §G12 R5.9, the `#12` row; gcc's `-fcunroll` case).
 // THEORY A7b — optimization: this pass ships its commuting square
 //
 // THE MEASUREMENT THAT ASKED FOR THIS. `n7_nested_subq` evaluates a WHERE

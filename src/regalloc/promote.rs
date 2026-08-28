@@ -1,4 +1,4 @@
-// Region-resident spill promotion (REARCH.md §13p, R4.16).
+// Region-resident spill promotion (MECHANISM.md §G7, R4.16).
 // THEORY A7 — Belady spilling's dual: a value the allocator spilled to MEMORY,
 // but which a register could have held across its whole range, is put back in a
 // register.
@@ -7,7 +7,7 @@
 // 6,041 instructions; zcc reloads one slot ([sp,#96], the `Vdbe *p` parameter)
 // 116 times — stored once, never modified, read everywhere — while x28 sits
 // UNUSED. The Braun-Hack spiller is Belady-correct within a block but its
-// residency is block-local (REARCH §7.2 note), so a value live across a wide
+// residency is block-local (MECHANISM.md §G7.2 note), so a value live across a wide
 // switch is reloaded once per arm. gcc keeps it in a callee-saved register: the
 // register IS the residency. This pass realizes that where it is provably free.
 //

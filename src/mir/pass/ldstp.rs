@@ -1,4 +1,4 @@
-// ldst_pair (REARCH.md §8) — two accesses to consecutive addresses become one.
+// ldst_pair (MECHANISM.md §G8) — two accesses to consecutive addresses become one.
 // THEORY A6b — MIR; THEORY A7b — optimization, proven pass by pass
 //
 // A64 has `ldp`/`stp` (DDI 0487 C6.2.130), and the code that uses them most is

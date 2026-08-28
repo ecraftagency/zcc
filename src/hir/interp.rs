@@ -1,4 +1,4 @@
-// ⟦hir⟧ — the executable reference semantics of HIR (SEMANTICS.md, REARCH §3.4).
+// ⟦hir⟧ — the executable reference semantics of HIR (SEMANTICS.md, MECHANISM.md §G3.4).
 // THEORY A6 — HIR; SEMANTICS 4 — ⟦Inst⟧, the reference semantics ⟦·⟧ denotes
 //
 // This is the *prover* half of Law 3: every HIR→HIR pass P ships the commuting
@@ -183,7 +183,7 @@ impl<'a> Machine<'a> {
     /// is ABI-aware, and it is inherited, not chosen: `va_arg` is already
     /// lowered against the psABI layout, so a semantics that refused to model it
     /// could not execute a variadic function at all — every square over one
-    /// would hold vacuously (REARCH §15).
+    /// would hold vacuously (MECHANISM.md §G15).
     fn call_va(
         &mut self,
         fi: usize,
@@ -476,7 +476,7 @@ impl<'a> Machine<'a> {
             // ── the EXT / builtin surface ──────────────────────────────────
             // Each of these has a MEANING, and giving it one here is what stops
             // a variadic, long-double or atomic function from being ⊥ on the HIR
-            // side of every square (REARCH §15).
+            // side of every square (MECHANISM.md §G15).
             Inst::Intrinsic { dst, kind, args } => {
                 let _ = fi;
                 let v = self.intrinsic(kind, args, vals)?;

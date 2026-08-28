@@ -15,12 +15,12 @@ maps one-to-one onto an arm of one interpreter — and, crucially, onto the SAME
 arm a future constant folder will use, so the folder and the semantics are one
 denotation function rather than two that must be kept in agreement.
 
-Scope after the re-architecture (`REARCH.md`): the old single IR is gone. There
+Scope after the re-architecture (`MECHANISM.md` Part G): the old single IR is gone. There
 are now two levels, and the interpreters share ONE memory model
 (`src/mem.rs`) — which is what makes `⟦hir⟧ = ⟦mir⟧` a meaningful equation
 rather than a comparison of two different worlds.
 
-See also: `THEORY.md` A6/A6b/A7 (the theorem catalogue), `REARCH.md` §10 (the
+See also: `THEORY.md` A6/A6b/A7 (the theorem catalogue), `MECHANISM.md` §10 (the
 proof map), `tests/alg.sh` (the source-level fold-vs-runtime square this document
 lifts to the IR level).
 
@@ -311,7 +311,7 @@ denotation and the one-instruction form diverge.
 
 ---
 
-## 6. The commuting squares (REARCH §10 made concrete)
+## 6. The commuting squares (MECHANISM.md §G10 made concrete)
 
 Each is an equality between two runs, with no assembler, linker or hardware in
 the loop. All are quantified over the battery's program shapes, and all compare

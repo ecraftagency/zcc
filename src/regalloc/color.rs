@@ -1,4 +1,4 @@
-// Chordal coloring of the SSA interference graph (REARCH.md §7.3).
+// Chordal coloring of the SSA interference graph (MECHANISM.md §G7.3).
 // THEORY A7 — chordal colouring in dominance order (Hack 2007)
 //
 // THE theorem this whole re-architecture rests on (Hack 2007): the interference
@@ -395,7 +395,7 @@ impl Occupancy {
     }
 }
 
-/// The colouring's own obligation (REARCH §7.6a), checked INDEPENDENTLY of the
+/// The colouring's own obligation (MECHANISM.md §G7.6a), checked INDEPENDENTLY of the
 /// walk that produced it: at every program point, two values that are live
 /// together hold different registers, and no value holds a physical register
 /// that is live there. The colourer maintains an `occupied` set incrementally,

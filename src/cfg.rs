@@ -6,7 +6,7 @@
 // Dominators: Cooper, Harvey & Kennedy 2001, "A Simple, Fast Dominance
 // Algorithm" — iterate the meet over predecessors in reverse postorder until the
 // idom array is stable. Adequate at our scale and far shorter than
-// Lengauer-Tarjan (REARCH §3.3).
+// Lengauer-Tarjan (MECHANISM.md §G3.3).
 pub type Node = u32;
 
 pub struct Cfg {

@@ -1,4 +1,4 @@
-// HIR → MIR instruction selection (REARCH.md §6, §12 R0.6).
+// HIR → MIR instruction selection (MECHANISM.md §G6, §12 R0.6).
 // THEORY A5 — instruction selection; THEORY II-5 — the A64 encodings it targets
 //
 // R0 shipped the BASE COVER: one HIR instruction becomes one canonical machine
@@ -21,7 +21,7 @@ use crate::hir::{self, BinOp, CmpOp, CvtOp, Inst, Operand, Term, UnOp, ValueId};
 use crate::mir::*;
 
 /// MEASURED M4 — the jump-table/compare-tree crossover, UNSETTLED
-/// The jump-table density threshold (REARCH §13n R4.14 (2)) — the case count at
+/// The jump-table density threshold (MECHANISM.md Part F R4.14 (2)) — the case count at
 /// which a table beats a compare tree on THIS machine, taken on the clock.
 /// The arm count at which a JUMP TABLE beats a linear chain of equality tests.
 ///
@@ -37,7 +37,7 @@ use crate::mir::*;
 /// A BALANCED SEARCH TREE was built and REFUTED here: it lost at every size from
 /// 4 to 64 (at 16 arms: chain 62 ms, table 65, tree 84). It asks fewer questions
 /// and takes more time, because the chain's tests FALL THROUGH while the tree
-/// spends a taken branch per level and scatters the arms. See `arm64_elf.md`.
+/// spends a taken branch per level and scatters the arms. See `ARM64.md`.
 const MIN_CASES: usize = 24;
 
 /// MEASURED M14 — the inline small-copy bound, in BYTES
@@ -130,7 +130,7 @@ enum Place {
     Slot(SlotId),
 }
 
-/// An address the memory operand can express by itself (REARCH §6, the
+/// An address the memory operand can express by itself (MECHANISM.md §G6, the
 /// addressing-mode rows of the munch table). Folding it is what removes the
 /// `add` the R1 ground metric measured at 28.2% of sqlite's instructions.
 #[derive(Clone, Copy)]
@@ -2019,7 +2019,7 @@ impl<'a> L<'a> {
     /// span occupied. Below that the table is mostly padding and a compare chain
     /// is both smaller and — for a handful of cases — no slower.
     /// The case count at which a jump table beats a compare tree. MEASURED, not
-    /// chosen: see `jump_table` and REARCH §13n R4.14 (2).
+    /// chosen: see `jump_table` and MECHANISM.md Part F R4.14 (2).
     fn jump_table(
         &mut self,
         x: Reg,

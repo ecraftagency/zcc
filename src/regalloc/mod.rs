@@ -1,4 +1,4 @@
-// Register allocation ON SSA — the core of the re-architecture (REARCH.md §7).
+// Register allocation ON SSA — the core of the re-architecture (MECHANISM.md §G7).
 // THEORY A7 — register allocation on SSA
 //
 // The order is the whole point, and it is the exact inverse of rc3's:

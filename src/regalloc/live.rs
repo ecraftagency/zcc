@@ -1,4 +1,4 @@
-// Liveness on MIR-SSA with block parameters (REARCH.md §7.1).
+// Liveness on MIR-SSA with block parameters (MECHANISM.md §G7.1).
 // THEORY A7 — liveness on SSA (Boissinot et al. 2008)
 //
 // The only subtlety block parameters introduce: a target's ARGUMENTS are uses on
@@ -9,7 +9,7 @@
 //   live_in(b)  = uses(b) ∪ ( live_out(b) ∖ defs(b) )        [defs include params]
 //
 // which is exactly the ordinary equation once edges are read that way — the
-// reason block parameters were chosen over φ instructions (REARCH §14).
+// reason block parameters were chosen over φ instructions (MECHANISM.md §G14).
 //
 // Physical registers are tracked alongside virtual ones. They must be: the
 // entry's parallel copy READS x0–x7 and a call's argument copy WRITES them, so

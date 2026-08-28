@@ -275,16 +275,16 @@ neither was checked by anything:
 
 * **`THEORY.md`** — Side I theorems and Side II **citations**: a section number
   in ISO 9899, AAPCS64, DDI 0487 or the ELF ABI that a reader can look up.
-* **`MEASURED.md`** — facts with **no spec to cite**. Apple publishes no
+* **`MECHANISM.md` Part F** — facts with **no spec to cite**. Apple publishes no
   Software Optimization Guide for the M1, so a latency, or whether a transform
   pays here, can only be measured. Keeping these out of `THEORY.md` is what lets
   Law 1's two-side claim stay literally true.
 * **`SEMANTICS.md`** — the ⟦·⟧ every square is stated against.
 
-`REARCH.md` is **not** one of these. It is the execution plan — R4 is unfinished
+`MECHANISM.md` is **not** one of these. It is the execution plan — R4 is unfinished
 (R4.15, R4.12, and the tracked residuals) and it stays until that ladder closes.
 What comes OUT of it as purity work proceeds is the durable half: theorems into
-`THEORY.md`, spec constants into II-*, measured facts into `MEASURED.md`, ⟦·⟧
+`THEORY.md`, spec constants into II-*, measured facts into `MECHANISM.md` Part F, ⟦·⟧
 definitions into `SEMANTICS.md`. It gets thinner, not deleted.
 
 #### A citation is a reading path, not a lint
@@ -342,7 +342,7 @@ Six real defects, none of which the full gate could see:
    exposed it: layout THREADS empty blocks, so a predecessor's successor changes
    (bb2: `[11,12]` → `[2,12]`). The edge set is not the invariant; the run is.
 5. **Constants with no provenance**, now each carrying one — and four that have
-   no spec to cite are labelled honestly in `MEASURED.md` rather than given
+   no spec to cite are labelled honestly in `MECHANISM.md` Part F rather than given
    invented citations: `MIN_CASES` (M4, measured INCONCLUSIVE), `WINDOW` (M5),
    `MAX_HEADER_INSTS` (M7, gcc's `--param`, not a spec), `ARM_LIMIT` (M8,
    reasoned, never swept).
@@ -358,16 +358,16 @@ Six real defects, none of which the full gate could see:
 
 # Part C — compile speed
 
-## CP.md — the compile-speed campaign (transient)
+## `MECHANISM.md` Part C — the compile-speed campaign (transient)
 
 > **Lifecycle (anti-bloat).** This is a TRANSIENT working doc, the compile-speed twin of `OPT.md`'s
 > role for the optimizer. It holds the plan + scoreboard for the §CP campaign only. **Delete it when
 > the campaign closes.** Before deleting, cook the durable results into the permanent record: any new
 > algorithm that becomes load-bearing (bitset liveness, worklist dataflow, memoized SCEV) is a
 > Side-I theorem and its provenance belongs in `THEORY.md`; the measured phase profile and final
-> baseline belong in `REARCH.md` §13/§CP-closeout. `REARCH.md` keeps only a one-line pointer here
+> baseline belong in `MECHANISM.md` §13/§CP-closeout. `MECHANISM.md` keeps only a one-line pointer here
 > while this runs, and that pointer is removed at deletion. This doc introduces NO new plan
-> numbering that forks the R-ladder — it is the CP2.x detail of one REARCH side-campaign, edited in
+> numbering that forks the R-ladder — it is the CP2.x detail of one side-campaign, edited in
 > place here (anti-fragmentation law still binds).
 
 ### §CP — THE COMPILE-SPEED CAMPAIGN (opened 2026-08-25; a side campaign, orthogonal to R4)
@@ -589,7 +589,7 @@ Keep the scoreboard here (mark each row `✅ banked <sha>` / `BLOCKED: …`), ed
 
 # Part D — the spiller
 
-## SPILL.md — the spill-placement campaign
+## `MECHANISM.md` Part D — the spill-placement campaign
 
 The plan of record for closing zcc's real-program performance gap. Opened
 2026-08-27, after the sqlite-segfault night. Read §0, then start at §3.
@@ -982,7 +982,7 @@ The tail (`MemShallowCopy` ~8%) is ~1.3. The rest is below the attribution
 instrument's noise floor, which is what a systemic allocation problem looks like
 from a distance. **1× is not reachable without this campaign**, and it may end at
 "chordal colouring in dominance order cannot revisit, so this needs a different
-allocator" — which is a REARCH decision, not a row.
+allocator" — which is an architectural decision, not a row.
 
 ---
 
@@ -1724,7 +1724,7 @@ and not live-out — the case a block-local history can actually justify — the
 recolour fires **7 times in the whole of sqlite**, for −37 instructions. Seven,
 against a reported eight thousand six hundred.
 
-**WHAT USES IT.** Nothing, now: the mechanism was reverted (`SPILL.md` §4b).
+**WHAT USES IT.** Nothing, now: the mechanism was reverted (`MECHANISM.md` Part D §4b).
 The entry exists so the next reader of that column knows it is an upper bound on
 an upper bound, and so the row is not attempted a seventh time on the strength
 of the same number.
@@ -1761,7 +1761,7 @@ and 1000:
 The whole three-orders-of-magnitude sweep moves sqlite by **72 instructions,
 0.04%**, monotonically, and saturates at 100 — beyond which no ranking changes
 at all. The taxonomy suite does not move by one byte at any value, which is a
-second reading of the same fact recorded in `SPILL.md` §4a: none of its kernels
+second reading of the same fact recorded in `MECHANISM.md` Part D §4a: none of its kernels
 is under enough register pressure to spill, so nothing there can see this
 constant. Ten sits on the flat part of a flat curve.
 
@@ -2583,3 +2583,381 @@ one measured a loss. The 70% family was not touched by any of them.
 
 **WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
 zcc, gcc -O1 referee, the 49-program taxonomy suite, both compilers at `-S`.
+
+---
+
+# Part G — the pipeline, layer by layer
+
+The architecture and the seam between each layer. Section numbers here are
+`§G<n>`; `src/` cites them by that name.
+### §G1 Ground rules — what dies, what survives
+
+| category | items | rule |
+|---|---|---|
+| **DIES** (written from zero) | `src/ir.rs` (1,858 LOC), `src/opt/*` (8,683), `src/codegen/*` (6,614) = **17,155 LOC, 70% of zcc** | delete at R0 start (`git rm`); never copy code from them |
+| **SURVIVES as INPUT** | `src/lexer.rs`, `src/preprocess.rs`, `src/parser.rs`, `src/ast.rs`, `src/ext.rs`, `src/main.rs` (~7.1k) | the AST + TyTab boundary (charter Article B). The failure is entirely below it. `main.rs` loses its call into `codegen`; `ext.rs` keeps its frontend hooks; IR-side `EXT(...)` lowerings are re-implemented in the new layers |
+| **SURVIVES as REFERENCE ONLY** | `THEORY.md` (A7 pass ladder = the list of theorems to re-realize; II-3 AAPCS64; II-4 ELF; II-5 arch), `SEMANTICS.md` (`⟦·⟧` definitions, re-targeted to HIR + extended to MIR), `tests/` (all suites, oracles, science gates, `bench/`, `corpus25.sh`, `exectime.sh`), `MECHANISM.md Part A` | theorems and measurement, never structure |
+
+Constraints that do not change: Rust, edition 2024, **zero external crates**, single crate, AArch64-ELF
+only (macOS = clang oracle only), strict C99 + marked `EXT(...)`, Laws 1–3 + Article E gates.
+
+---
+
+### §G2 Pipeline and module layout
+
+```
+C ──cpp/lex/parse──► AST + TyTab
+   ──lower (Braun on-the-fly SSA)──► HIR (SSA, target-independent, block parameters)
+   ──HIR passes (tree-SSA half)──► HIR
+   ──isel (maximal munch + AAPCS64 automaton)──► MIR (SSA, virtual registers, arm64 ops)
+   ──MIR-SSA passes (cmp-elim, auto-inc, sxtw-lattice, ldp/stp)──► MIR
+   ──regalloc (Braun-Hack spill → chordal color → biased coalesce → SSA destruct)──► MIR (physical)
+   ──frame lowering / shrink-wrap / block layout / structured peephole──► MIR (final)
+   ──emit (1:1 print from the ISA table)──► .s
+```
+
+MIR before and after allocation is ONE type in two lifecycle states (virtual/SSA vs physical/ordered),
+exactly as LLVM's "MIR". MIR is arm64-specific by design (Article B: one module per target); a
+target-independent middle layer is deferred until a second target exists.
+
+```
+src/hir/mod.rs        HIR types: Func, Block, Inst, Term, Value, Ty, Effect
+src/hir/build.rs      AST → HIR lowering. NOTE (R0.9 audit): Braun's SSA construction is NOT
+                      here yet and this line used to claim it was. R0/R1 keep every local in
+                      memory (Part H), so no φ/block-parameter insertion runs at all; Braun arrives
+                      with `pass/sroa.rs` at R2.2, which is also where mem2reg uses it.
+src/hir/verify.rs     SSA dominance property, arity, typing
+src/hir/interp.rs     ⟦hir⟧ — the executable reference semantics (SEMANTICS.md)
+src/hir/dom.rs        preds/succs, dominator tree (Cooper-Harvey-Kennedy), loop forest + depth
+src/hir/alias.rs      the memory oracle (THEORY A7 "ALIAS ANALYSIS", re-derived)
+src/hir/pass/*.rs     one file per theorem family (see §G4)
+src/mir/mod.rs        MIR types: MFunc, MBlock, MInst, Reg, Operand, AddrMode, constraints
+src/mir/isa.rs        Side-II tables: register files, classes, encodable-immediate predicates, ISA shapes
+src/mir/verify.rs     SSA (virtual phase) / constraint satisfaction (physical phase)
+src/mir/interp.rs     ⟦mir⟧ — one interpreter for virtual and physical MIR
+src/mir/pass/*.rs     cmp_elim, auto_inc, ext_lattice, ldst_pair, frame, shrink_wrap, layout, peephole
+src/isel/lower.rs     HIR → MIR, per-block bottom-up munch over single-use trees
+src/isel/pattern.rs   the pattern table (each row = one theorem, one battery test)
+src/isel/abi.rs       AAPCS64 C.1–C.15 automaton, varargs, HFA, sret, stack args
+src/isel/imm.rs       immediate legalization (imm12 / logical / movz-movk / shifts)
+src/regalloc/live.rs  liveness on SSA with block parameters
+src/regalloc/spill.rs Braun-Hack Belady spilling + rematerialization + SSA reconstruction
+src/regalloc/color.rs chordal greedy coloring in dominance preorder, biased coalescing
+src/regalloc/destruct.rs  block-arg → parallel copies → sequentialized moves
+src/regalloc/verify.rs    interference / constraints / slot dataflow / clobber safety
+src/emit.rs           MIR(final) → text (+ ELF directives, Side-II II-4)
+```
+
+---
+
+### §G3 HIR — target-independent SSA
+
+#### 3.1 Design decisions
+- **SSA from birth.** `build.rs` lowers the AST straight into SSA with Braun et al. 2013 ("Simple and
+  Efficient Construction of Static Single Assignment Form", on-the-fly, no dominance frontiers — already
+  a proven theorem in this project). Scalar locals become values; aggregates and address-taken locals
+  become `alloca` stack objects accessed by typed load/store. SROA + mem2reg (Braun again, on allocas)
+  promote the split pieces later. **There is no `out_of_ssa` anywhere in HIR.**
+- **Block parameters instead of φ instructions** (Cranelift/MLIR/Swift style):
+  `br %c, bb1(%a, %b), bb2(%c)`. Edge semantics are explicit; the verifier and the interpreter are
+  simpler; SSA destruction (in MIR) becomes literally "one parallel copy per edge". HIR and MIR share
+  this model — one mental model.
+- **Closed scalar types**: `Ty = I8 | I16 | I32 | I64 | F32 | F64`; pointers are `I64`. Signedness and
+  width live in the **opcode**, not in a TyTab lookup (`sdiv/udiv`, `srem/urem`, `sext/zext/trunc`,
+  `icmp.slt/ult`, `ashr/lshr`). After lowering, HIR is independent of the frontend's `TyTab`.
+  SEMANTICS.md §G3 (`canon_τ`, `⟦op⟧_τ`, `⟦cast⟧`) becomes a closed definition over this `Ty`.
+- **Effect class per instruction** — `Effect = Pure | Read | Write | Call | Control`. DCE, CSE, GVN,
+  LICM, sinking legality are a table lookup, never a per-pass hand-list.
+- **Calls carry the C signature** (param types incl. composites by (size, align, class-hint), return
+  type, `nfix` for variadics). ABI classification is NOT an HIR concern — it is isel's Side-II job.
+
+#### 3.2 Instruction set
+```
+Value operands: %v (SSA value) | const (iconst ty k | fconst ty bits) | sym (global/function address)
+Arithmetic  : add sub mul  sdiv udiv srem urem   and or xor  shl lshr ashr      (ty ∈ I*)
+Float       : fadd fsub fmul fdiv fneg                                          (ty ∈ F*)
+Compare     : icmp.{eq,ne,slt,sle,sgt,sge,ult,ule,ugt,uge}  fcmp.{oeq,one,olt,ole,ogt,oge,uno}  → I32 0/1
+Convert     : sext zext trunc (int↔int)  fptosi fptoui sitofp uitofp fpext fptrunc  bitcast(I64↔F64, I32↔F32)
+Memory      : load ty %addr [aclass]   store ty %addr %val [aclass]   alloca size align → I64   memcpy %dst %src n   memset %dst n
+              (aclass = the C effective type's alias class, assigned by the frontend lowering: the hook for
+               type-based alias analysis (TBAA, O2 `-fstrict-aliasing`) — cheap to carry from day one, expensive to retrofit)
+Address     : addr_global sym  addr_func sym  addr_label sym (EXT computed goto)   (address arithmetic = plain add/mul)
+Select      : select ty %c %a %b
+Call        : call sig callee(args…) → %r?      (callee = sym | %fnptr)
+Intrinsics  : va_start %ap  va_arg ty %ap → %r  va_area → %r  overflow.{add,sub,mul}.{s,u}.ty %a %b %rp → %flag
+              sync.{fetch_add,…} …  asm "tmpl" operands   (each = Effect::Call-class, opaque to passes)
+Terminators : jmp bb(args)  br %c, bb(args), bb(args)  switch %v, [(k, bb(args))…], default bb(args)
+              ret %v?  unreachable  goto_ptr %v (EXT)
+```
+`switch` is NEW (the old IR had none — hence no jump tables, hence the "5.1 switch quarantined" note).
+
+#### 3.3 Data structures (sketch)
+```rust
+pub struct Func { name, sig: Sig, blocks: Vec<Block>, values: Vec<ValueInfo>, allocas: Vec<Alloca>, entry: BlockId }
+pub struct Block { params: Vec<Value>, insts: Vec<Inst>, term: Term, weight: Freq /* static branch-probability estimate (Ball-Larus heuristics); drives layout + spill next-use weighting; PGO hook */ }
+pub struct ValueInfo { ty: Ty, def: Def /* Inst(bi, ii) | Param(bi, k) | FuncParam(k) */ }
+pub enum Inst { Bin{dst, op: BinOp, ty, a, b}, Un{..}, Cmp{..}, Cvt{..}, Load{..}, Store{..}, Alloca{..},
+                Addr{..}, Select{..}, Call{..}, Intrinsic{..} }
+pub enum Term { Jmp(Target), Br(Operand, Target, Target), Switch(Operand, Vec<(i64, Target)>, Target),
+                Ret(Option<Operand>), Unreachable, GotoPtr(Operand) }
+pub struct Target { block: BlockId, args: Vec<Operand> }
+```
+Analyses (cached on `Func`, invalidated by any CFG edit): `Cfg{preds,succs}`, `DomTree` (Cooper-Harvey-
+Kennedy iterative — simpler than Lengauer-Tarjan, adequate), `LoopForest{header, body, depth, latch,
+preheader}`, `Alias` (the B1 oracle: allocas non-escaping ⟹ disjoint; globals by symbol; TBAA-free
+otherwise = may-alias).
+
+#### 3.4 Interpreter `⟦hir⟧` and verifier
+`interp.rs`: Σ = ⟨values: Vec<Bits>, memory: flat byte array (LP64 layout, globals materialized),
+call stack⟩; big-step per SEMANTICS.md §G4, block-argument transfer replaces φ-select. Returns
+`Result<Bits, Trap>` — a trap (UB: div-by-zero, misaligned/OOB access) is `⊥` and any transform may
+refine `⊥` (commuting squares compare only on non-⊥ inputs). Externals: a small builtin table
+(memcpy/memset/strlen/printf-subset) so corpus functions run under the interpreter.
+`verify.rs`: every use dominated by its def; block-arg arity and types match every incoming edge;
+opcode/type consistency; exactly one terminator; entry has no params.
+
+---
+
+### §G4 HIR passes — the tree-SSA half (re-realized from THEORY A7)
+
+Order mirrors gcc -O1 (`-ftree-*`). Bounded fixpoint over the sequence, max 3 rounds.
+
+| # | pass | file | theorem (THEORY A7 row) | proof |
+|---|---|---|---|---|
+| 1 | cfg_simplify | `pass/cfg.rs` | block merge, unreachable elim, jump threading of trivial blocks | `⟦f⟧=⟦P f⟧` battery |
+| 2 | sroa + mem2reg | `pass/sroa.rs` | non-escaping aggregate → scalar allocas → Braun promotion | battery + alias oracle |
+| 3 | sccp | `pass/sccp.rs` | Wegman-Zadeck lattice over reachability | battery |
+| 4 | gvn | `pass/gvn.rs` | dominator-based value numbering; absorbs CSE, copy-prop, constant folding, algebraic normalization (`⟦L⟧=⟦R⟧` rewrite table) | battery + rewrite table exhaustively checked |
+| 5 | load_elim / dse | `pass/mem.rs` | store→load forwarding, dead store, gated by the alias oracle | battery |
+| 6 | dce | `pass/dce.rs` | Effect table: `Pure` with no uses is dead | battery |
+| 7 | inline | `pass/inline.rs` | β-reduction; gcc -O1 = called-once + small (size threshold = dated policy constant) + interprocedural purity (the #24 `pure_functions` theorem) | battery on caller |
+| 8 | licm | `pass/licm.rs` | pure, trap-free, invariant → preheader. **Unconditional at O1** — no register-pressure guard; the allocator owns pressure | battery |
+| 9 | iv / strength-reduce / pointer-iv / LFTR | `pass/iv.rs` | derived IV rewrite, address recurrence, linear-function test replacement | battery |
+| 10 | if_convert | `pass/ifconv.rs` | side-effect-free diamond → `select` | battery |
+| 11 | rotate / final-value / invariant-pure-call hoist | `pass/loop.rs` | loop rotation; the #24 4-fence theorem; SCEV closed forms for counted loops | battery |
+| 12 | sink | `pass/sink.rs` | the dual of licm: a pure trap-free instruction with ONE using block, dominated by here and no deeper in a loop, moves down to it. Added at R3 rather than planned: the excess histogram, Part F measured register pressure as the largest remaining item, and this is the cheapest thing that shortens a live range | battery |
+
+Battery = the existing method: small-domain-exhaustive inputs + boundary values, `⟦f⟧ ≡ ⟦P f⟧` on every
+corpus function, run under `cargo test`. Ported in spirit from `opt/tests.rs`; the *tests* are theorems
+and may be re-derived from the old file — the *pass code* may not.
+
+---
+
+### §G5 MIR — the load-bearing layer
+
+#### 5.1 Registers and classes (Side-II, AAPCS64 §G6.1.1 — the full table, no convenience truncation)
+```
+Class GPR : x0–x30 minus reserved {sp, x29 (fp when a frame pointer is required), x30 (lr), x16, x17 (IP0/IP1 — scratch for parallel-copy cycles and veneers), x18 (platform)}
+            allocatable order: caller-saved first x0–x15 (x0–x7 are also argument regs), then callee-saved x19–x28
+Class FPR : v0–v31 minus reserved {v31 (FP scratch for copy cycles)}; caller v0–v7,v16–v30; callee v8–v15 (low 64 bits)
+Class FLAGS: k=1, the NZCV register. `cmp/cmn/tst/adds/subs/ands/fcmp` define it; `b.cc/csel/cset/cinc/ccmp` use it.
+Reg = V(VReg) | P(PReg);  VRegInfo { class, width: W32|W64|S|D }
+```
+Modeling NZCV as a k=1 class makes compare-elimination a GVN over flag definitions and makes "two flag
+values live at once" an ordinary interference the allocator resolves by rematerializing the `cmp`
+(flags are always rematerializable: their producer is pure).
+
+#### 5.2 Operands, constraints, addressing modes
+```
+Operand   = Reg(Reg) | Imm(i64) | FImm(bits) | Mem(AddrMode) | Sym(Symbol, Reloc) | Cond(CC) | Slot(StackSlot)
+AddrMode  = BaseImm{base: Reg, off: i32 /*scaled-unsigned or signed-9*/}
+          | BaseReg{base, idx: Reg, ext: None|Uxtw|Sxtw|Lsl, shift: u8}
+          | PreIdx{base, off} | PostIdx{base, off}       (both DEFINE a new base vreg in SSA phase)
+          | PcRel{sym, page: bool} | Slot{id, off} | SpArg{off}
+Constraint on each register operand (regalloc2 model):
+   Use | Def | UseFixed(PReg) | DefFixed(PReg) | Clobber(RegSet /*on Call*/) | Reuse(def = use k) (rare on arm64)
+```
+Every instruction exposes `operands(&self) -> impl Iterator<(OperandRef, Constraint)>` and
+`operands_mut`, plus `effects(&self) -> MemEffect` (`None | Read(aclass) | Write(aclass) | Barrier`).
+The allocator, liveness, verifier and interpreter use ONLY these visitors — no per-opcode special
+cases outside `isa.rs`. `effects()` is also the dependence oracle a list scheduler needs (the O2 shelf, `THEORY.md` Appendix),
+so scheduling costs no new IR surface later.
+
+#### 5.3 Instruction families (enum by arm64 shape; `isa.rs` owns encodability)
+```
+AluRR{op, w, dst, a, b}  AluRI{op, w, dst, a, imm12<<sh}  AluRRS{op, w, dst, a, b, shift, amt}  AluRRX{op, w, dst, a, b, ext, amt}
+Mul{w,dst,a,b}  Madd/Msub{w,dst,a,b,c}  Smull/Umull  Div{s/u,w,dst,a,b}  Logic{op,w,dst,a,b|logimm}  Shift{op,w,dst,a,b|imm}
+MovZ/MovK/MovN{w,dst,imm16,shift}  Mov{w,dst,src}  Ext{sxtb/sxth/sxtw/uxtb/uxth}  Bfx{u/s,dst,src,lsb,width}  Bfi/Bfxil
+Ld{width,ext,dst,mem}  St{width,src,mem}  LdP/StP{w,r1,r2,mem}  Adrp{dst,sym}  AddLo12{dst,base,sym}  LdrGot
+Cmp/Cmn/Tst{w,a,b|imm}→FLAGS  AddS/SubS/AndS  Csel/Csinc/Csinv/Csneg{w,dst,a,b,cc}  Cset/Cinc  Ccmp
+B(target)  Bcc{cc,target}  Cbz/Cbnz{w,reg,target}  Tbz/Tbnz{reg,bit,target}  Br(reg)  Ret
+Bl{sym}  Blr{reg}                           (always wrapped by the Call pseudo below)
+FP: Fmov(rr, r↔g, imm8)  Fadd/Fsub/Fmul/Fdiv/Fneg/Fabs/Fsqrt  Fcmp→FLAGS  Fcsel  Fcvt{s↔d}  Scvtf/Ucvtf  Fcvtzs/Fcvtzu  LdF/StF
+Sync: Ldaxr/Stlxr/Ldar/Stlr/Dmb            (EXT __sync_*)
+Pseudo (exist only before their lowering pass):
+  Call{callee, args: fixed uses, rets: fixed defs, clobbers: caller-saved set, stack_bytes, tail: bool /* sibling call → `b` after epilogue (O2 -foptimize-sibling-calls) */}
+  Copy{dst,src}  ParallelCopy{pairs}  Spill{slot,src}  Reload{dst,slot}  FrameAddr{dst,slot}  Asm{tmpl,ops}
+  JumpTable{index, table: Vec<BlockId>}     (lowered to adr+ldr+br in layout)
+```
+#### 5.4 SSA, interpreter, verifier
+Virtual phase: every VReg defined once; block parameters carry values across edges; `PreIdx/PostIdx`
+define a fresh base vreg. `interp.rs`: machine state ⟨regs (a map for V, an array for P), NZCV,
+memory, sp/frame⟩; one interpreter for both phases so `⟦hir⟧ = ⟦mir_v⟧ = ⟦mir_p⟧ = ⟦mir_final⟧` is
+checkable end-to-end per function. `verify.rs`: virtual phase = SSA + arity + width consistency +
+FLAGS def-before-use; physical phase = no V left, every Fixed constraint met, clobbered regs not live
+across the clobber, every Slot resolved.
+
+---
+
+### §G6 isel — HIR → MIR
+
+Per block, bottom-up over the SSA use-def graph, **maximal munch on single-use trees** (a value with
+one use may be folded into its user; multi-use values are materialized once). The pattern table
+(`isel/pattern.rs`) is the theorem table — each row = one `⟦hir-tree⟧ = ⟦mir-seq⟧` battery test:
+
+| HIR tree | MIR | note |
+|---|---|---|
+| `load(add(b, shl(i, k)))`, k∈{0..3} matching width | `ldr [b, i, lsl #k]` | also `sxtw/uxtw` extend when `i` is I32 |
+| `load(add(b, c))`, c encodable | `ldr [b, #c]` | scaled-unsigned or signed-9 per width |
+| `load(addr_global s)` | `adrp; ldr [x, :lo12:s]` | GOT form for externs |
+| `br(icmp.cc a b)` | `cmp a, b; b.cc` | `cbz/cbnz` when b=0 and cc∈{eq,ne}; `tbz/tbnz` for single-bit tests |
+| `select(icmp…, a, b)` | `cmp; csel` | `csinc/csinv/csneg/cset` special forms |
+| `add(mul(a,b), c)` / `sub(c, mul(a,b))` | `madd` / `msub` | `smull/umull` for widened products |
+| `and(lshr(a,s), mask)` / `shl+ashr` | `ubfx` / `sbfx` | bit-field extract |
+| `add(a, sext(b))` etc. | `add a, b, sxtw` | operand-extend folding |
+| `mul(a, const)` | shift/add sequence | Side-II cost table, otherwise `mov+mul` |
+| immediates | `imm12`, `imm12<<12`, logical-imm, `movz/movk` chain, `mov wzr`, `movn` | `isel/imm.rs` predicates |
+| `switch` | jump table (`adr+ldr+br`) when density ≥ threshold else balanced compare tree | thresholds = gcc defaults, dated policy constants |
+
+**ABI (`isel/abi.rs`)** = the AAPCS64 §G6.4–6.8 C.1–C.15 automaton over the call's C signature (THEORY
+II-3): NGRN/NSRN/NSAA state, composites ≤16B in registers, HFA/HVA, >16B by reference (caller copy),
+sret in x8, C.11 lock, variadics (nfix; the 192-byte register save area; `va_start/va_arg` lowering),
+long double via soft-float calls. Emits fixed constraints on the `Call` pseudo + explicit `str` to
+`SpArg` for stack args; function entry materializes params from `DefFixed` or `SpArg` loads.
+
+---
+
+### §G7 Regalloc on MIR-SSA — the core
+
+References: Hack 2007 (thesis: SSA interference graphs are chordal; dominance preorder is a perfect
+elimination order), Braun & Hack 2009 ("Register Spilling and Live-Range Splitting for SSA-Form
+Programs"), Boissinot et al. 2009 (fast liveness / out-of-SSA), Braun et al. 2013 (SSA reconstruction).
+
+1. **Liveness** (`live.rs`): iterative backward dataflow on SSA with block parameters (a target's
+   argument is a use on the edge). Cheap enough; Boissinot's dominance-based variant is an optional
+   later optimization.
+2. **Spilling** (`spill.rs`) — Braun-Hack, per register class. **As built (R2.2, entry sets
+   widened at R4.1), with two deviations recorded here rather than left implicit:** SSA
+   RECONSTRUCTION is absent because it is not needed. Through R3 that held because a reload's
+   register never left the block that created it. Since **R4.1** a reload copy is carried into
+   the successors, but only where EVERY predecessor holds that same copy — and a copy has one
+   definition, so that condition says every path to the use runs through the definition, which
+   IS dominance. The use is dominated by its definition for the same reason as before, with no
+   block parameter and no renaming; `mir::verify` re-derives it after every spill in debug
+   builds. The second deviation is unchanged: a spilled BLOCK PARAMETER is removed from the IR
+   rather than stored at its definition, since its definition is the block head. One slot per SSA WEB (parameter ∪ its arguments), merged
+   only where the members do not interfere:
+   - Walk blocks in dominance order. For each block compute the entry set `W_entry` (≤ k values) from
+     the predecessors' exit sets, preferring values with the nearest next use (loop-aware next-use
+     distance: uses outside the current loop count as "far").
+   - Walk instructions applying Belady MIN: for each use not in `W`, insert `Reload` (a **new vreg**);
+     when `|W| + defs > k`, evict the value with the furthest next use, inserting a `Spill` at its
+     definition (once per value, lazily). Values marked **rematerializable** (`iconst`, `adrp+add`,
+     `mov`-of-immediate, extends of a value still in W) are recomputed instead of reloaded.
+   - At block boundaries reconcile `W_exit(pred)` with `W_entry(succ)`: insert reload/spill on the edge
+     (critical edges are split first, in `dom.rs`).
+   - Fixed constraints (`UseFixed/DefFixed`, `Clobber`) count against `k` at that instruction; Hack's
+     method: a `ParallelCopy` is inserted before a constrained instruction so the constraint is local.
+   - Reloads create new definitions ⟹ **SSA reconstruction** (Braun 2013 again) rewires uses to the
+     nearest reaching definition, inserting block parameters as needed.
+   - Post-condition (verified): register pressure ≤ k(class) at every program point. **This is
+     live-range splitting** — a value lives in a register where hot and in its slot elsewhere.
+3. **Coloring** (`color.rs`): dom-tree preorder over blocks, instructions in order; maintain the live
+   set incrementally; at each definition assign the lowest free color respecting the constraint and
+   the class order (caller-saved first, callee-saved last, so values not live across a call avoid
+   prologue saves). Block parameters are colored at the block head (after the predecessors' copies
+   are accounted for). **Theorem: never fails after step 2** (chordality + pressure ≤ k). A call's
+   `Clobber` set is treated as fixed definitions live across the instruction, so a value live across a
+   call cannot receive a caller-saved color — **no special "crossing" logic exists.**
+4. **Coalescing**: biased coloring — prefer a copy partner's color (`Copy`, block-argument pairs,
+   `PostIdx` base pairs) when free. Never merges nodes, never breaks the pressure guarantee. Upgrade to
+   Boissinot merging only if the measured residual copies (Law-4 residual check, Part F) justify it.
+5. **SSA destruction** (`destruct.rs`): each edge's parameters become a `ParallelCopy` (already colored);
+   sequentialize with the standard windmill algorithm; cycles broken with the reserved scratch
+   (x16 for GPR, v31 for FPR). Spill/Reload become `str/ldr` to `Slot` operands.
+6. **Verify** (`verify.rs`, run in debug builds on every function + in the battery): (a) no two values
+   simultaneously live (pre-destruction liveness) share a color; (b) every Fixed constraint met; (c)
+   every `Reload` slot is dominated by a `Spill` of the same value; (d) no value in a caller-saved
+   register is live across a `Call`; (e) `⟦mir_v⟧ = ⟦mir_p⟧` on the corpus.
+
+---
+
+### §G8 MIR passes — the O1 back-half (gcc -O1 has NO instruction scheduler; none here)
+
+Pre-allocation (on SSA):
+- `cmp_elim`: GVN over FLAGS definitions; `sub`+`cmp` → `subs`, `and`+`tst` → `ands` when the flags
+  consumer is the only other user. (gcc `-fcompare-elim`.)
+- `auto_inc`: `ldr [p]; add p', p, #k` → `ldr [p], #k` defining `p'` (post-index), pre-index dual.
+  (gcc `-fauto-inc-dec`.)
+- `ext_lattice`: known-width dataflow ("value is already sign/zero-canonical in its low 32 bits")
+  eliminating redundant `sxtw/uxtb/uxth`. Replaces the five old text sxtw levers with one pass.
+- `ldst_pair`: adjacent same-base accesses → `ldp/stp` (THEORY A7 "LDP/STP PAIRING").
+Post-allocation (physical):
+- `frame`: assign slots (spills, allocas, outgoing-arg area, callee-saved save area, vararg save
+  area); one frame adjust (`-fcombine-stack-adjustments` by construction); frame pointer only when a
+  VLA/alloca exists (`-fomit-frame-pointer`); prologue/epilogue with exactly the callee-saved set used.
+- `shrink_wrap` (R3): place prologue/epilogue at the nearest common dominator of the blocks that need
+  callee-saved registers or the frame (`-fshrink-wrap`).
+- `layout`: block order = RPO with loop bodies contiguous; invert conditions for fall-through; drop
+  `b .next`; lower `JumpTable`.
+- `peephole` (structured, on MIR — never on text): self-move elimination, `mov wzr`, dead defs.
+
+---
+
+### §G9 Emit
+
+`emit.rs`: `fn fmt(inst: &MInst) -> String` driven by `isa.rs`; sections, symbols, relocations,
+TLS per THEORY II-4 (`adrp/:lo12:`, `:got:`, `:tprel_*`, no `_` prefix). Determinism seal: identical
+MIR ⟹ identical bytes. Confirmation: `as` accepts every emitted file; the suites confirm.
+
+---
+
+### §G10 Proof map (Law 3 — certify at the middle) and the cost model
+
+| layer | obligation | mechanism | where it runs |
+|---|---|---|---|
+| AST → HIR | faithful lowering | HIR verifier + differential suites (c99 referee) | `cargo test` + box gates |
+| HIR pass P | `⟦f⟧ = ⟦P f⟧` | exhaustive small-domain battery on the corpus under `hir::interp` | `cargo test` |
+| isel | `⟦tree⟧ = ⟦seq⟧` per pattern; `⟦hir⟧ = ⟦mir_v⟧` per function | pattern battery + whole-function translation validation with generated inputs | `cargo test` |
+| MIR-SSA pass | `⟦m⟧ = ⟦P m⟧` | battery under `mir::interp` | `cargo test` |
+| regalloc | renaming bisimulation | mechanical verifier (§G7.6 a–d) + `⟦mir_v⟧ = ⟦mir_p⟧` | debug builds + `cargo test` |
+| frame / layout | `⟦mir_p⟧ = ⟦mir_final⟧` | interpreter with sp/frame semantics + verifier | `cargo test` |
+| emit | determinism; assembler acceptance | md5 seal; `as` | box |
+| whole compiler | CONFIRMS, never discovers | opt-parity (HIR passes off vs on), torture, csmith300, yarpgen300, cts, musl | box |
+
+**Cost-square exact by construction:** one `MInst` = one machine instruction after `frame/layout`, so
+`cost(f) = |MIR_final(f)|` needs no separate model. Δinsn of any transform is computed on MIR before
+emitting anything: **predict → apply → confirm** becomes cheap. (The lesson of lever ㉕.2 — a build
+without a prior prediction — is fixed structurally, not by discipline.)
+
+---
+
+---
+
+# Part H — the decision log
+
+### §14 Decision log (settled; reopen only with a stated reason)
+
+| decision | choice | why |
+|---|---|---|
+| frontend | keep as input | failure is entirely below AST; parser is an independent proven artifact |
+| SLP layer (R5.3) | a MIR pass, NOT a HIR pass with `Ty::V128` | the vector data path already exists one layer down — `Width::Q`, `MemOp::Q`, the FPR class, 16-byte slots, all carried since `long double` — so what was actually missing was arithmetic. HIR would have needed a new type in every exhaustive `match Ty` in the frontend half plus a lane semantics in `hir::interp`, for a type the frontend can never produce |
+| scheduler position (R5.4) | post-allocation but PRE-frame-lowering | post-RA so no schedule can create a live range; pre-frame so it never sees a prologue, an epilogue, or an sp-writeback address. Learned the hard way: the first cut ran after `frame_fold` and the box returned corpus-wide SIGSEGV, because two memory READS are unordered and one of them was the epilogue's sp-restoring load |
+| TBAA opt-out granularity (R5.2) | whole translation unit | `may_alias` and `optimize("-fno-strict-aliasing")` set one flag for the unit. The finer answer is a bit per `TypeId` beside `vol`; both gcc torture cases put the pun in `main`, where per-type buys nothing. Conservative direction: costs an optimization, never an answer |
+| SSA representation | block parameters (HIR and MIR) | explicit edges, trivial destruction, one model |
+| HIR types | closed `Ty` enum, signedness in opcodes | passes independent of TyTab; closed semantics |
+| allocation | on SSA, Braun-Hack spill first, chordal greedy color | polynomial + optimal for the spill set; splitting free |
+| SSA reconstruction after spilling | never built; R4.1 got the effect without it | carrying a copy only where every predecessor holds it IS dominance, so the copy's def dominates its uses and no φ/parameter is needed. §13n planned reconstruction; the measurement made it unnecessary |
+| coalescing | biased coloring first; Boissinot merge only on measured residual | never breaks the pressure guarantee |
+| the edge's parallel copy (2026-08-27) | its locations are registers **AND** spill slots | `evict_params` puts a slot on the edge, so read-before-write has to hold across the register/slot boundary; the register-only reading let a pointer rotation overwrite a slot another argument on the same edge still had to read, and the zcc-built sqlite CLI SIGSEGV'd on every two-table join. See THEORY A7 |
+| `regalloc::verify` (2026-08-27) | runs on EVERY compile, post-allocation and pre-frame-lowering | it was called only from unit tests, so its obligations held on fixtures and were never asked of real input. Pre-frame-lowering is not a convenience: obligation (b) is stated in the `Spill`/`Reload` vocabulary and `ldst_pair` spends it, so the same check after `finish` reports a false `reload of unstored slot` |
+| finding allocator defects | generated SHAPE families, not more corpus | the sqlite segfault survived 20,000 generated programs, torture 1694 and opt-parity 1552. No generator writes a pointer rotation under enough pressure to evict a parameter; 40 programs written to that shape found it in one run. A corpus corroborates, it does not discover |
+| call-crossing values | modeled as `Clobber` constraints, no special logic | falls out of constraint-respecting greedy coloring |
+| flags | k=1 register class | compare-elim = GVN; conflicts = liveness |
+| scheduler | none | gcc -O1 has none; YAGNI |
+| middle target-independent IR | deferred | one target |
+| migration | big-bang on `mir-rearch`; `rc3` is the fallback | user directive; incremental rejected |
+| scratch registers | x16, x17 (GPR), v31 (FPR) reserved | AAPCS64 IP0/IP1; parallel-copy cycle breaking |
+| R0/R1 local storage | every C local stays in ONE frame slot (memory); promotion is R2.2 SROA+mem2reg | the parser reports `Var(off)`, not variable identity — two locals in disjoint scopes may share an offset, so promotion at build time would rest on an unproven disambiguation. Consequence: R0/R1 exercise the allocator on expression temporaries only, and the R1 allocator KPI is re-measured at R2.2 (noted in §12 R1) |
+
+---

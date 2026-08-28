@@ -1,4 +1,4 @@
-// MIR passes (REARCH.md §8). Pre-allocation passes run on SSA; post-allocation
+// MIR passes (MECHANISM.md §G8). Pre-allocation passes run on SSA; post-allocation
 // THEORY A6b — MIR; THEORY A7b — proving a machine pass
 // passes run on physical MIR. gcc -O1 has no instruction scheduler; this list
 // has one (`sched`, R5.4), default-off behind `ZCC_SCHED` until it is measured

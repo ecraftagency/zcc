@@ -1,4 +1,4 @@
-// ⟦mir⟧ — the executable semantics of the machine layer (REARCH.md §5.4).
+// ⟦mir⟧ — the executable semantics of the machine layer (MECHANISM.md §G5.4).
 // THEORY A6b — MIR; SEMANTICS 5 — the machine layer's denotation
 //
 // ONE interpreter for both lifecycle states. That is the point: `⟦hir⟧ =
@@ -365,14 +365,14 @@ impl<'a> Machine<'a> {
                 (fr.slot_addr[*slot as usize] as i64 + *off as i64) as u64,
                 None,
             ),
-            // The folded frame-adjust pair (REARCH §13o R4.15). Its slot sits at
+            // The folded frame-adjust pair (MECHANISM.md Part F R4.15). Its slot sits at
             // frame offset 0, so its address is exactly `Slot { slot, off: 0 }`;
             // the sp writeback the real machine performs is the no-op `SpAdj` also
             // is — the frame is already established (`push_frame`) and sp never
             // held the caller's value inside the body. Hence no writeback pair.
             AddrMode::FrameWb { slot, .. } => (fr.slot_addr[*slot as usize], None),
             // The outgoing-argument area rides at the CURRENT sp — that is what
-            // makes it survive a `StackAlloc` (REARCH §5.2).
+            // makes it survive a `StackAlloc` (MECHANISM.md §G5.2).
             AddrMode::SpArg { off } => (self.mem.sp + *off as u64, None),
             AddrMode::SymLo12 { base, .. } => {
                 let _ = size;

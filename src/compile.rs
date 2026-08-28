@@ -1,4 +1,4 @@
-// The single door from the frontend to the layered backend (REARCH.md §2).
+// The single door from the frontend to the layered backend (MECHANISM.md §G2).
 // THEORY A5 — the isel/ABI seam; THEORY A6 — HIR; THEORY A6b — MIR
 // main.rs knows only this function; every layer below is private to the pipeline.
 //
@@ -81,7 +81,7 @@ pub fn pinned_symbols(ast: &Ast) -> std::collections::HashSet<String> {
 /// The HIR pass ladder is ON unless `ZCC_O0` says otherwise. The switch exists
 /// for ONE reason: `tests/opt-parity.sh` compiles every torture program twice and
 /// compares the two runs, which is the whole-compiler confirmation that the
-/// ladder preserves meaning (REARCH §10 — it CONFIRMS; the batteries discover).
+/// ladder preserves meaning (MECHANISM.md §G10 — it CONFIRMS; the batteries discover).
 pub fn optimize() -> bool {
     std::env::var_os("ZCC_O0").is_none()
 }
@@ -111,7 +111,7 @@ pub fn backend(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
 /// frame/layout square (`⟦mir_p⟧ = ⟦mir_final⟧`) has two sides to compare.
 pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> {
     let mut m = phase("isel", || crate::isel::lower(h));
-    // MIR passes on SSA, before allocation (REARCH §8, the pre-allocation half).
+    // MIR passes on SSA, before allocation (MECHANISM.md §G8, the pre-allocation half).
     phase("mir::pass", || {
         for f in m.funcs.iter_mut() {
             crate::mir::pass::ext::run(f);
@@ -145,7 +145,7 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
         Ok::<(), String>(())
     })?;
     phase("regalloc", || crate::regalloc::allocate_module(&mut m))?;
-    // THE ALLOCATOR'S OWN OBLIGATIONS, ON EVERY COMPILE (REARCH §7.6). These are
+    // THE ALLOCATOR'S OWN OBLIGATIONS, ON EVERY COMPILE (MECHANISM.md §G7.6). These are
     // decidable on the physical MIR alone — no virtual register survives, every
     // `Reload` reads a slot some `Spill` wrote on EVERY path to it, no
     // `ParallelCopy` is left unsequentialized — and until now they were checked
