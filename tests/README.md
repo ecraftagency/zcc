@@ -186,7 +186,23 @@ otherwise (presumption-of-guilt rule, CLAUDE.md).
 - **Clean-input law: the ultimate source of error is bad/garbage input collected while running the suite.** A PASS/FAIL verdict is worthless if the measurement itself rests on garbage data (a referee-filter skipping wrongly, `2>/dev/null` swallowing errors, mislabeled counts, a suite that is "green" without running anything). A green verdict is valid *only* when accompanied by a *mechanical evidence trail* proving real work occurred: number of artifacts produced + checksums + observed exit codes, *not* merely a pass/fail number. Publication standard: a "torture pass" claim must carry evidence of N real ELF binaries + total codegen bytes + a deterministic re-run sample (e.g. a torture-box run of 16s producing 1377 real ELF binaries / 21MB / 1694 cases fully covered — the suspicion "16s means no-op" is refuted by the manifest). An abnormal timing (fast *or* slow) is *measured*, not guessed (macOS clang compile+run is 2.7s per invocation due to codesign/dyld; Linux static-musl is nearly free — the same suite is 19 minutes on macOS versus 16s in the box).
 - **Test-loop optimization**: during triage/fix, re-run *exactly* the case/unit that failed last time, *not* the full suite; the full suite runs only once at the end to close the books (in the background, not blocking). Heavy suites run *sequentially*, not contending for cores.
 - **Numeric-provenance rule**: every number / decision must be derivable from a stated premise — no magic number without provenance.
-- **Byte-identical gate** — proves a pure-code-motion refactor changed nothing: identical `md5(.s)` over a fixed corpus *is* the commuting-square `⟦f⟧=⟦refactor f⟧` (Article G). Mechanism + usage in the script header: `tests/refactor_gate.sh`.
+- **Byte-identical gate** — proves a pure-code-motion refactor changed nothing: identical `md5(.s)` *is* the commuting-square `⟦f⟧=⟦refactor f⟧` (Article G). Mechanism + usage in the script header: `tests/refactor_gate.sh`.
+
+  **It takes two witnesses, and the second one is why.** The corpus is 58 small
+  programs, and on 2026-08-28 six inlining rows passed it — green every time —
+  while changing the assembly of the sqlite amalgamation. Nothing in the corpus
+  is large enough to make an inliner, a spiller, or anything else that reruns an
+  analysis per rewrite do the work where its behaviour differs. So the gate also
+  compiles ONE large translation unit and compares its `md5` against
+  `sums.large.txt`, which costs a single compile. When the box is unavailable the
+  gate reports that and FAILS: a gate that quietly proves less than it claims is
+  precisely what went wrong. `ZCC_GATE_LARGE=0` runs the corpus alone and prints
+  the waiver in place of the result.
+
+  **The baseline is the compiler being reproduced, never an earlier candidate.**
+  The same episode ran six rows against a hash produced by the first of them, so
+  the chain agreed with itself while walking away from the tree it was supposed
+  to match. Record `baseline` on a tree you trust, then leave it alone.
 - Compare against the reference answer at any time: `clang -S -O0 -std=c99 foo.c`.
 </content>
 </invoke>
