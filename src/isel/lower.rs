@@ -2212,13 +2212,20 @@ impl<'a> L<'a> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(MIN_CASES);
+        let why = |r: &str, span: i64| {
+            if std::env::var("ZCC_JTDBG").is_ok() {
+                eprintln!("JT {} arms={} span={} {}", self.h.name, arms.len(), span, r);
+            }
+        };
         if arms.len() < min_cases {
+            why("refused: too-few-arms", 0);
             return None;
         }
         let lo = arms.iter().map(|(k, _)| *k).min()?;
         let hi = arms.iter().map(|(k, _)| *k).max()?;
         let span_check = hi.checked_sub(lo)?.checked_add(1)?;
         if span_check > (arms.len() as i64).checked_mul(2)? || span_check > 4096 {
+            why("refused: span", span_check);
             return None;
         }
         let span = hi.checked_sub(lo)?.checked_add(1)?;
@@ -2258,8 +2265,10 @@ impl<'a> L<'a> {
         // both the holes in the range and the `default` field are filled with
         // it. So the table gets a trampoline and the `Bcc` keeps the real edge.
         if !dflt.args.is_empty() && !jt_default() {
+            why("refused: default-args", span);
             return None;
         }
+        why("ACCEPTED", span);
         let dflt_t = if dflt.args.is_empty() {
             dflt.clone()
         } else {

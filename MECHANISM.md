@@ -3147,12 +3147,41 @@ measuring toward: **the tail is the scoreboard**, `k1_dispatch` moves 1.151 →
 STRUCTURAL defect rather than a tuning choice — the kind that is worth removing
 at a known small size cost.
 
-**IT DOES NOT REACH SQLITE, and that was the hope.** `MEASURED M16` puts 85% of
-sqlite's runtime gap in `sqlite3VdbeExec`, whose dispatch is exactly this shape.
-After the fix sqlite is byte-for-byte unchanged — five jump tables before and
-after, 170,963 instructions both ways. Its blocker is a different one (the span
-against the arm count, or a dispatch that never reaches `Term::Switch` at all),
-and finding it is worth more than everything measured in this entry.
+**IT DOES NOT REACH SQLITE, AND THE FIRST EXPLANATION OF THAT WAS WRONG.**
+sqlite is byte-for-byte unchanged by the fix — five jump tables before and after,
+170,963 instructions both ways — and this entry first recorded that as an unfound
+blocker in `sqlite3VdbeExec`, whose 196-opcode dispatch `MEASURED M16` puts 85%
+of sqlite's runtime gap in.
+
+**It is not a blocker. `sqlite3VdbeExec` ALREADY GETS ITS TABLE:**
+
+```
+JT sqlite3VdbeExec arms=183 span=185 ACCEPTED
+```
+
+The wrong reading was self-inflicted and is worth recording as such: the
+`ZCC_JTDBG` output was piped through `sort -rn | head -12`, which ranks by
+FREQUENCY, and the one accepted 183-arm switch appears once while the small
+refused ones repeat. The single most important line in the instrument's output
+was cut off by the command reading it. **An instrument summarized by frequency
+answers "what happens most", never "what matters most"** — the same shape of
+error as `M26-correction`'s census, one layer up, in the shell rather than in the
+classifier.
+
+**WHAT THE INSTRUMENT DOES SAY** once read whole: the refusals that remain are
+all SPAN, `span > arms × 2` —
+
+| function | arms | span | ratio |
+|---|---|---|---|
+| `jsonTranslateTextToBlob` | 37 | 240 | 6.5 |
+| `sqlite3ExprCodeTarget` | 51 | 163 | 3.2 |
+| `strftimeFunc` | 27 | 83 | 3.1 |
+| `yy_destructor` | 50 | 115 | 2.3 |
+
+The standard answer is to split the range into dense clusters and give the
+outliers a compare chain. None of these is on sqlite's RUNTIME path — they are
+its parser, its expression coder and its JSON reader — so the row is a size and
+compile-time one, not a speed one, and it is not opened on this evidence.
 
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee.

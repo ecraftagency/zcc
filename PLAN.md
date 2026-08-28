@@ -138,14 +138,14 @@ interleaved), `cmp`-against-immediate 41 → 2. Suite geomean does NOT move (two
 pairs split) and INSN costs 0.13%; it ships as a structural defect removed, on
 the tail argument. `ZCC_NOJTDFLT=1` is the seam.
 
-**⭐ AND THE NEXT ROW IS NAMED BY IT.** sqlite is byte-for-byte UNCHANGED by the
-fix — five jump tables before and after, 170,963 instructions both ways. Yet
-`MEASURED M16` puts **85% of sqlite's runtime gap in `sqlite3VdbeExec`**, whose
-196-opcode dispatch is exactly this shape. So something else refuses it: the span
-against the arm count, or a dispatch that never reaches `Term::Switch` at all.
-**Find that blocker.** It is worth more than every suite program left in the
-tail, and it is the one place where a single fix reaches a real program rather
-than one benchmark of forty-nine.
+**AND THE ROW THIS FIRST NAMED AS NEXT DOES NOT EXIST.** `sqlite3VdbeExec`
+ALREADY gets its jump table — `arms=183 span=185 ACCEPTED`. The claim that it did
+not came from reading `ZCC_JTDBG` through `sort -rn | head -12`, which ranks by
+frequency: the one accepted 183-arm switch appears once, the small refused ones
+repeat, and the only line that mattered was cut off by the command reading it.
+sqlite is unchanged by the fix because it needed nothing. The remaining refusals
+are all SPAN and all on sqlite's compile-time paths (parser, expression coder,
+JSON reader), so they are a size row at best.
 
 **⭐ TWO ROWS THIS SESSION TERMINATED AT THE SAME ANSWER, AND IT IS PGO.**
 `M31` cannot rank a state machine's switch arms — which one is hot is a property
