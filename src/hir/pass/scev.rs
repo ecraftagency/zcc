@@ -83,9 +83,7 @@ pub struct LoopScev {
     nowrap_unsigned: std::collections::HashSet<ValueId>,
     latches: Vec<BlockId>,
 }
-
 impl LoopScev {
-    /// Analyse loop `li`.
     pub fn analyze(
         f: &Func,
         c: &dom::Cfg,

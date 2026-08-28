@@ -144,10 +144,27 @@ fn walk(f: &mut Func, unit: bool) -> bool {
     let lf = dom::loops(&c, &dt);
     // innermost first: the inner loop is the hot one, and rewriting it does not
     // disturb the outer loop's recurrences.
+    // Counted once for the whole function: it does not depend on which loop is
+    // being strengthened, and `strengthen` asks it of every loop.
+    let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
+    for b in f.blocks.iter() {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    *uses_total.entry(v).or_insert(0) += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                *uses_total.entry(v).or_insert(0) += 1;
+            }
+        });
+    }
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     for li in order {
-        if strengthen(f, &c, &dt, &lf, li, unit) {
+        if strengthen(f, &c, &dt, &lf, li, unit, &uses_total) {
             // The CFG is unchanged but every analysis over VALUES is stale.
             return true;
         }
@@ -244,6 +261,7 @@ fn strengthen(
     lf: &dom::LoopForest,
     li: usize,
     unit: bool,
+    uses_total: &HashMap<ValueId, usize>,
 ) -> bool {
     let s = match scev::LoopScev::analyze(f, c, dt, lf, li) {
         Some(s) => s,
@@ -337,7 +355,7 @@ fn strengthen(
     // it is on: an address value it rewrites carries its loads with it, since a
     // load's address operand is one of the uses being replaced.
     if consumer_blind() {
-        let vals = value_candidates(f, &s, lf, li);
+        let vals = value_candidates(f, &s, lf, li, uses_total);
         if !vals.is_empty() {
             let mut keys: Vec<Key> = vals.keys().cloned().collect();
             keys.sort();
@@ -393,6 +411,13 @@ fn value_candidates(
     s: &scev::LoopScev,
     lf: &dom::LoopForest,
     li: usize,
+    // HOW OFTEN EACH VALUE IS READ IN THE WHOLE FUNCTION — a fact about the
+    // FUNCTION, not about this loop, so it is counted once by the caller and
+    // handed down. Rebuilding it here walked every block of the function, and
+    // hashed every operand of every instruction, once per loop per round: on
+    // `s0940` that is 10,389 walks of the same unchanging thing, and it was the
+    // whole of a compile taking ten times gcc's.
+    uses_total: &HashMap<ValueId, usize>,
 ) -> HashMap<Key, Vec<ValueId>> {
     use std::collections::HashSet;
     let body: HashSet<BlockId> = lf.loops[li].body.iter().copied().collect();
@@ -417,42 +442,27 @@ fn value_candidates(
 
     // Where each value is read: inside the loop's instructions, or anywhere else
     // (another block, or any terminator) — the second kind disqualifies it.
+    //
+    // ONLY THE BODY IS WALKED, because the rest is arithmetic. "Anywhere else"
+    // is every use that is not a body INSTRUCTION — a non-body instruction, a
+    // non-body terminator, or a body terminator — and `uses_total` already
+    // counts every use in the function. So a value escapes exactly when it is
+    // read more often than the body's instructions read it, and the walk over
+    // blocks this loop does not contain buys nothing. That walk was the second
+    // of two over the whole function, per loop, per round.
     let mut read_in_loop: HashMap<ValueId, usize> = HashMap::new();
-    let mut escapes: HashSet<ValueId> = HashSet::new();
-    let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
-    for b in f.blocks.iter() {
-        for inst in &b.insts {
+    for &b in &lf.loops[li].body {
+        for inst in &f.blocks[b as usize].insts {
             inst.uses(|o| {
                 if let Operand::Val(v) = o {
-                    *uses_total.entry(v).or_insert(0) += 1;
+                    *read_in_loop.entry(v).or_insert(0) += 1;
                 }
             });
         }
-        b.term.uses(|o| {
-            if let Operand::Val(v) = o {
-                *uses_total.entry(v).or_insert(0) += 1;
-            }
-        });
     }
-    for (bi, b) in f.blocks.iter().enumerate() {
-        let inside = body.contains(&(bi as BlockId));
-        for inst in &b.insts {
-            inst.uses(|o| {
-                if let Operand::Val(v) = o {
-                    if inside {
-                        *read_in_loop.entry(v).or_insert(0) += 1;
-                    } else {
-                        escapes.insert(v);
-                    }
-                }
-            });
-        }
-        b.term.uses(|o| {
-            if let Operand::Val(v) = o {
-                escapes.insert(v);
-            }
-        });
-    }
+    let escaped = |v: ValueId, inside: usize| {
+        uses_total.get(&v).copied().unwrap_or(0) > inside
+    };
 
     // A probe, while the gate is being measured (`ZCC_IVXCALL`): fire only in a
     // loop that CALLS. A call forces every live value into a callee-saved
@@ -505,8 +515,8 @@ fn value_candidates(
             // one instruction; an address read twice or more amortizes it, which
             // is `n7_nested_subq`'s shape (one `&inner[j]` handed to two
             // predicates) and where the win was measured.
-            if escapes.contains(&v)
-                || read_in_loop.get(&v).copied().unwrap_or(0) < 2
+            let inside = read_in_loop.get(&v).copied().unwrap_or(0);
+            if escaped(v, inside) || inside < 2
                 || s.ivs.contains_key(&v)
             {
                 continue;
@@ -709,6 +719,23 @@ pub fn widen(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);
     let lf = dom::loops(&c, &dt);
+    // Counted once for the whole function: it does not depend on which loop is
+    // being strengthened, and `strengthen` asks it of every loop.
+    let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
+    for b in f.blocks.iter() {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    *uses_total.entry(v).or_insert(0) += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                *uses_total.entry(v).or_insert(0) += 1;
+            }
+        });
+    }
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     for li in order {
@@ -1071,6 +1098,23 @@ pub fn substitute(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);
     let lf = dom::loops(&c, &dt);
+    // Counted once for the whole function: it does not depend on which loop is
+    // being strengthened, and `strengthen` asks it of every loop.
+    let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
+    for b in f.blocks.iter() {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    *uses_total.entry(v).or_insert(0) += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                *uses_total.entry(v).or_insert(0) += 1;
+            }
+        });
+    }
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     for li in order {
@@ -1406,6 +1450,23 @@ pub fn countdown(f: &mut Func) -> bool {
     let c = dom::cfg(f);
     let dt = dom::domtree(f, &c);
     let lf = dom::loops(&c, &dt);
+    // Counted once for the whole function: it does not depend on which loop is
+    // being strengthened, and `strengthen` asks it of every loop.
+    let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
+    for b in f.blocks.iter() {
+        for inst in &b.insts {
+            inst.uses(|o| {
+                if let Operand::Val(v) = o {
+                    *uses_total.entry(v).or_insert(0) += 1;
+                }
+            });
+        }
+        b.term.uses(|o| {
+            if let Operand::Val(v) = o {
+                *uses_total.entry(v).or_insert(0) += 1;
+            }
+        });
+    }
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     for li in order {
