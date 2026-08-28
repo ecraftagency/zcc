@@ -1172,3 +1172,70 @@ no-inline build, which is faster than the referee.
 zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.
 The off/on geomeans in the last table are from different box sessions; only the
 three-pair table above is interleaved, and it is the one the removal rests on.
+
+## M25. Division by a constant: the theorem is right and it loses on this core
+
+**WHAT THIS IS.** Granlund–Montgomery division-by-multiplication was implemented,
+proven, measured, and REMOVED. This is the measurement, recorded so the row is
+not rebuilt on the strength of the textbook.
+
+**WHAT WAS BUILT.** A HIR pass rewriting `UDiv`/`URem`/`SDiv`/`SRem` by a
+non-power-of-two constant into the high half of a product plus a shift — Hacker's
+Delight §10-9 `magicu` and §10-4 `magic`, at 32 and 64 bits, the 32-bit case as a
+widening product with its top half taken (what `umull`/`smull` are). Powers of
+two, `d = 0` and `|d| = 1` refused, remainder derived as `n - (n / d) * d`.
+
+**THE TRANSCRIPTION IS CORRECT, and that is not the question it answers.** The
+multiplier and shift were checked against the real division over every divisor
+from 3 to 2000 at the boundaries of the width — 0, 1, 2, the powers, `INT_MIN`,
+`INT_MAX`, `UINT_MAX` — and at 64 bits over a divisor sample including
+`0x1_0000_0001` and `u64::MAX - 1`, signed and unsigned, positive and negative
+divisors. Not one case disagreed. The row was correct; it was not profitable.
+
+**WHAT IT MEASURED**, 49-program taxonomy suite, against the shipped compiler:
+
+| | shipped | + divmagic | + divmagic + `ZCC_HOIST` |
+|---|---|---|---|
+| EXEC geomean | 1.023 | 1.045 | 1.034 |
+| INSN geomean | 1.0717 | 1.1101 | 1.1440 |
+| `a2_udiv_mod` | 1.117 | 1.100 | — |
+| `a3_sdiv_mod` | 1.128 | 1.148 | — |
+| `e3_struct_byval` | 1.052 | 1.322 | — |
+
+**WHY IT LOSES, and it is not the theorem.** gcc -O1 emits the same rewrite on
+the same programs and is faster, so the decision is not what separates them —
+the ENCODING is. For `k % 5` in `e3_struct_byval`'s loop zcc emits nine
+instructions and gcc five:
+
+```
+sxtw x10, w8
+movz x11, #26215
+movk x11, #26214, lsl #16    ← the multiplier, rebuilt every iteration
+mul  x11, x10, x11
+asr  x11, x11, #32
+asr  w11, w11, #1
+add  w11, w11, w11, lsr #31
+movz w12, #5                 ← and the divisor, also every iteration
+msub w11, w11, w12, w8
+```
+
+Three of the nine are constant materialization inside the loop, which gcc hoists.
+So the row is a DEPENDENT of the loop-invariant constant hoist, and that hoist is
+itself off because it costs 3.0% of INSN geomean across the suite (this section's
+third column is the pair measured together: still a loss on both axes).
+
+**AND THE DIVIDER ON THIS CORE IS NOT SLOW**, which is the fact the textbook
+assumes and this machine denies. `a2_udiv_mod` runs three million iterations of a
+loop containing TWO `udiv` in 4,068 us — 1.36 ns, about 4.3 cycles per iteration.
+A divider that were "tens of cycles, not pipelined" could not produce that
+number. The folklore is a Cortex-A53-era fact; it is not a fact about this core,
+and there is no vendor optimization guide to have told us otherwise, which is
+precisely why this section exists.
+
+**WHAT WOULD HAVE TO CHANGE** before it is worth rebuilding: the loop-invariant
+constant hoist must pay for itself first, and the emitted sequence must reach
+gcc's five instructions rather than nine. Until both hold, the shipped `udiv` is
+the faster code.
+
+**WHEN / WHERE.** 2026-08-28, M1 Pro under Docker, aarch64-linux musl release
+zcc, gcc -O1 referee, the 49-program taxonomy suite.
