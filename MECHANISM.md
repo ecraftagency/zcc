@@ -2749,7 +2749,8 @@ row. The residual with it removed:
 
 **SCEV's own coverage is the frontier**, not any gate written on top of it.
 
-**THE SIGN-EXTENDED INDEX.** Counted over the same corpus:
+**THE SIGN-EXTENDED INDEX — counted, then REFUTED on the clock in the same
+session.** Read to the end before acting on the table.
 
 | | zcc | gcc -O1 |
 |---|---|---|
@@ -2775,11 +2776,38 @@ which is true of a 64-bit index and false of a 32-bit one, where the same
 addressing mode carries an extension M1 prices at a cycle. M2's measurement
 (`j2_histogram`) is not disturbed; its scope is.
 
-**NOT YET A ROW.** No hand edit has been taken, so nothing here is a prediction
-about cycles — only a count of what the two compilers emit. The narrow peephole
-underneath it (a `sxtw` whose source is the immediately preceding 32-bit ALU
-result) is 30 instructions on the suite and is NOT the row; widening the
-induction variable is, and it is unbuilt.
+**AND THE HAND EDIT REFUTES IT.** The count is large and the clock does not care.
+
+`k1_dispatch` holds 78 of the 141 sites. 73 of them are provably rewritable with
+no analysis at all: 63 index registers are defined by `and wD, wS, #255` and 10
+by `ldrb`, and a `w`-form write ZEROES bits 63:32 (DDI 0487 B1.2.1, the same fact
+`destruct::drop_self_moves` rests on), so the register already holds the
+zero-extended value and the index is in [0,255] where `sxtw` and `uxtw` and the
+identity all agree. Rewriting `[xB, wI, sxtw #k]` to `[xB, xI, lsl #k]` at those
+73 sites is therefore sound by inspection. Output identical, instruction count
+identical — 1,597 both sides, which is the point: this row can only pay in
+cycles.
+
+| | best-of-10 | best-of-40, alternating |
+|---|---|---|
+| hand / base | 0.9798 | **0.9946** |
+
+**0.5%, on the program that carries 55% of the whole suite's sites.** The first
+reading said 2.0% and was noise of the same magnitude as the effect — the fourth
+time this project has been told that by a single reading.
+
+**THE HARDWARE FACT THIS ESTABLISHES, and it is a correction to `M1`'s SCOPE.**
+`M1` measured an extended-register operand at 2 cycles against 1 and the operative
+rule in Law 3c was written from it. That is an **ALU** fact. In a MEMORY
+addressing mode the extension is absorbed by address generation and costs
+nothing measurable on this core: 73 of them removed from the hot path of a
+dispatch loop bought half a percent. So `[base, wN, sxtw #k]` is NOT a Law-3c
+liability, the 141-against-11 count is not a gap, and induction-variable widening
+cannot be justified from it — whatever it is worth, it is not worth this.
+
+The narrow peephole underneath (a `sxtw` whose source is the immediately
+preceding 32-bit ALU result) is 30 instructions on the suite, is a size row
+rather than a time one, and is not worth a pass on its own either.
 
 ---
 

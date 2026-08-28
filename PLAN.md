@@ -67,15 +67,14 @@ been aimed at it. First question, unanswered: `isa::mov_chain` knows
 ALU operands. Count the constants whose chain is ≥2 and which `logical_imm`
 accepts before writing anything.
 
-**THE BIGGEST UNBUILT ROW, and it is not a copy row either** (`M28`): a C `int`
-index stays 32 bits, so `a[i]` sign-extends at every use — **141 memory operands
-of the form `[base, wN, sxtw]` against gcc's 11**, 78 of them in `k1_dispatch`
-alone, plus 161 standalone `sxtw` against 65. gcc widens the induction variable
-to 64 bits once, which ISO 9899 6.5p5 permits. Law 3c first, size second: the
-folded extension costs no instruction and one cycle (`M1`), on the address path
-of a dispatch loop. HAND-EDIT `k1_dispatch` BEFORE writing any pass — the narrow
-peephole underneath (a `sxtw` on the immediately preceding 32-bit ALU result) is
-only 30 instructions and is not the row.
+**REFUTED THE SAME SESSION** (`M28`): the sign-extended index. zcc emits 141
+memory operands of the form `[base, wN, sxtw]` against gcc's 11, 78 in
+`k1_dispatch` alone — and rewriting 73 of them by hand, output identical and
+instruction count identical, bought **0.5%** (0.9946, best-of-40 alternating; a
+first best-of-10 said 0.9798 and was noise). The extension is free inside an
+addressing mode on this core, which is a correction to `M1`'s SCOPE: that 2-cycle
+fact is about an ALU operand. Do not open induction-variable widening on the
+strength of this count.
 
 **The gate every row owes:** a commuting square, both axes, and for EXEC an
 interleaved A/B in ONE box session (`tests/bench/abpair.sh`). Two `realprog.sh`
