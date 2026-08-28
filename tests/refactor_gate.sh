@@ -33,9 +33,19 @@ MODE="${1:-check}"
 OUT="$WORK/.out"; mkdir -p "$OUT"
 SUMS="$WORK/sums.$MODE.txt"; : > "$SUMS"
 md5f(){ md5 -q "$1" 2>/dev/null || md5sum "$1" | awk '{print $1}'; }
-# Corpus = freestanding stress programs + every tests/cases + tests/bench .c that compiles
-# with embedded headers alone (header-needing cases are skipped: they need the Linux box).
-for c in "$WORK"/stress/*.c "$ROOT"/tests/cases/*.c "$ROOT"/tests/bench/*.c; do
+# Corpus = freestanding stress programs + every tests/cases, tests/bench and
+# tests/bench/suite .c that compiles with embedded headers alone (header-needing
+# cases are skipped: they need the Linux box).
+#
+# THE SUITE PROGRAMS ARE IN THE CORPUS BECAUSE OF WHAT THEY REACH, not because
+# they are benchmarks. A gate program earns its place by making a pass FIRE:
+# a corpus that never exercises a row cannot notice a change to it, and on
+# 2026-08-28 exactly that happened — `iv`'s consumer-blind row fired on 0 of the
+# 59 programs then in the corpus, so a change to it passed this gate, passed the
+# sqlite witness, and crashed on musl. `k1_dispatch` and `k2_live_pressure` are
+# the two programs in the tree that fire that row. The rule the episode leaves:
+# when a defect escapes this gate, the shape that escaped joins the corpus.
+for c in "$WORK"/stress/*.c "$ROOT"/tests/cases/*.c "$ROOT"/tests/bench/*.c "$ROOT"/tests/bench/suite/*.c; do
   [ -e "$c" ] || continue
   b="$(basename "${c%.c}")"
   s="$OUT/$b.$MODE.s"
@@ -57,7 +67,6 @@ MUSL="$ROOT/target/aarch64-unknown-linux-musl/release/zcc"
 large_md5() { # prints the md5, or nothing when the box is unavailable
   [ -f "$SUITES/sqlite/sqlite3.c" ] || return 1
   command -v docker >/dev/null 2>&1 || return 1
-  docker image inspect zcc-box >/dev/null 2>&1 || return 1
   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
     cargo build -q --release --target aarch64-unknown-linux-musl 2>/dev/null || return 1
   docker run --rm \

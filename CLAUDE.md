@@ -6,7 +6,7 @@ zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external cra
 
 > **⚠️ AWS OPERATIONAL SAFETY only operation on **`us-east-2` region
 
-> **⚠️ EVERY SCRIPT RUNS DETACHED, NOTIFIED ABLE, PROGRESS CHECKABLE, ON EITHER BOX — and NOTHING WATCHES IT. The completion notice is the signal; a second process that sleeps and greps competes with the run it is watching and quietly corrupts every timing taken beside it. To look in mid-run, read the output file once.
+> **⚠️ RUN ONE THING, WAIT FOR IT, REPORT IT. Detach only ON DEMAND — when the user asks, or for a job long enough that waiting is absurd (the reference `.s`, a fuzz campaign), and then say so. Nothing watches a detached job: the completion notice is the signal, and a second process that sleeps and greps competes with the run it is watching. Concurrency is not free here even when the machine can afford it: parallel work makes it cheap to START things and expensive to stay aimed, it lets a measurement be read while something else perturbs the box, and it tempts a baseline to be taken from whatever finished first instead of from the thing being reproduced. All three of those produced wrong calls on 2026-08-28. One command, one result, one decision.
 
 ## Law 0 — PURITY IS THE PRECONDITION (standing order, 2026-08-26)
 
