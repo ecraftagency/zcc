@@ -8,7 +8,7 @@ static int a[N];
 int main(void){
     long i; unsigned long s = 0, seed = 1u;
     for(i=0;i<N;i++) a[i] = (int)(i*3);
-    for(i=0;i<600000;i++){
+    for(i=0;i<250000;i++){
         long lo = 0, hi = N-1; int key;
         seed = seed*6364136223846793005UL + 1442695040888963407UL;
         key = (int)((seed>>33) % (unsigned long)(N*3));

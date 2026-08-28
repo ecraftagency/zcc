@@ -1,201 +1,163 @@
 # zcc — Project Charter
 
-zcc is a strict-C99 C compiler (C89 ⊂ C99), written in Rust, zero external crates. Terminology stays English. This file holds the project's standing rules: the laws first, then the articles that support them, each with its detail offloaded to its own document. Only Laws 0–3 and **Law 3c** carry the word **law**; the rest are mechanisms.
+A strict-C99 compiler (C89 ⊂ C99) in Rust, no external crates, AArch64 ELF.
 
-**THIS FILE CARRIES NOTHING THAT CHANGES ACROSS A PHASE OR A MILESTONE.** That is the whole test, and it is a test about the line's LIFETIME, not its subject: if a milestone can make the line wrong, it belongs in a document the Index names, never here. Measurements, ratios, statuses, commits, tags, branch names, plan positions and date-stamped findings all fail it by construction — every one of them is true only on the day it was written, and a stale rule is worse than no rule because it is still obeyed. What stays is what remains true whatever the numbers do. A line that would need editing after a good session does not belong here.
+**Only what stays true across every milestone belongs here.** Measurements,
+ratios, statuses, commits, tags, branch names and dated findings do not — a
+stale rule is worse than no rule, because it is still obeyed. Read this and act;
+it cites other documents, it does not depend on them.
 
-> **⚠️ AWS OPERATIONAL SAFETY only operation on **`us-east-2` region
+**Operating:** run one thing, wait, report it — detach only on request, and say
+so. Parallel work makes it cheap to start things and expensive to stay aimed.
+**AWS: `us-east-2` only.**
 
-> **⚠️ RUN ONE THING, WAIT FOR IT, REPORT IT. Detach only ON DEMAND — when the user asks, or for a job long enough that waiting is absurd (the reference `.s`, a fuzz campaign), and then say so. Nothing watches a detached job: the completion notice is the signal, and a second process that sleeps and greps competes with the run it is watching. Concurrency is not free here even when the machine can afford it: parallel work makes it cheap to START things and expensive to stay aimed, it lets a measurement be read while something else perturbs the box, and it tempts a baseline to be taken from whatever finished first instead of from the thing being reproduced. All three of those produced wrong calls on 2026-08-28. One command, one result, one decision.
+## Law 0 — purity is the precondition
 
-## Law 0 — PURITY IS THE PRECONDITION (standing order, 2026-08-26)
+    purity ≫ exec > size > compile speed
 
-THE ULTIMATUM names 1× against gcc-O1 on both axes as the STOPPING POINT.
-This says what may not be spent to reach it:
+**No number is banked at the cost of a citation.** A row that reaches parity by
+removing a proof does not ship, however large the number. zcc is educational, so
+a citation is a reading path — a student landing on any line can read upward to
+the theorem it realizes — not a lint marker. `tests/provenance.sh` checks it.
 
-```
-purity  ≫  exec  >  size  >  compile speed
-```
+## Law 1 — the decomposition theorem
 
-**No number is banked at the cost of a citation.** A row that would reach parity
-by removing a proof does not ship, however large the number. Laws 1 and 3 are
-claims ABOUT THE SOURCE — every line in theory ∪ fact, every pass carrying its
-commuting square — and `tests/provenance.sh` checks both in the sci gate.
-`MECHANISM.md` Part B is the plan of record for that work; its Part F holds the
-facts that have no spec to cite, so `THEORY.md` II-* stays cited-spec and
-nothing else.
+    zcc source = ( theory    → control flow + data structure + algorithm )
+               ⊕ ( spec text → constant + parameter + table )
 
-zcc is an EDUCATIONAL compiler and a community project. A citation is therefore
-a READING PATH — a student who lands on any line should be able to read upward
-to the theorem it realizes — not a lint marker. Write it for a person.
+Every line of `src/` lies on exactly one side. **No magic number without
+provenance.** If no line lies outside {theorem ∪ spec}, zcc passes every suite by
+construction: zcc and the referee are both shadows of the same specification. zcc
+never proves itself — the referee is independent, which is also why the AI stays
+out of the trust path.
 
-## Law 1 — the decomposition theorem (Law Zero; if only one is kept, keep this. Full text: `THEORY.md`)
+## Law 2 — a defect has exactly two doors
 
-```
-zcc source = ( math/theory → control-flow + data-structure + algorithm )   [Side I: THEORY.md Part I]
-           ⊕ ( iso/os/arch/gcc spec → constant + param + value-table )      [Side II: THEORY.md Part II]
-```
+1. **Side I** — a misread theorem: an algorithm outside the theorem it claims.
+2. **Side II** — a wrongly-injected value: an offset, ABI constant, layout or
+   section applied wrongly.
 
-Every line of `src/` lies on exactly one side — an algorithm derived from a theorem, or a constant transcribed from a spec line (no magic number without provenance). **Correctness-by-construction:** if no line lies outside {theory-fact ∪ spec-fact} and each faithfully realizes its side, zcc necessarily passes every suite — zcc and the referee are both shadows of the same specification. Gödel/Rice/Halting lie *outside* the compiler↔suite relation: the referee is an *independent* oracle, so zcc never proves itself (the same reason the AI is kept out of the trust path).
+**The exception, and it is not a third door:** the measurement lied. Claim it only
+after several independent formulations converge. Reflexive blame of the test is
+how a real defect hides.
 
-## Law 2 — bug-fix by decomposition (a *direct corollary* of Law 1, by inverse proof)
+**Measure before speaking.** Locate the line mechanically first, classify after.
+Guessing the wrong side is normal; keep measuring. Build the oracle, run it, stay
+silent until it prints a verdict.
 
-`src/*.rs` is produced by nothing but `compile(theorems) ⊕ inject(ultimate-fact values)` (Law 1). Contrapositive: a defect in `src` can therefore lie in **only two places** — there is provably no third door:
-1. **Side I** — a *misinterpreted theorem*: an algorithm/control-flow outside its theorem.
-2. **Side II** — a *wrongly-injected value*: a spec-constant (offset, ABI value, layout, section) applied wrongly.
+## Law 3 — certify at the middle, not at the binary
 
-The **one exception**, rare and rarer still, is that the **measurement itself is wrong** — the oracle / referee / test / generator lied, and zcc was *innocent all along*. This is not a co-equal Side III; it is the case that proves zcc was never guilty, so it may be claimed **only after multi-angle proof** (several independent formulations converging). Reflexive blame of the test is exactly what conceals a real Side-I/II bug.
+Every intermediate artifact carries the theorem that certifies it, so always ask
+*"can this be proven here, before the final suite?"* A theorem is not only a
+compiler of `src/`; it is a prover.
 
-**Measure before speaking:** locate the line mechanically *first*, classify into I / II (/ the measurement exception) *after* — guessing the wrong side first is normal, keep measuring. No classification is asserted before a script has printed a verdict; the AI may only build and run the oracle, then stay silent until it speaks. (Recorded evidence + full presumption-of-guilt text: `MECHANISM.md` Part A.)
+- **Correctness** — a pass ships its commuting square `⟦IR⟧ = ⟦IR'⟧` (translation
+  validation for backend passes). Generators only confirm, never discover.
+- **Cost** — instruction count is a fold over the IR, written independently of
+  the lowering; the square `cost(f) ≡ len(codegen(f))` certifies the backend
+  realizes it. A mismatch is a Law-2 defect at one instruction, never a mystery
+  to grep out of `.s`. Compute a transform's delta on the model **before any
+  build**; patch-and-run-the-suite is the last resort.
+- **Exhaustion** — a theorem is not done at its first green. Measure its
+  **residual**, every site where it could have fired and did not, and classify
+  each: (a) a real ISA/ABI boundary, proven, or (b) an incomplete realization. It
+  is exhausted only when the residual is entirely (a). Stopping while (b) remains
+  is a Law-1 violation.
 
-## Law 3 — early-catch: certify at the middle, not at the binary
+## Law 3c — count is not cost
 
-Not a corollary of Law 1 but an *idea of the Correctness-by-Construction approach itself*: since `src/` is compiled theorem-by-theorem, each **intermediate artifact carries the very theorem that certifies it** — so the question is always *"can this be proven here, before the final suite (csmith + yarpgen)?"*, and where the answer is yes it is proven **at the earliest layer where it becomes decidable** (IR / emitted `.s`), never deferred down to the final binary + suite. A theorem is not only a *compiler* of `src/`; it is a *prover*.
-- **Correctness** — a pass `IR→IR'` ships with its commuting square `⟦IR⟧=⟦IR'⟧` (IR passes) or a machine translation-validation (backend passes). csmith/yarpgen only *confirm*, never *discover*.
-- **Optimization (cost-square)** — cost is proven the way correctness is: at the **theorem layer, in the theorem-programming-language**, not on the compiled artifact (Rust `.s`) via patch→build→suite. The instruction-count of a function is a *catamorphism over the IR*, `cost(f) = Σ_inst emit_len(inst, alloc)`, written **independently** from the lowering theorems (each `Inst` → its machine-insn expansion); the **cost-square** `cost(f) ≡ len(codegen(f))` — proven per-function over the whole corpus — certifies that the Rust in the backend *faithfully realizes* that cost-theorem. `[mir-rearch]`: this square is now EXACT BY CONSTRUCTION rather than a separate model — one `MInst` is one machine instruction after frame/layout, so `cost(f) = |MIR_final(f)|` and `emit.rs` expands nothing (the single exception, `MovImm`, reports its chain length via `isa::mov_chain().len()`). This is the exact dual of the correctness commuting square: there `⟦f⟧=⟦opt(f)⟧`, here `cost=len∘codegen`. A mismatch is a **Law-2 defect**, localized to the offending `Inst` — either code drifted from its lowering theorem (Side I) or the cost-theorem was mis-transcribed — *never* a mystery to be grepped out of `.s`. Once the square holds, a transform's Δinsn is computed **on the model, before any build** (predict → apply → the model confirms); patch-Rust-then-run-the-suite is the slow path of last resort, reserved for effects the cost-model provably cannot see. `.s` and the suite *confirm*, never *discover* (the LICM ship-then-regress trap).
-- **Exhaustion (vắt kiệt — Law-4 folded in, a corollary not a fourth law)** — a theorem is not "done" at its first positive result, however large; **cấm dừng ở green đầu tiên**. For each shipped theorem T, its **residual** — the multiset of sites where T *could* fire but did not — is measured on the cost-model, and every residual case classified: (a) a *fundamental limit* (a real ISA/ABI encoding boundary, proven — e.g. an offset genuinely beyond imm12 range), or (b) a *convenience truncation* (an incomplete or gated realization). T is **exhausted** only when residual = (a) entirely. This is the **coverage-dual** of Article E's constant-fidelity question: there it is *"the spec's number, or my convenience's number?"* (the value of a constant); here it is **"have I PROVEN this theorem exhausted, or did I stop at the first green?"** (the coverage of a transform). Stopping at a small positive while (b)-cases remain is a **Law-1 violation** — the algorithm does not *faithfully realize* its side over the full ultimate-fact — catchable as a Law-2 Side-I defect. Improvement therefore stays *inside* Law 1's "faithfully realizes" clause, now made mechanical and deterministic by the cost-model, with no separate "improvement law" needed.
+    size:  cost(f)   = |MIR(f)|                 proven per function
+    time:  cycles(L) = critical recurrence(L)   proven per loop
 
+> **Fewest instructions is not fastest code.** A codegen row is judged by the
+> longest dependence chain it leaves. Where the two models disagree, time wins.
 
-## Law 3c — COUNT IS NOT COST (the TIME dual; performance stands immediately behind correctness)
+**Operative rule:** never leave a multi-cycle operation in front of an address or
+a loop-carried value when a one-cycle operation computes the same thing.
 
-A law, not a mechanism: correctness is first, and **performance is the thing
-directly behind it**. Law 3 certifies a pass at the middle on two axes — meaning
-(`⟦f⟧ = ⟦opt f⟧`) and SIZE (`cost(f) = |MIR(f)|`, exact by construction on this
-branch). That second square is exact for size **and blind to time by the same
-construction**, because one `MInst` is one machine instruction. So it needs its
-dual:
+**Third blindness:** a static count weighs an instruction in a latch run millions
+of times the same as one in a cold arm. Rank a row by executions.
 
-```
-size:   cost(f)   = |MIR(f)|                    proven per function
-time:   cycles(L) = critical-recurrence(L)      proven per loop
-```
+**What may be claimed.** A suite is always narrower than the language and runs on
+one microarchitecture at one input size. **Name the suite and the core, or say
+nothing.** Claim parity only with a margin — how far the sampled fraction must
+win before the unsampled remainder is unlikely to flip the sign. Parity announced
+from a narrow suite is a Law-0 failure. Widen the surface: generators find
+cliffs, real programs carry the geomean.
 
-> **Fewest instructions is not fastest code. A code-generation row is judged by
-> the longest dependence chain it leaves, not by how many instructions it emits.**
-> Where the two models disagree, TIME wins (Law 0: `exec > size`).
+## Articles
 
-**The operative rule.** Never leave a multi-cycle operation in front of an
-address or a loop-carried value when a one-cycle operation computes the same
-thing: `madd` on a strided address → `add`; `add …, w, sxtw` → `ldrsw` + `add`;
-`mul` by a constant → shift-and-add.
+**A** — (1) strict C99; extensions only when real software demands one, marked
+`EXT(...)`. (2) Minimal LOC: no feature before a real `.c` demands it, no
+anticipatory abstraction, zero external crates. **Compliance beats LOC.**
 
-**Measured, not asserted.** The law was not reasoned into this file; it
-was forced by a kernel that reached parity at an instruction count that did not
-change at all, because a multiply had stood at the head of a chain ending in a
-strided load. `MECHANISM.md` Part F holds that case and the latency table it
-rests on, and `ARM64.md` holds the leverage table the model is built from.
+**B** — `main.rs → lexer → parser → AST → compile.rs → HIR (target-independent
+SSA) → isel → MIR (machine SSA) → regalloc → frame/layout → emit.rs → .s`. The
+frontend/backend boundary is `src/ast.rs`: frontend builds, backend only reads.
+`compile.rs` is the single door. **All target knowledge lives in the ISA tables,
+the ABI automaton and the emitter**; nothing above `isel` may name a machine
+register. A second target adds a second MIR and isel, never a conditional. **A
+pass is a pass, never a text peephole** — the emitter decides nothing and
+re-parses nothing. Single crate.
 
-**Law-4 dual (exhaustion).** A row is exhausted only when no remaining site
-trades chain length for instruction count. A residual measured on `cost = |MIR|`
-alone cannot see this class, so it does not discharge Law 4 for a codegen row.
+**C** — `CC=zcc` slots into a real build system without editing one build file.
+Acquire flags test-first; swallow the rest silently, but **never mis-swallow a
+flag carrying an argument** — one misalignment eats an input file. Standard
+`file:line:` diagnostics, correct exit codes.
 
-**WHAT MAY BE CLAIMED, and it is not what the number says.** Parity against
-gcc -O1 is the stopping point, and a measured parity on the suite of the day
-does NOT establish it. The suite is always narrower than the language: whole
-classes go unsampled — heavy floating point, working sets past cache, deep call
-graphs and indirect dispatch, varargs and bitfields — and it runs on ONE
-microarchitecture at one input size per program. A geomean over it is evidence
-about ITS members first.
+**D** — extension logic lives in `src/ext.rs`; the core only calls `ext_*`.
+Unfactorable sites carry `// EXT(...)` and `grep 'EXT(' src/` must cover the whole
+deviation surface. Verified by excision. Extension tests live apart from the C99
+cases.
 
-Therefore parity is claimed only with a **margin**, and even then the claim
-names the suite and the core it was taken on — never "matches gcc -O1" plain.
-The margin is not padding; it is coverage insurance, the amount by which the
-sampled fraction must win before the unsampled remainder is unlikely to flip the
-sign. Compiler comparison is not a single number, and a compiler that announces
-parity from a narrow suite has mis-stated its own result, which is a Law-0
-failure (a claim bought at the cost of its provenance) rather than a small one.
+**E — how anything gets believed.**
+- **Differential** against an independent oracle. A diff at an undefined point is
+  meaningless: filter by spec, never by hand-waving.
+- **Numeric provenance** — every number derives from a stated premise, and every
+  constant answers: *the spec's number, or my convenience's?* A truncation posing
+  as a spec constant is a Law-1 violation.
+- **Clean input** — a green verdict needs an evidence trail, never a bare count.
+- **Byte-identical** — pure code motion holds `md5(.s)` unchanged; identical bytes
+  *are* the square. Two witnesses, because small programs cannot see a pass that
+  scales with function size. A green is scoped to what was compiled, and a
+  baseline is an artefact of the compiler being reproduced, never of an earlier
+  candidate.
+- **Determinism** — identical IR gives identical bytes, across fresh processes.
+- **Iteration speed** — a mechanism measured slower than the direct loop is
+  discarded, however elegant.
+- **Science gates** — structural exhaustion above the corpus, expanded, never
+  contracted.
 
-The surface is to be WIDENED, and the two instruments do
-different jobs: **csmith finds CLIFFS** (run many, report only the tail where
-zcc/gcc exceeds a threshold; it is a discovery engine pointed at time instead of
-correctness, and it is already in the gate), while **real programs carry the
-geomean** (csmith's control flow and global-memory traffic are nothing like real
-software, so a geomean over it would be a number about csmith).
+**F** — the ABI specifics are Side-II constants and mistakes there produce
+cryptic crashes. Read the spec tables before touching the ISA tables, the ABI
+automaton or the emitter.
 
----
+**G** — refactor, optimize and extend all obey Laws 1–3 and none trades
+verification for a number. A **refactor** ships a byte-identical proof, ranked
+*better ground for optimization ∧ easier proof ≫ fewer lines* — never merge two
+proof-carrying passes to save lines. An **optimization** ships both squares. An
+**extension** stays strict C99 with the deviation visible.
 
-## Article A — the two supreme requirements (every decision reduces to these)
+## Index — five documents, and `src/` may point at no others
 
-1. **Strict C99 compliance** — semantics exactly per spec; extensions (C11/vendor) only when real software demands, marked `EXT(...)`. Status of the remaining C99 items: `README.md`.
-2. **Minimal LOC** — no feature before a real `.c` demands it, no anticipatory abstraction, zero external crates; the compiler is the theorem and must stay readable. Ceiling + budget: `README.md`.
+A document per campaign is how a repository acquires contradictions faster than
+facts. **A new one is not created without deleting one.**
 
-When they conflict, **compliance wins over LOC.**
+- **`THEORY.md`** — the two-side catalog: Part I theorems, Part II spec tables.
+- **`SEMANTICS.md`** — the reference semantics behind `⟦·⟧`.
+- **`MECHANISM.md`** — how the compiler is built and every fact measured about
+  it, each dated and pinned to a commit. **Part G §G0 is the field guide to where
+  defects live — start there when something is wrong and the reason is not
+  obvious.** Facts with no spec to cite are in Part F, cited as `MEASURED M<n>`.
+- **`ARM64.md`** — the target's facts and the isel exhaustion checklist.
+- **`README.md`** — what zcc is, how to build it, the milestone ladder and debt.
 
-## Article B — architecture (invariant)
+**`PLAN.md` is not one of the five.** One grind, not a list; 100 lines; never
+cited from `src/`; emptied when the grind closes. Every row leaves by one of two
+doors: into `MECHANISM.md` because it won, or into its Part F as a refutation
+because it lost.
 
-```
-main.rs (driver) → lexer → parser → AST (arena + NodeId(u32)) → compile.rs (the single door)
-                 → HIR (target-independent SSA) → isel → MIR (machine, SSA) → regalloc
-                 → MIR (physical) → frame/layout → emit.rs → .s text
-```
-- **Frontend/backend boundary = `src/ast.rs`** (AST + TyTab). Frontend builds, backend only reads; no cross-import. Layout size/align live in TyTab (LP64 locked — parameterize TyTab, don't scatter conditionals).
-- **`src/compile.rs` is the single door** (`compile(&Ast) -> String`); every layer below it is private to the pipeline. Layer map and the rationale for each seam: `MECHANISM.md` §G2.
-- **Layered, not one module per target** `[mir-rearch]`. The old rule ("one module per target under `src/codegen/`") was written when the backend was a single AST→asm emitter; it does not survive a pipeline whose seams are LAYERS, and `src/codegen/` no longer exists. The invariant it protected does survive, restated: **all target knowledge — ABI, register file, encodability, sections, asm syntax — lives in `src/mir/isa.rs` (Side-II tables), `src/isel/abi.rs` (the AAPCS64 automaton) and `src/emit.rs` (sections/relocations)**, and nothing above `isel` may name a machine register. HIR is target-independent by construction (closed scalar `Ty`, no TyTab lookup); MIR is AArch64-specific by design, and a second target adds a second MIR + isel, not a conditional. **ELF-only** (AArch64 Linux; x86_64 deferred; macOS is the clang oracle only).
-- **A pass is a pass, never a text peephole.** A machine optimization is an `MIR→MIR` pass shipping its commuting square; `emit.rs` makes no decisions and re-parses nothing. This is the rc3 defect written into the architecture so it cannot recur.
-- Single crate, no workspace.
-
-## Article C — driver drop-in
-
-`CC=zcc` slots into a *real* build system (configure/make/cmake) **without editing one build file**. The driver coordinates the host toolchain directly (`as`→`ld`, not through a `cc` driver). Flag surface acquired test-first: implement a flag when a real build uses it and swallowing would be wrong; swallow the rest silently — but **never** mis-swallow a flag that carries an argument (one misalignment consumes an input file). Standard `file:line:` diagnostics + correct exit codes (configure greps stderr).
-
-## Article D — extension-decoupling (the ISO-C / vendor boundary must be visible)
-
-Extension logic lives in **`src/ext.rs`**; the core only calls `ext_*`. Unfactorable touch-points carry `// EXT(gcc|clang|apple|c99)` — `grep 'EXT(' src/` must cover 100% of the deviation surface. Verified by excision: removing `ext.rs` + marked branches leaves a remainder that still passes the full C99 suite. Extension tests live in `tests/ext/` (referee `cc`, no `-std`), never in `tests/cases/`.
-
-## Article E — test & proof mechanisms (not laws — the gate that anchors Laws 1–3)
-
-- **Differential referee** — every correctness verdict is differential: referee is `cc` or an independent oracle; a diff at a UB/unspecified point is meaningless (the generator must filter UB first, proven by spec + referee, never hand-waved).
-- **Iteration-speed** — an iteration mechanism, however elegant, is discarded the moment measurement shows it *slower* than the direct loop (detect → fix → re-test exactly the failing case). Full suite runs once at the end, in the background.
-- **Science-gate** (theorem-verification tier, above the corpus) — `abi.sh` / `alg.sh` / `cpp.sh` / `shape.sh` / `decay.sh` exhaust the *structural* space + boundary value-samples; to be *expanded, never contracted*. Runner `fullsuite.sh [TARGET] [SEEK]`, 100% in-box.
-- **Clean-input** — a green verdict is valid only with a mechanical evidence trail (N binaries + bytes + exit codes), never a bare pass/fail number. Abnormal timing is measured, not guessed.
-- **Numeric-provenance** — every number derives from a stated premise.
-- **Byte-identical gate** — pure code motion (file splits, helper extraction, renames) is proven by `md5(.s)` held unchanged: identical bytes *are* the commuting-square `⟦f⟧=⟦refactor f⟧`, confirming not discovering. It takes TWO witnesses, because a corpus of small programs cannot see a pass whose behaviour scales with the size of a function — one large translation unit is compiled alongside the corpus, and when it cannot be, the gate says so and fails rather than reporting a pass it did not establish. A green result is scoped to what was actually compiled; a baseline is the artefact of the compiler being reproduced, never of an earlier candidate. `tests/refactor_gate.sh`; corpus + rationale in `MECHANISM.md` Part A.
-- **Resource-fidelity** (the dual of the commuting-square, for *performance*-theorems) — the commuting-square certifies a pass is *correctness*-faithful (`⟦f⟧=⟦f'⟧`); this gate certifies it is *realization*-faithful. A performance-pass must declare (a) the hardware ultimate-fact it exploits, as a **spec citation**, and (b) that it is instantiated over the **full** fact, not a convenient truncation. Every resource-constant is either the **spec's number** or carries a dated justification for the gap. The mandatory question for each: **"is this the spec's number, or my convenience's number?"** — a truncation posing as a Side-II constant is a **Law-1 violation** (algorithm not faithfully realizing its side) catchable as a **Law-2 Side-II defect**, *not* a missing "improvement law": improvement stays inside Law 1's "faithfully realizes" clause, measured against the full ultimate-fact. (This is Law 3's "certify at the middle" extended from the correctness-theorem to the cost-theorem.)
-- **Determinism seal** — identical IR ⟹ identical bytes, checked by compiling each corpus program in several FRESH processes so a per-process hash seed cannot leak into the output. Distinct from the byte-identical refactor gate, which only compares across a refactor.
-- Full text of the correctness five + recorded traps: **`MECHANISM.md` Part A**, which also names every place a spec constant is duplicated and the gate that proves the copies agree.
-
-## Article F — ABI
-
-AArch64-ELF (Linux) specifics — no leading `_`, `adrp`/`:got:`/TLS relocations, variadic-in-registers + 192B reg-save area, `char` **unsigned**, AAPCS64 register table, sections — are Side-II constants: **`THEORY.md` II-3 (AAPCS64) + II-4 (ELF/relocations/sections)**. Mistakes here produce cryptic crashes; read before touching `mir/isa.rs`, `isel/abi.rs` or `emit.rs`.
-
-## Article G — operation supremacy (refactor · optimize · extend obey the Laws)
-
-Every operation is subordinate to Laws 1–3 + THE ULTIMATUM and must leave CbC intact — none trades correctness/verification for a number (speed·size·LOC). **Refactor** ships a byte-identical proof (Article E), ranked *better-ground-for-optimization ∧ easier-proof ≫ fewer-LOC* — never merge two proof-carrying passes or blur a theorem seam to save lines. **Optimize** ships its commuting-square + cost-square (Law 3); **extend** stays strict-C99 with the deviation visible (Article D).
-
-## Index
-
-**FIVE documents, and the source may point at no others.** A doc-per-campaign is
-how a repository acquires contradictions faster than it acquires facts; the file
-count is the mechanism against it, and a new one is not created without deleting
-one.
-
-- **`THEORY.md`** — the two-side catalog (Part I theorems / Part II spec-tables); answers "what foundation does zcc rest on". Adding a theorem or constant updates it.
-- **`SEMANTICS.md`** — the reference operational semantics (the executable meaning behind `⟦·⟧`).
-- **`MECHANISM.md`** — how the compiler is actually built, and every fact measured
-  about it: the gate (Part A), purity (B), compile speed (C), the spiller (D),
-  the copy census (E), and the facts with no spec to cite (F, cited from code as
-  `MEASURED M<n>` exactly as spec is cited as `THEORY II-<n>`). Everything in it
-  carries the date and the commit it was measured on.
-- **`ARM64.md`** — the target's own facts, the ledger of what has beaten gcc -O1
-  on it, and the isel exhaustion checklist (Law 4 applied to the munch table).
-- **`README.md`** — what zcc is, how to build it, and the milestone ladder with
-  the C99 remainder and the debt.
-
-**`PLAN.md` is not one of the five and is not a document.** It holds **the ONE
-grind in progress** — not a list of campaigns — is capped at 100 lines, may not
-be cited from `src/`, and is EMPTIED when that grind closes, every row leaving by
-one of two doors: baked into `MECHANISM.md` because it won, or written into its
-Part F as a refutation because it lost. An open row of a campaign that has
-already closed is not a plan but a fact about what was not built, and it lives in
-that campaign's status table, never here. The cap and the one-grind rule are the
-whole mechanism: `REARCH.md` reached 3,194 lines by accumulating every
-campaign's plan beside every campaign's results until no reader could tell which
-lines were true of the compiler that was green.
-
-**A citation is a NAME, not a fetch.** A comment must say enough *why* to fix the
-line it sits on without opening any document; the citation names where the full
-derivation lives, for a reader who wants it and for `tests/provenance.sh`, which
-checks this direction and can check no other — a document that points back at
-`file.rs:412` is stale at the next refactor and nothing catches it.
-
-- **`src/ext.rs` + `grep 'EXT(' src/`** — the entire current deviation surface.
+**A citation is a name, not a fetch.** A comment says enough *why* to fix the line
+it sits on without opening anything; the citation names where the derivation
+lives. `tests/provenance.sh` can only check this direction — a document pointing
+back at `file.rs:412` is stale at the next refactor and nothing catches it.

@@ -7,14 +7,18 @@
 static unsigned char b[N];
 int main(void){
     long i, r; unsigned long cps = 0, sum = 0;
+    /* `b[i++] = f(i)` would read and modify `i` with no sequence point between
+     * them — undefined by C99 6.5p2, and a differential taken at an undefined
+     * point says nothing about either compiler (Article E). Every step below
+     * writes through an index it does not also advance in the same expression. */
     i = 0;
     while(i < N-4){
         unsigned k = (unsigned)((i*2654435761u)>>26) % 4u;
-        if(k == 1){ b[i++] = 0xC2; b[i++] = 0xA9; }
-        else if(k == 2){ b[i++] = 0xE2; b[i++] = 0x82; b[i++] = 0xAC; }
-        else b[i++] = (unsigned char)(i & 127);
+        if(k == 1){ b[i] = 0xC2; b[i+1] = 0xA9; i += 2; }
+        else if(k == 2){ b[i] = 0xE2; b[i+1] = 0x82; b[i+2] = 0xAC; i += 3; }
+        else { b[i] = (unsigned char)(i & 127); i += 1; }
     }
-    while(i < N) b[i++] = 0x41;
+    while(i < N){ b[i] = 0x41; i += 1; }
     for(r=0;r<60;r++){
         i = 0;
         while(i < N){
