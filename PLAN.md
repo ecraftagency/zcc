@@ -129,6 +129,24 @@ SCEV bounds a loop only when its count is a compile-time constant, and m1's setu
 loop runs `3 + k%9` times while its parse loop runs `n`. Both fall back to
 `TRIPS = 10`. Reverted.
 
+**BANKED — the jump table a dense forty-arm switch was refused** (`M34`).
+`isel::jump_table` trampolines an ARM that carries edge copies but refused the
+whole switch when the DEFAULT edge did. `k1_dispatch`: forty dense arms, past
+`MIN_CASES`, and no table — `ZCC_JT=2` still produced none, so it was never the
+count. Fixed by the mechanism already there. k1 **1.151 → 1.105** (0.9603,
+interleaved), `cmp`-against-immediate 41 → 2. Suite geomean does NOT move (two
+pairs split) and INSN costs 0.13%; it ships as a structural defect removed, on
+the tail argument. `ZCC_NOJTDFLT=1` is the seam.
+
+**⭐ AND THE NEXT ROW IS NAMED BY IT.** sqlite is byte-for-byte UNCHANGED by the
+fix — five jump tables before and after, 170,963 instructions both ways. Yet
+`MEASURED M16` puts **85% of sqlite's runtime gap in `sqlite3VdbeExec`**, whose
+196-opcode dispatch is exactly this shape. So something else refuses it: the span
+against the arm count, or a dispatch that never reaches `Term::Switch` at all.
+**Find that blocker.** It is worth more than every suite program left in the
+tail, and it is the one place where a single fix reaches a real program rather
+than one benchmark of forty-nine.
+
 **⭐ TWO ROWS THIS SESSION TERMINATED AT THE SAME ANSWER, AND IT IS PGO.**
 `M31` cannot rank a state machine's switch arms — which one is hot is a property
 of the INPUT. `M33` cannot rank two loops — the bound is a runtime value. Neither

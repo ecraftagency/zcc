@@ -25,6 +25,13 @@ use crate::mir::*;
 /// EXEC reading the ±0.007 session spread demands (`MECHANISM.md` Part E §6).
 /// The A/B seam for the switch-arm ordering (`MEASURED M31`). ON by default;
 /// `ZCC_NOARMORD=1` turns it off.
+/// The A/B seam for the default's trampoline (`MEASURED M34`). ON by default;
+/// `ZCC_NOJTDFLT=1` restores the old refusal.
+fn jt_default() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("ZCC_NOJTDFLT").is_err())
+}
+
 fn armord() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("ZCC_NOARMORD").is_err())
@@ -2234,9 +2241,32 @@ impl<'a> L<'a> {
         // block, put the edge there, and let the table point at THAT. The
         // trampoline is one `b` on the taken path — against ninety compares —
         // and the copies it carries are the ones the edge always had.
-        if !dflt.args.is_empty() {
+        // …AND SO DOES THE DEFAULT, for exactly the same reason.
+        //
+        // The arms got their trampoline; the default did not, and the refusal
+        // above it turned every switch whose DEFAULT edge carries copies back
+        // into a linear compare chain — the very shape the paragraph above says
+        // costs `sqlite3VdbeExec` 85% of sqlite's gap. `k1_dispatch` is that
+        // case in miniature: forty dense arms, well past `MIN_CASES`, span equal
+        // to the arm count, and no table, because one edge out of forty-one had
+        // arguments. gcc spends one indirect branch there; zcc spent
+        // forty-one `cmp`/`b.eq` pairs (`MEASURED M34`).
+        //
+        // The default appears in two places and only one of them is a problem.
+        // The out-of-range `Bcc` below is an ordinary MIR edge and carries its
+        // copies as any edge does. The TABLE cannot: an entry is an address, and
+        // both the holes in the range and the `default` field are filled with
+        // it. So the table gets a trampoline and the `Bcc` keeps the real edge.
+        if !dflt.args.is_empty() && !jt_default() {
             return None;
         }
+        let dflt_t = if dflt.args.is_empty() {
+            dflt.clone()
+        } else {
+            let tb = self.f.new_block();
+            self.f.blocks[tb as usize].term = MTerm::B(dflt.clone());
+            MTarget { block: tb, args: vec![] }
+        };
         let arms: Vec<(i64, MTarget)> = arms
             .iter()
             .map(|(k, t)| {
@@ -2288,14 +2318,14 @@ impl<'a> L<'a> {
             dflt.clone(),
             MTarget { block: body, args: vec![] },
         );
-        let mut table: Vec<MTarget> = vec![dflt.clone(); span as usize];
+        let mut table: Vec<MTarget> = vec![dflt_t.clone(); span as usize];
         for (k, t) in &arms {
             table[(k - lo) as usize] = t.clone();
         }
         self.f.blocks[body as usize].term = MTerm::Switch {
             idx,
             table,
-            default: dflt.clone(),
+            default: dflt_t,
         };
         Some(out)
     }

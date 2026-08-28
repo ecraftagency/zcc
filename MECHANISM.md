@@ -3106,6 +3106,57 @@ and read back on a second compile, answers both — and would also make
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, 49-program taxonomy suite.
 
+### M34. A dense forty-arm switch got no jump table, because ONE edge had arguments
+
+**THE REFUSAL.** `isel::jump_table` gives an ARM that carries edge copies its own
+trampoline block — the table entry points at the trampoline and the copies live
+there — and the comment beside it explains why, naming `sqlite3VdbeExec`'s 196
+opcodes as the case the refusal used to cost. The DEFAULT got no such
+trampoline, and one line above refused the whole switch when its default edge
+carried arguments.
+
+`k1_dispatch` is that in miniature: **forty dense arms (0..39), span equal to the
+arm count, well past `MIN_CASES = 24` — and no table.** Not the case count, not
+the span: `ZCC_JT=2` still produced none. One edge out of forty-one had
+arguments.
+
+**THE FIX** is the mechanism already there, applied to the default. It appears in
+two places and only one is a problem: the out-of-range `Bcc` is an ordinary MIR
+edge and carries its copies as any edge does; the TABLE cannot, because an entry
+is an address and both the range's holes and the `default` field are filled with
+it. So the table gets a trampoline and the `Bcc` keeps the real edge.
+`ZCC_NOJTDFLT=1` is the seam.
+
+| `k1_dispatch` | compare chain | jump table |
+|---|---|---|
+| `cmp` against an immediate | 41 | **2** |
+| instructions | 1,567 | 1,665 |
+| time | 13,597 us (1.151 × gcc) | **13,057 us (1.105 × gcc)** |
+| | | **0.9603** |
+
+Interleaved, best of 24 alternating runs, output identical to both the old build
+and gcc's.
+
+**AND THE SUITE GEOMEAN DOES NOT MOVE, which is the honest headline.** Two
+interleaved pairs split — off 1.0212 / 1.0189, on 1.0198 / 1.0208 — and INSN
+regresses deterministically, 1.0688 → 1.0701, because a table is bigger than the
+chain it replaces. One program of forty-nine cannot move a geomean, and the
++0.13% on the size axis is real. It ships on the reasoning this session has been
+measuring toward: **the tail is the scoreboard**, `k1_dispatch` moves 1.151 →
+1.105, and a dense forty-arm switch refused a table by an unrelated edge is a
+STRUCTURAL defect rather than a tuning choice — the kind that is worth removing
+at a known small size cost.
+
+**IT DOES NOT REACH SQLITE, and that was the hope.** `MEASURED M16` puts 85% of
+sqlite's runtime gap in `sqlite3VdbeExec`, whose dispatch is exactly this shape.
+After the fix sqlite is byte-for-byte unchanged — five jump tables before and
+after, 170,963 instructions both ways. Its blocker is a different one (the span
+against the arm count, or a dispatch that never reaches `Term::Switch` at all),
+and finding it is worth more than everything measured in this entry.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee.
+
 **BUILT, and it wins at the heuristic strength predicted.** `isel::order_switch_arms`
 (`ZCC_NOARMORD=1` is the seam) partitions the arms STABLY, staying arms first.
 
