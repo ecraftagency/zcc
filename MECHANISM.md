@@ -3034,6 +3034,20 @@ NOT admit `get2` (still seventeen calls, so its node count is high for another
 reason) and DID admit other callees: **INSN geomean 1.0688 → 1.0739**, a
 regression on the deterministic axis. Reverted.
 
+**AND SO DOES THE SECOND OBVIOUS FIX** (2026-08-29). The diagnosis above says
+the two sides of `bs <= base` are in different units, so the fix that suggests
+itself is to put `body_size` in the unit `call_cost` already uses — machine
+instructions — by lowering the callee and counting `|MIR|`. Measured with
+`isel::lower_func` wired straight into `body_size`: `get2` scores **7 there too**,
+not the 3 machine instructions it finally becomes. MIR before the MIR passes and
+the allocator still carries the parameter copies, the `ret`, and an `add` that
+has not yet folded into an addressing mode. Seventeen `bl get2` survive, the
+program is 540 instructions either way, and it runs 47.9 ms against 47.8 ms.
+**The unit half of the diagnosis is right and the cheap way to fix it is not:**
+`get2` only becomes three instructions after the MIR passes and regalloc, so an
+honest count means running most of the backend per callee, which costs more
+compile time than the row buys. Two ways in now measure zero.
+
 **WHAT THE ROW ACTUALLY NEEDS**, and it is why the cheap versions all fail
 Article E: the honest cost of a call at a site is
 `args + 3 + |values live across it|`, because that last term is what forces the
