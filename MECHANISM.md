@@ -3022,6 +3022,48 @@ program's 5.8% by 49. That ratio is the point rather than a caveat: **the
 scoreboard to watch is how many programs LEAVE the tail**, not the geomean delta.
 Gate: 15 PASS / 0 RED (provenance re-run after a comment-only citation fix).
 
+**THE RESIDUAL, CHASED TO ITS END — and it stops at a profile.**
+
+The first shipped predicate missed exactly the arms that matter, and the reason
+is `ifconv`: `if (--want == 0) st = S_CR;` collapses to a `Select`, so on the
+common path the old state is not an edge ARGUMENT but an OPERAND. Following `v`
+through a `Select` as well fixes the identification —
+
+```
+m1  stay=[2,1]        → [0,2,1,3,4]   go=[5]
+m2  stay=[0,1,4]      → [0,1,2,4,5,6,8]  go=[3,7]
+```
+
+— and buys **m2 1.242 → 1.229**, m1 unchanged. But it also shows the rule has run
+out of discrimination: five of m1's six arms and seven of m2's nine now qualify,
+so the partition barely reorders anything. **The problem was never identifying
+the staying arms; it is RANKING them.**
+
+Three candidate rankings, all measured against the shipped build (m2 at 1.229):
+
+| ranking | ratio | m2 becomes |
+|---|---|---|
+| hot arm first (the answer, taken by hand) | 0.8198 | **1.008** |
+| states on the header cycle `{4,5,6,7}` first | 0.8927 | 1.097 |
+| shipped (staying arms first, source order) | 1.000 | 1.229 |
+
+**The cycle rule measures well and is NOT ADOPTED, and the reason is the point.**
+Its premise is that `S_HNAME → S_HCOLON → S_HVALUE → S_HEOL → S_HNAME` is a cycle
+the other states are not on. The state graph says otherwise: `S_DONE → S_METHOD`
+closes it, so all nine states are ONE strongly-connected component and no
+structural rule separates them. Shortest-cycle length does not either — `S_VER ↔
+S_EOL` is a 2-cycle and is cold. A rule that scores 0.8927 while resting on a
+premise the program's own graph refutes is fitted to this benchmark, which
+Article E's mandatory question ("the spec's number, or my convenience's?")
+answers plainly.
+
+**SO THE REMAINING 20% IS A PROFILE, and that is a finding rather than a
+failure.** Which arm of a state machine is hot is a property of the INPUT — HTTP
+header values are long, methods are short — and no analysis of the source can
+know it. This is the first row in the project whose residual names
+profile-guided optimization as the mechanism, and it is worth ~0.11 of the
+suite's 0.97 total log-mass on one program.
+
 The residual is unchanged and now measured on the shipped rule: the predicate
 finds three of m1's staying arms and misses `S_BULK`, and finds three of m2's and
 misses `S_HVALUE`, which is why m2 reaches 1.242 rather than the hand-edited

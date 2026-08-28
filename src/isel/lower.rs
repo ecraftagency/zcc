@@ -1097,8 +1097,18 @@ impl<'a> L<'a> {
         /// the header is further away than that is not the arm consuming a run
         /// of bytes.
         const BUDGET: usize = 8;
+        //
+        // AND `v` DOES NOT ONLY TRAVEL ON EDGES. `if (--want == 0) st = S_CR;`
+        // is exactly the shape `ifconv` collapses, so on the common path the old
+        // state is not an edge ARGUMENT at all — it is the false arm of a
+        // `Select`, an OPERAND. The first shipped cut looked at edges alone and
+        // therefore caught `S_COUNT`/`S_BULKLEN`, whose bodies branch, while
+        // missing `S_BULK` and `S_HVALUE` — the two arms that actually consume
+        // the runs, and the whole point of the rule. A value kept by a select is
+        // kept.
+        let keeps_v = |o: &Operand| *o == Operand::Val(v);
         let stays = |t: &hir::Target| -> bool {
-            if t.args.iter().any(|a| *a == Operand::Val(v)) {
+            if t.args.iter().any(keeps_v) {
                 return true;
             }
             let mut seen: Vec<hir::BlockId> = Vec::new();
@@ -1110,8 +1120,16 @@ impl<'a> L<'a> {
                         continue;
                     }
                     seen.push(b);
-                    for e in self.h.blocks[b as usize].term.targets() {
-                        if e.args.iter().any(|a| *a == Operand::Val(v)) {
+                    let blk = &self.h.blocks[b as usize];
+                    for i in &blk.insts {
+                        if let hir::Inst::Select { a, b: bb, .. } = i {
+                            if keeps_v(a) || keeps_v(bb) {
+                                return true;
+                            }
+                        }
+                    }
+                    for e in blk.term.targets() {
+                        if e.args.iter().any(keeps_v) {
                             return true;
                         }
                         next.push(e.block);
@@ -1128,6 +1146,15 @@ impl<'a> L<'a> {
         // STABLE partition: the staying arms first, source order kept in both
         // halves, so a program with no such arm is compiled exactly as before.
         let (a, b): (Vec<_>, Vec<_>) = out.drain(..).partition(|(_, t)| stays(t));
+        if std::env::var("ZCC_ARMDBG").is_ok() {
+            eprintln!(
+                "ARMORD {} v{} stay={:?} go={:?}",
+                self.h.name,
+                v,
+                a.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                b.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+            );
+        }
         a.into_iter().chain(b).collect()
     }
 

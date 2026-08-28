@@ -86,13 +86,20 @@ best-of-N — and only then touch the compiler. n7's win was 13% of a program fo
 0.0008 of the INSN geomean; m1's two hottest blocks are 58% of that program and
 the static count ranks them nineteenth.
 
-**BANKED — the switch-arm order** (`M31`, `isel::order_switch_arms`): a sparse
-switch becomes a linear compare chain in SOURCE order, so a state tested late
-costs a `cmp`+`b.eq` per byte for every arm ahead of it. Staying arms go first.
-**m2_http_parse 1.318 → 1.242**, suite EXEC 1.0204 → **1.0185**, INSN unchanged,
-gate 15/0. Residual: the predicate finds three of each parser's staying arms and
-misses the hottest one, which is why m2 reaches 1.242 and not the hand-edited
-1.02. Ranking WITHIN the staying set is the open half.
+**BANKED — the switch-arm order** (`M31`, `isel::order_switch_arms`): staying
+arms first, following `v` through a `Select` as well as an edge (that second half
+matters — `ifconv` turns `if (--want==0) st = S_CR;` into a select, which is
+exactly where the hot arm's old state hides). **m2_http_parse 1.318 → 1.229**,
+INSN unchanged, gate 15/0.
+
+**AND ITS RESIDUAL IS A PROFILE, chased to the end.** Identification is solved —
+5 of m1's 6 arms and 7 of m2's 9 now qualify — so what is left is RANKING, and
+nothing static separates them: hand-ordering m2's hot arm first measures 0.8198
+(→ **1.008**), a `{4,5,6,7}`-cycle rule measures 0.8927 (→ 1.097) but its premise
+is false because `S_DONE → S_METHOD` makes all nine states one SCC. Which arm is
+hot is a property of the INPUT. **Do not build another static rule here** — it is
+the project's first row whose answer is PGO, worth ~0.11 of the suite's 0.97 log
+mass.
 
 **THE SCOREBOARD IS THE TAIL, NOT THE GEOMEAN.** Σln(rᵢ) ≈ 0.97 over 49
 programs, and essentially all of the positive mass is the 11–13 programs above
