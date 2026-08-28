@@ -101,6 +101,22 @@ hot is a property of the INPUT. **Do not build another static rule here** — it
 the project's first row whose answer is PGO, worth ~0.11 of the suite's 0.97 log
 mass.
 
+**OPEN, MEASURED, AND THE CHEAP FIX IS REFUTED** (`M32`): the inliner refuses
+`n1_btree_page`'s four-instruction `get2` at all **seventeen** call sites where
+gcc inlines it everywhere. Inlining it in the SOURCE measures **0.9567**
+(n1 1.312 → 1.255) and thirteen instructions FEWER. It is upstream of n1's
+constant row: the calls are what make all ten callee-saved registers live, which
+is why the loop-invariant LCG constants are rebuilt eight instructions per
+iteration in a block worth 54% of the program.
+
+The diagnosis stands — `body_size` counts HIR nodes, `call_cost` counts machine
+instructions, and the mismatch is systematic against inlining. The obvious fix
+(subtract zero-extensions, DDI 0487 B1.2.1) did NOT admit `get2` and DID admit
+others: INSN 1.0688 → 1.0739, reverted. What the row needs is
+`args + 3 + |live across the site|`, and HIR has no general liveness. **Build the
+liveness or leave the row** — every substitute is a threshold somebody picked,
+which is what `call_cost`'s own comment refuses.
+
 **THE SCOREBOARD IS THE TAIL, NOT THE GEOMEAN.** Σln(rᵢ) ≈ 0.97 over 49
 programs, and essentially all of the positive mass is the 11–13 programs above
 1.1× (m1 0.35, n1 0.28, m2 0.22, n7 0.18, k1 0.17, …≈1.8 between them), offset by

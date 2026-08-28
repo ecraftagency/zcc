@@ -2994,6 +2994,58 @@ assertion is the chain's position of the self-transition arm.
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee.
 
+### M32. The inliner refuses a four-instruction leaf seventeen times, and the obvious fix loses
+
+**THE SITE.** `n1_btree_page` (EXEC 1.31, the third-largest contributor to the
+suite's log mass) reads every page header through
+`static unsigned get2(const unsigned char *p) { return (p[0] << 8) | p[1]; }`.
+**gcc inlines it everywhere — zero calls. zcc emits seventeen `bl get2`.**
+
+**WHAT IT COSTS,** measured by inlining it in the SOURCE (a macro), which
+changes the input and not the compiler:
+
+| | zcc | zcc + get2 inlined | gcc -O1 |
+|---|---|---|---|
+| time | 47,103 us | **45,063 us (0.9567)** | 35,909 us |
+| vs gcc | 1.312 | **1.255** | — |
+| instructions | 540 | **527** | 455 |
+
+It gets SMALLER as well as faster, because the loads then fold into their
+addressing modes.
+
+**WHY IT MATTERS BEYOND THE 4%.** All ten callee-saved registers are live in
+`main`, so the loop-invariant LCG constants cannot be hoisted and are rebuilt
+every iteration — eight `movz`/`movk` in a forty-instruction block that is 54% of
+the program's weighted cost. gcc hoists one of the two (`x27`). The pressure
+comes from the calls: AAPCS64 §6.1.1 makes every value live across a `bl`
+callee-saved. So the refused inline is upstream of the constant row, not beside
+it.
+
+**THE DIAGNOSIS, which stands.** `body_size` counts HIR NODES and `call_cost`
+counts MACHINE INSTRUCTIONS, and the comparison `bs <= base` puts the two units
+against each other. HIR is more verbose than A64 and the disagreement is
+systematic AGAINST inlining. `get2` is six HIR nodes (two loads, two zero
+extensions, a shift, an or) against a call sequence of four.
+
+**AND THE OBVIOUS FIX LOSES.** Subtracting zero-extensions from `body_size` — a
+real spec fact, DDI 0487 B1.2.1 plus the zero-extending narrow load forms — did
+NOT admit `get2` (still seventeen calls, so its node count is high for another
+reason) and DID admit other callees: **INSN geomean 1.0688 → 1.0739**, a
+regression on the deterministic axis. Reverted.
+
+**WHAT THE ROW ACTUALLY NEEDS**, and it is why the cheap versions all fail
+Article E: the honest cost of a call at a site is
+`args + 3 + |values live across it|`, because that last term is what forces the
+caller into callee-saved registers and is the whole of the pressure measured
+above. HIR has no general liveness — `sroa.rs` carries a bespoke one for its own
+pieces — so the term is not available, and every substitute for it is a
+threshold somebody picked. `call_cost`'s own comment already makes the point in
+the other direction: its bound is "derived from the ABI rather than picked".
+Build the liveness or leave the row.
+
+**WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
+musl release zcc, gcc -O1 referee, 49-program taxonomy suite.
+
 **BUILT, and it wins at the heuristic strength predicted.** `isel::order_switch_arms`
 (`ZCC_NOARMORD=1` is the seam) partitions the arms STABLY, staying arms first.
 
