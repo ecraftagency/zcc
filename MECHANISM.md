@@ -2726,6 +2726,61 @@ transitive walk reached a different partner first. Neither is discharged.
 **WHEN / WHERE.** 2026-08-28, `mir-rearch`, M1 Pro under Docker, aarch64-linux
 musl release zcc, gcc -O1 referee. Gate `fullsuite.sh all`: 15 PASS / 0 RED.
 
+### M28. The sign-extended index, and what the IVX trip gate is really refusing
+
+Two residual measurements taken the same day, both on the 49-program suite.
+
+**THE IVX TRIP GATE IS NOT THE BINDING ONE.** `value_candidates` refuses a loop
+whose trip count SCEV cannot bound above 32, and its own comment classes that as
+a Law-4 category (b). It is the second-largest refusal — 653 sites, 101 of them
+in `n2_varint_record`, whose EXEC ratio is 1.435. Removing it (`ZCC_IVTRIP=0`)
+changes the suite by **zero instructions**: every one of the 653 is refused again
+by a later condition, mostly the silent `inside < 2` and `escaped` pair. On
+sqlite it moves 2 instructions of 171,276. So the gate is very nearly dead
+weight, and — more usefully — relaxing it buys nothing, which retires it as a
+row. The residual with it removed:
+
+| refusal | sites |
+|---|---|
+| `scev-refused` | 1,489 (78%) |
+| `invariant-address` | 289 |
+| `no-multiply-to-remove` | 109 (fundamental — there is no multiply) |
+| `multiply-shared` | 18 |
+
+**SCEV's own coverage is the frontier**, not any gate written on top of it.
+
+**THE SIGN-EXTENDED INDEX.** Counted over the same corpus:
+
+| | zcc | gcc -O1 |
+|---|---|---|
+| memory operands of the form `[base, wN, sxtw]` | 141 | 11 |
+| standalone `sxtw` | 161 | 65 |
+| post-indexed accesses | 66 | 0 |
+
+Concentrated: `k1_dispatch` 78 of the 141, `k2_live_pressure` 17,
+`n2_varint_record` 10 — the dispatch and parsing loops, which are also where the
+EXEC ratio is worst.
+
+The cause is that a C `int` index stays 32 bits in zcc's HIR, so `a[i]` must
+sign-extend at every use; gcc widens the induction variable to 64 bits once (it
+may: signed overflow is undefined, ISO 9899 6.5p5) and then addresses with a
+plain 64-bit index. **This is a Law 3c fact before it is a size fact**: the
+extension folded into the addressing mode costs no instruction and one cycle
+(`MEASURED M1`, extended-register operands are 2 cycles against 1), and it sits
+on the ADDRESS path of a load inside a dispatch loop.
+
+It also reopens `MEASURED M2` on its own terms rather than contradicting it. M2
+refused the unit-stride pointer walk because "the scaled index rides for free" —
+which is true of a 64-bit index and false of a 32-bit one, where the same
+addressing mode carries an extension M1 prices at a cycle. M2's measurement
+(`j2_histogram`) is not disturbed; its scope is.
+
+**NOT YET A ROW.** No hand edit has been taken, so nothing here is a prediction
+about cycles — only a count of what the two compilers emit. The narrow peephole
+underneath it (a `sxtw` whose source is the immediately preceding 32-bit ALU
+result) is 30 instructions on the suite and is NOT the row; widening the
+induction variable is, and it is unbuilt.
+
 ---
 
 # Part G — the pipeline, layer by layer

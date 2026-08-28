@@ -88,6 +88,18 @@ fn residual(reason: &str) {
     }
 }
 
+/// The trip-count floor the consumer-blind half demands, `ZCC_IVTRIP` (default
+/// 32, `0` removes the gate). MEASURED M28 — the instrument, not a constant.
+fn ivtrip() -> u64 {
+    static W: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("ZCC_IVTRIP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
 fn enabled() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| ENABLED || std::env::var("ZCC_IV").is_ok())
@@ -480,11 +492,29 @@ fn value_candidates(
     // exchange to pay. A loop whose bound is a runtime length has no such
     // evidence and is refused — a residual to measure under Law 4, not a
     // theorem's limit.
-    match s.trips {
-        Some(t) if t >= 32 => {}
-        _ => {
-            residual("trip-count-unproven-or-short");
-            return HashMap::new();
+    //
+    // LAW-4 PROBE (`ZCC_IVTRIP`, 2026-08-28). This gate is the largest single
+    // refusal after SCEV's own — 653 sites on the 49-program suite, 101 of them
+    // in `n2_varint_record`, whose EXEC ratio is 1.435 — and the paragraph above
+    // classifies it as category (b) in its own words. What it is really standing
+    // in for is "the multiply must actually die", and that condition now has a
+    // gate of its own further down (`multiply-shared`). `ZCC_IVTRIP=<n>` sets the
+    // bound; `0` removes it.
+    //
+    // THE A/B IS TAKEN and the gate is NOT the binding one (MEASURED M28):
+    // `ZCC_IVTRIP=0` changes the 49-program suite by zero instructions and sqlite
+    // by two, because every one of the 653 sites is refused again below — mostly
+    // by the silent `inside < 2` and `escaped` pair. It stays at 32 because
+    // relaxing it buys nothing, not because it is load-bearing, and the frontier
+    // is SCEV's own coverage (78% of the residual).
+    let trip_min = ivtrip();
+    if trip_min > 0 {
+        match s.trips {
+            Some(t) if t >= trip_min => {}
+            _ => {
+                residual("trip-count-unproven-or-short");
+                return HashMap::new();
+            }
         }
     }
     if std::env::var("ZCC_IVXCALL").is_ok() {

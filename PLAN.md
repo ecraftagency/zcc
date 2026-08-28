@@ -53,6 +53,10 @@ denominator has moved.
 x0–x7 traffic is 22,813 against gcc's 14,626. Do not fold it into C1's
 measurement.
 
+**MEASURED AND CLOSED THIS SESSION** (`M28`): the IVX trip-count gate is not the
+binding one — removing it changes the suite by zero instructions — and SCEV's own
+coverage is 78% of that pass's residual. Do not spend a session on the gate.
+
 **AND THE ROW C0 UNCOVERED, which is not a copy row at all.** `M26-correction`
 inverted the constant-materialization column: zcc emits **951 against gcc's 790,
 +161**, where the old table read −182 and was taken as proof the constant-sharing
@@ -62,6 +66,16 @@ been aimed at it. First question, unanswered: `isa::mov_chain` knows
 `isa::logical_imm` — the encodability test — already exists and is used only for
 ALU operands. Count the constants whose chain is ≥2 and which `logical_imm`
 accepts before writing anything.
+
+**THE BIGGEST UNBUILT ROW, and it is not a copy row either** (`M28`): a C `int`
+index stays 32 bits, so `a[i]` sign-extends at every use — **141 memory operands
+of the form `[base, wN, sxtw]` against gcc's 11**, 78 of them in `k1_dispatch`
+alone, plus 161 standalone `sxtw` against 65. gcc widens the induction variable
+to 64 bits once, which ISO 9899 6.5p5 permits. Law 3c first, size second: the
+folded extension costs no instruction and one cycle (`M1`), on the address path
+of a dispatch loop. HAND-EDIT `k1_dispatch` BEFORE writing any pass — the narrow
+peephole underneath (a `sxtw` on the immediately preceding 32-bit ALU result) is
+only 30 instructions and is not the row.
 
 **The gate every row owes:** a commuting square, both axes, and for EXEC an
 interleaved A/B in ONE box session (`tests/bench/abpair.sh`). Two `realprog.sh`
