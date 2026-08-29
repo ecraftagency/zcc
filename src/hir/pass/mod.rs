@@ -12,6 +12,7 @@
 // the arm, gvn re-numbers what the deletion merged), and the rounds stop when a
 // round changes nothing or the bound is reached.
 pub mod cfg;
+pub mod copyprobe;
 pub mod dce;
 pub mod fold;
 pub mod gvn;
@@ -285,6 +286,7 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     if on("cfg") {
         cfg::run(f);
     }
+    copyprobe::census(f, a);
     if iv::fv_wanted() {
         iv::fv_opportunity(f, a);
     }
