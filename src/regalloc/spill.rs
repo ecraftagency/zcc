@@ -320,8 +320,14 @@ pub fn spill_with(
                 fell_back = true;
                 prev_exit = vec![Vec::new(); f.blocks.len()];
             }
+            let t0 = std::time::Instant::now();
             let lv = live::compute(f, &cfg);
-            match simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat)? {
+            SPILL_NS[0].fetch_add(t0.elapsed().as_nanos() as usize, std::sync::atomic::Ordering::Relaxed);
+            SPILL_LIVE.fetch_add(lv.live_in.iter().map(|s| s.len()).sum::<usize>(), std::sync::atomic::Ordering::Relaxed);
+            let t1 = std::time::Instant::now();
+            let sim = simulate(f, &lv, &cfg, &spilled, cross_cap, &prev_exit, carry, &lf, &web, &remat)?;
+            SPILL_NS[1].fetch_add(t1.elapsed().as_nanos() as usize, std::sync::atomic::Ordering::Relaxed);
+            match sim {
                 Sim::Plan(p) => {
                     // SPEND A ROUND ONLY IF IT CAN BUY SOMETHING. The seeding is
                     // worth another walk while it is still finding NEW block
@@ -887,6 +893,19 @@ struct Res {
 /// a compile, and the question "is it more rounds or a costlier round" is one a
 /// count answers and a stopwatch cannot.
 pub static SPILL_ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// THEORY A7 — instrument half. Nanoseconds inside the round loop, split
+/// `[liveness, simulate]`, and the total live-in cardinality the rounds saw.
+/// Which of the two grows, and whether it grows with the LIVE SET, is the
+/// question `MEASURED M44`'s real cause turns on.
+pub static SPILL_NS: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+/// THEORY A7 — instrument half. The total live-in cardinality the spiller's
+/// rounds walked: the INPUT SIZE, beside the two times above, so a slower
+/// spiller can be told from a bigger problem handed to the same spiller.
+pub static SPILL_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn simulate(
     f: &MFunc,

@@ -290,6 +290,25 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
     // lifted again by the enclosing loop's turn
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    // ONE LEVEL, NOT ALL OF THEM — the A/B seam `ZCC_HOISTALL` restores the
+    // original, and the original is what `MEASURED M44` priced.
+    //
+    // Lifting innermost-first and then letting each enclosing loop lift again
+    // walks a constant all the way to the function's outermost preheader. The
+    // WIN is already collected at the first step: the instruction is out of the
+    // body that executes most often. Every further step buys a rewrite in a
+    // region that runs less and pays for it in LIVE RANGE across a larger one —
+    // and live range is the whole cost of this pass, measured on sqlite3.c as
+    // Σ live-in 5,428,707 -> 16,537,840, a 3.05x input handed to a spiller that
+    // is the largest phase of a compile. The rounds barely move (2665 -> 2730),
+    // so it is not the allocator iterating: it is the same allocator on three
+    // times the liveness.
+    let hoist_all = {
+        static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *W.get_or_init(|| std::env::var_os("ZCC_HOISTALL").is_some())
+    };
+    // A value this pass already lifted is not offered to the enclosing loop.
+    let mut lifted_once: Vec<bool> = vec![false; f.vregs.len()];
     // WHICH BLOCKS EACH LOOP CONTAINS, asked once for the function instead of
     // once per loop. The predicate is unchanged — a block belongs to `li` when
     // `li` lies on the parent chain of the innermost loop holding it — but asked
@@ -346,8 +365,13 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
             debug_assert!(inloop(blk), "members[] and inloop disagree at b{}", b);
             let mut keep: Vec<MInst> = Vec::with_capacity(f.blocks[b].insts.len());
             for inst in std::mem::take(&mut f.blocks[b].insts) {
-                match &inst {
-                    MInst::MovImm { dst: Reg::V(_), .. } | MInst::Adrp { dst: Reg::V(_), .. } => {
+                let v = match &inst {
+                    MInst::MovImm { dst: Reg::V(v), .. } | MInst::Adrp { dst: Reg::V(v), .. } => Some(*v),
+                    _ => None,
+                };
+                match v {
+                    Some(v) if hoist_all || !lifted_once[v as usize] => {
+                        lifted_once[v as usize] = true;
                         lifted.push(inst);
                         moved += 1;
                     }
@@ -433,7 +457,7 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
 pub fn hoist_wanted() -> bool {
     HOIST.with(|c| c.get()).unwrap_or_else(|| {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENV.get_or_init(|| std::env::var_os("ZCC_HOIST").is_some())
+        *ENV.get_or_init(|| std::env::var_os("ZCC_NOHOIST").is_none())
     })
 }
 
