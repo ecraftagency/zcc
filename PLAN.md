@@ -23,12 +23,29 @@ dismantled on 2026-08-28.
 
 ## THE GRIND: an ANALYSIS layer — the re-architecture the measurements keep asking for
 
-**THE SHAPE OF THE ARGUMENT.** The HIR/MIR split gave each half of the compiler
-its own theorems and its own passes, and the seam is why a second target adds a
-second MIR instead of a conditional. This grind is the same move one level in:
-every loop pass in `hir/pass/` privately rebuilds the same three analyses, so
-there is no seam, no sharing, and no place to put a fourth analysis when one is
-needed. Three separate measurements on 2026-08-29 point at that one fact.
+**THE SHAPE OF THE ARGUMENT, and it is not "zcc needs more passes".** Count what
+is already built and NOT RUNNING:
+
+| capability | where | why it is off |
+|---|---|---|
+| **SLP vectorizer** | `mir/pass/slp.rs:63` | *"R5.3's A/B SEAM (`ZCC_SLP`). Off, no `VAlu` is ever built"* |
+| **TBAA alias oracle** | `hir/mod.rs:236` | *"R5.2's A/B SEAM (`ZCC_TBAA`). Off, every access is stamped `ACLASS_ANY`"* |
+| **loop-constant hoist** | `mir/pass/const_share.rs` | reverted by `M44` for **+28.7% of sqlite's compile time** |
+| **tailjump**, at its target | `hir/pass/tailjump.rs` | fenced by missing SSA reconstruction (`M53`) |
+| **unroll**, past its limit | `hir/pass/unroll.rs:242` | *"SSA reconstruction this row does not do"* |
+
+**Five advanced capabilities, present, not delivering.** TBAA being off is the
+sharpest of them: every memory pass in the compiler — `mem.rs`, `licm`, and
+`loopmem` written on 2026-08-29 — runs against an oracle where everything may
+alias everything, because the field that would say otherwise is stamped `ANY`.
+
+The HIR/MIR split gave each half of the compiler its own theorems and its own
+passes, and the seam is why a second target adds a second MIR instead of a
+conditional. This grind is the same move one level in: every loop pass in
+`hir/pass/` privately rebuilds the same three analyses, so there is no seam, no
+sharing, and no place to put a fourth analysis when one is needed. **The structure
+is what is holding the passes down, not their absence.** Three measurements on
+2026-08-29 point at that one fact.
 
 * **`M44`** — the loop-constant hoist was reverted for **+28.7% of sqlite's
   compile time**. It builds `cfg` + `DomTree` + `LoopForest` per function, and
@@ -42,9 +59,11 @@ needed. Three separate measurements on 2026-08-29 point at that one fact.
   stops at the one block worth duplicating, with `M52`'s counters saying **1.95×
   the instructions** are on the table at `m2_http_parse`.
 * **The 1.1× target** — 33 of 96 programs are above 1.3× against `gcc -O2` and
-  they are dominated by vectorization. A vectorizer needs DEPENDENCE analysis,
-  which needs exactly this substrate; building it on top of per-pass rebuilds
-  would make the compile-time problem structural rather than incidental.
+  they are dominated by vectorization. `slp.rs` is BUILT; what it lacks is an
+  alias oracle sharp enough to prove two accesses independent (TBAA, also built,
+  also off) and a loop-level dependence test to sit beside it. Both want the same
+  substrate, and building them on per-pass rebuilds would make the compile-time
+  problem structural rather than incidental.
 
 **WHAT THE LAYER IS.** One owner for dominance, loops, and SSA repair, held
 across a function's pass pipeline and INVALIDATED rather than rebuilt:
@@ -78,7 +97,9 @@ the Graviton box. **Any codegen change is a bug in the caching, not a bonus.**
 * the hoist row becomes affordable again and can be re-measured on its merits
   (it was −0.74% EXEC on the suite, neutral on the application).
 * `tailjump` reaches its target and `unroll` loses its stated limitation.
-* the vectorizer becomes a pass rather than a project.
+* `ZCC_SLP` and `ZCC_TBAA` become answerable questions rather than seams nobody
+  can afford to turn on — each is one A/B on the Graviton box once the analysis
+  they need is cheap and shared.
 
 **WHAT IT DOES NOT DO.** It buys no exec by itself. A re-architecture is ranked
 `better ground for optimization ∧ easier proof` (Article G), and it must be
