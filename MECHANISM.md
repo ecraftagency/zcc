@@ -3572,6 +3572,92 @@ cargo 208/0.
 
 ---
 
+### M40. The inline-copy bound was set on the wrong axis, and a `bl memcpy` costs twelve instructions the static count cannot see
+
+**VALUE.** `INLINE_COPY_MAX = 128` in `isel/lower.rs`, raised from the 32 that
+`M14` derived. The measurement seam is `ZCC_ICM=<bytes>`.
+
+**WHY M14's ANSWER WAS RIGHT FOR ITS QUESTION AND WRONG FOR THIS ONE.** M14 swept
+the bound against **sqlite's static instruction count** and found a clean minimum
+at 32, which it is: a call is four instructions whatever the length, while the
+open-coded form grows with it, so on the SIZE axis the call wins early and keeps
+winning. That axis cannot see what the call then *executes* — the branch, the
+return, the argument setup, and libc's own entry — and `M38` had just measured
+`corr(INSN, EXEC) = 0.196` over ninety programs, which is the general statement of
+why a size-derived constant may not be believed on the clock. Law 3c names this
+exact failure and Law 0 ranks `exec > size`.
+
+**THE INSTRUMENT.** Wall-clock could not settle it: `v3_struct_copy` runs 1.4 ms,
+where the ±20 % of a millisecond clock swamps the effect — the first sweep read
+1.307 / 1.255 / 1.066 at bounds 96 / 128 / 192 whose emitted assembly is
+BYTE-IDENTICAL (`md5` 7bc3c6 at all three). What settled it is **dynamic
+instruction count** (`callgrind` Ir), which is deterministic, has no error bar at
+all, and is a far better predictor of time than the static count it replaces.
+
+**THE CROSSOVER, measured.** 200,000 struct assignments per point, always-call
+against always-inline, same program:
+
+| bytes | Ir per copy, called | Ir per copy, open-coded | saving |
+|---|---|---|---|
+| 16 | 33.6 | 15.6 | 18.0 |
+| 32 | 33.6 | 17.6 | 16.0 |
+| 64 | 33.6 | 21.6 | 12.0 |
+| 128 | 39.6 | 29.6 | 10.0 |
+| 256 | 57.6 | 45.6 | 12.0 |
+| 512 | 89.6 | 77.6 | 12.0 |
+
+**There is no crossover out to 512 bytes.** The open-coded form wins at every size
+by an almost constant ~12 instructions, which is the call's own overhead: musl's
+`memcpy` moves sixteen bytes per iteration exactly as the expansion does, so the
+two agree on the payload and differ only by the call. The bound is therefore NOT
+set by a crossover — it is set by what is worth spending static size on, which is
+the axis M14 was measuring all along.
+
+**WHERE 128 COMES FROM.** sqlite at six bounds, everything else identical:
+
+| bound | sqlite instructions | `bl memcpy` sites |
+|---|---|---|
+| 0 (always call) | 174,050 | 321 |
+| 32 | 173,963 | 258 |
+| 64 | 173,994 | 247 |
+| 96 | 174,041 | 238 |
+| **128** | **174,094** | **233** |
+| 256 | 174,094 | 233 |
+
+Two facts pin the value. The size cost of 32 → 128 is **+131 instructions, 0.075 %**,
+which Law 0 spends without argument for a win on the clock. And the curve is FLAT
+from 128 to 256 — 233 sites at both — so **no compiler-generated copy in the whole
+amalgamation exceeds 128 bytes**; the 233 that remain are `memcpy` the source
+itself calls. That is the row's exhaustion proof (Law 3): the residual is entirely
+category (a), a real boundary, with nothing left to realize.
+
+**WHAT IT BOUGHT.** `v3_struct_copy` was calling `bl memcpy` FOUR times per
+iteration for its 64- and 96-byte structs:
+
+| | ICM=32 | ICM=128 |
+|---|---|---|
+| exec vs gcc -O1 (interleaved, min of 31) | 1.574× | **1.099×** |
+| dynamic Ir vs gcc -O1 | 2.410 | **1.420** |
+| static instructions | 137 | 141 |
+
+Suite 96: EXEC 1.0784 → **1.0739**, INSN 1.0753 → 1.0757. **Exactly one program of
+the ninety-six changes its assembly at all** (checked by `md5` over the whole
+suite at both bounds), so the suite move is a floor, not the row's value — the
+row pays wherever a 33-to-128-byte aggregate is assigned, which is struct-heavy
+real code rather than a kernel suite.
+
+**THE STANDING CORRECTION TO M14.** M14's number was not a mistake, it was an
+answer to the size question; what was wrong was letting a size-derived constant
+stand unexamined on the time axis. Every other constant swept the same way —
+`MIN_CASES`, the inliner's bounds — is now a candidate for the same re-derivation,
+and dynamic Ir is the instrument that makes it cheap.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu,
+gcc 14.2.0 -O1, musl in-box; `callgrind` from valgrind for every Ir figure.
+Gate 15/0 at FUZZ_N=300; cargo 208/0.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer

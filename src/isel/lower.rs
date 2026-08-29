@@ -62,9 +62,27 @@ fn commute() -> bool {
 /// spends a taken branch per level and scatters the arms. See `ARM64.md`.
 const MIN_CASES: usize = 24;
 
-/// MEASURED M14 — the inline small-copy bound, in BYTES
-/// MEASURED M14 — the inline small-copy bound, in BYTES
-const INLINE_COPY_MAX: usize = 32;
+/// MEASURED M40 — the inline small-copy bound, in BYTES (M14 set this to 32 by
+/// minimizing sqlite's STATIC instruction count; M40 re-derives it on the TIME
+/// axis, where a `bl memcpy` costs a constant ~12 dynamic instructions the
+/// static count cannot see, and the open-coded form wins at every size measured
+/// out to 512). 128 is where sqlite's static cost stops moving: no
+/// compiler-generated copy in the amalgamation exceeds it.
+const INLINE_COPY_MAX: usize = 128;
+
+/// The measurement seam for the bound above — `ZCC_ICM=<bytes>` overrides it so
+/// the threshold can be re-swept without a rebuild per point, exactly as
+/// `ZCC_NOHOIST` and `ZCC_LDSTP` are the seams for their own rows.
+fn inline_copy_max() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ZCC_ICM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(INLINE_COPY_MAX)
+    })
+}
 
 pub fn lower(m: &hir::Module) -> MModule {
     MModule {
@@ -1375,7 +1393,7 @@ impl<'a> L<'a> {
             } => self.call(*dst, sig, callee, args, *sret),
             Inst::MemCpy { dst, src, len } => {
                 let (d, s) = (self.reg(*dst, hir::Ty::I64), self.reg(*src, hir::Ty::I64));
-                if (*len as usize) <= INLINE_COPY_MAX {
+                if (*len as usize) <= inline_copy_max() {
                     self.copy_inline(d, s, *len as i32);
                 } else {
                     let n = self.reg(Operand::Imm(*len as i64), hir::Ty::I64);
