@@ -59,17 +59,14 @@ analyses. **The structure holds the passes down, not their absence.**
 **WHAT THE LAYER IS.** One owner for dominance, loops, and SSA repair, held
 across a function's pass pipeline and INVALIDATED rather than rebuilt:
 
-  1. **A cached analysis handle.** `cfg`, `DomTree`, `LoopForest` computed once
-     per function and invalidated by the passes that change the CFG. Most passes
-     do not change it at all.
+  1. **A cached handle** — `cfg`, `DomTree`, `LoopForest` computed once per
+     function, invalidated by the passes that change the CFG. Most do not.
   2. **`reconstruct(f, &[ValueId])` as a first-class operation.** `sroa.rs:256`
      already computes iterated dominance frontiers and places pruned parameters
-     for memory pieces (Cytron et al. 1991 §4.2, "the runner formulation").
-     **START HERE: read `promote` and answer one question — does it factor, or is
-     its pruning too tied to a `Piece`?** That answer decides whether this grind
-     is small or medium, and it is one reading of one function.
-  3. **A place for dependence analysis to live**, beside the SLP that is already
-     written.
+     (Cytron et al. 1991 §4.2). **START HERE: read `promote` — does it factor, or
+     is its pruning too tied to a `Piece`?** One reading of one function, and it
+     decides whether this grind is small or medium.
+  3. **Somewhere for dependence analysis to live**, beside the built SLP.
 
 **THE SEAM RULE (Article B).** A pass READS the layer and DECLARES what it
 invalidates. The reviewer's question for every diff: *what did this pass rebuild
