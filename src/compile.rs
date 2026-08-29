@@ -155,6 +155,10 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             a.invalidate();
             crate::mir::pass::const_share::run(f, a);
             crate::mir::pass::const_share::hoist_invariant_consts(f, a);
+            // AFTER the jam's addresses have settled onto one base and BEFORE
+            // `autoinc`, which would rewrite them into post-index forms this
+            // pass cannot read.
+            crate::mir::pass::vecmla::run(f);
             crate::mir::pass::autoinc::run(f);
             // R5.3, LAST of the SSA-MIR rows: it consumes the shape the rows
             // above leave — plain `BaseImm` addresses and scalar FP ops — and
@@ -164,6 +168,22 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             crate::mir::pass::slp::run(f);
         }
     });
+    if std::env::var_os("ZCC_MIRDUMP").is_some() {
+        for f in m.funcs.iter() {
+            if std::env::var("ZCC_MIRDUMP").ok().as_deref() == Some("1")
+                || std::env::var("ZCC_MIRDUMP").ok().as_deref() == Some(f.name.as_str())
+            {
+                eprintln!("=== MIR {} entry=b{} ===", f.name, f.entry);
+                for (b, blk) in f.blocks.iter().enumerate() {
+                    eprintln!("b{} params={:?}", b, blk.params);
+                    for i in &blk.insts {
+                        eprintln!("    {:?}", i);
+                    }
+                    eprintln!("    -> {:?}", blk.term);
+                }
+            }
+        }
+    }
     // R4.18's instrument: the TIME model, read beside the size model. Placed
     // here because the recurrence is a property of SSA MIR — the loop-carried
     // edges are the header parameters, and `regalloc` is about to destroy them.

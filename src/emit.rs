@@ -733,11 +733,27 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
                 Reg::P(p) => format!("v{}.{}", p.num, d),
                 Reg::V(x) => format!("<v{}>", x),
             };
-            let sn = match src {
-                Reg::P(p) => format!("{}{}", sw, p.num),
-                Reg::V(x) => format!("<x{}>", x),
-            };
+            // The general side goes through `isa::reg_name`, which is where the
+            // fact that register 31 prints `wzr`/`xzr` and never `w31` lives —
+            // the assembler rejected `dup v0.4s, w31` when this printed it raw.
+            let _ = sw;
+            let sn = reg(*src, match arr { Arr::V4S => Width::W32, Arr::V2D => Width::W64 });
             let _ = writeln!(s, "\tdup {}, {}", dn, sn);
+        }
+        MInst::VExt { arr, lane, dst, src } => {
+            // `umov` names the lane's own width on the general side: `.s` takes a
+            // `w`, `.d` takes an `x` (DDI 0487 C7.2.395).
+            let (l, dw) = match arr {
+                Arr::V4S => ("s", "w"),
+                Arr::V2D => ("d", "x"),
+            };
+            let _ = dw;
+            let dn = reg(*dst, match arr { Arr::V4S => Width::W32, Arr::V2D => Width::W64 });
+            let sn = match src {
+                Reg::P(p) => format!("v{}.{}[{}]", p.num, l, lane),
+                Reg::V(x) => format!("<v{}>", x),
+            };
+            let _ = writeln!(s, "\tumov {}, {}", dn, sn);
         }
         MInst::VAddv { arr, dst, src } => {
             // The destination is the SCALAR form of one lane (DDI 0487 C7.2.10):

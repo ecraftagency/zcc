@@ -199,6 +199,11 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
             want(*dst, Class::Fpr, "dst")?;
             want(*src, Class::Gpr, "src")?;
         }
+        // `umov` is `dup` run backwards: a vector in, a general register out.
+        MInst::VExt { dst, src, .. } => {
+            want(*dst, Class::Gpr, "dst")?;
+            want(*src, Class::Fpr, "src")?;
+        }
         MInst::VAddv { dst, src, .. } => {
             want(*dst, Class::Fpr, "dst")?;
             want(*src, Class::Fpr, "src")?;

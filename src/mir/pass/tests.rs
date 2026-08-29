@@ -1169,3 +1169,64 @@ fn a_constant_is_the_same_constant_every_iteration() {
     const_share::set_hoist(None);
     same(src);
 }
+
+// ── vecmla ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn four_jammed_lanes_are_one_lane_operation() {
+    // The shape `jam` leaves: four outer iterations through one inner loop, four
+    // loads sixteen contiguous bytes apart, four multiply-accumulates sharing one
+    // factor. Built BOTH ways from the same HIR and compared, because that is the
+    // only form this pass's square can take — the two programs are the two arms.
+    // TWO THINGS ARE LOAD-BEARING IN THIS SOURCE and both are the row's real
+    // conditions, not incidental to the test:
+    //   * the bound is a CONSTANT and the row stride is NOT a power of two (12
+    //     ints is 48 bytes), because only then does `iv` strength-reduce the walk
+    //     into a pointer — a power-of-two stride folds into a shifted index and
+    //     `iv` correctly refuses, leaving nothing at `BaseImm` for this to read;
+    //   * the counters are `long`, because an `int` counter puts a `Sext` between
+    //     `j` and the address and `jam`'s constant-displacement rule does not see
+    //     through it yet. That is a residual, and it is written down rather than
+    //     hidden by a test that avoids it silently.
+    let src = "static int A[12][12], B[12][12], C[12][12];                                        \
+               int main(void){ long i,j,k; int t=0;                                               \
+                 for(i=0;i<12;i++) for(j=0;j<12;j++){ A[i][j]=(int)((i*3+j)&15);                  \
+                                                      B[i][j]=(int)((i+j*5)&15); }                \
+                 for(i=0;i<12;i++) for(j=0;j<12;j++){ int s=0;                                    \
+                   for(k=0;k<12;k++) s += A[i][k]*B[k][j]; C[i][j]=s; }                           \
+                 for(i=0;i<12;i++) for(j=0;j<12;j++) t += C[i][j]*(int)(i*12+j+1);                \
+                 return t & 0x7fff; }";
+    let ast = frontend(src);
+    let mut h = hir::build::build(&ast);
+    // The HIR ladder must run: `jam` is what creates the shape and `iv` is what
+    // puts the four loads on one base. `same()` above deliberately skips the
+    // ladder; this row cannot.
+    hir::pass::run_module_with(&mut h, &crate::compile::pinned_symbols(&ast));
+    let h = h;
+
+    super::vecmla::set_wanted(Some(false));
+    let off = allocated(&h).unwrap();
+    let a = mi::new_machine(&off, &ast).call("main", &[], &[]);
+
+    super::vecmla::set_wanted(Some(true));
+    let on = allocated(&h).unwrap();
+    super::vecmla::set_wanted(None);
+    for f in &on.funcs {
+        crate::mir::verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
+    }
+    // NON-VACUITY: the lane operation must be there, or the equality below is
+    // proving that two identical programs agree.
+    let vec = on
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, crate::mir::MInst::VInt { .. }))
+        .count();
+    assert!(vec >= 2, "vecmla did not widen the loop: {} lane ops", vec);
+    let b = mi::new_machine(&on, &ast).call("main", &[], &[]);
+    match (a, b) {
+        (Ok(x), Ok(y)) => assert_eq!(x as i32, y as i32, "⟦scalar⟧={} ⟦vector⟧={}", x as i32, y as i32),
+        (x, y) => panic!("⟦scalar⟧={:?} ⟦vector⟧={:?}", x, y),
+    }
+}

@@ -634,6 +634,19 @@ impl<'a> Machine<'a> {
                 self.set(fr, *dst, lo);
                 self.set_hi(fr, *dst, hi);
             }
+            MInst::VExt { arr, lane, dst, src } => {
+                let (lo, hi) = (self.get(fr, *src), self.get_hi(fr, *src));
+                let v = match arr {
+                    Arr::V2D => {
+                        if *lane == 0 { lo } else { hi }
+                    }
+                    Arr::V4S => {
+                        let w = if *lane < 2 { lo } else { hi };
+                        ((w >> (32 * (*lane as u32 % 2))) as u32) as u64
+                    }
+                };
+                self.set(fr, *dst, v);
+            }
             MInst::VAddv { arr, dst, src } => {
                 let (lo, hi) = (self.get(fr, *src), self.get_hi(fr, *src));
                 // `addv` narrows to ONE lane of the element width, and the rest

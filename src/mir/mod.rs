@@ -611,6 +611,16 @@ pub enum MInst {
         dst: Reg,
         src: Reg,
     },
+    /// Read ONE lane out of a vector into a general register (`umov wD, vN.s[i]`,
+    /// DDI 0487 C7.2.395). The inverse of `VDup`, and what a vectorized loop needs
+    /// at its EXIT when the lanes are four different iterations rather than four
+    /// partial sums: they are extracted, not added.
+    VExt {
+        arr: Arr,
+        lane: u8,
+        dst: Reg,
+        src: Reg,
+    },
     /// Horizontal add ACROSS the lanes into a scalar in the FP register file
     /// (`addv sD, vN.4s`). What closes a vectorized reduction: the vector
     /// accumulator becomes the one value the scalar epilogue reads.
@@ -1018,7 +1028,9 @@ impl MInst {
                 g(b, Constraint::Use);
                 g(dst, Constraint::Def);
             }
-            MInst::VDup { dst, src, .. } | MInst::VAddv { dst, src, .. } => {
+            MInst::VDup { dst, src, .. }
+            | MInst::VAddv { dst, src, .. }
+            | MInst::VExt { dst, src, .. } => {
                 g(src, Constraint::Use);
                 g(dst, Constraint::Def);
             }
@@ -1169,7 +1181,9 @@ impl MInst {
                 f(b, Constraint::Use);
                 f(dst, Constraint::Def);
             }
-            MInst::VDup { dst, src, .. } | MInst::VAddv { dst, src, .. } => {
+            MInst::VDup { dst, src, .. }
+            | MInst::VAddv { dst, src, .. }
+            | MInst::VExt { dst, src, .. } => {
                 f(src, Constraint::Use);
                 f(dst, Constraint::Def);
             }
