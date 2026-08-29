@@ -2224,3 +2224,41 @@ fn tbaa_obeys_the_gnu_opt_outs() {
         "optimize(\"-fno-strict-aliasing\") did not turn the type oracle off"
     );
 }
+
+// ── copyidiom ──────────────────────────────────────────────────────────────
+
+#[test]
+fn a_disjoint_copy_loop_is_memcpy() {
+    // Two distinct objects, so the guard holds and the fast arm is the one that
+    // runs. `cp` is exactly the shape the census counted 16 times in sqlite3.c.
+    let src = "static char a[64], b[64];                                                          \
+               void cp(char *d, const char *s, int n){ int i; for(i=0;i<n;i++) d[i]=s[i]; }       \
+               int main(void){ int i,t=0; for(i=0;i<64;i++) a[i]=(char)(i+1);                     \
+                 cp(b,a,64); for(i=0;i<64;i++) t+=b[i]; return t; }";
+    let after = module(src, true);
+    let f = func(&after, "cp");
+    // NON-VACUITY. Without this the square below would be proving a transform
+    // that never fired — the failure mode `tests/provenance.sh` exists to catch.
+    let calls = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, Inst::Call { callee: super::super::Callee::Direct(n), .. } if n == "memcpy"))
+        .count();
+    assert_eq!(calls, 1, "copyidiom did not version the loop");
+    square(src, 2080); // 1+2+...+64
+}
+
+#[test]
+fn a_copy_loop_whose_ranges_overlap_takes_the_slow_arm() {
+    // THE GUARD IS THE PROOF, and this is what proves the guard. `d = a+1`,
+    // `s = a`: the ranges overlap, so the element-at-a-time loop PROPAGATES
+    // `a[0]` across the array — every byte ends up 1 — while `memcpy` over the
+    // same range is undefined and would not. A version that took the fast arm
+    // here would be a miscompile, not a slow program.
+    let src = "static char a[16];                                                                 \
+               void cp(char *d, const char *s, int n){ int i; for(i=0;i<n;i++) d[i]=s[i]; }       \
+               int main(void){ int i,t=0; for(i=0;i<16;i++) a[i]=(char)(i+1);                     \
+                 cp(a+1,a,15); for(i=0;i<16;i++) t+=a[i]; return t; }";
+    square(src, 16); // every byte became a[0] == 1
+}
