@@ -4516,6 +4516,54 @@ detector is removed under Article A(2) now that it has answered.
 
 ---
 
+### M52. Hardware counters, at last — and the first thing they did was correct me
+
+**WHAT BECAME POSSIBLE.** Every performance question this project has ever asked
+was answered with a wall clock or a static count, because Docker on macOS exposes
+no PMU: `MECHANISM.md` and the session notes both carry the line *"neither
+reachable without hardware counters"*. On the Graviton4 box `perf` is native and
+real. `kernel.perf_event_paranoid` ships at 3 and has to be lowered to 1.
+
+**THE PROGRAM.** `m2_http_parse` is an nginx-shaped request parser — a switch over
+a state inside a byte loop — and it reads **2.14× against `gcc -O2`**. Diffing the
+assembly showed something specific: gcc emits **fifteen `ldrb` sites, each after a
+different label**, where zcc emits **one** and fifteen unconditional branches back
+to it. gcc has TAIL-DUPLICATED the dispatch into the end of every state, which is
+exactly why a computed-goto interpreter beats a `switch` one.
+
+**THE HYPOTHESIS THAT FOLLOWED, and it was wrong.** Tail duplication is textbook
+branch-prediction work: each dispatch site gets its own predictor entry instead of
+sharing one. So the gap should be mispredicts. `perf stat`:
+
+| | instructions | cycles | IPC | branches | branch-misses |
+|---|---|---|---|---|---|
+| gcc -O2 | 472,918,822 | 86,742,883 | 5.45 | 102,460,432 | 33,033 (0.03%) |
+| zcc | 922,116,374 | 185,143,293 | 4.98 | 285,787,792 | 701,101 (0.25%) |
+
+**zcc executes 1.95× the instructions and 2.79× the branches.** The mispredicts are
+21× worse in ratio and about **7% of cycles** in absolute terms — real, and not the
+main term. IPC is 5.45 against 4.98, so neither side is stalling.
+
+**SO THE TRANSFORMATION IS RIGHT AND THE MECHANISM WAS NOT.** Tail duplication
+wins here by DELETING INSTRUCTIONS, not by fixing prediction: each of gcc's arms
+branches straight to the next state's code, so the whole dispatch sequence —
+`adrp`, `add`, `ldrsw`, `add`, `br` — is never executed. zcc pays it every byte.
+Had this been settled by reading assembly alone, the row would have been built
+against the wrong cost model and its profit predicted from the wrong number.
+
+**THE INSTRUMENT LADDER, now complete enough to state.** Static count answers
+*what did the compiler emit*; dynamic count (`callgrind`) answers *what did it
+execute*; `perf` answers *what did the machine charge for*. `M38` measured that
+the first predicts the third at corr 0.196. This entry is the first time the third
+was available at all, and it separated two hypotheses that the first two could not
+tell apart.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4 spot in us-west-2,
+`perf` 6.12.105, `kernel.perf_event_paranoid=1`, gcc 14.2.0 -O2, zcc native,
+output-gated before counting.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer

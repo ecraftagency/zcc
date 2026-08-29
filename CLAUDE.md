@@ -16,7 +16,15 @@ bare `aws` call takes the profile's default region, not this rule, so always pas
 
 ## Law 0 — purity is the precondition
 
-    purity ≫ exec > size > compile speed
+    purity ≫ exec ≫ size > compile speed
+
+**The second `≫` is as load-bearing as the first.** A row that buys execution
+time with code size SHIPS — tail duplication, inlining, an unrolled prologue, a
+magic-number sequence four instructions longer than a `udiv`. Size is a real term
+and it is reported, never traded away silently; but it does not veto an exec win,
+and "the binary grew" is not by itself an argument against a row. What still
+vetoes is a lost citation (Law 0's first `≫`) and a compile-time regression large
+enough to change how the compiler is used (`M44`).
 
 **No number is banked at the cost of a citation.** A row that reaches parity by
 removing a proof does not ship, however large the number. zcc is educational, so
