@@ -1,5 +1,9 @@
 #!/bin/sh
-# zlib.sh — PLAN.md, second real program: zlib 1.3.1 on the clock.
+# zlib.sh — zlib 1.3.1 on the clock, one arm of the real-program surface.
+#
+# The surface itself is recorded in `MECHANISM.md` Part F and summarised in
+# `README.md`. PLAN.md is NOT cited: it holds one grind and is emptied when that
+# grind closes, so a pointer into it dies with the work it described.
 #
 # WHY A SECOND ONE. sqlite is the only member of the measured surface with real
 # register pressure, and Law 3c's note on what may be claimed names the gaps in

@@ -2290,7 +2290,7 @@ impl P<'_> {
                         // C99 6.7.6.2: a 2D VLA `int M[d0][d1]` → pointer to a VLA ROW `int[d1]`
                         // + alloca(d0*d1*elem). Reuse the (*p)[w] mechanism verbatim: register
                         // the row-type in vla_arrs so mkbin scales the runtime row step (d1*elem);
-                        // indexing M[i][j] then works via the Deref-Array decay (867-875 arm64_elf).
+                        // indexing M[i][j] then works via the Deref-Array decay (ARM64.md).
                         // ≥3 dimensions or an inner VLA-nested dimension → reject cleanly (unsupported).
                         _ if vla.is_some() && !vla_in.is_empty() => {
                             if vla_in.len() != 1 {

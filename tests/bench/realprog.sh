@@ -1,5 +1,10 @@
 #!/bin/sh
-# realprog.sh — PLAN.md: a REAL PROGRAM on the clock, both axes, both sides.
+# realprog.sh — a REAL PROGRAM on the clock, both axes, both sides.
+#
+# The measured surface is `MECHANISM.md` Part F; this module is its sqlite arm,
+# and `tests/bench/real/*.sh` are the others. PLAN.md is NOT cited here: it holds
+# one grind and is emptied when that grind closes, so a pointer into it is dead
+# the moment the work it described is banked.
 #
 # WHY THIS EXISTS. The 35-program taxonomy suite times 18 of its 35 programs and
 # is structurally blind to three things: instruction-cache pressure (every kernel
