@@ -1,275 +1,149 @@
 # zcc
 
-> ### AI-authored
-> **Not a single line of code in this repository was written by a human.** The
-> compiler, its tests, and its documentation were produced entirely by AI, under
-> the direction of the project author. The author designed, reviewed, and steered
-> the work; the AI wrote all of it. This disclaimer applies to every file here.
+> **AI-authored.** Not a single line in this repository was written by a human.
+> The compiler, its tests and its documents were produced entirely by AI under
+> the direction of the project author, who designed, reviewed and steered.
 
-A C compiler for strict C99, written in Rust — targeting AArch64 ELF (Linux).
-Single crate, zero external dependencies.
+A compiler for strict C99, written in Rust, targeting AArch64 ELF (Linux).
+Single crate, zero external dependencies. `CC=zcc` slots into a real build
+system unmodified.
 
-## Why another compiler
+## Correctness by construction
 
-The world has enough compilers. zcc is not meant to be one more — it is an
-experiment in a single question:
+zcc exists to ask one question: *how do you know a compiler is correct?* Testing
+answers it only halfway — Dijkstra's wall, that testing shows the presence of
+bugs and never their absence — so zcc tries to **construct** correctness instead
+of only checking it afterwards. Two rules do the work:
 
-> *How do you know a compiler is correct?*
+**Every line of `src/` lies on exactly one side** — it realizes a *theorem*
+(control flow, data structure, algorithm) or transcribes a line of
+*specification* (a constant, an ABI offset, a table). Nothing else is allowed, no
+constant appears without provenance, and `tests/provenance.sh` fails the build if
+a line escapes both. If nothing lies outside {theorem ∪ spec}, zcc and its
+referee are two shadows of the same document.
 
-It began as a study of how to **test** a compiler: differential testing against
-a reference compiler, random-program fuzzing (csmith/yarpgen), and structural
-exhaustion over the grammar of each phase. Pushed far enough, testing runs into
-the wall Dijkstra named:
+**Every optimization pass ships its commuting square.** `SEMANTICS.md` gives an
+executable reference semantics ⟦·⟧ of the IR; a pass is correct exactly when
+⟦IR⟧ = ⟦pass(IR)⟧, and that equality is *run*, per pass, on every `cargo test` —
+and checked **non-vacuous**, because a theorem nobody exercises is not a theorem.
 
-> *Program testing can be used to show the presence of bugs, but never to show
-> their absence.*
+The pressure point is deliberate: differential studies locate most
+*miscompilation* bugs in the IR and its passes rather than the parser, so zcc
+carries that part — typed SSA and about thirty passes — because it is the hard
+part, and makes it the object of proof.
 
-So zcc turns the question around. Instead of only *checking* correctness after
-the fact, it tries to *construct* it. Every line of `src/` maps either to a
-theorem (control flow, data structure, algorithm) or to a line of specification
-(a constant or lookup table) — nothing else.
-
-The pressure point is the optimizer. Differential-fuzzing studies of production
-compilers (csmith, EMI) consistently locate the majority of *miscompilation*
-bugs not in the parser but in the intermediate representation and its
-transformation passes — the part that separates a translator from a *compiler*.
-zcc carries that part (a typed SSA IR and roughly twenty optimization passes) precisely
-because it is the hard part,
-and then makes it the object of proof: each pass carries an **executable
-equivalence check** against a **reference semantics** of the IR. A pass is
-correct if and only if it commutes with the meaning of the program, and that is
-*measured*, not asserted. Small enough to read in full; hard enough to be worth
-verifying.
-
-The long-term aim is to retire the test suite by proof.
+**Stated honestly:** this is *mechanized and structurally exhaustive*, **not** a
+machine-checked proof, and zcc does not claim to be "verified". Formal proof —
+translation validation, then per-pass machine-checked proofs — is on the roadmap
+in `SEMANTICS.md` §6.
 
 ## Capabilities
 
-Everything below is what a compiler of **28.7k lines of Rust** does — `src/`
-excluding test modules, blank lines and comments; 45.4k raw, of which 6.3k are
-in-tree batteries. Re-measure with
-`find src -name '*.rs' ! -name tests.rs | xargs cat | grep -vcE '^[[:space:]]*(//|/\*|\*|$)'`.
-
-> **THE LOC CEILING IS ABOLISHED (2026-08-29).** The ledger below records a 10k
-> cap and stops at the musl milestone; entries that reason from it are marked
-> where they are wrong. The cap is gone, not merely stale: a line count cannot
-> tell a proof from bloat, and this compiler spends most of its lines on the
-> proofs Law 0 ranks above every number — so honouring a ceiling would mean
-> deleting exactly what makes it worth reading. It had also begun to steer
-> architecture (Windows/PE partly dropped for "breaching" it; M22's
-> assembler-and-linker budget approved because it was "unchanged", when it was
-> not). What replaces it is the rule that was doing the real work all along:
-> **nothing is built before a real `.c` demands it.**
-
 A ✅ is measured and reproducible; a ⏳ is a gate that must close before release.
 
-| | Capability |
+| | |
 |---|---|
-| ✅ | **Language:** C99 (C89 is a subset); preprocessor, parser, full type system, code generator |
-| ✅ | **Targets:** AArch64 — ELF (Linux). macOS/clang is the reference oracle only |
-| ✅ | **Dependencies:** none — a single Rust crate, zero external crates |
-| ✅ | **Drop-in driver:** `CC=zcc` slots into real build systems (configure/make/cmake) unmodified; drives `as`/`ld` directly |
-| ✅ | **Real software:** compiles and differentially validates real C projects (redis, sqlite, git, nginx, …) |
-| ✅ | **IR + optimization:** a typed SSA intermediate representation with 17 HIR passes and 13 MIR passes — SSA construction, sparse conditional constant propagation, global value numbering, CSE + alias-aware store→load forwarding, dead-code elimination, CFG simplification, LICM / strength-reduction / pointer-IV, if-conversion, inlining, SROA — then a machine-level SSA IR (MIR) with instruction selection, its own passes, and **register allocation ON SSA**: chordal colouring in dominance order (Hack 2007), which is optimal once the spiller has brought pressure under *k*, with biased colouring for coalescing |
-| ✅ | **Structural-exhaustion gates:** five science-gates exhaust the grammar of each phase (lexer/layout, preprocessor, type derivation, usual-arithmetic-conversions, ABI) |
-| ✅ | **Random differential — csmith:** passing |
-| ✅ | **Mechanized reference semantics:** a formal semantics ⟦·⟧ of the IR (`SEMANTICS.md`) with an executable commuting-square theorem — each ⟦·⟧-preserving pass checked against the reference semantics over a 312-expression battery |
-| ✅ | **Random differential — yarpgen:** 300 seeds per gate run, 0 divergence; a 1000-seed seal is owed before release |
-| ⏳ | **End-to-end — Linux chroot boot:** *release gate* |
-| ✅ | **What widening the surface to real applications actually found** *(2026-08-29)*: adding oniguruma 6.9.9 turned up **two defects, both fixed, that 20,000 generated programs had never produced** — and then a third, in the gate itself. First, C99 6.2.3 puts tags in a name space of their own, so one spelling may be both an enum tag and a typedef name; oniguruma writes exactly that and zcc reported `expected ";"`. Second, and far worse because it was SILENT: zcc had no `\u` arm in its escape handler at all, so a universal character name (C99 6.4.3) fell through to the undefined-escape identity rule and the escape for OHM SIGN became the five characters `u2126` — wrong answers, no diagnostic. Both fixed; oniguruma's own suite now reads 1,516 pass / 0 fail on zcc, identical to gcc. <br> **Neither was reachable from a benchmark, and that is the point.** torture 1694, c-testsuite 220, opt-parity 1552 and both fuzzers were green through both, because a tag colliding with a typedef and a `\u` escape are shapes no generator emits — and libpng and bzip2 compare their output against gcc's byte for byte and agree, because no workload here contains a `\u`. **A differential comparison covers only what its workload executes; an application's own test suite sweeps the application deliberately.** <br> **The third was in the gate.** `fullsuite.sh` hard-set `ZCC=/usr/local/bin/zcc`, which on the Graviton box is a symlink into a build tree the gate does not own — so fifteen stages reported PASS about a compiler four hours older than the fix. Only the new regression case caught it. The gate now honours an explicit `ZCC` and **prints the resolved path and the binary's mtime in its banner**, because a gate that does not name what it gated cannot be trusted the next morning (`MECHANISM.md` M59) |
-| ✅ | **Against its peers** *(cproc+qbe measured 2026-08, 42 programs, Apple M1 Pro, referee `gcc -O1`, all three producing byte-identical output — zcc **1.023×**, cproc+qbe **1.556×**, worst 4.13×; re-measured on Graviton4 against `-O2`, cproc+qbe reads **2.141×** where zcc reads 1.209×)*: among independently-written C compilers that actually optimize, **cproc + QBE is the only one on this list that has been MEASURED against zcc on the same box**, and the durable half of that comparison is not the ratio — cproc cannot compile the sqlite amalgamation at all (`volatile store is not yet supported`, upstream-documented as "requires qbe support"), while zcc builds sqlite, lua, zlib, libpng, bzip2, oniguruma, git, redis, nginx and musl libc. <br> **What is NOT claimed.** tcc, PCC, lacc and chibicc have not been run on this box. tcc and chibicc are one-pass compilers with no optimizer by design, so they are not in this race — but that is a statement about their documented architecture, not a measurement, and it is written here as such. CompCert sits in range of `gcc -O1` and is excluded from "independent" only because AbsInt sells it; anyone reading a superlative here should ask about it first. **No claim of the form "nothing beats zcc" is made, because the measurements that would support it have not all been taken** |
-| ✅ | **Speed** *(2026-08-29; 96-program taxonomy suite, the sqlite CLI and five real programs, on a Graviton4 / Neoverse V2 spot box, native, Debian 13, gcc 14.2.0)*: <br> **against `gcc -O2`, which is what real software is built with** — suite EXEC geomean **1.209×**, static instruction count **1.015×**. Real programs, each built and RUN by both compilers with their output differentially checked first: sqlite CLI **1.123×** (11 phases, time-weighted total), lua 5.4.7 **1.160×** (3 arms), zlib 1.3.1 **1.130×**, libpng 1.6.43 **1.010×**, bzip2 1.0.8 **1.102×** compressing and **1.074×** decompressing. <br> **READ THE INSTRUMENT'S OWN FLOOR BEFORE READING ANY OF THIS.** Six runs of ONE unchanged binary over the same 96 programs returned 1.2091, 1.2014, 1.2107, 1.2097, 1.2105 and 1.1990 — a spread of 0.012. The suite geomean cannot resolve a change below about 1.5%, and two rows measured this session were buried by exactly that; `perf`'s dynamic instruction count is the deterministic instrument for anything smaller. A real program with a 100 ms workload resolves to ±0.3%, which is why the surface is being widened with programs and not with more kernels. <br> **No parity is claimed, and the tail is where the truth is:** 49 of the 96 timed programs are above 1.1× and the worst is `e2_many_args` at **2.75×**. The gap to -O2 is dominated by ONE thing measured rather than guessed — `perf` says the twelve worst programs are all COUNT-driven, not chain-driven: zcc's IPC is 4.1–6.7 and it simply retires 1.4× to 4.6× the instructions, because gcc -O2 vectorizes seven of those twelve and zcc vectorizes none of them. <br> The same binaries read **1.069× on an Apple M1 Pro under Docker** against `-O1` where Neoverse reads 1.172× (`MECHANISM.md` M46), so no number here is quotable without its core and its referee level. `tests/bench/exectime.sh`, `tests/bench/real/*.sh`; bench is `-O2` only since 2026-08-29, and a number taken at one level does not transfer to the other |
+| ✅ | **Language** — C99 (C89 is a subset): preprocessor, parser, full type system, code generator |
+| ✅ | **Target** — AArch64 ELF (Linux). macOS/clang is a reference oracle only |
+| ✅ | **Drop-in driver** — `CC=zcc` through configure/make/cmake; drives `as` and `ld` directly |
+| ✅ | **Real software** — builds and differentially validates sqlite, lua, zlib, libpng, bzip2, oniguruma, git, redis, nginx and musl libc |
+| ✅ | **IR + optimization** — typed SSA, 17 HIR passes and 13 MIR passes, each carrying its square |
+| ✅ | **Structural-exhaustion gates** — five science-gates exhaust the grammar of each phase: lexer/layout, preprocessor, type derivation, arithmetic conversions, ABI |
+| ✅ | **Random differential** — csmith and yarpgen, 0 divergence; a 10,000-seed seal is owed before release |
+| ⏳ | **End-to-end Linux chroot boot** — *release gate* |
 
-**Stated honestly:** the correctness evidence above is *mechanized and
-structurally exhaustive*, **not** a machine-checked proof. The project does
-**not** claim to be "verified." Formal proof (translation validation, then
-per-pass machine-checked proofs) is on the roadmap — see `SEMANTICS.md` §6.
+The gate is 16 stages, native on AWS Graviton4: torture 1694, c-testsuite 220,
+opt-parity 1552, csmith, yarpgen, musl 479 test binaries, determinism 188×8,
+provenance, UBSan over every benchmark. It prints which binary it graded — see
+below for why that matters.
 
-## Design documents
+## Measurements
 
-There are five, and the source is allowed to point at no others. A document per
-campaign is how a repository acquires contradictions faster than it acquires
-facts, so the count is the mechanism: a new one is not created without deleting
-one.
+Referee is **`gcc -O2`** — the level real software is built at — on a
+**Graviton4 / Neoverse V2** box, native Debian 13, gcc 14.2.0, 2026-08-29. Both
+compilers build and RUN every program, output checked before any clock is read,
+and each comparison pins the WORK rather than only the answer: libpng's encoded
+size and bzip2's compressed length fix every filter and Huffman decision.
+
+| program | what it exercises | exec | insn |
+|---|---|---|---|
+| sqlite 3 CLI | query engine, cold branches, real spilling | **1.123** | — |
+| lua 5.4.7 | ~100-arm dispatch loop, FP through the VM, GC | **1.160** | — |
+| zlib 1.3.1 | one hot loop, 32 KB sliding window | **1.130** | 1.155 |
+| libpng 1.6.43 | byte-wise row filters, narrow types, constant stride | **1.010** | 1.073 |
+| bzip2 1.0.8 — compress | suffix sort, genuinely unpredictable branches | **1.102** | 0.548 |
+| bzip2 1.0.8 — decompress | inverse BWT, one dependent load per byte | **1.074** | 1.611 |
+| oniguruma 6.9.9 | backtracking regex engine | *1,516 / 1,516 pass, = gcc* | — |
+
+bzip2's two INSN columns run opposite ways and cancel to 1.005 in the total —
+which is why the arms are reported, and the geomean is not.
+
+**Kernel suite** — 96 programs, one shape each, deliberately adversarial:
+
+    EXEC geomean 1.209   ·   INSN geomean 1.015   ·   0 divergence
+
+49 of the 96 sit above 1.1× and the worst is 2.75×. The gap is measured, not
+guessed: `perf` says the twelve worst are all **count-driven**, never
+chain-driven — zcc's IPC is 4.1–6.7 and it retires 1.4×–4.6× the instructions,
+because gcc -O2 vectorizes seven of those twelve and zcc vectorizes none.
+
+**Read the instrument's floor before any of these.** Six runs of ONE unchanged
+binary over the same 96 programs spread 1.1990 to 1.2107 — 0.012. The suite
+geomean cannot resolve a change below ~1.5%, and two rows measured the day this
+was written were buried by exactly that; `perf`'s dynamic instruction count is
+the deterministic instrument for anything smaller. A 100 ms real program resolves
+to ±0.3%, which is why the surface grows by programs, not by kernels.
+
+**No parity and no superlative is claimed.** Only cproc+qbe has been run against
+zcc here — 2.141×, and it cannot compile the sqlite amalgamation at all. tcc,
+PCC, lacc and chibicc have not; tcc and chibicc are one-pass compilers with no
+optimizer *by design*, which is a statement about their architecture, not a
+measurement. CompCert sits in range of `gcc -O1`. Nor does a number transfer
+across cores: these binaries read 1.069× on an Apple M1 Pro where Neoverse reads
+1.172× against `-O1`.
+
+## What the surface found
+
+Widening from benchmarks to real applications found three defects in one
+afternoon that 20,000 generated programs never produced. All three are fixed.
+
+- **C99 6.2.3** — tags are their own name space, so `enum SaveType {...}` may sit
+  beside `typedef int SaveType;`. zcc refused the tag.
+- **C99 6.4.3** — zcc had *no `\u` arm in its escape handler at all*: a universal
+  character name fell through to the undefined-escape rule and the escape for OHM
+  SIGN became the five characters `u2126`. **Silent** wrong answers.
+- **The gate itself** — it hard-set the compiler path to a symlink into a build
+  tree it did not own, so fifteen stages reported PASS about a binary four hours
+  older than the fix under test. It now prints what it graded.
+
+Neither compiler defect was reachable from a benchmark: libpng and bzip2 agree
+with gcc byte for byte because no workload here writes a `\u`. **A differential
+comparison covers only what its workload executes; an application's own test
+suite sweeps the application deliberately** — the whole argument for the
+real-program surface.
+
+## Documents
+
+Five, and the source may point at no others — a document per campaign is how a
+repository acquires contradictions faster than facts.
 
 - `CLAUDE.md` — the charter: the laws, above all five.
-- `THEORY.md` — the two-side catalog: every line of `src/` mapped either to a
-  theorem it realizes or to a spec constant it transcribes.
+- `THEORY.md` — every line mapped to a theorem or a spec constant.
 - `SEMANTICS.md` — the reference operational semantics ⟦·⟧ of the IR.
-- `MECHANISM.md` — how the compiler is actually built and every fact measured
-  about it: the gate, purity, compile speed, the spiller, the copy census, the
-  pipeline layer by layer, the decision log, and the measurements that have no
-  spec to cite.
-- `ARM64.md` — the target's own facts, and the ledger of what has beaten
-  gcc -O1 on it.
+- `MECHANISM.md` — how it is built and every fact measured about it; Part G §G0
+  is the field guide to where defects live.
+- `ARM64.md` — the target's facts and the isel exhaustion checklist.
 
-`PLAN.md` is not one of the five and is not a document: it holds the ONE grind
-in progress, is capped at 100 lines, may not be cited from `src/`, and is
-emptied when that grind closes — into `MECHANISM.md` if it won, or into its
-Part F as a refutation if it lost.
+`PLAN.md` is not one of them: one grind, 100 lines, never cited from `src/`,
+emptied when the grind closes. And the history is in the tags rather than here —
+`git tag -n50 rc3` through `rc11` is the chronicle, each carrying the
+measurements and the refutations of its milestone.
 
-## Build
+## Build and license
 
 ```sh
 cargo build --release      # the compiler: target/release/zcc
-cargo test                 # unit tests, including the commuting-square theorem
+cargo test                 # unit tests, including the commuting-square theorems
 ```
 
-`zcc` drives the host assembler and linker directly and slots into a real build
-system as `CC=zcc`.
-
-## License
-
 MIT — see [`LICENSE`](LICENSE). Use it for any purpose, without restriction.
-
----
-
-## zcc — Milestone Ladder, Achievements, Debt Ledger
-
-(The charter and laws live in `CLAUDE.md`; the test-asset register in `MECHANISM.md Part A`. This file is the *chronicle*: it proceeds sequentially, without skipping; each milestone is closed by a repeatable gate.)
-
-### Phase 1 — pure C89 (M0–M8, fully achieved)
-
-- **M0**: `int main() { return N; }` → .s → `cc` link → correct exit code. Proves the whole pipeline.
-- **M1**: expressions `+ - * / %`, parentheses, unary, comparison — still confined to `return`.
-- **M2**: local variables (stack slots), `=`, `if/else`, `while`, `for`, blocks.
-- **M3**: function definition and calls with multiple parameters, recursion (a working `fib`).
-- **M4**: pointers, `&` `*`, arrays, pointer arithmetic, `int`/`char`/`long` + `sizeof`.
-- **M5**: string literals, `char *`, calling `printf` (observing the varargs-onto-stack rule). From here, stdout can be diffed.
-- **M6**: struct/union, typedef, enum, global variables, initializers.
-- **M7**: full C89 preprocessor (`#include #define #if…` — macro expansion/rescan is the genuine boss of the whole project).
-- **M8** (capstone): compiles `chibicc` or `tcc`, and the produced binary compiles hello-world (a transitive verification, standing in for self-hosting since Rust cannot self-host). Achieved; repeated by `tests/m8.sh`.
-
-### Phase 2 — C89+ (goal: nginx + redis on Apple-silicon Mach-O, fully achieved)
-
-"C89+" means keeping the C89 frame and cherry-picking exactly the C99/C11/GCC-extension parts that nginx/redis hit. It does *not* claim C99. Each milestone: the prior suites (run.sh, m8.sh) must stay green.
-
-- **M9 — a proper cc-compatible driver** (a survival condition for toolchain integration): multiple inputs in one command (`zcc a.c b.o c.o -o app` — compile the .c parts, forward all .o to ld), `-l`/`-L`, `-U`, `-MMD -MF` (redis's make needs it), `-v`, correct exit codes and standard `file:line:` diagnostic format (configure greps stderr), unknown flags swallowed silently but *never* mis-swallowing a flag that carries an argument (`-o`, `-I`, …). **Gate: build tcc using its own original Makefile (not ONE_SOURCE) — many .c → .o → link — then m8.sh still passes.** Achieved; repeated by `tests/m9.sh` (the `-Dinline=__inline` hack is no longer needed).
-- **M10 — the C89+ language**: mixed declarations + declarations inside `for(...)`, real `long long` + `_Bool`, variadic macros `__VA_ARGS__` (+ named `args...`, `,##__VA_ARGS__`), `__typeof__`, flexible array member, `inline`/`__restrict`/`__extension__` as no-ops, `__attribute__` parse-skip honoring `aligned`/`packed`, `__builtin_expect/unreachable`, C99 designated initializers, `#warning`. **Gate: one case per feature in tests/ext/ (`tests/run.sh ext`).** Achieved — most already existed from the torture era; only `__typeof__`, named variadics, comma-deletion, and `#warning` had to be added. Case-range `1 ... 5` and `$` in identifiers: not done (nothing demands them yet).
-- **M11 — consuming *real* SDK headers** (dropping stubs incrementally — repaying the library debt): the `_Nullable` family, `__attribute__((availability...))`, blocks `^` (parse-skip at declarator position), `__asm("_rename")` (symbol rename at emit), `__has_include`, `#pragma` skip. The driver defaults to `-I $SDK/usr/include` when an include is not in the embedded set. **Gate `tests/m11.sh`: a file including `pthread.h`, `sys/socket.h`, `netinet/in.h`, `sys/event.h`, `signal.h` from the real SDK — compile, create a socket + kqueue, run correctly.** Achieved. Major decision: **zcc identifies as `__GNUC__ 4.2.1`** (as clang does), because the SDK writes the arm64 branch only under `#ifdef __GNUC__` — the non-GNUC branch is x86-only and lacks definitions. It does *not* identify as `__clang__`, and does *not* define `__BLOCKS__` (blocks `^` then vanish behind the `#if` guard — no need to parse them). `__has_feature/__has_builtin` are *not* implemented — cdefs.h falls back to 0 on its own. `defined(...)` must resolve *after* macro expansion too (pthread.h expands a macro into `defined`). `__uint128_t` is 16-byte, align-16 *storage* (for mcontext), not arithmetic.
-- **M12 — atomics + threading (achieved)**: the `__sync_*` family (fetch_and_add/sub and their reverse, val/bool_compare_and_swap, lock_test_and_set, lock_release, synchronize) lowers to `Node::Sync` → an LL/SC ldaxr/stlxr loop (acquire+release = seq_cst), operands integer/pointer of 4 or 8 bytes; the name table lives in `src/ext.rs` (the file was born here, per the decoupling law). **Gate `tests/m12.sh`: 4 threads × 100000 counter increments via fetch_add + a spinlock CAS + redis's `atomicvar.h` macros used verbatim, exactly 3/3; single-thread semantics locked in `tests/ext/gcc_sync_atomics.c`.**
-- **M13 — nginx (achieved)**: configure + make + real serving, repeated by `tests/m13.sh` (clean clone → serve → curl matches even a 200KB file). Patches required: the `__has_feature/extension/builtin/attribute` family become `#if` operators returning 0 (table in ext.rs — arm/_types.h calls them before cdefs.h can fall back), `__APPLE_CC__ 6000` (TargetConditionals selects the GNUC branch by it), `##` paste using *raw* spelling (199506L once lost its suffix → wrong cdefs macro name), **inline definitions lowered to static** (the SDK's gnu89 `extern __inline` stopped emitting duplicate symbols), five stubs shrunk toward the real SDK: sys/time.h, unistd.h, fcntl.h, time.h, errno.h → real SDK, and stdio.h stub gained `sys_nerr`. A diff-probe of configure against cc left only 2 harmless divergences (-Wl,-E swallowed-so-found, __builtin_bswap64 missing-but-has-fallback).
-- **M14 — redis (Phase 2 capstone, achieved)**: `make CC=zcc MALLOC=libc` — server + cli + benchmark link, and the vendored deps (lua, hiredis, hdr_histogram, fpconv, xxhash, tre, linenoise) all compile with zcc. **Gate `tests/m14.sh`: clean clone → build → `redis-server` runs, PING→PONG + SET/GET/INCR correct.** Major decisions:
-  - **Reversing the "no extended asm" doctrine**: xxhash genuinely required it → a *subset* `Node::Asm` is supported — constraints only `=r`/`+r`/`r`, ≤7 operands hard-assigned to x9..x15, clobbers parsed-then-discarded (safe at -O0: every statement reloads from memory), template emitted verbatim.
-  - **`__atomic_*` are macros redirecting to `__sync_*`** (the ATOMIC_MACROS table in ext.rs) — load = fetch_add(p,0), CAS via statement-expression + `__typeof__`; memory order ignored (always seq_cst). fetch_or/and/xor are demanded only by jemalloc — not done (MALLOC=libc is the macOS default).
-  - **gnu89 inline**: an inline definition with no bare declaration → `.weak_definition` (non-static) + **per-TU DCE** (as clang does; required because the inline body in server.h references a symbol that redis-cli does not link). A bare declaration → truly external (C99 6.7.4p7, relied on by logreqres.c). This entails `.subsections_via_symbols`.
-  - **VLA lowered to a pointer + `Node::Alloca(n*sizeof(elem))`** (networking.c `iov[iovmax]`); `sizeof(vla)` returns the pointer size — a *deliberate* spec deviation; multi-dimensional non-constant VLAs / VLAs with initializers / VLAs outside local scope are errors.
-  - Bit-manipulation builtins (`__builtin_bswap*/clz*/ctz*/popcount*`) are pure statement-expression macros in the ext.rs BIT_MACROS. Computed include `#include MACRO` (standard C89 3.8.2). Brace-wrapped string init `char x[]={ "s" }` (C89 3.5.7). Line-splice `\`+newline *inside* a string literal. Driver `-shared`/`-dynamiclib` → `ld -dylib`. `typedef enum : type` (SDK malloc.h). Local shadowing typedef (`quicklist *quicklist`). Predefine `__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ 110000` (without it redis config.h falls into a hidden `struct stat64` branch). Stubs deleted: dlfcn.h, stdint.h, limits.h (the real SDK serves them). Stubs added: INFINITY/NAN/M_PI/fpclassify (math.h), `_IO*` + setvbuf (stdio.h), `getprogname` (stdlib.h — missing it makes implicit-int *truncate the pointer*, exactly the ASLR/implicit-int trap from M8).
-  - `__thread` was initially a no-op (sufficient for io-threads=1); it was later raised to *real* Mach-O TLS when redis's io-threads≥2 unit tests required it: data in `__thread_data`/`.tbss`, a 3-quad descriptor in `__thread_vars`, access via `@TLVPPAGE` + `blr` to `tlv_get_addr` (preserving every register except x0/x16/x17). Gate `tests/ext/gcc_thread_tls.c`.
-
-LOC budget derived from the then-current 5281 lines: M9 ~150, M10 ~350, M11 ~250, M12 ~150, M13+M14 unpredictable patching — projected ~6.6k. **Phase-2 close of books: 6107 LOC + 333 stubs; after real TLS: 6301 + 328. After M15 (arm64 ELF): 7762 + 404 (arm64_elf.rs is a deliberate parallel copy of ~1.26k — the price of "the diff is the documentation"; ~2.2k of buffer remains under the ceiling).**
-
-### Phase 3 — multi-target ELF
-
-Decided: open **arm64 ELF Linux first** (reusing the existing instruction selection; runs natively in Docker/OrbStack on Apple silicon). **Windows/PE: dropped** — LLP64 breaks the LP64-lock premise, requires a second MinGW-header campaign, and breaches the 10k ceiling *(void — the ceiling is abolished. The decision stands on the first two reasons, which are about the target rather than about size)*; Windows development is served via WSL2 with ELF binaries.
-
-- **M15 — arm64 ELF Linux (achieved)**: file `codegen/arm64_elf.rs` *(that file and the whole of `src/codegen/` were deleted by the MIR re-architecture; target knowledge now lives in `mir/isa.rs`, `isel/abi.rs` and `emit.rs` — see `CLAUDE.md` Article B)* (a deliberate copy of arm64_darwin.rs — `diff`-ing the two files *is* the "how Mach-O differs from ELF" documentation) + a `Target` enum crossing the ast.rs boundary + a `--target` flag (defaulting to the host OS at zcc build time: a statically cross-compiled `aarch64-unknown-linux-musl` binary becomes a native compiler inside the box, drop-in `CC=zcc` needing no flag). The cheap part was as predicted: ELF sections, dropping the `_` prefix, `:lo12:`/`:got:` replacing `@PAGE`/`@GOTPAGE`, `.weak`, GNU `.comm` byte alignment (Darwin uses log2), TLS local-exec `tpidr_el0 + :tprel_*` replacing the `@TLVPPAGE` descriptor. The substantial part, as planned: (1) **va_list = a 32-byte AAPCS struct** — a 192B register-save area (q0–q7 + x0–x7) immediately below the frame in the variadic prologue; `__builtin_va_start/va_arg` become *real* builtins `Node::VaStart/VaArg` (Darwin still uses the char* macro path — the node never appears there); va_arg selects the GP/VR/stack region by the *sign* of `gr_offs/vr_offs`; (2) anonymous variadic args go in registers like named ones; (3) stack args in rounded 8-byte slots; (4) `char` is *unsigned* by default (parameterized via `P.tgt`, `__CHAR_UNSIGNED__` predefine); (5) `long double` *kept* = double, a *deliberate* deviation (the `float_h` case diffs LDBL_* against gcc — the only objective failure in the box). ELF link path: crt1/crti/crtn + `-dynamic-linker /lib/ld-linux-aarch64.so.1` + `-lc -lm` (glibc splits libm, Darwin fuses libSystem). Emergent items: `#include_next` (subset: like `#include <>` but skipping the embedded table) + an embedded `limits.h` playing "the compiler's limits.h" as clang/gcc do, then forwarding down to glibc (`_GCC_LIMITS_H_`). **Gate achieved: abi.sh (292 cases × 4 cross-link directions zcc↔gcc, 0 fail) + alg.sh (43036 runtime points + 21552 folds, 4 comparisons) + cpp.sh (37 mechanism lines + 1425 #if points) run verbatim in the Debian/gcc-14 box; tests/cases 64/65 (1 fail = the deliberate float_h); tests/ext 14/14 including 4-thread TLS + atomics.** Debt left by M15: `-shared` ELF all-globals-through-GOT not yet proven with a real .so; va_arg composite ≤16 not yet handling C.11 straddling reg/stack (the gate does not demand it).
-- **M16 — x86_64 ELF (deferred)**: yielding its LOC to M17 first; a new instruction selection + SysV classification, to be scheduled when reopened.
-- **M17 (in progress) — the coverage campaign**: spend the remaining LOC (~2.2k under the ceiling after deferring M16) on gcc/clang dialect coverage + cherry-picked C99/C11 — *keeping the law*: no checklist-driven implementation; each feature must be demanded by a real, canonical piece of software. Order: sqlite → git → musl libc, then the remaining basket by coverage-per-LOC: zlib → standalone lua → jemalloc (promised since M14) → curl → sbase → coreutils (gnulib, last). When ext.rs exceeds ~300 LOC: split into `ext/gcc.rs, ext/clang.rs…` by *originating* dialect. If the basket exceeds budget, the ceiling is re-decided by probe data, not padded.
-  - **sqlite achieved**: the 262,899-line amalgamation compiled clean on the first pass, zero LOC; the CLI runs, differential against cc matches 31 lines byte-for-byte. Debt: the official TCL suite needs a Linux box + tcl.
-  - **git achieved**: the 2.55.GIT binary links + smoke suffices (init/commit/log/diff/fsck); t/ suite: t0000 92/92, t0001 103/103, t3600 81/82 (1 fail = a known git breakage). Cost +62 LOC: `__STDC_VERSION__ 199901L`, `[restrict]` array parameters, PRI/SCN MAX, `__builtin_types_compatible_p`, `__extension__` expr/stmt, and 3 pure-C89 bugs exposed (global-name scope before initializer; an identifier after a specifier is a name even if it collides with a typedef; stray locals leaking into ginit). Details in MECHANISM.md Part A. LOC after git: 7824 Rust + 447 header.
-  - **musl libc 1.2.5 achieved**: a full in-box build — **1350 objects, zero errors, libc.a 4.3MB + crt**, installed as a sysroot; static hello + a broad smoke set (qsort/printf/math/file-IO/strtod) **matching gcc+glibc byte-for-byte**. The official libc-test suite: zcc fails 77 / the musl-gcc referee fails 46 — the differential settles it: most failures are upstream baseline; zcc-only leaves ~10 genuine suspects (mbc/wide cluster, setjmp, vfork, tls_local_exec, ilogb/isless fp-exception) + the -shared debt + LDBL64 consequences — details in MECHANISM.md Part A. Major decision: `long double` kept = double by porting `bits/float.h` LDBL64 (the upstream arm32 branch — one file, and the world stays consistent on its own); the driver grows `ZCC_SYSROOT`; discovered that **GNU ld drops the addend on a GOT-local symbol** → ELF FunAddr static goes via adrp/add directly (unlike Darwin). Cost: `_Complex` desugared to a struct, weak/alias/top-level asm, `.s/.S` passthrough, inf/nan builtins, seeding `__zcc_va_list` on ELF. LOC after musl: **8894 Rust + 424 header** (buffer ~1.1k under the ceiling). Conclusion after musl: a working libc unlocks roughly 90% of userland — M17 pauses to yield to the **correctness campaign (M18 pulled forward)**: the math/science gate + additional suites, driving correctness to 100%.
-
-- **M18 (planned) — the 100%-correctness campaign** (four facets; supplemented: after passing all current suites, replenish along two axes — (a) the highest achievable theorem coverage, (b) supplementary industrial suites).
-  - **Update — Csmith/yarpgen reactivated (the IR-era correctness axis):** the entry condition of the "conditional deferral" (a tool acting as generator/referee *outside* the repo, like gcc — installed in the box, not vendored, not in the build path) is now *satisfied* — csmith 2.3.0 + yarpgen 2.0 installed via apt/build in the `zcc-box:fuzz` image, gcc as oracle, 3-way differential (gcc vs zcc-noopt vs zcc `ZCC_OPT=1`). First-batch result: **csmith 300 (seeds 1–300) → 300 PARITY / 0 DIVERGE** after fixing one lowering bug (orphan-temp dead-code, commit `5c6a65d`); yarpgen + csmith seeds 301+ are expanding. This is expensive *practical* verification (a tier below the science-gate), consistent with the two-tier doctrine: single-file deterministic cases, seekable, satisfying the speed law.
-  - **Close — the SEAL-IR campaign is complete (branch `seal-ir-10k` → main):** IR→ops→asm is now the *only* path. All 13 exotic nodes have been sealed into typed `Inst` (Block/stmt-expr, Alloca/VLA, CallX composite+SRet, Sync/atomic, Asm/inline, addr-of-exotic…); `Inst::Opaque` and the entire AST-walk backend (`emit`/`expr`/`call`/`stmt`/`addr`, ~518 LOC) have been *deleted*; **the `--ir` flag is gone** (the backend has no path-selection switch — no real compiler has one; `--ir` was removed from the driver and all scripts). The architecture reaches its intended target: `ast → ir,ops → s`. src LOC: 11344 → **11023**. Closing gate (default = IR): torture 1377/0 · musl-box PASS (1350 obj/6.5MB libc.a, SMOKE byte-identical) · cargo 29/29 · 0 warnings · **csmith 300 PARITY / 0 DIVERGE** (evidence: 162MB of real ELF ⟹ no no-op). Mechanical evidence that Opaque was dead before deletion: probe showed 0 bridge-hits / 3748 real files.
-  **Freeze law: throughout M18 the feature surface is *frozen* — no new feature/dialect is acquired (the M17 coverage campaign is paused, including M20's visibility attribute), so that proofs converge on a stationary target and every suite/gate conclusion is *preserved*. Only permitted edits: a bug making the *existing* surface semantically wrong (a fix, not a feature), and only in service of the current compile goals (musl, sqlite, git, redis, nginx and their suites/gates) — no anticipatory fixing for software not yet in the basket. Unfreezing is a recorded event: each new feature must declare a PROOF.md line + gate before merge.**
-  **"Stopping-point" adjustment: the suite surface is *frozen* — the official suite basket is the four named members: nginx, redis, musl, git ("having a suite is enough")**; sqlite remains in the corpus-compile + byte-diff/bench role (its tcl suite no longer runs); the internal gates + static corpus already in place (torture, c-testsuite, chibicc, kr, nora) are unchanged. Facet 1 (Csmith/yarpgen/supplementary suites) is **cancelled — left as homework for forks** (rationale: Csmith generates chaotic flow then md5-compares with gcc — all deterministic Bohrbugs; anyone can fork the repo and run it): "adding a test suite only adds bugs to chase, it is not an effort to *eliminate* bugs — C itself is broken; the workspace must have a stopping point, which is itself a way to kill bugs; tcc surely has bugs too." Same-night supporting evidence: differential git t/ ×3 on both sides yielded *symmetric background noise* (zcc-only 86 lines vs gcc-only 106 lines, t7112#57 flaky across sessions on both compilers) — a flaky industrial suite is not worth appointing as judge. Consequences: (i) correctness proceeds along *one* axis from here — theory/math (PROOF.md facet 0 + the science-gate), facets 2–4 kept because they are gates/theorems, not new suites; (ii) acceptance standard is tcc-style — a recorded known-fail baseline + differential, *not* demanding 100% on a flaky suite; (iii) once the theory axis is consolidated → **proceed directly to assembler/ld (M22 pulled forward)**; crt0 + loader borrowed from musl as-is (libc is the firstborn — ld-musl = libc.so, crt1.o = musl's), not written from scratch.
-  **Two-tier doctrine (completing the "stopping point")**: a compiler's proof surface splits into two tiers with different roles and test cadence. **The wiring tier** = compiler ↔ real world: OS/arch/ABI/memory/relocation/libc/build-system — a space that cannot be self-exhausted, whose only witness is real software → the four suites nginx/redis/git/sqlite(+musl) verify it *once* until a baseline is locked; thereafter they re-run only when *the wiring itself* changes (a new target, zas/zld replacing GNU, a musl bump…), *not* when compiler semantics change — that is the gate's job. (Every real bug in that period was a wiring-tier bug: va_arg HFA, GOT-static, transparent_union, char signedness, stack size — exactly its role as a falsifier.) **The theory tier** = pure language semantics: a closed, deterministic, single-file space → exhaustive gates + generative differential. **Csmith/yarpgen belong to the *theory* tier, not the industrial suites** (a case = a single-file deterministic checksum, satisfying all three speed-law criteria below) → the earlier cancellation was refined to a *conditional deferral*: once the wiring tier is verified (baseline locked + ABI/reloc gate standing), returning to theory focus makes csmith/yarpgen eligible for reconsideration — entry condition: the tool acts as generator/referee *outside* the repo like gcc (installed in the box, not vendored, not in the build path), and follows a self-written gen_flow.py (a cheap probe measuring the density of that space before paying to import an 80k-LOC tool).
-  **Test-speed law (restating the "stopping point" as a measurable criterion; the root reason: slow suites that cannot seek to the failing unit)**: a new test set is admitted only if (a) each case = *one* self-contained .c file, deterministic (UB-free by construction, seed recorded in the filename); (b) a failure seeks to the exact case, and re-test after fix is milliseconds–seconds; (c) the whole gate runs in single-digit minutes on the host, without docker, without harness state. Integration suites (git t/, nginx-tests…) are permanently in the release-only witness role. Two new gates meet this standard, built on the existing gen_* pattern (the same lineage as alg.sh/decay.sh): **node.sh + gen_node.py** — exhausting the Node × type-combo alphabet of codegen (filling the "informal per-node simulation" gap in PROOF.md, a finite space → a real theorem); **flow.sh + gen_flow.py** — a *self-written* generator in tests/ (not importing the 80k-LOC C++ Csmith — Csmith-the-tool remains fork homework), producing small UB-free seeded control-flow+arithmetic programs, differential checksum vs cc — filling exactly the cancelled generative region but in the fast/seekable class.
-  0. **PROOF.md — the theorem ledger (axis a, the measure standing above the four facets below)**: one line per feature — *which space / finite (exhaustion = theorem) or infinite (induction + differential = evidence) / which gate guards it / the acknowledged residue*. "Math coverage" = the fraction of features with a gate standing guard, measurable rather than felt. Known gaps needing new gates: variadic + HFA into abi.sh (bug 920625-1 slipped through exactly this gap), FP (facet 3), linkage (facet 4), per-node codegen simulation (weakest — currently informal). **The 1:1-mapping law (tightened after cases B/pr92904)**: each feature must map 1:1 to exactly *one* theorem, and the proof obligation has *two separate tiers* — (i) *correct mapping*: the model's alphabet covers the entire real construct surface (both period bugs were *mapping* gaps, not exhaustion gaps: abi.sh lacked the letter aligned(16), and no gate modeled type-derivation so ternary/comma decay slipped through); (ii) *proving the theorem*: exhaustion when the space is finite, induction + differential when infinite. Industrial suites are the tier-(i) falsifier; gates are the tier-(ii) prover. A new escape must answer "which letter is missing from which alphabet" before the case is closed. A model gate born of this law: **decay.sh + gen_decay.py** — the lvalue-conversion theorem 6.3.2.1p3 (+6.5.15/6.5.2.2p6/6.5.17), exhausting SOURCES×CONTEXTS 12×11, differential cc; on its very first run it caught the comma-missing-decay bug (6.5.17).
-  1. **Csmith generative fuzzing (axis b)** — mass-generate random C programs *guaranteed* UB-free, differential zcc↔gcc/cc (output checksum + compile-crash = bug). The same lineage as alg.sh (referee + UB-filtering generator) but generative over whole programs: it exhausts nested-struct / deep-pointer combinations that a static corpus (torture/nginx/redis) never touches. Goal: a `tests/csmith.sh` harness running nightly, reducing caught cases with creduce. Same axis-b basket: **yarpgen** (Csmith's successor, UB-free by construction, loop/arithmetic-heavy — filling exactly the region where Csmith is thin), **c-testsuite** (~220 independent conformance cases), both differential in-box. Commercial suites (Plum Hall / Perennial — the genuine industrial standard) noted as existing, not acquired.
-  2. **Valgrind memcheck** — wrap the real runtest/binaries to expose silent stack-misalignment / over-writes short of a segfault. Note: Valgrind does *not* support macOS arm64 → run in the Linux box with the zcc-ELF binary (M15 opened exactly this door); the cheaper option on Darwin: `-fsanitize=address` is unavailable (zcc -O0 has no sanitizer) → use libc guard-page/malloc-debug (`MallocScribble`).
-  3. **Numeric rigor — gate `num.sh` + the reduction theorem** (expanded to cover scientific tools — long long/float/double, overflow/underflow): the -O0 reduction theorem — zcc does not compute arithmetic itself at runtime; the IEEE-754 silicon is the axiom; the proof obligation reduces to three propositions: (i) correct instruction + correct width per node (no excess precision — double rounding); (ii) the correct UAC/6.3 conversion sequence (chaining alg.sh); (iii) the two places the compiler computes *itself* must be bit-identical to runtime: the constant folder (including inf/NaN/subnormal, unsigned wrap mod 2^n) and the literal parser (decimal→double correctly-rounded; an `f` literal parsed *directly* to f32, never via f64). Gate tiers: (a) **exhaust f32 unary over 2^32** — every cast/negate/convert over all 4 billion bit patterns, differential gcc in-box = a true exhaustion theorem; (b) binary: exhaust the structural cross-product of special values (±0, subnormal min/max, normal min/max, ±1, ±inf, NaN) + rounding boundary samples; (c) int: overflow boundaries per (op × width × sign), unsigned wrap, fold-vs-runtime. External suites: Paranoia (Kahan), **Berkeley TestFloat** (an independent softfloat oracle), IBM FPgen vectors, **David Gay's testbase** (specializing in strtod/literal). Note: libc-test math/* (ULP check vectors, crlibm) *is* the scientific suite already running — the math failure cluster in the 77 suspects is the input to this campaign. Related debt: long double=double on ELF (fp128) is a *recorded* deviation, renegotiable when real scientific tools demand it. A *confirmed* landmine awaiting this gate: an `f` literal parsed f64→narrowed-to-f32 (parser.rs ~2923, double rounding — C89 6.1.3.1 grants 1-ULP latitude so it is not yet non-conforming, but it diverges from gcc/clang on rare cases such as 7.038531e-26f; the fix = parse directly to f32 from PTok.raw when num.sh lands).
-  4. **Linkage & multi-file symbols** — new gate `link.sh`: tentative definitions scattered across TUs (C89 3.7.2 — the linker merges), weak symbols, shadowing global/local, calling a *prototype-less* function with default argument promotion (char→int, float→double) cross-linked cc↔zcc (a natural extension of abi.sh into the linkage space).
-
-- **M19 (planned) — the userland campaign: shell + classics** ("building nearly the entire userland" is part of the compiler-capability replenishment roadmap; it converges with the long-range vision — a musl-static initramfs booting under qemu needs a shell to become a *living* system). The law is unchanged: test-first, each new ext must be demanded by software in the basket; each item graded by its own official suite. Order by cost/coverage:
-  1. **dash** — the smallest POSIX sh, almost certainly builds immediately; unlocks an interactive initramfs. Oracle: run its own POSIX tests + compare gcc.
-  2. **busybox** (or sbase+ubase, already in the M17 basket) — a single binary = the whole userland (init/sh/coreutils/mount); kconfig + moderate GNU ext. This is "nearly the entire userland" in one target.
-  3. **bash** — an icon, with a thick official `tests/` suite (a genuine third pillar); its dialect is more conservative than reputed (autoconf-era C). Includes bundled readline.
-  4. **GNU make** — self-builds software *on the target system* → a self-reproducing userland.
-  5. **zsh** — a stretch (large, dlopen modules → requires -shared/TLS-in-.so first).
-  6. **The foundation-library chain → PostgreSQL 18**: zlib → libpng (requires zlib — test the dep chain) → libjpeg (the plain IJG C, not turbo-SIMD) → **PG18**. *(Per the "stopping point": PG is graded by **compile + run = OK** — initdb + start + a live query; pg_regress is *not* used as a suite, no suite repository imported. Libraries graded by their own runnable-level smoke, in the same spirit.)* Scouted and *pre-paid* (52 LOC, local PASS 19/19 ext + 67/67 cases): __sync_fetch_and_and/or/xor (atomics/generic-gcc.h uses the whole family directly when HAVE_GCC__SYNC_INT32_CAS is on) + `_Static_assert` EXT(c11) in both scopes (StaticAssertStmt/Decl). The rest of PG18 already exists from M12–M17: spinlock TAS (slock_t arm64 = int), CAS 32/64, barrier, asm-label, __builtin_expect/constant_p/unreachable. No external async lib needed: PG18 grows its own AIO, io_method=worker default, io_uring/liburing is opt-in configure — not enabled; --without-icu --without-readline --without-zlib for minimality if needed (PG17+ removed --disable-spinlocks, so the __sync cluster is mandatory — present).
-  - **systemd: recorded refusal** — not for its size but for a doubly-wrong target: (a) officially glibc-only (musl unsupported — Alpine/Void use runit/openrc for exactly this reason), while the target system is musl-static; (b) GNU11 dense with `__attribute__((cleanup))` = destructor semantics, `_Generic`, meson — buying an enormous dialect surface for *one* piece of software that cannot run on the target system. PID 1 for a small system: **sinit/runit** (a few hundred lines of plain C) or a self-written init in the initramfs — the right MINIX-inspired character.
-
-- **M20 (planned) — dynamic linking with musl: loader + .so** (the system must run dynamically like a real distro — full-static is only a bootstrap stepping stone; Alpine also ships musl dynamic). Fully repays the M15 debt "-shared not yet proven". The musl specialty: **ld-musl *is* libc.so** — building libc shared yields the loader, with no GNU fragment growing in. The pieces, in order:
-  1. **zcc: visibility** — a real hole: zcc silently swallows `__attribute__((visibility("hidden")))`, does not emit `.hidden`, and under -fPIC pushes *every* non-static global through the GOT. The musl ldso demands hidden = *direct* access (non-preemptible, and the _dlstart path runs *before* self-relocation and must not touch an unrelocated GOT). Task: parse visibility → emit `.hidden` + adrp/add directly even under pic.
-  2. **Build musl shared**: recompile -fPIC (.lo), link `libc.so` (-shared -nostdlib, entry _dlstart self-relocating) → `ld-musl-aarch64.so.1` in the sysroot. Cache note: the old config.mak baked in the static decision — reconfigure when opening shared.
-  3. **Driver sysroot dynamic mode**: PT_INTERP = <sysroot>/lib/libc.so, link against libc.so (keeping static as default/flag — the initramfs still needs it).
-  4. **TLS model for .so**: the current local-exec is correct only in an exe — initial-exec for .so (the M15 TLS-in-.so debt folds in here).
-  5. **Gate link.sh grows a dynamic dimension**: exe-overrides-so interposition, PLT, GOT data, cross-link gcc-main↔zcc-so and the reverse (copy-reloc on the gcc side vs always-GOT on the zcc side — exactly the ABI automaton, exhaustible).
-  - Grading: the libc-test dynamic branch + dlopen/dso tests (currently outside the static scope), then dash/busybox linked dynamically running on the zcc-built ld-musl.
-
-- ~~nginx-tests rerun~~ DONE: minimal 493 files/1136 tests All PASS; the FULL build (ssl+http2+stream+mail, pcre2+openssl@3) 5346 tests, zcc-only failures = *empty* (the nginx-cc referee with the same config fails identically — MECHANISM.md Part A).
-- ~~tcc.sh smoke~~ DONE: 108 pass, 31 skip, 0 fail — an empty baseline on the first run.
-- ~~real TLS for `__thread` Mach-O~~ DONE (see M14); the ELF TLS model moved into M15.
-- `tests/suites/musl.sh` (suite 7, *written*, deferred): compile-only on Darwin; the Linux box now exists (M15) — upgrade to a real build + libc-test when reopened.
-- M15 debt: `-shared` ELF (.so + global GOT) not yet proven; va_arg composite straddling reg/stack (AAPCS C.11) not yet handled.
-- **C99-complete goal (smooth userland needs full C99, not only demand-driven ext; executed the moment M18 unfreezes, before M19).** Measured with 20 differential probes: **18/20 already pass** (mixed decl, for-decl, __VA_ARGS__ + empty arg, inline + extern inline, restrict, _Bool, compound literal including static, designated init including nested, flexible array, __func__, long long, UCN, wide string, VLA local/param/ptr, full _Complex algebra, hex float, _Pragma; __STDC_VERSION__ already identifies 199901L). Remaining, priced: (1) `sizeof(VLA)` runtime — probe FAIL, the most worth buying; (2) digraphs `<% %> <: :>` — a few lexer lines, bought for completeness; (3) `#pragma STDC FP_CONTRACT/FENV_ACCESS/CX_LIMITED_RANGE` — swallow-and-note is *conforming* at -O0 (never contracts, never optimizes across fenv); (4) `tgmath.h` — needs builtin dispatch, real software almost never uses it, bought *last*; (5) `long double`=double — *still conforming* C99 (5.2.4.2.2 requires only ≥ double; MSVC made the same choice) — the fp128 issue is an ELF-interop ABI debt on a separate ledger, not counted against C99. **Deliberate debt**: redis full-suite (the frozen basket) fails 86/156 at moduleapi/misc — a zcc module passes an 8-byte long double into glibc expecting 16-byte fp128, `'0' != '0.00000000000000001'` (the second schrödinbug in the collapse ledger, ledger R1). ~~Handled under FREEZE: known-fail baseline + skipunit~~ **Reversed under the new law: "if a suite in the basket demands a feature, the feature *must* be bought"** — the frozen suite basket is the *definition* of the current surface; a suite in the basket that demands something is an *obligation* no baseline can dodge (this applies *only* to the four-member wiring-witness suite basket; static-corpus known-fails — torture nested-fn… — keep the old triage mode). fp128 long double on ELF becomes a *mandatory purchase*, still following the unfreeze procedure: declare PROOF.md + gate (letter Q into abi.sh + va_arg fp128) before merge. Scouted price: TyTab parameterized 16/16 per target (Darwin keeps 8/8) + a Ty long double split from double via UAC + codegen libcalls __addtf3/__extenddftf2/__fixtfsi… (libgcc.a — the ELF driver adds -lgcc, previously unlinked because it goes as→ld directly) + pass/return q-regs NSRN + va_arg q-slot + `L` literal parsed via double+extend (sufficient for redis's ld2string %.17Lf; correctly-rounded fp128 literals = a later upgrade if a suite demands it). The C99 library (snprintf, stdint, wchar…) is carried by musl, already present. The unfreeze law stands: each item enters with a PROOF.md line + gate (sizeof-VLA into shape.sh, digraph into gen_lex).
-- **fp128 PURCHASED — ledger R1 CLOSED** (before M18 even unfroze, under the "suite-in-basket demands = mandatory" law): 120 LOC, design memory=binary128/reg=f64 (cheaper than the scouted price — no __addtf3 needed, the arithmetic runs valid-C99 double because float.h declares LDBL_MANT_DIG 53). The real bug: default arg promotion swallowing long double (C99 6.5.2.2p6). Redis 22 units: the ldbl family ~113 err → 0; the gcc referee 5998 ok/0 err proves the box is clean → exactly 2 remaining new zcc cases (ledger R2 stacktrace ×9, R3 proctitle ×1). The PROOF.md + letter-Q gate procedure: not yet declared — the process was minimized (SOP v4), a debt if called in.
-  **Executed the same day (early, without waiting for unfreeze — "put all of C99 in except tgmath.h")**: charter #1 changed to **Strict C99 compliance**; 24 `EXT(c99)` markers demoted to `C99:` comments (the deviation surface is now 88 vendor: 77 gcc + 8 clang + 3 apple); purchased (1) `sizeof(VLA)` runtime — a hidden local `.vlasz` locks the byte at declaration, read by both sizeof and alloca (vla_szs keyed by offset, cleared per function like reg_pins; covers `sizeof(int[n])` typename + `sizeof *p` via vla_arrs); (2) digraphs — a 6-entry DIGRAPHS table mapping to canonical punctuation *before* the PUNCTS table (C 6.4.6 unconditional, no C++ `<::` rule); (3) `#pragma STDC` — pre-swallowed, declared conforming at -O0. The run.sh cases/ referee was raised `-std=c89`→`-std=c99`, corpus 67/67 (the new c99_digraph_vla.c differential matches byte-for-byte), shape + cpp PASS. **The single remaining declared C99 deviation: tgmath.h** (needs builtin dispatch/_Generic, unused by real userland — bought when a creditor appears; the cheap path is a musl-style `__typeof__` header).
-- A dedicated driver harness (flag matrix: -nostdinc/-bundle/-undefined/-MMD/-shared… currently tested only indirectly via m9/m13/m14).
-- Probe sqlite/zlib/sbase/jemalloc… to measure the failure surface (feeding M17).
-
-### Long-range vision
-
-Use zcc together with qemu to write a simple operating system → needs a freestanding mode (no libc, bare-metal assembler directives). *Not* designed ahead of time — only keeping codegen file-separated so it can be swapped (already an architecture law).
-
-A now-feasible stepping stone (musl sysroot + self-built crt, a static ELF kernel that self-maps needing no loader): **a small Linux initramfs** — an arm64 kernel + a static-musl-zcc `/init` booting under qemu; M19 supplies the shell/tools that make it a living system. Learn the boot chain / initramfs / syscall surface here before replacing the kernel with a self-written one.
-
-**M21 (publication target)** — a console-first distro PoC. **Hard precondition: compose no distro until the entire current test suite / science-proof passes, AND the future suites+proofs (M18 fully: PROOF.md with no empty cell + Csmith/yarpgen/c-testsuite + the four facets). Correctness precedes reputation — the order is non-negotiable: M18 → M19/M20 → M21.** *(Per the "stopping point": the clause "future suites + Csmith/yarpgen/c-testsuite" is dropped — the precondition reduces to: the four-member suite basket nginx/redis/musl/git with a recorded known-fail baseline + PROOF.md with no empty cell.)* Content: rootfs = musl + ld-musl + init + shell + utils, *all* userland compiled by zcc (the kernel borrowed as every distro does; as/ld binutils at build-time — the precise claim: "zcc is the only compiler in the toolchain"; the "GNU-free build chain" claim is stated *only after* a self-written assembler/linker exists — that item is open and requires renegotiating the LOC ceiling). Publication condition per the charter: a *reproducible* artifact — a script building the image from source + a zcc seed (a static-musl binary, needing no rustc on the system), booting under qemu, with a suite table (libc-test, redis, git t/, sqlite byte-diff). Promoted by a command others can re-run themselves, not by assertion.
-
-**M22 — zas + zld: a GNU-free toolchain. ~~planned, budget approved~~ DROPPED
-(2026-08-29).** Writing an assembler and a linker to own the whole stack is the
-largest possible violation of Article A's "no feature before a real `.c` demands
-it" — nothing in the basket demands it, and the justification below ("shrinking
-the foreign surface") is an argument for scope, not from need. Its budget also rested on a premise that was already false
-when written — "the 10k compiler ceiling is unchanged (src/ intact)", with `src/`
-at 28.7k — and that ceiling has since been abolished outright. The paragraph is
-kept as a record of the reasoning and of what it got wrong, not as a plan. ~~Ranked after M20~~ **pulled forward** — proceeding right after the M18 theory axis consolidates, *before* PG18 (as/ld chosen over postgres because: shrinking the foreign surface = killing a source of bugs; an assembler is a finite automaton, exhaustible — exactly the theory axis; the gate = differential GNU as/ld over the very .s corpus zcc already produced in the frozen basket, needing no new suite; PG is instead a new configure surface). **crt0 + loader borrowed from musl as-is (libc is the firstborn)** — zld need only link *correctly* against ld-musl/crt1.o, not write a loader; the "learn through GNU ld first" condition is met incrementally by the existing reloc corpus rather than waiting for all of M20. LOC budget: **the 10k compiler ceiling is unchanged** (src/ intact); zas/zld are separate binaries on a separate ledger — zas ~2k (an aarch64 assembler subset: swallowing only (a) zcc's own output — the mnemonic set exhausted by grepping codegen, (b) musl's hand-written .s files), zld static ~1.5k + dynamic ~1k (only the relocation set zas produces: ADR_PREL_PG_HI21, ADD_ABS_LO12, CALL26, ABS64, the GOT/TLS cluster). **Dynamic is a *completion condition*, not an option: zlinux must run .so + loader — no all-static despite cheap disk; a static-only zld is only an internal milestone, *not* yet qualified to replace GNU ld.** Total target toolchain **<15k** — still without a peer in its class (tcc 80k x86, cproc borrows QBE). The math: assembler = an encoding-table lookup automaton (finite → exhaustible); linker = reachability + relocation algebra. Gate: differential vs GNU as/ld — the same .s, semantic readelf/objdump diff; the same .o, a binary run through the official suites. A side benefit: assemble-time returns to one's own hands (Apple clang-as 3.9s vs GNU as 1s on a 742k-line sqlite .s — measured). Unlocked claim: "a toolchain without one line of GNU: zcc → zas → zld → musl". Honest meta-disclosure at publication: zcc is built by rustc (a seed binary — every toolchain needs a bootstrap compiler; a pedagogical link to Thompson's *Trusting Trust*).
-**Interface law: zas/zld *must* be drop-in with make/configure/m4 — extending the charter's driver law.** Specifically: (1) the flag surface is acquired test-first from the basket's own verbose build logs (every `as`/`ld` invocation the zcc driver + real build system emitted — the V=1 logs of the overnight runs *are* the spec record); (2) *never* mis-swallow a flag carrying an argument; (3) exit code + stderr format that configure can grep; (4) the libtool/m4 trap: LT_PATH_LD sniffs `ld --version` for the string "GNU" and changes behavior accordingly — whether to masquerade or teach libtool to recognize us separately is decided by data when busybox/bash enter the basket, not guessed ahead; (5) zld's minimum contract = *exactly* the ld command the zcc driver emits today (crt1/crti/crtn, -dynamic-linker, -lc -lm, -shared/-soname at M20) + the -Wl, tail that build systems tunnel through. (6) A named claim-hole: a real build still calls **ar/ranlib** (musl seals libc.a, redis seals deps, every static lib) — "GNU-free" additionally requires **zar** (~200-300 LOC: the classic ar format + a symbol index /; ranlib = zar -s). nm/strip/objcopy/readelf are *not* required for the build chain — diagnostic tools, borrowable without losing the claim. The differentiator: an auditable toolchain — "trusting trust" at the scale of one student semester.
-
-### C99-complete — closing the last 3 ISO C99 holes (VLA)
-
-**torture `1377 pass / 317 not-impl / 0 FAIL` (box, gate holding).** Phase 2 closed 3 *genuine* ISO C99 constructs (not vendor — proof: `clang -pedantic-errors` ACCEPTs + spec), each mapping to a theorem, test-first, differential vs gcc:
-- **`pr57568` — 2D constant address** (6.6p9): `gaddr` gains a `Deref(p)` branch when the type is `Array(..)` → `&arr[i][j]` is a valid constant address (previously rejected).
-- **`20040411-1` — variably-modified typedef `sizeof`** (6.7.7 + 6.5.3.4p2): `typedef int c[i+2]` — size evaluated *once* at the declaration point, byte locked into a hidden local `.vmtsz`; `sizeof(c)` reads it back (previously returned 0 = silent miscompile). Non-ISO cases (VM-typedef outside an array / multi-dimensional) are still rejected cleanly.
-- **`20221006-1` — 2D local VLA** `int M[d0][d1]` (6.7.6.2): lowered to a pointer-to-VLA-row `int[d1]` + `alloca(d0·d1·elem)`. *Reusing* the whole `(*p)[w]` mechanism: register the row-type into `vla_arrs` (runtime row-stride `d1·elem` in a hidden local `.rowsz`) → indexing `M[i][j]` is correct on its own via the `Deref-Array` decay (arm64_elf 867-875, no added codegen). Each declarator produces its own row TypeId ⇒ `M1`/`M2` of different widths do not collide. `vla_inner: Vec<NodeId>` gathers the inner dimensions; ≥3 dimensions / an inner dimension nested in a VLA are rejected cleanly. Differential gcc: the sum + row-stride matches even for the rectangular `a≠b` case (stride `= b·4` independent of the row count).
-
-Also: **VLA-in-struct** (a GNU non-ISO extension, `-pedantic-errors` "will never be supported") now rejects *honestly* at the struct body (`VLA in struct/union not supported`) instead of leaking state → miscompile (pr82210/20040423-1/pr41935/20040308-1/20041218-2/20070919-1/align-nest). `align-nest` dropped pass→not-impl: the old "pass" was *vacuous* (the test only stores then `return 0`, checking no value — an exit-0 is meaningless on an undefined layout) → honest-reject > vacuous-pass. Batch `src ~10124/13000`.
-
-### Torture campaign — nested functions (GNU) ~~ACHIEVED~~ **REVERSED: REMOVED**
-
-**Retracted (after the 2-fact Phase 1):** nested functions were *entirely removed* — `−240 LOC src (10271→10031)`, full suite 14/14 still PASS, 0 FAIL. Reasons:
-(1) **vendor lock-in with no creditor** — clang/MSVC lack it, no app in the basket (nginx/redis/git/sqlite/musl, including future PG18/CPython — both barred because they must build under MSVC) demands it; buying it *only* to pass torture is the *wrong door* for test-first (torture is a verification corpus, not an app-demand trigger — it violates the charter's "no feature before a real .c file demands it"). (2) it requires an **executable stack** (trampoline) = a security red flag, against W^X/NX. (3) it simplifies the VLA space (pr22061-3/4 nested+2D-VLA become clean GNU-ext NOT-IMPL). Measured cost: 23 torture cases PASS→NOT-IMPL (cleanly rejected `nested function (GNU) not supported`) — the 2-fact gate = 0 FAIL, so the gate is *not* broken, only the pass column drops. Fully removed: 3 nodes (Upvar/Tramp/NlGoto) + 3 Func fields (uid/parent_uid/chain) + `nested_funcdef` + static-chain x18 + non-local-goto + the `.note.GNU-stack` note + IR `Place::Upvar`. `__label__` kept as parse-and-ignore (a same-function label still goes through an ordinary Goto).
-
-**Historical content (removed; kept as chronicle):** ~~+23 torture (95→72 fail, 0 NEW fail), full suite 14/14 PASS, src 9894/10000 (no need to drop Mach-O).~~ GNU nested functions = the vendor dialect `EXT(gcc)`, **ELF-only** (the trampoline requires an executable stack — Darwin W^X refuses it at parse). Drawn directly from gcc-14 aarch64 asm as oracle (not guessed from memory) — 3 orthogonal mechanisms, each case a sub-combination:
-- **T trampoline**: 40B generated at *runtime* on the stack in a local slot
-  (`bti c; ldr x17,.+20; ldr x18,.+24; br x17; dsb sy; isb; .xword fn; .xword chain`),
-  patched (fn_addr, chain) + `__clear_cache` (libgcc, the ELF driver already `-lgcc`);
-  fnptr = the trampoline address. Requires an *executable* stack → emit `.note.GNU-stack,"x"` *only* when the TU has a nested function (keeping NX for every other program). *Every* reference to a nested name (call/pass) lowers to `Node::Tramp`→`CallPtr(tramp)` — eliminating the direct-call-chain branch, with struct-sret/variadic still correct (the trampoline touches only x17/x18, not x8).
-- **C static chain via x18** (STATIC_CHAIN_REGNUM, zcc does not use x18, so it is free): the nested prologue saves x18 into the `Func.chain` slot; an upvar = `[chain - off]`, off = a *shared* compile-time constant (chain = the enclosing function's x29, whose locals are already addressed `x29-off`). The Tramp's chain: same parent ⟹ x29, sibling ⟹ forward one's own chain.
-- **G non-local goto**: the enclosing function's `__label__` + a `goto` from a nested function → restore the enclosing `(x29,sp)` via the chain then `b lg_{parent}.{label}` (label = a same-TU local symbol, adrp-reachable). The enclosing sp = x29 - frame (correct without a VLA).
-
-8/8 cases: nestfunc-1..3,5,6,7 + nest-align-1 (over-align 16) + nest-stdar-1 (variadic nested). Cost: +258 LOC src (ast 3 nodes + 3 Func fields; parser `nested_funcdef` + upvar/Tramp/NlGoto resolution + a shared `setup_params`; codegen ELF Tramp/Upvar/NlGoto + prologue chain-save + the GNU-stack note). Depth-1 (upvar/goto to the *directly* enclosing function) — depth>1 has no demanding case, not done.
-
-### Strategic fork (raised) — ~~DEFERRED, not yet executed~~ **EXECUTED, and the estimate was wrong by 10×**
-
-**What actually happened.** The IR and the optimizer below were built, then built
-AGAIN: `main` carries the SSA IR the plan describes, and the `mir-rearch` branch
-replaced the whole backend with a second, machine-level SSA IR and an allocator
-that colours on SSA. Mach-O was dropped as planned; ELF-only holds.
-
-**The estimate is the lesson.** The plan below budgets "a linear IR ~300-500 +
-provable passes ≈ 1000-1500" and concludes the whole thing fits under a 10k
-ceiling with room to spare. It does not: the two IRs, thirty passes, the
-instruction selector, the spiller and the allocator are most of the 28.7k the
-tree now holds. The passes are not the expensive part — **the proofs are**, and
-that is the trade this project chose knowingly (Law 0 ranks provenance above
-size). The historical text is kept below unedited.
-
-**Intent**: drop Mach-O/Darwin entirely (arm64_darwin.rs ~1402 LOC) → use that budget to build **one simple IR layer + a few mathematically-proven optimization techniques** → making zcc a "full-fledged" compiler still within the 10k ceiling (ELF-only). The arithmetic: 9894 − 1402 = 8492 → ~1500 headroom; a linear IR (3-address/SSA-lite) ~300-500 + provable passes (const-fold ~50, DCE ~80, local value numbering ~120, copy-prop ~60, linear-scan register allocation ~300-500) ≈ 1000-1500 → feasible.
-
-**Amending supreme requirement #2** ("no optimization pass, -O0 semantics") — the new discipline that replaces it: "every pass must be proven semantics-preserving mathematically" (consistent with the mathematical foundation). Narrow the target to ELF-only.
-
-**Gate condition: until torture passes clean, do *not* touch IR or optimization.** The remaining 72 torture failures must all be handled (a real fix or a proof of out-of-scope per the presumption-of-guilt law) *first*. This effort stops at nested-func + recording the roadmap; no IR code.
