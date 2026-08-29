@@ -829,13 +829,21 @@ impl P<'_> {
     }
     fn enum_spec(&mut self) -> Result<TypeId, String> {
         let mut tag = String::new();
-        if let Some(Tok::Ident(n)) = self.toks.get(self.pos)
-            && (!self.is_type_word(n) && self.toks.get(self.pos + 1) != Some(&Tok::Punct("{"))
-                || self.toks.get(self.pos + 1) == Some(&Tok::Punct("{")))
-            {
-                tag = n.clone();
-                self.pos += 1;
-            }
+        // C99 6.2.3 — TAGS ARE A SEPARATE NAME SPACE. An identifier following
+        // `enum` is the tag, always, and whether the same spelling also names an
+        // ordinary identifier somewhere is not this decision's business. The
+        // first cut refused the tag when `is_type_word` said the spelling was a
+        // typedef name, which made `enum X` yield a bare `int` and left `X` to be
+        // re-read as a second specifier — so `enum SaveType type;` failed with
+        // `expected ";"`. oniguruma 6.9.9 writes exactly that (`regint.h` has
+        // `enum SaveType {...}` and `typedef int SaveType;`, and `regparse.h:420`
+        // declares a member with the enum), and it is conforming: gcc accepts it
+        // under `-std=c99 -pedantic-errors`. No generator found this — a tag and
+        // a typedef that collide is a shape csmith and yarpgen do not emit.
+        if let Some(Tok::Ident(n)) = self.toks.get(self.pos) {
+            tag = n.clone();
+            self.pos += 1;
+        }
         // EXT(clang): enum tag : underlying-type (SDK malloc.h) — honor the underlying type
         let under = if self.eat(&Tok::Punct(":")) {
             Some(self.typename()?)

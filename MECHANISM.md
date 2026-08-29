@@ -4776,6 +4776,54 @@ BUILDING a row and is not evidence the row will pay.
 **WHEN / WHERE.** 2026-08-29, `main` `dd80a8d`, c8gd.4xlarge Graviton4, gcc
 14.2.0 -O2, `ZCC_VECMAP=1`.
 
+### M58. The tag name space, and the five that are still open
+
+**THE DEFECT, and it is a Law-2 Side-I: a misread of C99 6.2.3.** Tags occupy a
+name space of their own, so one spelling may be an enum tag AND an ordinary
+identifier at the same time. oniguruma 6.9.9 writes exactly that — `regint.h` has
+`enum SaveType { ... }` and, seventeen lines later, `typedef int SaveType;` —
+and `regparse.h:420` then declares a member with the enum:
+
+    enum SaveType { SAVE_A, SAVE_B };
+    typedef int SaveType;
+    struct S { enum SaveType t; };   /* zcc: expected ";" */
+
+`enum_spec` refused to take the identifier as a tag whenever `is_type_word` said
+the spelling was a typedef name. `enum SaveType` therefore yielded a bare `int`,
+the specifier loop re-read `SaveType` as a SECOND specifier, and the member name
+arrived where a `;` was expected. It is conforming C: `gcc -std=c99
+-pedantic-errors` accepts it. Fixed by taking the identifier unconditionally —
+whether the spelling also names an ordinary identifier is not that decision's
+business.
+
+**NO GATE SAW IT, AND THE REASON IS STRUCTURAL.** torture 1694, c-testsuite 220,
+opt-parity 1552, csmith and yarpgen at 10,000 seeds each were all green through
+it. A tag that collides with a typedef is a shape neither generator emits; a
+corpus corroborates, it does not discover. Six lines reproduce it, and no amount
+of random program generation was going to write them.
+
+**AND THE FIVE THAT ARE STILL OPEN.** With the parse fixed, oniguruma builds and
+runs its own suite. gcc: `SUCC: 1516, FAIL: 0`. zcc: `SUCC: 1511, FAIL: 5`:
+
+    FAIL: /(?i)\ufb00a/ 'ffa'   #1561
+    FAIL: /(?i)\u2126/  'omega' #1563
+    FAIL: /a(?i)\u2126/ 'a...'  #1564
+    FAIL: /(?i)A\u2126/  'a...'  #1565
+    FAIL: /(?i)A\u2126=/ 'a...=' #1566
+
+All five are Unicode case folding — U+2126 OHM SIGN folding to omega, U+FB00
+folding to `ff`. NOT localized, and this entry deliberately claims nothing about
+where the fault lies, because two attempts to localize it were both defeated by
+the instrument: `ZCC_NOPASS=all` is a SILENT NO-OP (`all` is not a pass name, and
+`md5(.s)` was unchanged), and disabling every named pass at once makes zcc emit a
+program that dies part-way through the suite, so that reading means nothing
+either. Bisect one pass at a time.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4, gcc 14.2.0,
+oniguruma 6.9.9 built from its own `./configure`. Gate 16/0 with the parse fix.
+
+---
+
 ---
 
 ---
