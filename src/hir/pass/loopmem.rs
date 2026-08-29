@@ -54,13 +54,11 @@ use super::*;
 
 /// THEORY A7b  SQUARE loopmem_forwards_a_global_accumulator_across_the_back_edge —
 /// the loop-carried memory cell
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     if std::env::var_os("ZCC_NOLOOPMEM").is_some() {
         return false;
     }
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+    let (c, dt, lf) = a.all(f);
     let mut changed = false;
     // innermost first: an outer loop's body still contains the inner one, and a
     // cell promoted in the inner loop is no longer a candidate outside it.

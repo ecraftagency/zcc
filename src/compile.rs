@@ -39,6 +39,7 @@ pub fn compile(ast: &Ast) -> String {
     });
     let h = h;
     let m = backend(&h).unwrap_or_else(|e| panic!("zcc: internal: {}", e));
+    acount();
     phase("emit", || crate::emit::emit(ast, &m))
 }
 
@@ -86,6 +87,24 @@ pub fn optimize() -> bool {
     std::env::var_os("ZCC_O0").is_none()
 }
 
+/// `ZCC_ACOUNT` — how many times the three control-flow analyses were BUILT for
+/// this translation unit. The analysis layer's claim is about that count, so this
+/// is what settles it; a stopwatch cannot, because on any input small enough to
+/// time locally the process startup is larger than the effect.
+pub fn acount() {
+    if std::env::var_os("ZCC_ACOUNT").is_none() {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let b = &crate::cfg::BUILDS;
+    eprintln!(
+        "[acount] cfg {} domtree {} loops {}",
+        b[0].load(Relaxed),
+        b[1].load(Relaxed),
+        b[2].load(Relaxed)
+    );
+}
+
 /// Wall-clock per pipeline stage, printed when `ZCC_TIME` is set. A performance
 /// claim is a measurement (Article E), and the measurement has to be available
 /// without rebuilding the compiler.
@@ -114,6 +133,11 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
     // MIR passes on SSA, before allocation (MECHANISM.md §G8, the pre-allocation half).
     phase("mir::pass", || {
         for f in m.funcs.iter_mut() {
+            // The analysis layer, MIR half (`mir::analysis`). One handle per
+            // function for the whole pre-allocation ladder; `MEASURED M44` is
+            // the row it was built for.
+            let mut a = crate::mir::MAnalyses::new();
+            let a = &mut a;
             crate::mir::pass::ext::run(f);
             crate::mir::pass::cmpelim::run(f);
             crate::mir::pass::cmpelim::branch_on_flags(f);
@@ -121,8 +145,12 @@ pub fn allocated(h: &crate::hir::Module) -> Result<crate::mir::MModule, String> 
             // arithmetic result and folding a compare into a branch each leave a
             // compare that a later one may now duplicate exactly.
             crate::mir::pass::cmpelim::drop_redundant_cmps(f);
-            crate::mir::pass::const_share::run(f);
-            crate::mir::pass::const_share::hoist_invariant_consts(f);
+            // `ext` and `cmpelim` rewrite instructions and fold compares into
+            // branches; `branch_on_flags` can retarget a terminator, so the
+            // handle starts here rather than above.
+            a.invalidate();
+            crate::mir::pass::const_share::run(f, a);
+            crate::mir::pass::const_share::hoist_invariant_consts(f, a);
             crate::mir::pass::autoinc::run(f);
             // R5.3, LAST of the SSA-MIR rows: it consumes the shape the rows
             // above leave — plain `BaseImm` addresses and scalar FP ops — and

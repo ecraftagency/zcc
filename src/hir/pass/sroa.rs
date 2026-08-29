@@ -50,13 +50,16 @@ struct Piece {
 }
 
 /// THEORY A7b  SQUARE sroa_splits_a_struct_field_by_field — a private cell is a value
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     let mut changed = canon_slot_addr(f);
     let pieces = analyze(f);
     if pieces.is_empty() {
         return changed;
     }
-    changed |= promote(f, &pieces);
+    // `canon_slot_addr` rewrote instructions, never a terminator, so the CFG the
+    // handle holds still describes `f` — the declaration this pass makes, and the
+    // one `analysis::checking` re-derives on every debug build.
+    changed |= promote(f, &pieces, a);
     changed
 }
 
@@ -253,10 +256,12 @@ fn object_of(f: &Func, slot: u32, off: i64) -> Option<(i64, i64)> {
 
 // ── SSA construction (Cytron placement + a reaching-definition walk) ───────
 
-fn promote(f: &mut Func, pieces: &[Piece]) -> bool {
+fn promote(f: &mut Func, pieces: &[Piece], a: &mut Analyses) -> bool {
     let n = f.blocks.len();
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
+    // Borrowed from the handle, not from `f`: the rewrites below mutate the
+    // function while these stay live, which is sound exactly because this pass
+    // does not read the handle again after it starts rewriting.
+    let (c, dt) = a.dom(f);
     // which variable, if any, a `SlotAddr` value names
     let mut var_of_addr: HashMap<ValueId, usize> = HashMap::new();
     for b in &f.blocks {

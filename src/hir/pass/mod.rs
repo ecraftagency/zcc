@@ -112,79 +112,140 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     // Critical edges are split once, up front: sccp and gvn both want to place a
     // value on an edge, and a critical edge offers nowhere to put it.
     dom::split_critical_edges(f);
+    // THE ANALYSIS LAYER (`hir::analysis`). `cfg`, `DomTree` and `LoopForest` are
+    // owned here for the whole ladder instead of rebuilt at the head of each of
+    // the twenty-four rows below, and INVALIDATED by the pass that changes the
+    // function rather than recomputed by the one that reads it next.
+    //
+    // THE INVALIDATION IS CONSERVATIVE ON PURPOSE, and that is a first cut rather
+    // than the answer: any pass reporting a change drops the whole handle, even
+    // where it rewrote instructions and left every edge alone. What it collects
+    // is the sharing WITHIN a pass and across the rows that report nothing, which
+    // is most of them after round one. Narrowing a row's declaration to "I did
+    // not touch the CFG" is a separate row, and `analysis::checking` is what
+    // makes each such claim provable rather than asserted.
+    let mut a = Analyses::new();
+    let a = &mut a;
     for _ in 0..ROUNDS {
         let mut changed = false;
         if on("cfg") {
-            changed |= timed("cfg", || cfg::run(f));
+            if timed("cfg", || cfg::run(f)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("sroa") {
-            changed |= timed("sroa", || sroa::run(f));
+            if timed("sroa", || sroa::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("sccp") {
-            changed |= timed("sccp", || sccp::run(f));
+            if timed("sccp", || sccp::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // AFTER sccp: a value the point lattice settles is an interval of one,
         // so the cheaper analysis goes first and this one reasons about what is
         // left. BEFORE gvn, which is what removes the comparisons this decides.
         if on("vrp") {
-            changed |= timed("vrp", || vrp::run(f));
+            if timed("vrp", || vrp::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("gvn") {
-            changed |= fold::canon(f);
-            changed |= fold::narrow_mask(f);
-            changed |= timed("gvn", || gvn::run(f));
+            if fold::canon(f) | fold::narrow_mask(f) {
+                changed = true;
+                a.invalidate();
+            }
+            if timed("gvn", || gvn::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("mem") {
-            changed |= timed("mem", || mem::run(f));
+            if timed("mem", || mem::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("ifconv") {
-            changed |= timed("ifconv", || ifconv::run(f));
+            if timed("ifconv", || ifconv::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // Rotation runs BEFORE licm, not after: a bottom-tested loop is what
         // makes "the loop runs at least once" structural rather than
         // arithmetic, and that is the fence licm's call hoist was refusing on.
         if on("rotate") {
-            changed |= timed("rotate", || rotate::run(f));
+            if timed("rotate", || rotate::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // BEFORE licm and the IV rows: unrolling decides a guard and deletes a
         // back edge, so what it leaves is straight-line code those rows can see
         // through — and a loop it removes is one they no longer have to reason
         // about.
         if on("unroll") {
-            changed |= timed("unroll", || unroll::run(f));
+            if timed("unroll", || unroll::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("licm") {
-            changed |= timed("licm", || licm::run_with(f, ro));
+            if timed("licm", || licm::run_with(f, ro, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // BEFORE gvn's next turn and before dce: the sequence divmagic writes is
         // ordinary arithmetic, so everything downstream folds, numbers and
         // schedules it like any other. AFTER licm, so a divisor that was loop
         // invariant has already moved and the multiply lands where the divide was.
         if on("divmagic") {
-            changed |= timed("divmagic", || divmagic::run(f));
+            if timed("divmagic", || divmagic::run(f)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // AFTER licm, which is what moves the address computation out of the loop
         // — the invariance this pass requires of it is a property of that shape.
         if on("loopmem") {
-            changed |= timed("loopmem", || loopmem::run(f));
+            if timed("loopmem", || loopmem::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // LAST of the loop rows: it duplicates blocks, so every analysis above it
         // sees the smaller CFG, and the copies it leaves are ordinary code that
         // `gvn` and `dce` clean up on the next turn.
         if on("tailjump") {
-            changed |= timed("tailjump", || tailjump::run(f));
+            if timed("tailjump", || tailjump::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // AFTER licm and rotation: the loop must already be in its final shape,
         // because the recurrence this reads is a property of that shape. Before
         // dce, which is what removes the address chain it replaces.
         if on("iv") {
-            changed |= timed("iv", || iv::run(f));
+            if timed("iv", || iv::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // Widening is a SEPARATE row from the pointer walk above and is ON: it
         // removes the per-iteration `sxtw` that stands between an `a[i]` loop
         // and gcc's (§13l).
         if on("widen") {
-            changed |= timed("iv", || iv::widen(f));
+            if timed("iv", || iv::widen(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // IV SUBSTITUTION is a third row again (§13q ii): `widen` removes a
         // `sxtw` from an `a[i]` loop, this removes the ADD that rebuilds
@@ -192,18 +253,30 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // `widen`, because a loop whose counter already feeds a `sext` belongs
         // to that row and this one refuses it.
         if on("subst") {
-            changed |= timed("iv", || iv::substitute(f));
+            if timed("iv", || iv::substitute(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         // LAST of the IV rows, because it DESTROYS the index: once the loop
         // counts down, `widen` and `substitute` have nothing left to recognize.
         if on("countdown") {
-            changed |= timed("iv", || iv::countdown(f));
+            if timed("iv", || iv::countdown(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("sink") {
-            changed |= timed("sink", || sink::run(f));
+            if timed("sink", || sink::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if on("dce") {
-            changed |= timed("dce", || dce::run(f));
+            if timed("dce", || dce::run(f)) {
+                changed = true;
+                a.invalidate();
+            }
         }
         if !changed {
             break;
@@ -213,7 +286,7 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         cfg::run(f);
     }
     if iv::fv_wanted() {
-        iv::fv_opportunity(f);
+        iv::fv_opportunity(f, a);
     }
 }
 

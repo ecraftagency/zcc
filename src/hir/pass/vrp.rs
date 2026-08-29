@@ -129,14 +129,13 @@ impl R {
 }
 
 /// THEORY A7b  SQUARE vrp_replaces_an_expression_by_one_equal_on_its_range
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     if !wanted() {
         return false;
     }
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let rng = solve(f, &c);
-    let guards = guard_map(f, &c, &dt);
+    let (c, dt) = a.dom(f);
+    let rng = solve(f, c);
+    let guards = guard_map(f, c, dt);
     let mut changed = false;
     let mut map: Vec<Option<Operand>> = vec![None; f.values.len()];
     for b in 0..f.blocks.len() {

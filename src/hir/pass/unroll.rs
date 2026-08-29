@@ -79,19 +79,17 @@ fn enabled() -> bool {
 }
 
 /// THEORY A7b  SQUARE unroll_replays_the_same_iterations — a decided guard is not a loop
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     if !enabled() {
         return false;
     }
-    force(f)
+    force(f, a)
 }
 
 /// The pass with its gate open, for the batteries: a theorem still owes its
 /// square while the row is being measured.
-pub fn force(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+pub fn force(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, _dt, lf) = a.all(f);
     for li in 0..lf.loops.len() {
         // innermost only
         if lf.loops.iter().any(|l| l.parent == Some(li as u32)) {

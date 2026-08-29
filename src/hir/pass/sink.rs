@@ -22,10 +22,8 @@
 use super::*;
 
 /// THEORY A7b  SQUARE sink_moves_a_computation_to_the_block_that_needs_it — domination of every use
-pub fn run(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     // where each value is used
     let mut users: Vec<Vec<BlockId>> = vec![Vec::new(); f.values.len()];
     for b in 0..f.blocks.len() {

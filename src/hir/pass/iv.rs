@@ -134,8 +134,8 @@ fn consumer_blind() -> bool {
 }
 
 /// THEORY A7b  SQUARE a_strided_load_walks_a_pointer — the AddRec IS the address it replaces
-pub fn run(f: &mut Func) -> bool {
-    walk(f, enabled())
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
+    walk(f, enabled(), a)
 }
 
 /// The pass with BOTH halves live. `run` is now the same entry — the default-off
@@ -144,16 +144,14 @@ pub fn run(f: &mut Func) -> bool {
 /// addressing mode cannot reach is always strength-reduced. The batteries call
 /// this directly because a theorem that ships half-disabled still owes its
 /// square on both halves.
-pub fn force(f: &mut Func) -> bool {
-    walk(f, true)
+pub fn force(f: &mut Func, a: &mut Analyses) -> bool {
+    walk(f, true, a)
 }
 
 /// `unit` = also strength-reduce the unit-stride half MEASURED M2 refuted, the
 /// half that ships off. The batteries pass `true`; the ladder passes `enabled()`.
-fn walk(f: &mut Func, unit: bool) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+fn walk(f: &mut Func, unit: bool, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     // innermost first: the inner loop is the hot one, and rewriting it does not
     // disturb the outer loop's recurrences.
     // Counted once for the whole function: it does not depend on which loop is
@@ -697,10 +695,8 @@ pub fn fv_wanted() -> bool {
     *W.get_or_init(|| std::env::var("ZCC_FVDBG").is_ok())
 }
 
-pub fn fv_opportunity(f: &Func) {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+pub fn fv_opportunity(f: &Func, a: &mut Analyses) {
+    let (c, dt, lf) = a.all(f);
     for li in 0..lf.loops.len() {
         let s = match scev::LoopScev::analyze(f, &c, &dt, &lf, li) {
             Some(s) => s,
@@ -745,10 +741,8 @@ pub fn fv_opportunity(f: &Func) {
     }
 }
 
-pub fn widen(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+pub fn widen(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     // Counted once for the whole function: it does not depend on which loop is
     // being strengthened, and `strengthen` asks it of every loop.
     let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
@@ -1124,10 +1118,8 @@ fn append_cvt(f: &mut Func, b: BlockId, op: CvtOp, from: Ty, to: Ty, a: Operand)
 // straight back as the counter's own step.
 
 /// THEORY A7b  SQUARE an_invariant_plus_the_counter_becomes_the_counter — Law 3c
-pub fn substitute(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+pub fn substitute(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     // Counted once for the whole function: it does not depend on which loop is
     // being strengthened, and `strengthen` asks it of every loop.
     let mut uses_total: HashMap<ValueId, usize> = HashMap::new();
@@ -1476,10 +1468,8 @@ fn apply_substitute(
 // index's type.
 
 /// THEORY A7b  SQUARE a_counted_loop_counts_down_and_the_compare_disappears
-pub fn countdown(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+pub fn countdown(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     // Counted once for the whole function: it does not depend on which loop is
     // being strengthened, and `strengthen` asks it of every loop.
     let mut uses_total: HashMap<ValueId, usize> = HashMap::new();

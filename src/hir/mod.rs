@@ -12,6 +12,7 @@
 //      `udiv`, `icmp.slt` vs `icmp.ult`, `sext` vs `zext`), never in a lookup
 //      into the frontend's TyTab. After lowering, HIR is independent of TyTab —
 //      which is what makes `⟦·⟧` (SEMANTICS.md §3) a closed definition.
+pub mod analysis;
 pub mod build;
 pub mod dom;
 pub mod freq;
@@ -20,6 +21,8 @@ pub mod pass;
 #[cfg(test)]
 mod tests;
 pub mod verify;
+
+pub use analysis::Analyses;
 
 pub type BlockId = u32;
 pub type ValueId = u32;

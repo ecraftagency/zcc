@@ -26,23 +26,22 @@ use super::*;
 use std::collections::HashSet;
 
 /// THEORY A7b  SQUARE licm_hoists_an_invariant_expression_out_of_the_loop — invariance + the four fences
-pub fn run(f: &mut Func) -> bool {
-    run_with(f, &HashSet::new())
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
+    run_with(f, &HashSet::new(), a)
 }
 
 /// `readonly` is the interprocedural purity set (`pass/purity.rs`). When it is
 /// empty this is exactly the pass above; when it is not, a CALL becomes a
 /// hoistable term too — see `hoist_call` for the four fences that licence it.
-pub fn run_with(f: &mut Func, readonly: &HashSet<String>) -> bool {
+pub fn run_with(f: &mut Func, readonly: &HashSet<String>, a: &mut Analyses) -> bool {
     let mut changed = false;
     // Preheaders first: creating one changes the CFG, so the analyses are rebuilt
     // afterwards and the motion itself runs on a stable graph.
-    if preheaders(f) {
+    if preheaders(f, a) {
         changed = true;
+        a.invalidate();
     }
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+    let (c, dt, lf) = a.all(f);
     if lf.loops.is_empty() {
         return changed;
     }
@@ -481,10 +480,8 @@ fn preheader_of(f: &Func, c: &dom::Cfg, dt: &dom::DomTree, header: BlockId) -> O
 /// arguments — so the preheader takes the same parameters and forwards them. No
 /// value changes, no order changes: ⟦f⟧ = ⟦preheader f⟧ by the same argument as
 /// critical-edge splitting.
-fn preheaders(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+fn preheaders(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     let mut changed = false;
     for l in &lf.loops {
         let h = l.header;

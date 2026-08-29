@@ -63,7 +63,7 @@ const MAX_GROWTH: usize = 800;
 
 /// THEORY A7b  SQUARE tailjump_copies_the_dispatch_into_each_arm — the duplicated
 /// dispatch
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     if std::env::var_os("ZCC_NOTAILJUMP").is_some() {
         return false;
     }
@@ -71,9 +71,9 @@ pub fn run(f: &mut Func) -> bool {
     let mut changed = false;
     // One sweep per shape, innermost loops first — an inner dispatch is the hot
     // one, and duplicating it first leaves the outer loop's shape unchanged.
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+    // The handle's borrow ends with `targets`: the duplication below rewrites the
+    // graph, so it reads the layer again, once per block it actually copies.
+    let (_c, _dt, lf) = a.all(f);
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
     let mut targets: Vec<BlockId> = Vec::new();
@@ -98,9 +98,10 @@ pub fn run(f: &mut Func) -> bool {
         if grown >= MAX_GROWTH {
             break;
         }
-        if let Some(n) = dup_into_preds(f, b, MAX_GROWTH - grown) {
+        if let Some(n) = dup_into_preds(f, b, MAX_GROWTH - grown, a) {
             grown += n;
             changed = true;
+            a.invalidate();
         }
     }
     if changed {
@@ -113,7 +114,7 @@ pub fn run(f: &mut Func) -> bool {
 /// number of instructions added, or `None` if the block is refused.
 macro_rules! why { ($($t:tt)*) => { if std::env::var_os("ZCC_TJ_REPORT").is_some() { eprintln!($($t)*); } } }
 
-fn dup_into_preds(f: &mut Func, b: BlockId, budget: usize) -> Option<usize> {
+fn dup_into_preds(f: &mut Func, b: BlockId, budget: usize, a: &mut Analyses) -> Option<usize> {
     let bi = b as usize;
     if f.blocks[bi].insts.len() > MAX_BLOCK || !f.blocks[bi].labels.is_empty() {
         why!("tj b{}: too big ({}) or labelled", b, f.blocks[bi].insts.len());
@@ -126,7 +127,7 @@ fn dup_into_preds(f: &mut Func, b: BlockId, budget: usize) -> Option<usize> {
     if f.blocks[bi].insts.iter().any(|i| !matches!(i.effect(), Effect::Pure | Effect::Read)) {
         return None;
     }
-    let c = dom::cfg(f);
+    let c = a.cfg(f);
     // Predecessors reached by an unconditional jump: those are arm tails, and the
     // copy replaces the jump exactly. A conditional edge would need the copy in a
     // new block, which buys the same thing and costs an extra branch.

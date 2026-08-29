@@ -1216,12 +1216,12 @@ fn unrotated(src: &str) -> Module {
         super::super::dom::split_critical_edges(f);
         for _ in 0..super::ROUNDS {
             super::cfg::run(f);
-            super::sroa::run(f);
-            super::sccp::run(f);
+            super::sroa::run(f, &mut crate::hir::Analyses::new());
+            super::sccp::run(f, &mut crate::hir::Analyses::new());
             super::fold::canon(f);
-            super::gvn::run(f);
-            super::mem::run(f);
-            super::licm::run_with(f, &ro);
+            super::gvn::run(f, &mut crate::hir::Analyses::new());
+            super::mem::run(f, &mut crate::hir::Analyses::new());
+            super::licm::run_with(f, &ro, &mut crate::hir::Analyses::new());
             super::dce::run(f);
         }
         verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
@@ -1357,11 +1357,11 @@ fn rotated(src: &str) -> (Module, bool) {
         super::super::dom::split_critical_edges(f);
         for _ in 0..super::ROUNDS {
             super::cfg::run(f);
-            super::sroa::run(f);
-            super::sccp::run(f);
-            super::gvn::run(f);
+            super::sroa::run(f, &mut crate::hir::Analyses::new());
+            super::sccp::run(f, &mut crate::hir::Analyses::new());
+            super::gvn::run(f, &mut crate::hir::Analyses::new());
         }
-        any |= super::rotate::force(f);
+        any |= super::rotate::force(f, &mut crate::hir::Analyses::new());
         verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
     }
     (m, any)
@@ -1444,7 +1444,7 @@ fn rotation_is_not_applied_twice() {
     let (mut m, fired) = rotated(src);
     assert!(fired);
     for f in m.funcs.iter_mut() {
-        assert!(!super::rotate::force(f), "rotation must be idempotent");
+        assert!(!super::rotate::force(f, &mut crate::hir::Analyses::new()), "rotation must be idempotent");
     }
 }
 
@@ -1615,7 +1615,7 @@ fn with_iv(src: &str) -> (Module, bool) {
     super::run_module_with(&mut m, &crate::compile::pinned_symbols(&ast));
     let mut any = false;
     for f in m.funcs.iter_mut() {
-        any |= super::iv::force(f);
+        any |= super::iv::force(f, &mut crate::hir::Analyses::new());
         verify::verify(f).unwrap_or_else(|e| panic!("{}\n{}", e, src));
     }
     (m, any)

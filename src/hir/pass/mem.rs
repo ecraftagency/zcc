@@ -106,7 +106,7 @@ pub(super) fn same(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
 type Avail = Vec<((Loc, u32, AClass), Ty, Operand, Option<usize>)>;
 
 /// THEORY A7b  SQUARE a_second_read_of_the_same_place_is_the_first — the alias oracle
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     // where each value's address comes from
     let mut addr: Vec<Option<Loc>> = vec![None; f.values.len()];
     for b in &f.blocks {
@@ -134,7 +134,7 @@ pub fn run(f: &mut Func) -> bool {
     // R4.9: the table each block LEAVES, so a single-predecessor successor can
     // start from it instead of from nothing. Reverse postorder is what makes the
     // predecessor's entry already present when its successor is reached.
-    let cfg = dom::cfg(f);
+    let cfg = a.cfg(f);
     let mut exit: Vec<Option<Avail>> = vec![None; f.blocks.len()];
     for &blk in &cfg.rpo {
         let b = blk as usize;

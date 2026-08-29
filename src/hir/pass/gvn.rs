@@ -96,9 +96,8 @@ fn key_of(inst: &Inst, r: &dyn Fn(Operand) -> Operand) -> Option<Key> {
 }
 
 /// THEORY A7b  SQUARE gvn_numbers_a_repeated_expression_once — redundancy under dominance
-pub fn run(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt) = a.dom(f);
     let mut map: Vec<Option<Operand>> = vec![None; f.values.len()];
     let mut dead: Vec<(usize, usize)> = Vec::new();
     let mut table: HashMap<Key, ValueId> = HashMap::new();

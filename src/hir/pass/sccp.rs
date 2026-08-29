@@ -40,9 +40,9 @@ impl Lat {
 }
 
 /// THEORY A7b  SQUARE sccp_kills_the_arm_a_constant_makes_unreachable — the lattice meet
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     let n = f.blocks.len();
-    let c = dom::cfg(f);
+    let c = a.cfg(f);
     // Incoming edges, addressed the way `Term::targets()` orders them.
     let mut in_edges: Vec<Vec<(BlockId, usize)>> = vec![Vec::new(); n];
     for b in 0..n {

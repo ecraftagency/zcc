@@ -76,28 +76,30 @@ fn enabled() -> bool {
 }
 
 /// THEORY A7b  SQUARE rotation_moves_the_test_to_the_bottom — execution-count equality
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     if !enabled() {
         return false;
     }
-    force(f)
+    force(f, a)
 }
 
 /// The pass itself, past the default-off gate. The batteries call this: a
 /// theorem that ships disabled still owes its commuting square, or turning it on
 /// later would be turning on something unproven.
-pub fn force(f: &mut Func) -> bool {
+pub fn force(f: &mut Func, a: &mut Analyses) -> bool {
     let mut changed = false;
     // Each rotation rewrites the CFG, so the analyses are rebuilt between them.
     // The bound is the block count purely as a runaway guard: a rotated loop
     // cannot be rotated again, so the real bound is the number of loops.
     for _ in 0..f.blocks.len() {
-        if !rotate_one(f) {
+        a.invalidate();
+        if !rotate_one(f, a) {
             break;
         }
         changed = true;
     }
     if changed {
+        a.invalidate();
         // The guard has two successors and both of its targets have gained a
         // predecessor, so rotation manufactures critical edges by construction.
         dom::split_critical_edges(f);
@@ -115,10 +117,8 @@ fn residual_wanted() -> bool {
     *W.get_or_init(|| std::env::var("ZCC_RESIDUAL").is_ok())
 }
 
-fn rotate_one(f: &mut Func) -> bool {
-    let c = dom::cfg(f);
-    let dt = dom::domtree(f, &c);
-    let lf = dom::loops(&c, &dt);
+fn rotate_one(f: &mut Func, a: &mut Analyses) -> bool {
+    let (c, dt, lf) = a.all(f);
     let pin = pinned(f);
     // innermost first: the inner loop is the hot one
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();

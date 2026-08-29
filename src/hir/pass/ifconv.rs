@@ -28,7 +28,7 @@ use super::*;
 const ARM_LIMIT: usize = 2;
 
 /// THEORY A7b  SQUARE ifconv_turns_a_diamond_into_a_select — a side-effect-free diamond
-pub fn run(f: &mut Func) -> bool {
+pub fn run(f: &mut Func, a: &mut Analyses) -> bool {
     let mut changed = false;
     // WHAT IS PINNED DOES NOT CHANGE HERE, so it is asked once. A block is pinned
     // by being the entry, by having its address taken, or by being a computed
@@ -39,7 +39,10 @@ pub fn run(f: &mut Func) -> bool {
     // converted diamond was a full walk of every instruction in the function.
     let pin = pinned(f);
     loop {
-        let c = dom::cfg(f);
+        // Each conversion rewrites terminators, so the handle is invalidated at
+        // the top of every turn — the DECLARATION this pass owes the layer.
+        a.invalidate();
+        let c = a.cfg(f);
         let mut hit = None;
         for b in 0..f.blocks.len() {
             if !c.reachable(b as BlockId) {

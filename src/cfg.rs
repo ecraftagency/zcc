@@ -9,6 +9,20 @@
 // Lengauer-Tarjan (MECHANISM.md §G3.3).
 pub type Node = u32;
 
+/// THEORY B — instrument half. Not a value the compiler computes with: it is
+/// what lets a measurement ask how many control-flow analyses were BUILT, which
+/// is exactly the claim `hir::analysis` and `mir::analysis` make. Counted at the
+/// CONSTRUCTORS, so no caller anywhere can be missed.
+pub static BUILDS: [std::sync::atomic::AtomicUsize; 3] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+fn tick(i: usize) {
+    BUILDS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct Cfg {
     pub preds: Vec<Vec<Node>>,
     pub succs: Vec<Vec<Node>>,
@@ -20,6 +34,7 @@ pub struct Cfg {
 
 impl Cfg {
     pub fn build(n: usize, entry: Node, succ_of: impl Fn(Node) -> Vec<Node>) -> Cfg {
+        tick(0);
         let mut succs: Vec<Vec<Node>> = (0..n as Node).map(&succ_of).collect();
         for s in succs.iter_mut() {
             s.dedup();
@@ -79,6 +94,7 @@ pub struct DomTree {
 
 impl DomTree {
     pub fn new(cfg: &Cfg, entry: Node) -> DomTree {
+        tick(1);
         let n = cfg.succs.len();
         let mut idom = vec![u32::MAX; n];
         idom[entry as usize] = entry;
@@ -181,6 +197,7 @@ impl LoopForest {
     /// Natural loops: a back edge b→h (h dominates b) defines the loop headed by
     /// h; its body is every node that reaches b without leaving h.
     pub fn new(cfg: &Cfg, dt: &DomTree) -> LoopForest {
+        tick(2);
         let n = cfg.succs.len();
         let mut headers: Vec<(Node, Vec<Node>)> = Vec::new();
         // Where each header already sits in `headers`, so a second back edge to

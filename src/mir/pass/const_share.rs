@@ -77,14 +77,13 @@ enum Key {
 /// DOMINATING copy executes first on every run that reaches the second, so it
 /// faults first and the run is ⊥ either way. Nothing is speculated and nothing
 /// observable moves.
-pub fn run(f: &mut MFunc) {
+pub fn run(f: &mut MFunc, a: &mut crate::mir::MAnalyses) {
     // A/B while the trade is being measured: sharing buys a materialization and
     // pays in live range, and only the paired number says which wins.
     if std::env::var("ZCC_NOSHARE").is_ok() {
         return;
     }
-    let cfg = crate::mir::verify::cfg(f);
-    let dt = DomTree::new(&cfg, f.entry);
+    let (cfg, dt) = a.dom(f);
     // The value, its width, and the call count at its definition — a merge is
     // offered only when no call separates the two (see the header).
     let mut table: HashMap<Key, (Reg, Width, u32)> = HashMap::new();
@@ -278,13 +277,14 @@ fn visit(
 ///     constant hoisted out of a loop is live across the whole loop, and a
 ///     program that was one value short of spilling now spills. That is a
 ///     measurement, not an argument (`ZCC_HOIST`, `MEASURED M42`, `M44`).
-pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
+pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> usize {
     if !hoist_wanted() {
         return 0;
     }
-    let cfg = crate::mir::verify::cfg(f);
-    let dt = crate::cfg::DomTree::new(&cfg, f.entry);
-    let lf = crate::cfg::LoopForest::new(&cfg, &dt);
+    // `MEASURED M44`, and this line is the whole of its fix: `run` above just
+    // built `cfg` and `dt` on this function and RENAMED USES — it moved no edge —
+    // so both still describe `f`, and only the loop forest is new work here.
+    let (cfg, dt, lf) = a.all(f);
     let mut moved = 0usize;
     // innermost loops first: a constant lifted to an inner preheader can then be
     // lifted again by the enclosing loop's turn
