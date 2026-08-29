@@ -65,42 +65,48 @@ compilers build and RUN every program, output checked before any clock is read,
 and each comparison pins the WORK rather than only the answer: libpng's encoded
 size and bzip2's compressed length fix every filter and Huffman decision.
 
-| program | what it exercises | exec | insn |
+Speed is **percent of gcc -O2's**, so higher is better and 100% is parity.
+
+| program | what it exercises | speed | code size |
 |---|---|---|---|
-| sqlite 3 CLI | query engine, cold branches, real spilling | **1.123** | — |
-| lua 5.4.7 | ~100-arm dispatch loop, FP through the VM, GC | **1.160** | — |
-| zlib 1.3.1 | one hot loop, 32 KB sliding window | **1.130** | 1.155 |
-| libpng 1.6.43 | byte-wise row filters, narrow types, constant stride | **1.010** | 1.073 |
-| bzip2 1.0.8 — compress | suffix sort, genuinely unpredictable branches | **1.102** | 0.548 |
-| bzip2 1.0.8 — decompress | inverse BWT, one dependent load per byte | **1.074** | 1.611 |
+| libpng 1.6.43 | byte-wise row filters, narrow types, constant stride | **99%** | 1.07× |
+| bzip2 1.0.8 — decompress | inverse BWT, one dependent load per byte | **93%** | 1.61× |
+| bzip2 1.0.8 — compress | suffix sort, genuinely unpredictable branches | **91%** | 0.55× |
+| sqlite 3 CLI | query engine, cold branches, real spilling | **89%** | — |
+| zlib 1.3.1 | one hot loop, 32 KB sliding window | **88%** | 1.16× |
+| lua 5.4.7 | ~100-arm dispatch loop, FP through the VM, GC | **86%** | — |
 | oniguruma 6.9.9 | backtracking regex engine | *1,516 / 1,516 pass, = gcc* | — |
 
-bzip2's two INSN columns run opposite ways and cancel to 1.005 in the total —
-which is why the arms are reported, and the geomean is not.
+Code size is instructions emitted, zcc over gcc. bzip2's two figures run opposite
+ways and cancel to 1.00× over the library — which is why the arms are reported
+separately, and their geomean is not.
 
 **Kernel suite** — 96 programs, one shape each, deliberately adversarial:
 
-    EXEC geomean 1.209   ·   INSN geomean 1.015   ·   0 divergence
+    83% of gcc -O2's speed (geomean)  ·  code size 1.02×  ·  0 divergence
 
-49 of the 96 sit above 1.1× and the worst is 2.75×. The gap is measured, not
+These are single-shape kernels chosen to be hard, not a workload anyone runs;
+half of them sit below 91% and the worst is 36%. The gap is measured, not
 guessed: `perf` says the twelve worst are all **count-driven**, never
 chain-driven — zcc's IPC is 4.1–6.7 and it retires 1.4×–4.6× the instructions,
 because gcc -O2 vectorizes seven of those twelve and zcc vectorizes none.
 
 **Read the instrument's floor before any of these.** Six runs of ONE unchanged
-binary over the same 96 programs spread 1.1990 to 1.2107 — 0.012. The suite
-geomean cannot resolve a change below ~1.5%, and two rows measured the day this
-was written were buried by exactly that; `perf`'s dynamic instruction count is
-the deterministic instrument for anything smaller. A 100 ms real program resolves
-to ±0.3%, which is why the surface grows by programs, not by kernels.
+binary over the same 96 programs spread across a full percentage point of each
+other. The suite geomean cannot resolve a change below ~1.5%, and two rows
+measured the day this was written were buried by exactly that; `perf`'s dynamic
+instruction count is the deterministic instrument for anything smaller. A 100 ms
+real program resolves to ±0.3%, which is why the surface grows by programs, not
+by kernels.
 
 **No parity and no superlative is claimed.** Only cproc+qbe has been run against
-zcc here — 2.141×, and it cannot compile the sqlite amalgamation at all. tcc,
+zcc here — 47% of gcc's speed, and it cannot compile the sqlite amalgamation at
+all. tcc,
 PCC, lacc and chibicc have not; tcc and chibicc are one-pass compilers with no
 optimizer *by design*, which is a statement about their architecture, not a
 measurement. CompCert sits in range of `gcc -O1`. Nor does a number transfer
-across cores: these binaries read 1.069× on an Apple M1 Pro where Neoverse reads
-1.172× against `-O1`.
+across cores: against `-O1` these same binaries read 94% on an Apple M1 Pro where
+Neoverse reads 85%.
 
 ## What the surface found
 
