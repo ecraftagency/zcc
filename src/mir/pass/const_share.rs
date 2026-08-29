@@ -307,6 +307,25 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
         static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *W.get_or_init(|| std::env::var_os("ZCC_HOISTALL").is_some())
     };
+    // WHAT IS WORTH THE LIVE RANGE, and the criterion is the spiller's own.
+    //
+    // `spill.rs` ranks a value that can be REBUILT in one instruction as the
+    // first eviction victim (Briggs 1992): holding it costs a register, and
+    // recomputing it costs the one instruction hoisting it would have saved. So
+    // lifting such a constant out of a loop offers the allocator a trade it is
+    // already documented to refuse — it buys one instruction per iteration and
+    // pays a live range the allocator then spends work undoing. `isa::mov_chain`
+    // gives the exact chain length before anything is emitted (MECHANISM.md
+    // §G10's cost square), so the question is decided, not estimated.
+    //
+    // `ZCC_HOISTMIN` is the A/B seam: 1 restores the every-constant lift, and
+    // whether 2 keeps the exec is a measurement, not an argument.
+    let hoist_min: usize = {
+        static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *W.get_or_init(|| {
+            std::env::var("ZCC_HOISTMIN").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+        })
+    };
     // A value this pass already lifted is not offered to the enclosing loop.
     let mut lifted_once: Vec<bool> = vec![false; f.vregs.len()];
     // WHICH BLOCKS EACH LOOP CONTAINS, asked once for the function instead of
@@ -366,7 +385,13 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
             let mut keep: Vec<MInst> = Vec::with_capacity(f.blocks[b].insts.len());
             for inst in std::mem::take(&mut f.blocks[b].insts) {
                 let v = match &inst {
-                    MInst::MovImm { dst: Reg::V(v), .. } | MInst::Adrp { dst: Reg::V(v), .. } => Some(*v),
+                    // An `Adrp` is always offered: a symbol's page address is not
+                    // a `mov` chain and there is no one-instruction rebuild of it.
+                    MInst::Adrp { dst: Reg::V(v), .. } => Some(*v),
+                    MInst::MovImm { dst: Reg::V(v), w, imm } => {
+                        (crate::mir::isa::mov_chain(*imm, matches!(w, Width::W64)).len() >= hoist_min)
+                            .then_some(*v)
+                    }
                     _ => None,
                 };
                 match v {
