@@ -216,6 +216,22 @@ pub fn run_module(m: &mut Module, pinned: &HashSet<String>) -> bool {
                                 return false;
                             }
                             let once = counts.get(n).copied().unwrap_or(0) == 1;
+                            // THE `!hl(gi)` FENCE SURVIVED THE CROSSING (`MEASURED
+                            // M50`). It was set by one M1 Pro reading of
+                            // `h2_revbits` — 43 ms to 61 ms — against `gcc -O1`,
+                            // and on 2026-08-29 both halves of that premise moved:
+                            // the authoritative core became Neoverse V2 (`M46`) and
+                            // the referee became `-O2` (`M49`). Re-measured there,
+                            // dropping the fence costs EXEC 1.3160 -> 1.3199 and
+                            // INSN 0.9922 -> 1.0226, and `h2_revbits` itself goes
+                            // 2.169 -> 2.886. The rule holds for the reason it was
+                            // written for: splicing one loop into another changes
+                            // what the allocator must hold across the inner one,
+                            // and that is a property of register files, not of a
+                            // particular core. Three decisions of the same vintage
+                            // were reversed that day; this one is not, and the
+                            // difference is that it was measured rather than
+                            // reasoned.
                             let called_once = once
                                 && (g.is_static
                                     || (inloop.get(b).copied().unwrap_or(false) && !hl(gi)));

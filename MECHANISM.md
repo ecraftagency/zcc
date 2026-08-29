@@ -4415,6 +4415,51 @@ Debian 13 arm64, gcc 14.2.0, zcc native, 96-program suite and the sqlite CLI.
 
 ---
 
+### M50. A fourth decision of the same vintage, re-measured — and this one holds
+
+**WHY IT WAS ASKED.** `M25`, `M14` and `M42` were all set on an Apple M1 Pro
+against `gcc -O1`, and all three were reversed on 2026-08-29 once the core and the
+referee moved. That is a reason to re-ask every decision of that vintage, not a
+reason to assume they all fall. The inliner's `!hl(gi)` fence — *an external
+callee that CONTAINS a loop is not spliced into a call site inside a loop* — is
+the next one down the list, and it stands in front of `g1_memcpy_loop`, the worst
+program in the suite at 30.8× against `-O2`.
+
+**THE MEASUREMENT**, 96 programs, Graviton4, `gcc -O2`:
+
+| | EXEC | INSN | programs > 1.1× |
+|---|---|---|---|
+| fence ON (shipped) | **1.3160** | **0.9922** | 56 |
+| fence OFF | 1.3199 | 1.0226 | 53 |
+
+and `h2_revbits`, the program the fence was written for, goes **2.169 → 2.886**.
+
+**THE FENCE HOLDS, AND FOR ITS ORIGINAL REASON.** Its comment says splicing one
+loop into another changes what the allocator must hold across the inner one. That
+is a property of a register file, not of a particular microarchitecture, which is
+why it crosses where a divider's latency does not. Dropping it costs 3% of code
+size and buys negative time.
+
+**WHAT SEPARATES THE THREE THAT FELL FROM THE ONE THAT DID NOT.** `M25` reasoned
+from a latency it had measured on one core and generalized ("the folklore is a
+Cortex-A53-era fact"); `M14` swept the right curve on the wrong axis; `M42` read a
+suite that could not resolve the effect it claimed. This fence measured the
+program it was about, stated the mechanism, and the mechanism is
+core-independent. **A measurement that names its mechanism travels; one that
+names only its number does not.**
+
+**AND THE ROW IT GUARDS IS UNAFFECTED.** `g1_memcpy_loop` stays at 30.6× with the
+fence dropped, because inlining `mycopy` yields a byte-copy loop and a byte-copy
+loop is what zcc already emits. gcc's 30× is the SECOND step — recognizing the
+idiom and calling `memcpy`, which it can only do after inlining proves the two
+pointers are distinct globals. The row is loop-idiom recognition with an overlap
+proof, and it is not blocked by this fence.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4 spot in us-west-2,
+Debian 13 arm64, gcc 14.2.0 -O2, zcc native, 96-program suite.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
