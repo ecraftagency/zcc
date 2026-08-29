@@ -666,6 +666,51 @@ fn loopmem_refuses_when_the_loop_may_write_the_same_object() {
     square(src, 28);
 }
 
+// ── tailjump ───────────────────────────────────────────────────────────────
+
+#[test]
+fn tailjump_copies_the_dispatch_into_each_arm() {
+    // A state machine whose arms converge on one latch: the latch is what gets
+    // copied into each arm, which is the first half of the shape gcc produces.
+    let src = "int f(const char *p,int n){int st=0,c=0,i;                                        \
+                 for(i=0;i<n;i++){ switch(st){                                                   \
+                   case 0: st=1; break; case 1: c+=2; st=2; break;                               \
+                   case 2: c+=3; st=3; break; default: c+=5; st=0; break; } }                    \
+                 return c;}                                                                      \
+               int main(void){return f(\"aaaaaaaa\",8);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    assert_eq!(lf.loops.len(), 1, "the loop must still be a loop");
+    // The duplication must have happened somewhere: the loop's back edges rise
+    // from one to several, because each arm now carries its own copy of the tail.
+    assert!(
+        lf.loops[0].latches.len() > 1,
+        "the tail was not copied into the arms: {} latch(es)",
+        lf.loops[0].latches.len()
+    );
+    square(src, 20); // eight turns of the 0,1,2,3 cycle: c = 2+3+5 twice
+}
+
+#[test]
+fn tailjump_refuses_a_block_whose_value_outlives_its_successors() {
+    // The SSA condition, and it is the pass's ceiling. `c` is computed in the
+    // dispatch and read past the arm it dispatches to, so a copy would need a phi
+    // the pass does not build; it must decline rather than emit a wrong argument
+    // list. Verified by the square, which is what a wrong list would break.
+    let src = "int g(int);                                                                       \
+               int f(int n){int st=0,s=0,i;                                                      \
+                 for(i=0;i<n;i++){ int c=i*3; switch(st){                                        \
+                   case 0: if(c>4){s+=c;} st=1; break;                                           \
+                   default: if(c>2){s+=c;} st=0; break; } }                                      \
+                 return s;}                                                                      \
+               int g(int x){return x;}                                                           \
+               int main(void){return f(6);}";
+    square(src, 45); // c = 0,3,6,9,12,15 under the alternating guards
+}
+
 // ── licm ───────────────────────────────────────────────────────────────────
 
 #[test]

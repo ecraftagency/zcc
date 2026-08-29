@@ -46,6 +46,7 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
     base_e() { stage ext   sh "$W/tests/run.sh" ext   "$SEEK" ; }
     run_sci()    { echo "-- SCI-GATE (theorem verification, structural exhaustion) --"
                    stage provenance sh "$W/tests/provenance.sh"
+                   stage ubscan sh "$W/tests/ubscan.sh"
                    for g in shape cpp decay alg abi; do gate "$g"; done
                    stage determ sh "$W/tests/determinism.sh" ; }
     run_base()   { echo "-- BASE (hand-written differential, fast loop) --"; base_c; base_e ; }

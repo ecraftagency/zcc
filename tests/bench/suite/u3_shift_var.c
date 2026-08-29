@@ -7,7 +7,7 @@ int main(void){
     unsigned long i, s = 0; unsigned u = 0xdeadbeefu; int v = -12345678;
     for(i=0;i<7000000UL;i++){
         unsigned k = (unsigned)(i & 31), j = (unsigned)((i>>5) & 31);
-        u = (u << k) | (u >> (32u - k ? 32u - k : 1u));
+        u = (u << k) | (u >> ((32u - k) & 31u));
         v = (v >> (int)(j & 15)) - (int)(u & 255u);
         s += (unsigned long)(u ^ (unsigned)v) + (unsigned long)(k * j);
     }

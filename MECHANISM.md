@@ -4564,6 +4564,129 @@ output-gated before counting.
 
 ---
 
+### M53. The dispatch, copied into the arm it came from — and the ceiling that stopped it halfway
+
+**VALUE.** `hir/pass/tailjump.rs`, with `MAX_BLOCK = 12` and `MAX_GROWTH = 800`.
+`ZCC_NOTAILJUMP` turns it off. Suite 96 against `gcc -O2` on Graviton4: **EXEC
+1.3177 → 1.3098**, INSN 0.9921 → 1.0073.
+
+**THE CENSUS THAT AUTHORIZED THE BUILD**, run before a line of transform was
+written, because `M51` had just cost an afternoon proving that the previous
+obviously-right row fired on nothing. A loop whose header ends in a `Switch`:
+
+| corpus | dispatch loops |
+|---|---|
+| sqlite amalgamation | **7** — including `sqlite3VdbeExec`, 184 arms, header **three** instructions |
+| lua 5.4.7 | **84** |
+| 96-program suite | 29 |
+| musl, 200 sources | 0 |
+
+**Both constants come from that table.** `MAX_BLOCK = 12` admits every dispatch it
+found — `sqlite3VdbeExec`'s is three instructions, `m2_http_parse`'s is two — and
+refuses the loop bodies that merely end in a switch. `MAX_GROWTH = 800` admits the
+largest real case, 184 arms times a three-instruction header = 552, and stops a
+pathological switch from turning a function into its own jump table. Neither is a
+taste: the corpus set both.
+
+**AND MUSL HAVING ZERO IS THE POINT.** This is an interpreter and parser shape.
+The corpora that contain interpreters contain it in quantity; a libc does not have
+one. That is what `M51` asks of every row before it is built.
+
+**WHAT THE ROW ACTUALLY DOES.** It copies a block into each predecessor that
+reaches it by an unconditional jump, so an arm's tail carries its own copy of the
+loop's latch and dispatch instead of branching back to a shared one. Duplication,
+not motion: the copy runs exactly when that edge is taken, on the same values, and
+no instruction is added to or removed from any PATH.
+
+**THE CEILING, and it is the honest result of the day.** The pass stops at the one
+block worth duplicating. `m2_http_parse`'s dispatch loads the byte its arms read,
+and that byte is used PAST the arm's first block — so a copy would need a phi, and
+the pass refuses rather than emit a wrong argument list. `m2` therefore moves only
+2.094 → 2.075 where `M52`'s counters say 1.95× the instructions are on the table.
+Two ways past it:
+
+  * **SSA reconstruction over the dominance frontier** — the general answer, and
+    SHARED infrastructure: `unroll.rs` names the identical gap in its own comment.
+  * **Remat, then duplicate** — copy the load down into each arm that uses it,
+    which removes the live-out and is free on the clock, since every path still
+    executes exactly one load and only the static count grows. Built and REVERTED
+    the same hour: the first cut deleted the load from the dispatch without
+    placing it correctly, and `m2` went from one `ldrb` to none and hung. The idea
+    is sound; that implementation was not.
+
+**AND TWO PROGRAMS ACCUSED THIS PASS OF A MISCOMPILE THAT WAS NOT ITS.**
+`k1_dispatch` and `k2_live_pressure` diverged with the row on — and diverged with
+it OFF as well. `M54` is what they turned out to be.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4 spot in us-west-2,
+Debian 13 arm64, gcc 14.2.0 -O2, zcc native; 96/96 output-matched, cargo 219/0.
+
+---
+
+### M54. Four of the ninety-six timed programs were UNDEFINED, and every gate was silent
+
+**HOW IT SURFACED.** `tailjump` (`M53`) was accused of miscompiling
+`k1_dispatch` and `k2_live_pressure`. Turning the pass off left both diverging,
+which took the accusation off the pass and put it somewhere else:
+
+| | `k1_dispatch` | `k2_live_pressure` |
+|---|---|---|
+| gcc -O0 | 4090464163158582321 | −6311100434712172540 |
+| gcc -O1 | 4090464163158582321 | −6311100434712172540 |
+| **gcc -O2** | **−8133137304650377657** | **5490126384503059296** |
+| zcc | 4090464163158582321 | −6311100434712172540 |
+
+Three readings agree and `-O2` is the outlier, which is the signature of undefined
+behaviour rather than of a compiler bug. UBSan named it exactly:
+`signed integer overflow: 271182 * 7919 cannot be represented in type 'int'`.
+**Nobody was miscompiling.** C99 6.5p5 leaves signed overflow undefined, `-O2`
+assumes it cannot happen, and `-O0`/`-O1`/zcc happen to wrap. All four are
+conforming.
+
+**THE SCAN, and the number it returned.** Running UBSan over all ninety-six:
+
+| program | defect |
+|---|---|
+| `e2_many_args` | `46338 * 46345` — four of five products left at `int` width |
+| `k1_dispatch` | signed overflow, twice: the `i*7919` seed and the `long` accumulators |
+| `k2_live_pressure` | the same, forty accumulators |
+| `u3_shift_var` | `u >> (32u - k ? 32u - k : 1u)` — the guard tests the TRUTH of `32−k`, which is 32 when `k` is 0, so it shifts by the width |
+
+**Four of ninety-six timed programs had no defined answer.** `e2_many_args` is one
+of the ten worst against `-O2`; its 2.41× was never a measurement of anything.
+Fixed: widen the products, make the VM's value type unsigned (wrapping is defined,
+C99 6.2.5p9), and mask the rotate. Re-scanned: **0 of 96**.
+
+**WHY NO GATE SAW IT, and the gate is not at fault.** `exectime.sh` compares zcc's
+output against the referee's, which is the right question for a MISCOMPILE and is
+silent about a program neither compiler can get right. At `-O1` the two agreed by
+accident and the row was timed; at `-O2` they disagreed and the harness printed
+`DIVERGE` for both, twice, correctly.
+
+**THE READER WAS AT FAULT.** The table was filtered with `awk 'NF==5 && $5+0>0'`,
+a `DIVERGE` row carries `-` in that column, and the geomean was then reported as
+"over 94" without anyone asking where the other two had gone. That is the third
+instance in one session of the same error — a glob that failed silently and took
+its command with it, a `callgrind` job that held a core for 93 minutes, and now
+two `DIVERGE` lines eaten by a filter. **The instrument said so every time.**
+
+**THE GATE THAT NOW EXISTS.** `tests/ubscan.sh`, in the sci-gate beside
+`provenance`. It compiles every suite program at `-O0` with
+`-fsanitize=undefined -fno-sanitize-recover=all` and runs it; a non-zero exit is
+RED. `-O0` on purpose — an optimizer may delete the undefined operation before the
+sanitizer sees it, which would make the gate quieter without making the corpus
+cleaner. It refuses to pass on an empty scan, per `M39`.
+
+**AND EVERY `-O2` NUMBER BEFORE THIS ENTRY IS AFFECTED.** The geomeans quoted
+earlier on 2026-08-29 were over 94 programs with two excluded and two more
+included that should not have been. The corrected suite reads **EXEC 1.3177 over
+96, 0 DIVERGE**.
+
+**WHEN / WHERE.** 2026-08-29, `main`, gcc 14.2.0 UBSan at `-O0`, c8gd.4xlarge
+Graviton4 and the local box; scan is `tests/ubscan.sh`.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer

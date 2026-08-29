@@ -627,6 +627,22 @@ impl Term {
             t.args.iter().for_each(|a| f(*a));
         }
     }
+
+    /// The mutable mirror of `uses`, in the same order and over the same
+    /// operands — the condition or scrutinee, the returned value, and every
+    /// edge ARGUMENT. `Inst` has carried `uses_mut` since the first rewriting
+    /// pass; a terminator needs it as soon as a pass copies one, because the
+    /// copy's operands and its edge arguments are renamed together.
+    pub fn uses_mut(&mut self, mut f: impl FnMut(&mut Operand)) {
+        match self {
+            Term::Br(c, ..) | Term::Switch(c, ..) | Term::GotoPtr(c, _) => f(c),
+            Term::Ret(Some(v)) => f(v),
+            _ => {}
+        }
+        for t in self.targets_mut() {
+            t.args.iter_mut().for_each(&mut f);
+        }
+    }
 }
 
 // ── signatures (the C-level view a call must carry for AAPCS64) ────────────

@@ -20,6 +20,7 @@ pub mod inline;
 pub mod iv;
 pub mod divmagic;
 pub mod licm;
+pub mod tailjump;
 pub mod loopmem;
 pub mod mem;
 pub mod purity;
@@ -166,6 +167,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // — the invariance this pass requires of it is a property of that shape.
         if on("loopmem") {
             changed |= timed("loopmem", || loopmem::run(f));
+        }
+        // LAST of the loop rows: it duplicates blocks, so every analysis above it
+        // sees the smaller CFG, and the copies it leaves are ordinary code that
+        // `gvn` and `dce` clean up on the next turn.
+        if on("tailjump") {
+            changed |= timed("tailjump", || tailjump::run(f));
         }
         // AFTER licm and rotation: the loop must already be in its final shape,
         // because the recurrence this reads is a property of that shape. Before
