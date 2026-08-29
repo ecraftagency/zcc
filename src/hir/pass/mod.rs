@@ -13,6 +13,7 @@
 // round changes nothing or the bound is reached.
 pub mod cfg;
 pub mod copyidiom;
+pub mod vecprobe;
 pub mod copyprobe;
 pub mod dce;
 pub mod fold;
@@ -294,6 +295,7 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         cfg::run(f);
     }
     copyprobe::census(f, a);
+    vecprobe::census(f, a);
     if iv::fv_wanted() {
         iv::fv_opportunity(f, a);
     }

@@ -414,6 +414,20 @@ pub enum FpOp {
     Fdiv,
 }
 
+/// The INTEGER lanewise ALU (DDI 0487 C7.2.5 `add`, C7.2.234 `sub`, C7.2.146
+/// `mul`, and the bitwise forms). Separate from `FpOp` because the mnemonic and
+/// the lane semantics are different even where the arrangement suffix is the
+/// same: `add v0.4s` is four 32-bit integer adds, `fadd v0.4s` is four singles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VIntOp {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Eor,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FpUnOp {
     Fneg,
@@ -578,6 +592,32 @@ pub enum MInst {
         dst: Reg,
         a: Reg,
         b: Reg,
+    },
+    /// `VAlu`'s integer sibling: the same `q` register file, the same
+    /// arrangement, integer lane arithmetic. A64 has no scalar/vector
+    /// distinction in the register file, so nothing below this needs to change —
+    /// `Width::Q` and `MemOp::Q` have carried 128-bit values since `long double`.
+    VInt {
+        op: VIntOp,
+        arr: Arr,
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Broadcast one GPR into every lane (`dup vD.4s, wN`). What a vectorized
+    /// loop needs to start a reduction, and to hold an invariant factor.
+    VDup {
+        arr: Arr,
+        dst: Reg,
+        src: Reg,
+    },
+    /// Horizontal add ACROSS the lanes into a scalar in the FP register file
+    /// (`addv sD, vN.4s`). What closes a vectorized reduction: the vector
+    /// accumulator becomes the one value the scalar epilogue reads.
+    VAddv {
+        arr: Arr,
+        dst: Reg,
+        src: Reg,
     },
     FpUn {
         op: FpUnOp,
@@ -971,9 +1011,15 @@ impl MInst {
                 g(flags, Constraint::Use);
                 g(dst, Constraint::Def);
             }
-            MInst::FpAlu { dst, a, b, .. } | MInst::VAlu { dst, a, b, .. } => {
+            MInst::FpAlu { dst, a, b, .. }
+            | MInst::VAlu { dst, a, b, .. }
+            | MInst::VInt { dst, a, b, .. } => {
                 g(a, Constraint::Use);
                 g(b, Constraint::Use);
+                g(dst, Constraint::Def);
+            }
+            MInst::VDup { dst, src, .. } | MInst::VAddv { dst, src, .. } => {
+                g(src, Constraint::Use);
                 g(dst, Constraint::Def);
             }
             MInst::FpUn { dst, src, .. }
@@ -1116,9 +1162,15 @@ impl MInst {
                 f(flags, Constraint::Use);
                 f(dst, Constraint::Def);
             }
-            MInst::FpAlu { dst, a, b, .. } | MInst::VAlu { dst, a, b, .. } => {
+            MInst::FpAlu { dst, a, b, .. }
+            | MInst::VAlu { dst, a, b, .. }
+            | MInst::VInt { dst, a, b, .. } => {
                 f(a, Constraint::Use);
                 f(b, Constraint::Use);
+                f(dst, Constraint::Def);
+            }
+            MInst::VDup { dst, src, .. } | MInst::VAddv { dst, src, .. } => {
+                f(src, Constraint::Use);
                 f(dst, Constraint::Def);
             }
             MInst::FpUn { dst, src, .. }

@@ -187,10 +187,21 @@ fn check_classes(f: &MFunc, inst: &MInst) -> Result<(), String> {
         // change which file they live in, so the check is the class and nothing
         // else — an arrangement mismatch is not expressible here, since both
         // sources and the destination carry the same one by construction.
-        MInst::VAlu { dst, a, b, .. } => {
+        MInst::VAlu { dst, a, b, .. } | MInst::VInt { dst, a, b, .. } => {
             want(*dst, Class::Fpr, "dst")?;
             want(*a, Class::Fpr, "lhs")?;
             want(*b, Class::Fpr, "rhs")?;
+        }
+        // `dup` reads a GPR and writes a vector; `addv` reads a vector and
+        // writes the scalar form of the SAME file. The two directions are what
+        // let a vectorized reduction start and finish.
+        MInst::VDup { dst, src, .. } => {
+            want(*dst, Class::Fpr, "dst")?;
+            want(*src, Class::Gpr, "src")?;
+        }
+        MInst::VAddv { dst, src, .. } => {
+            want(*dst, Class::Fpr, "dst")?;
+            want(*src, Class::Fpr, "src")?;
         }
         MInst::Alu { dst, a, b, flags, w, .. } => {
             want(*dst, Class::Gpr, "dst")?;

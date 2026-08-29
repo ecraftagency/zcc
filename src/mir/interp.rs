@@ -588,6 +588,72 @@ impl<'a> Machine<'a> {
             // ops it replaces, taken lanewise. That is the whole of the pack's
             // commuting square, and it is why the pass may only build one where
             // the scalars were independent.
+            // The integer siblings. `⟦·⟧` is what the vectorizer's commuting
+            // square is stated against, so a lane operation the reference
+            // semantics cannot execute is a theorem nothing can check.
+            MInst::VInt { op, arr, dst, a, b } => {
+                let (xl, xh) = (self.get(fr, *a), self.get_hi(fr, *a));
+                let (yl, yh) = (self.get(fr, *b), self.get_hi(fr, *b));
+                let apply64 = |p: u64, q: u64| -> u64 {
+                    match op {
+                        VIntOp::Add => p.wrapping_add(q),
+                        VIntOp::Sub => p.wrapping_sub(q),
+                        VIntOp::Mul => p.wrapping_mul(q),
+                        VIntOp::And => p & q,
+                        VIntOp::Or => p | q,
+                        VIntOp::Eor => p ^ q,
+                    }
+                };
+                let (lo, hi) = match arr {
+                    Arr::V2D => (apply64(xl, yl), apply64(xh, yh)),
+                    Arr::V4S => {
+                        let pack = |v: u64, w: u64| -> u64 {
+                            let mut o = 0u64;
+                            for i in 0..2 {
+                                let p = (v >> (32 * i)) as u32 as u64;
+                                let q = (w >> (32 * i)) as u32 as u64;
+                                o |= (apply64(p, q) as u32 as u64) << (32 * i);
+                            }
+                            o
+                        };
+                        (pack(xl, yl), pack(xh, yh))
+                    }
+                };
+                self.set(fr, *dst, lo);
+                self.set_hi(fr, *dst, hi);
+            }
+            MInst::VDup { arr, dst, src } => {
+                let v = self.get(fr, *src);
+                let (lo, hi) = match arr {
+                    Arr::V2D => (v, v),
+                    Arr::V4S => {
+                        let w = v as u32 as u64;
+                        (w | (w << 32), w | (w << 32))
+                    }
+                };
+                self.set(fr, *dst, lo);
+                self.set_hi(fr, *dst, hi);
+            }
+            MInst::VAddv { arr, dst, src } => {
+                let (lo, hi) = (self.get(fr, *src), self.get_hi(fr, *src));
+                // `addv` narrows to ONE lane of the element width, and the rest
+                // of the register reads as zero — which is what makes the scalar
+                // that follows it a plain read of the low lane.
+                let v = match arr {
+                    Arr::V2D => lo.wrapping_add(hi),
+                    Arr::V4S => {
+                        let mut t = 0u32;
+                        for w in [lo, hi] {
+                            for i in 0..2 {
+                                t = t.wrapping_add((w >> (32 * i)) as u32);
+                            }
+                        }
+                        t as u64
+                    }
+                };
+                self.set(fr, *dst, v);
+                self.set_hi(fr, *dst, 0);
+            }
             MInst::VAlu { op, arr, dst, a, b } => {
                 let (xl, xh) = (self.get(fr, *a), self.get_hi(fr, *a));
                 let (yl, yh) = (self.get(fr, *b), self.get_hi(fr, *b));

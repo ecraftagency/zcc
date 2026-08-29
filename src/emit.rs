@@ -688,6 +688,82 @@ fn emit_inst(s: &mut String, ast: &Ast, f: &MFunc, i: &MInst) {
         MInst::CSet { w, dst, cc, .. } => {
             let _ = writeln!(s, "\tcset {}, {}", reg(*dst, *w), cc_name(*cc));
         }
+        // The integer lane forms. The arrangement suffix is the SAME text as the
+        // float ones — `.4s` is four lanes of 32 bits whichever file reads them —
+        // so only the mnemonic differs (DDI 0487 C7.2.5 / C7.2.234 / C7.2.146).
+        MInst::VInt { op, arr, dst, a, b } => {
+            // SPEC, and the assembler is the referee that supplied it: A64's
+            // integer vector MULTIPLY exists for `.8b`/`.16b`/`.4h`/`.8h`/`.2s`/
+            // `.4s` and NOT for `.2d` (DDI 0487 C7.2.146) — `mul v0.2d, ...` is
+            // rejected by `as`. A 64-bit lane product needs the widening
+            // `umull`/`smull` pair, which is a different instruction and not this
+            // one. Refused here rather than emitted and discovered at link time.
+            debug_assert!(
+                !(matches!(op, VIntOp::Mul) && matches!(arr, Arr::V2D)),
+                "A64 has no `mul` on .2d lanes"
+            );
+            let m = match op {
+                VIntOp::Add => "add",
+                VIntOp::Sub => "sub",
+                VIntOp::Mul => "mul",
+                VIntOp::And => "and",
+                VIntOp::Or => "orr",
+                VIntOp::Eor => "eor",
+            };
+            // `and`/`orr`/`eor` have NO arrangement other than `.8b`/`.16b`: the
+            // bitwise forms are defined on bytes and the assembler rejects `.4s`.
+            let suf = match op {
+                VIntOp::And | VIntOp::Or | VIntOp::Eor => "16b",
+                _ => arr.suffix(),
+            };
+            let v = |r: Reg| match r {
+                Reg::P(p) => format!("v{}.{}", p.num, suf),
+                Reg::V(x) => format!("<v{}>", x),
+            };
+            let _ = writeln!(s, "\t{} {}, {}, {}", m, v(*dst), v(*a), v(*b));
+        }
+        MInst::VDup { arr, dst, src } => {
+            // The source is a GPR named in the lane's own width: `.4s` takes a
+            // `w`, `.2d` takes an `x` (DDI 0487 C7.2.35).
+            let (d, sw) = match arr {
+                Arr::V4S => ("4s", "w"),
+                Arr::V2D => ("2d", "x"),
+            };
+            let dn = match dst {
+                Reg::P(p) => format!("v{}.{}", p.num, d),
+                Reg::V(x) => format!("<v{}>", x),
+            };
+            let sn = match src {
+                Reg::P(p) => format!("{}{}", sw, p.num),
+                Reg::V(x) => format!("<x{}>", x),
+            };
+            let _ = writeln!(s, "\tdup {}, {}", dn, sn);
+        }
+        MInst::VAddv { arr, dst, src } => {
+            // The destination is the SCALAR form of one lane (DDI 0487 C7.2.10):
+            // `addv s0, v1.4s`, `addp d0, v1.2d` — A64 has no `addv` across two
+            // 64-bit lanes, so the pairwise form is the one that exists.
+            let sn = match src {
+                Reg::P(p) => format!("v{}.{}", p.num, arr.suffix()),
+                Reg::V(x) => format!("<v{}>", x),
+            };
+            match arr {
+                Arr::V4S => {
+                    let dn = match dst {
+                        Reg::P(p) => format!("s{}", p.num),
+                        Reg::V(x) => format!("<v{}>", x),
+                    };
+                    let _ = writeln!(s, "\taddv {}, {}", dn, sn);
+                }
+                Arr::V2D => {
+                    let dn = match dst {
+                        Reg::P(p) => format!("d{}", p.num),
+                        Reg::V(x) => format!("<v{}>", x),
+                    };
+                    let _ = writeln!(s, "\taddp {}, {}", dn, sn);
+                }
+            }
+        }
         MInst::VAlu { op, arr, dst, a, b } => {
             let m = match op {
                 FpOp::Fadd => "fadd",
