@@ -1889,6 +1889,55 @@ impl<'a> L<'a> {
                     addr: a,
                 });
             }
+            hir::IntrinKind::VecMap { op, ty, bmem } => {
+                let (op, ty, bmem) = (*op, *ty, *bmem);
+                // 16 bytes at a time, which is the register — the lane count is
+                // a consequence of the element width, not a choice.
+                let arr = match ty {
+                    hir::Ty::I32 => Arr::V4S,
+                    hir::Ty::I64 => Arr::V2D,
+                    other => unreachable!("vecmap on {:?}: pass::vecmap refuses it", other),
+                };
+                let vop = match op {
+                    hir::BinOp::Add => VIntOp::Add,
+                    hir::BinOp::Sub => VIntOp::Sub,
+                    hir::BinOp::Mul => VIntOp::Mul,
+                    hir::BinOp::And => VIntOp::And,
+                    hir::BinOp::Or => VIntOp::Or,
+                    hir::BinOp::Xor => VIntOp::Eor,
+                    other => unreachable!("vecmap on {:?}: pass::vecmap refuses it", other),
+                };
+                let da = self.base(args[0]);
+                let aa = self.base(args[1]);
+                let qa = self.tmp(Width::Q);
+                self.push(MInst::Load {
+                    op: MemOp::Q,
+                    dst: qa,
+                    mem: AddrMode::BaseImm { base: aa, off: 0 },
+                    vol: false,
+                });
+                let qb = self.tmp(Width::Q);
+                if bmem {
+                    let ba = self.base(args[2]);
+                    self.push(MInst::Load {
+                        op: MemOp::Q,
+                        dst: qb,
+                        mem: AddrMode::BaseImm { base: ba, off: 0 },
+                        vol: false,
+                    });
+                } else {
+                    let bs = self.reg(args[2], ty);
+                    self.push(MInst::VDup { arr, dst: qb, src: bs });
+                }
+                let qr = self.tmp(Width::Q);
+                self.push(MInst::VInt { op: vop, arr, dst: qr, a: qa, b: qb });
+                self.push(MInst::Store {
+                    op: MemOp::Q,
+                    src: qr,
+                    mem: AddrMode::BaseImm { base: da, off: 0 },
+                    vol: false,
+                });
+            }
             hir::IntrinKind::Dmb => self.push(MInst::Dmb),
             hir::IntrinKind::Asm { tmpl, ops } => self.asm(tmpl, ops, args),
             _ => todo!("R1.3: EXT intrinsics"),

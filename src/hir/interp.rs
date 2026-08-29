@@ -514,6 +514,39 @@ impl<'a> Machine<'a> {
                 self.mem.store(get(&args[0]), t.bytes(), get(&args[1]))?;
                 None
             }
+            // ⟦VecMap⟧ — the reference semantics of one vector iteration, and
+            // it is written LANEWISE rather than as a wide value on purpose: a
+            // vectorizer's square says the vector body computes what the four
+            // scalar iterations computed, and that is only checkable if `⟦·⟧`
+            // executes the lanes separately.
+            IntrinKind::VecMap { op, ty, bmem } => {
+                let w = ty.bytes() as u64;
+                let lanes = 16 / w;
+                let (d, a) = (get(&args[0]), get(&args[1]));
+                for i in 0..lanes {
+                    let x = self.mem.load(a + i * w, ty.bytes())?;
+                    let y = if *bmem {
+                        self.mem.load(get(&args[2]) + i * w, ty.bytes())?
+                    } else {
+                        get(&args[2])
+                    };
+                    let (x, y) = (x as i64, y as i64);
+                    let r = match op {
+                        BinOp::Add => x.wrapping_add(y),
+                        BinOp::Sub => x.wrapping_sub(y),
+                        BinOp::Mul => x.wrapping_mul(y),
+                        BinOp::And => x & y,
+                        BinOp::Or => x | y,
+                        BinOp::Xor => x ^ y,
+                        // `pass::vecmap` builds this node and only ever with
+                        // the six ops above; anything else is a defect there,
+                        // not an input the semantics has to define.
+                        other => unreachable!("vecmap does not build {:?}", other),
+                    };
+                    self.mem.store(d + i * w, ty.bytes(), r as u64)?;
+                }
+                None
+            }
             IntrinKind::Dmb => None,
             // THEORY II-2: memory is binary128, the register is canonical f64.
             IntrinKind::LdLoad => {

@@ -2262,3 +2262,64 @@ fn a_copy_loop_whose_ranges_overlap_takes_the_slow_arm() {
                  cp(a+1,a,15); for(i=0;i<16;i++) t+=a[i]; return t; }";
     square(src, 16); // every byte became a[0] == 1
 }
+
+// ── vecmap ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn four_independent_iterations_are_one_lane_operation() {
+    // Two distinct streams, and a trip count that is NOT a multiple of the lane
+    // count — so the tail is exercised as well as the vector body.
+    let src = "static int a[32], b[32], c[32];                                                    \
+               void addv(int *d, const int *x, const int *y, int n){                              \
+                 int i; for(i=0;i<n;i++) d[i]=x[i]+y[i]; }                                        \
+               int main(void){ int i,t=0; for(i=0;i<32;i++){ a[i]=i+1; b[i]=100-i; c[i]=-1; }     \
+                 addv(c,a,b,29); for(i=0;i<32;i++) t+=c[i]*(i+1); return t & 0xffff; }";
+    super::vecmap::set_wanted(Some(true));
+    let after = module(src, true);
+    let f = func(&after, "addv");
+    // NON-VACUITY: the lane operation must actually be in the function.
+    let vec = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, Inst::Intrinsic { kind: super::super::IntrinKind::VecMap { .. }, .. }))
+        .count();
+    assert_eq!(vec, 1, "vecmap did not vectorize the loop");
+    square(src, {
+        // 1..29 paired with 100..72 is 101 per element, times (i+1); the rest of
+        // c stays -1. Computed the same way the program does, then masked.
+        let mut t: i64 = 0;
+        for i in 0..32i64 {
+            let v = if i < 29 { 101 } else { -1 };
+            t += v * (i + 1);
+        }
+        t & 0xffff
+    });
+}
+
+#[test]
+fn a_map_loop_whose_streams_partly_overlap_takes_the_slow_arm() {
+    super::vecmap::set_wanted(Some(true));
+    // `d = a+1` against `x = a`: lane 1 would read what lane 0 has already
+    // written, so four-at-a-time is NOT four in order. The guard must refuse,
+    // and the square is what a wrong guard breaks.
+    let src = "static int a[32], b[32];                                                           \
+               void addv(int *d, const int *x, const int *y, int n){                              \
+                 int i; for(i=0;i<n;i++) d[i]=x[i]+y[i]; }                                        \
+               int main(void){ int i,t=0; for(i=0;i<32;i++){ a[i]=i+1; b[i]=0; }                  \
+                 addv(a+1,a,b,20); for(i=0;i<32;i++) t+=a[i]*(i+1); return t & 0xffff; }";
+    square(src, {
+        let mut a = [0i64; 32];
+        for i in 0..32 {
+            a[i] = i as i64 + 1;
+        }
+        for i in 0..20 {
+            a[i + 1] = a[i];
+        }
+        let mut t: i64 = 0;
+        for i in 0..32 {
+            t += a[i] * (i as i64 + 1);
+        }
+        t & 0xffff
+    });
+}

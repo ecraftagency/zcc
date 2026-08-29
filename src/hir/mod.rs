@@ -389,6 +389,24 @@ pub enum IntrinKind {
     Stlr(Ty),
     /// `dmb ish`
     Dmb,
+    /// One VECTOR ITERATION of a unit-stride map loop, written by
+    /// `pass::vecmap` and expanded by isel: load `lanes` elements from
+    /// `args[1]`, combine them with `args[2]` — another `lanes`-element load
+    /// when `bmem`, a broadcast scalar otherwise — and store the result at
+    /// `args[0]`. `args[0..2]` are BYTE ADDRESSES, already advanced.
+    ///
+    /// WHY AN INTRINSIC RATHER THAN A VECTOR TYPE IN HIR. A lane operation is
+    /// one instruction on this target and HIR has no aggregate value; giving it
+    /// a type would put a machine width into the target-independent IR, which
+    /// Article B places in the ISA tables and the emitter instead. As an
+    /// intrinsic it is `Effect::Call` — opaque to every pass, which is the
+    /// conservative reading and costs nothing on a body of four instructions.
+    VecMap {
+        op: BinOp,
+        ty: Ty,
+        /// is `args[2]` an address to load from, or a scalar to broadcast?
+        bmem: bool,
+    },
     /// EXT(gcc) `__builtin_{add,sub,mul}_overflow`: op 0=+ 1=- 2=*.
     Overflow {
         op: u8,

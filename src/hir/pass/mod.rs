@@ -13,6 +13,7 @@
 // round changes nothing or the bound is reached.
 pub mod cfg;
 pub mod copyidiom;
+pub mod vecmap;
 pub mod vecprobe;
 pub mod copyprobe;
 pub mod dce;
@@ -226,6 +227,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // LAST of the loop rows: it duplicates blocks, so every analysis above it
         // sees the smaller CFG, and the copies it leaves are ordinary code that
         // `gvn` and `dce` clean up on the next turn.
+        if on("vecmap") {
+            if timed("vecmap", || vecmap::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
+        }
         if on("copyidiom") {
             if timed("copyidiom", || copyidiom::run(f, a)) {
                 changed = true;

@@ -67,7 +67,7 @@ pub fn census(f: &Func, a: &mut Analyses) {
                 }
             }
         }
-        if std::env::var_os("ZCC_COPYDBG").is_some() {
+        if std::env::var_os("ZCC_COPYDBG").is_some() && false {
             eprintln!(
                 "[copydbg] {} loop@b{} loads={} stores={} opaque={}",
                 f.name, l.header, loads.len(), stores.len(), opaque

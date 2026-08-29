@@ -100,6 +100,12 @@ pub fn census(f: &Func, a: &mut Analyses) {
                 SEEN[2].fetch_add(1, Relaxed);
             }
             eprintln!("[vecprobe] {} loop@b{} elt={} {}", f.name, l.header, elt, kind);
+            if std::env::var_os("ZCC_VECDBG").is_some() {
+                for inst in &f.blocks[h].insts {
+                    eprintln!("   {:?}", inst);
+                }
+                eprintln!("   params={:?} term={:?}", f.blocks[h].params, f.blocks[h].term);
+            }
         }
     }
 }
