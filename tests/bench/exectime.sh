@@ -35,7 +35,17 @@
 #
 # Clean-input law: every case is correctness-gated (gcc stdout == zcc stdout) before it
 # is timed; a mismatch is reported DIVERGE, never silently skipped.
+# THE REFEREE IS `gcc -O2`, and the level is a decision rather than a default.
+# Real software is built at -O2: it is the level every distribution, every
+# `./configure` and every `Makefile` reaches for, so it is the only level a claim
+# about zcc's generated code can be read against without misleading someone. The
+# project scored against -O1 until 2026-08-29 because -O1 is the fair comparison
+# for a compiler with no loop or vector passes — that reasoning is sound and it
+# answers a question about the COMPILER, not about the code a user would get.
+# Both are available: `GCC_OPT=-O1 sh <this>` restores the old column.
+#
 set -u
+GCCO="${GCC_OPT:--O2}"   # MEASURED M48 — the referee level; see the header
 SUITE="${SUITE:-/work/tests/bench/suite}"
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 GCC="${GCC:-gcc}"
@@ -69,14 +79,14 @@ insns() { grep -cE '^[[:space:]]+[a-z]' "$1" 2>/dev/null || echo 0; }
 printf "%-22s %8s %8s %8s %8s\n" program insn_r gcc_us zcc_us exec_r
 for c in "$SUITE"/*.c; do
   b=$(basename "$c" .c)
-  "$GCC" -O1 -w -o /tmp/g "$c" 2>/dev/null || { skip=$((skip+1)); continue; }
+  "$GCC" $GCCO -w -o /tmp/g "$c" 2>/dev/null || { skip=$((skip+1)); continue; }
   "$ZCC" -o /tmp/z "$c" 2>/dev/null || { skip=$((skip+1)); continue; }
   /tmp/g > /tmp/go 2>/dev/null; /tmp/z > /tmp/zo 2>/dev/null
   if ! cmp -s /tmp/go /tmp/zo; then
     printf "%-22s %8s %8s %8s %8s\n" "$b" - DIVERGE - -; diverge=$((diverge+1)); continue
   fi
   # DETERMINISTIC static insn ratio (user code only, via -S).
-  "$GCC" -O1 -w -S -o /tmp/g.s "$c" 2>/dev/null; "$ZCC" -S -o /tmp/z.s "$c" 2>/dev/null
+  "$GCC" $GCCO -w -S -o /tmp/g.s "$c" 2>/dev/null; "$ZCC" -S -o /tmp/z.s "$c" 2>/dev/null
   gi=$(insns /tmp/g.s); zi=$(insns /tmp/z.s)
   ir=$(awk "BEGIN{ if($gi>0) printf \"%.3f\", $zi/$gi; else print \"-\" }")
   [ "$gi" -gt 0 ] && echo "$b $ir" >> "$allinsn"
@@ -134,12 +144,12 @@ awk '{n++; r=$2; s+=log(r); a[n]=r; if(r>worst){worst=r; wn=$1}; if(r>1.1)hi++}
 
 zc=$(wc -l < "$zeroed" | tr -d ' ')
 if [ "$zc" -gt 0 ]; then
-  echo "gcc-ZEROED (gcc-O1 killed the loop; asymptotic = #24 SCEV/loop-DCE) — insn ratio still deterministic:"
+  echo "gcc-ZEROED (the referee killed the loop; asymptotic = #24 SCEV/loop-DCE) — insn ratio still deterministic:"
   while read -r nm ms ir; do printf "  %-20s zcc=%sms vs gcc≈0  (insn %s)\n" "$nm" "$ms" "$ir"; done < "$zeroed"
 fi
 zz=$(wc -l < "$zzero" | tr -d ' ')
 if [ "$zz" -gt 0 ]; then
-  echo "zcc-ZEROED (zcc killed the loop gcc-O1 keeps; asymptotic WIN, kept out of the geomean):"
+  echo "zcc-ZEROED (zcc killed the loop the referee keeps; asymptotic WIN, kept out of the geomean):"
   while read -r nm ms ir; do printf "  %-20s gcc=%sus vs zcc≈0  (insn %s)\n" "$nm" "$ms" "$ir"; done < "$zzero"
 fi
 echo "(skipped $skip trivial, $diverge DIVERGE)"

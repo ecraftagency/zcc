@@ -56,7 +56,7 @@ use super::*;
 
 /// A memory location, as precisely as the oracle can name it.
 #[derive(Clone, PartialEq)]
-enum Loc {
+pub(super) enum Loc {
     /// a byte range of a stack slot
     Slot(u32, i64),
     /// a linker symbol — the whole object, since the offset is not tracked
@@ -77,7 +77,7 @@ enum Loc {
 /// So ANY on either side answers "may alias" without looking, and every access
 /// the frontend cannot type — a character access, a union member, an aggregate,
 /// `va_arg`'s bookkeeping, an `asm` operand — carries ANY.
-fn disjoint(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
+pub(super) fn disjoint(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
     if a.2 != ACLASS_ANY && b.2 != ACLASS_ANY && a.2 != b.2 {
         return true;
     }
@@ -96,7 +96,7 @@ fn disjoint(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
     }
 }
 
-fn same(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
+pub(super) fn same(a: &(Loc, u32, AClass), b: &(Loc, u32, AClass)) -> bool {
     a.1 == b.1 && a.0 == b.0
 }
 

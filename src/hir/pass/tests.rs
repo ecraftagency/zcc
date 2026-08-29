@@ -605,6 +605,67 @@ fn divmagic_leaves_a_variable_divisor_alone() {
     square(src, 42);
 }
 
+// ── loopmem ────────────────────────────────────────────────────────────────
+
+#[test]
+fn loopmem_forwards_a_global_accumulator_across_the_back_edge() {
+    // `g` is read and written every iteration; `t` is a different global, so the
+    // oracle must see through `&t + i*4` to say the two cannot alias. Without the
+    // base-symbol walk this refuses outright.
+    let src = "long g; int t[8];                                                                 \
+               void acc(int n){int i;for(i=0;i<n;i++) g += t[i&7];}                              \
+               int main(void){int i;for(i=0;i<8;i++)t[i]=i;acc(8);return (int)g;}";
+    let after = module(src, true);
+    let f = func(&after, "acc");
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    assert_eq!(lf.loops.len(), 1, "the loop must still be a loop");
+    let body = &lf.loops[0].body;
+    let (loads, stores) = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| body.contains(&(*b as u32)))
+        .flat_map(|(_, blk)| blk.insts.iter())
+        .fold((0, 0), |(l, s), i| match i {
+            Inst::Load { .. } => (l + 1, s),
+            Inst::Store { .. } => (l, s + 1),
+            _ => (l, s),
+        });
+    // one load left — `t[i&7]`; the accumulator's load has crossed the back edge.
+    assert_eq!(loads, 1, "the accumulator's load must leave the loop");
+    // and its store stays, which is what makes the transform need no exit fix-up.
+    assert_eq!(stores, 1, "the store is deliberately left in place");
+    square(src, 28); // 0+1+...+7
+}
+
+#[test]
+fn loopmem_refuses_when_the_loop_may_write_the_same_object() {
+    // `t[i&7]` and `t[0]` are the SAME symbol, so the oracle must answer may-alias
+    // and the accumulator's load has to stay: an iteration can change what the
+    // next one would read.
+    let src = "int t[8];                                                                         \
+               void acc(int n){int i;for(i=0;i<n;i++){ t[0] += t[i&7]; }}                        \
+               int main(void){int i;for(i=0;i<8;i++)t[i]=i;acc(8);return t[0];}";
+    let after = module(src, true);
+    let f = func(&after, "acc");
+    let c = super::dom::cfg(f);
+    let dt = super::dom::domtree(f, &c);
+    let lf = super::dom::loops(&c, &dt);
+    let body = &lf.loops[0].body;
+    let loads = f
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| body.contains(&(*b as u32)))
+        .flat_map(|(_, blk)| blk.insts.iter())
+        .filter(|i| matches!(i, Inst::Load { .. }))
+        .count();
+    assert!(loads >= 2, "both loads must stay: same object, may alias");
+    square(src, 28);
+}
+
 // ── licm ───────────────────────────────────────────────────────────────────
 
 #[test]

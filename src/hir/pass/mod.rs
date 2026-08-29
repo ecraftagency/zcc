@@ -20,6 +20,7 @@ pub mod inline;
 pub mod iv;
 pub mod divmagic;
 pub mod licm;
+pub mod loopmem;
 pub mod mem;
 pub mod purity;
 pub mod rotate;
@@ -160,6 +161,11 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // invariant has already moved and the multiply lands where the divide was.
         if on("divmagic") {
             changed |= timed("divmagic", || divmagic::run(f));
+        }
+        // AFTER licm, which is what moves the address computation out of the loop
+        // — the invariance this pass requires of it is a property of that shape.
+        if on("loopmem") {
+            changed |= timed("loopmem", || loopmem::run(f));
         }
         // AFTER licm and rotation: the loop must already be in its final shape,
         // because the recurrence this reads is a property of that shape. Before

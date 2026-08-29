@@ -20,7 +20,17 @@
 # this script checks rather than assumes.
 #
 # Run in the box:  sh tests/bench/quickapp.sh
+# THE REFEREE IS `gcc -O2`, and the level is a decision rather than a default.
+# Real software is built at -O2: it is the level every distribution, every
+# `./configure` and every `Makefile` reaches for, so it is the only level a claim
+# about zcc's generated code can be read against without misleading someone. The
+# project scored against -O1 until 2026-08-29 because -O1 is the fair comparison
+# for a compiler with no loop or vector passes — that reasoning is sound and it
+# answers a question about the COMPILER, not about the code a user would get.
+# Both are available: `GCC_OPT=-O1 sh <this>` restores the old column.
+#
 set -u
+GCCO="${GCC_OPT:--O2}"   # MEASURED M48 — the referee level; see the header
 SQ="${SQLITE_DIR:-/suites/sqlite}"
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 GCC="${GCC:-gcc}"
@@ -32,7 +42,7 @@ CF="-w -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DISABLE_LFS"
 [ -f "$SQ/sqlite3.c" ] || { echo "no $SQ/sqlite3.c"; exit 2; }
 
 echo "== building the sqlite CLI both ways =="
-$GCC -O1 $CF -I"$SQ" -o "$T/cli_gcc" "$SQ/shell.c" "$SQ/sqlite3.c" -lm 2>/dev/null || { echo "gcc build failed"; exit 2; }
+$GCC $GCCO $CF -I"$SQ" -o "$T/cli_gcc" "$SQ/shell.c" "$SQ/sqlite3.c" -lm 2>/dev/null || { echo "gcc build failed"; exit 2; }
 $ZCC     $CF -I"$SQ" -o "$T/cli_zcc" "$SQ/shell.c" "$SQ/sqlite3.c" -lm 2>/dev/null || { echo "zcc build failed"; exit 2; }
 echo "   gcc $(wc -c < "$T/cli_gcc") bytes   zcc $(wc -c < "$T/cli_zcc") bytes"
 
@@ -78,4 +88,4 @@ for c in cli_gcc cli_zcc; do
     echo "$c: ${best}ms"
     eval "t_$c=$best"
 done
-awk "BEGIN{ printf \"zcc / gcc-O1 = %.3fx\n\", $t_cli_zcc / $t_cli_gcc }"
+awk "BEGIN{ printf \"zcc / gcc$GCCO = %.3fx\n\", $t_cli_zcc / $t_cli_gcc }"

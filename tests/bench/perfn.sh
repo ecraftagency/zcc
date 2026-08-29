@@ -8,7 +8,17 @@
 # Ranked by delta desc = the worklist. Instruction-count is the size+speed proxy the
 # plan optimizes (user decision 2026-08-24); wall-clock is confirmation only.
 #   Run in box:  ZCC=/usr/local/bin/zcc GCC=aarch64-linux-gnu-gcc sh tests/bench/perfn.sh
+# THE REFEREE IS `gcc -O2`, and the level is a decision rather than a default.
+# Real software is built at -O2: it is the level every distribution, every
+# `./configure` and every `Makefile` reaches for, so it is the only level a claim
+# about zcc's generated code can be read against without misleading someone. The
+# project scored against -O1 until 2026-08-29 because -O1 is the fair comparison
+# for a compiler with no loop or vector passes — that reasoning is sound and it
+# answers a question about the COMPILER, not about the code a user would get.
+# Both are available: `GCC_OPT=-O1 sh <this>` restores the old column.
+#
 set -u
+GCCO="${GCC_OPT:--O2}"   # MEASURED M48 — the referee level; see the header
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 GCC="${GCC:-gcc}"
 DIR="$(dirname "$0")/suite"
@@ -25,10 +35,10 @@ ROWS="$TMP/rows"; : > "$ROWS"
 ndiv=0; nmis=0; nok=0
 for c in "$DIR"/*.c; do
   b=$(basename "$c" .c)
-  $GCC -O1 -w -S -o "$TMP/g.s" "$c" 2>"$TMP/ge" || { echo "GCC-COMPILE-FAIL $b"; continue; }
+  $GCC $GCCO -w -S -o "$TMP/g.s" "$c" 2>"$TMP/ge" || { echo "GCC-COMPILE-FAIL $b"; continue; }
   if ! $ZCC -S -o "$TMP/z.s" "$c" 2>"$TMP/ze"; then echo "ZCC-COMPILE-FAIL $b: $(head -1 "$TMP/ze")"; continue; fi
   # correctness gate (execute both)
-  $GCC -O1 -w -o "$TMP/g" "$c" 2>/dev/null; $ZCC -o "$TMP/z" "$c" 2>/dev/null
+  $GCC $GCCO -w -o "$TMP/g" "$c" 2>/dev/null; $ZCC -o "$TMP/z" "$c" 2>/dev/null
   "$TMP/g" > "$TMP/go" 2>&1; "$TMP/z" > "$TMP/zo" 2>&1
   if ! cmp -s "$TMP/go" "$TMP/zo"; then echo "MISCOMPILE $b: gcc=$(cat "$TMP/go") zcc=$(cat "$TMP/zo")"; nmis=$((nmis+1)); continue; fi
   nok=$((nok+1))

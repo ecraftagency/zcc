@@ -1311,6 +1311,24 @@ this machine, cannot be referenced — it can only be MEASURED. Those facts live
 here rather than in `THEORY.md`, so that Law 1's two-side claim stays literally
 true: `THEORY.md` II-* is cited spec and nothing else.
 
+> ## READ EVERY RATIO BELOW AGAINST ITS DATE — the referee and the core both moved
+>
+> **THE REFEREE.** Entries dated **before 2026-08-29** compare against **`gcc
+> -O1`**. From `M49` the harnesses default to **`gcc -O2`**, because that is what
+> real software is built with; `GCC_OPT=-O1` restores the old column. The two are
+> far apart — the same compiler reads **1.06 against -O1 and 1.31 against -O2** on
+> the same 96 programs — so a ratio quoted without its level says nothing.
+>
+> **THE CORE.** Entries dated **before 2026-08-29** were measured on an **Apple M1
+> Pro under Docker**. From `M46` the authoritative core is a **Graviton4 (Neoverse
+> V2)**, native, because that is the machine zcc's declared target actually runs
+> on. These are also far apart — the same binaries read **1.0686 on the M1 and
+> 1.1716 on Neoverse**, and two rows worth 4.5x each were INVISIBLE on the M1.
+>
+> Nothing below is deleted for this: an entry is a dated measurement and stays
+> one. But a number carried forward without its date and its two axes is a stale
+> rule, and this file's own charter says a stale rule is worse than none.
+
 An entry is not an opinion. Each carries:
 
 * **VALUE** — the number or verdict the compiler acts on;
@@ -1836,9 +1854,13 @@ else: masks, `k`, and the callee-saved set are all order-independent.
 
 ---
 
-### M14. A copy of 32 bytes or less is cheaper open-coded than called
+### M14. A copy of 32 bytes or less is cheaper open-coded than called — the SIZE answer, re-derived on time by `M40`
 
-**VALUE.** `INLINE_COPY_MAX = 32` in `isel/lower.rs`. An `Inst::MemCpy` of this
+> **STATUS: the constant is now 128** (`M40`). The sweep below is correct and it
+> answers the SIZE question; `M40` asks the TIME question of the same bound and
+> gets a different number, which is what `M38`'s corr(INSN, EXEC) = 0.196 predicts.
+
+**VALUE.** `INLINE_COPY_MAX`, **32 here and 128 since `M40`**, in `isel/lower.rs`. An `Inst::MemCpy` of this
 many bytes or fewer becomes loads and stores; anything larger stays a call to
 `memcpy`.
 
@@ -2473,7 +2495,13 @@ zcc, gcc -O1 referee, sqlite 3 amalgamation and the 49-program taxonomy suite.
 The off/on geomeans in the last table are from different box sessions; only the
 three-pair table above is interleaved, and it is the one the removal rests on.
 
-### M25. Division by a constant: the theorem is right and it loses on this core
+### M25. Division by a constant: the theorem is right and it loses ON THE M1 PRO — SUPERSEDED by `M47`
+
+> **STATUS: REVERSED.** The row this entry removed was rebuilt and shipped in
+> `M47`. Everything below is a correct measurement of an Apple M1 Pro, and its
+> conclusion does not survive the crossing to Neoverse V2, where `udiv` costs 4.98
+> dependent adds and the same theorem is worth 7% of the whole suite. Read this
+> entry as the record of how a row is deleted on one core's evidence.
 
 **WHAT THIS IS.** Granlund–Montgomery division-by-multiplication was implemented,
 proven, measured, and REMOVED. This is the measurement, recorded so the row is
@@ -4270,6 +4298,120 @@ NATIVELY on the c8gd.4xlarge Graviton4 box** — the first time zcc's gate has r
 on its own target ISA without a container — torture 1694/0, opt-parity 1552/0,
 csmith 254/0, yarpgen 300/0, musl 479 binaries, determinism 187 programs; cargo
 215/0; provenance 29 passes, 50 citations.
+
+---
+
+### M48. The accumulator a loop keeps in memory, and the edge `mem.rs` cannot cross
+
+**VALUE.** `hir/pass/loopmem.rs`. A memory cell a loop reads and writes every
+iteration is forwarded across the back edge into a header parameter, so the LOAD
+leaves the loop. `ZCC_NOLOOPMEM` turns it off. **Suite 96 on Graviton4: EXEC
+1.0902 → 1.0598** against gcc -O1, on top of `M47`.
+
+**THE SHAPE, and it is the commonest accumulator in C:**
+
+    void accumulate(int n){ for (int i=0;i<n;i++) gsum += gtab[i&255]; }
+
+`mem.rs` owns store→load forwarding and cannot make this one. Its reasoning is
+block-local plus a single-predecessor edge — the scope where its oracle is exact
+without a memory SSA, and its header says so — while the store at the end of
+iteration k feeds the load at the start of iteration k+1. The forward crosses the
+BACK edge. So zcc emitted `ldr` and `str` on `gsum` every iteration, putting a
+round trip through memory on the loop-carried dependence, where gcc holds the
+value in a register for the whole loop.
+
+**WHY IT SURVIVED A YEAR.** On an Apple M1 Pro store-to-load forwarding hides the
+entire cost: `i1_global_acc` measured **0.709 — zcc FASTER than gcc -O1**. The
+program was in the suite, at the top of the winners list, and there was nothing
+to investigate. On Neoverse V2 the same binary reads **4.51** (`M46`).
+
+**THE SMALLER HALF OF THE TRANSFORM, DELIBERATELY.** The pass forwards the store
+and LEAVES THE STORE IN PLACE. Memory is therefore written exactly as before at
+every point, so no loop exit needs a fix-up and no path can observe a difference —
+the store-sinking half needs the value on every exit edge and is a different
+proof. What the loop loses is the load, which is the half that sits on the
+dependence chain:
+
+    .Laccumulate_2:                     .Laccumulate_2:
+      and   w11, w10, #255                and   w12, w10, #255
+      ldrsw x11, [x9, w11, sxtw #2]       ldrsw x12, [x9, w12, sxtw #2]
+      ldr   x12, [x8]         <- gone     add   x11, x11, x12
+      add   x11, x12, x11                 add   w10, w10, #1
+      add   w10, w10, #1                  str   x11, [x8]
+      str   x11, [x8]                     cmp   w10, w0
+      cmp   w10, w0                       b.lt  .Laccumulate_2
+      b.lt  .Laccumulate_2
+
+**THE CONDITION THAT MADE IT FIRE, and the pass was worth nothing without it.**
+The first build refused `i1_global_acc` outright, reporting "another access may
+alias". `mem.rs`'s oracle reads an address only where a `SymAddr` or `SlotAddr`
+defines it DIRECTLY; `gtab[i&255]` is `SymAddr(gtab)` plus an offset, so it came
+back as a `Ptr` — and `Ptr` against `Sym` is "may alias". **A different global
+might be the same global.** Walking the base symbol through address arithmetic
+fixes it and is sound for the reason `Loc::Sym` already exists: it means the WHOLE
+object, offset untracked, and `&g + k` is an access to `g` or it is undefined
+(C99 6.5.6p8). Two different symbols stay disjoint, which is the only question
+this pass asks. A sum with a symbol on BOTH sides stays a `Ptr` — `&a − &b` is not
+an address into either.
+
+**THE PROOF.** Four side conditions, each of which the square would catch:
+one reader and one writer in that order, in a block that dominates every latch;
+nothing else in the loop may alias, and no call, `alloca`, `memcpy` or volatile
+access; the address is defined outside the loop; and the location is a linker
+symbol, so the preheader load cannot fault even where the body never runs — which
+is what removes the `entered` obligation `licm` carries for its own hoists.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4 spot in us-west-2,
+Debian 13 arm64, gcc 14.2.0 -O1, zcc native; 96/96 suite programs output-matched.
+
+---
+
+### M49. The referee moves to `gcc -O2`, and the number nearly triples
+
+**VALUE.** `exectime.sh`, `quickapp.sh`, `realprog.sh` and `perfn.sh` default to
+`GCC_OPT=-O2`. `GCC_OPT=-O1` restores the old column. Every ratio in this file
+dated before 2026-08-29 is against `-O1`.
+
+**WHY THE OLD CHOICE WAS DEFENSIBLE AND STILL HAD TO GO.** `-O1` is the fair
+comparison for a compiler with no loop, vector or unrolling passes: it answers
+*how good is this codegen* without charging zcc for transformations it never
+claimed. That is a question about the COMPILER. It is not the question a user
+asks, because no one builds software at `-O1` — distributions, `./configure`,
+`Makefile` defaults and the Linux kernel all stop at `-O2`. A number published
+without its level is read as `-O2` by everyone who reads it, so scoring against
+`-O1` and saying "gcc" is a claim about a build nobody performs.
+
+**THE COST OF TELLING THE TRUTH**, 96 programs, Graviton4, two runs each:
+
+| referee | EXEC geomean | zcc's speed | INSN geomean | programs > 1.1× |
+|---|---|---|---|---|
+| `gcc -O1` | 1.060 | 94% | 1.109 | 41 of 96 |
+| **`gcc -O2`** | **1.3148 / 1.3148** | **76%** | **0.9922** | 54 of 94 |
+
+and on the sqlite CLI, **1.576× — 63.5% of gcc -O2's speed**.
+
+**TWO THINGS THE NEW COLUMN SAYS THAT THE OLD ONE COULD NOT.**
+
+*The code is SMALLER.* INSN geomean **0.9922** against `-O2`: zcc emits fewer
+static instructions than gcc does at the level everyone ships, because `-O2`
+unrolls and vectorizes. The sqlite binary is 1,139,744 bytes against 1,359,104 —
+**0.84×**. "Smaller code, 24% slower" is a real and defensible trade, and it was
+invisible while the referee was `-O1` (where zcc is 1.109 on the same axis).
+
+*The gap is not where a year of grinding assumed it was.* The worst program is
+`g1_memcpy_loop` at **30.8×** — gcc replaces the loop outright — and TWO programs
+leave the geomean entirely because `-O2` deletes their loop. Excluding the 30.8×
+outlier the geomean is still ~1.27. **The distance to `-O2` is dominated by two
+transformations zcc does not have at all — vectorization and loop deletion — not
+by per-instruction codegen.** No peephole reaches a loop that was deleted, so the
+row-by-row grind that `-O1` rewards is the wrong instrument for this column.
+
+**WHAT THIS OBLIGES.** Every public number carries its level and its core, or it
+is not published (Law 3c already required the core; this adds the level). And the
+next campaign is chosen against `-O2`'s tail, not `-O1`'s geomean.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4 spot in us-west-2,
+Debian 13 arm64, gcc 14.2.0, zcc native, 96-program suite and the sqlite CLI.
 
 ---
 

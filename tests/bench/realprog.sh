@@ -25,7 +25,17 @@
 #
 # Run INSIDE the box:
 #   ZCC_REL=1 sh tests/box.sh s 'sh /work/zcc/tests/bench/realprog.sh'
+# THE REFEREE IS `gcc -O2`, and the level is a decision rather than a default.
+# Real software is built at -O2: it is the level every distribution, every
+# `./configure` and every `Makefile` reaches for, so it is the only level a claim
+# about zcc's generated code can be read against without misleading someone. The
+# project scored against -O1 until 2026-08-29 because -O1 is the fair comparison
+# for a compiler with no loop or vector passes — that reasoning is sound and it
+# answers a question about the COMPILER, not about the code a user would get.
+# Both are available: `GCC_OPT=-O1 sh <this>` restores the old column.
+#
 set -u
+GCCO="${GCC_OPT:--O2}"   # MEASURED M48 — the referee level; see the header
 SQ="${SQLITE_DIR:-/suites/sqlite}"
 W="${ZCC_WORK:-/work/zcc}"
 ZCC="${ZCC:-/usr/local/bin/zcc}"
@@ -67,9 +77,9 @@ build() { # name  cc-command...
     echo "$best_ms $best_kb"
 }
 
-r=$(build gcc $GCC -O1 $CFLAGS -I"$SQ" -o "$T/cli_gcc" "$SQ/shell.c" "$SQ/sqlite3.c" -lm)
+r=$(build gcc $GCC $GCCO $CFLAGS -I"$SQ" -o "$T/cli_gcc" "$SQ/shell.c" "$SQ/sqlite3.c" -lm)
 g_ms=${r% *}; g_kb=${r#* }; g_sz=$(wc -c < "$T/cli_gcc")
-printf "%-10s %10s %12s %12s\n" "gcc -O1" "$g_ms" "$g_kb" "$g_sz"
+printf "%-10s %10s %12s %12s\n" "gcc $GCCO" "$g_ms" "$g_kb" "$g_sz"
 
 r=$(build zcc $ZCC $CFLAGS -I"$SQ" -o "$T/cli_zcc" "$SQ/shell.c" "$SQ/sqlite3.c" -lm)
 z_ms=${r% *}; z_kb=${r#* }; z_sz=$(wc -c < "$T/cli_zcc")
