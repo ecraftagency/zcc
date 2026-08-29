@@ -3741,10 +3741,15 @@ against gcc's; Ir from `callgrind`.
 
 ---
 
-### M42. The loop-constant hoist ships, and the argument that kept it off was retired by a correlation
+### M42. The loop-constant hoist, priced on the suite — and see `M44`, which priced it on a real program and took it back out
 
-**VALUE.** `const_share::hoist_invariant_consts` is ON by default; `ZCC_NOHOIST`
-turns it off. It was off since R5.
+> **STATUS: the row is OFF.** Everything below is correct and was enough to ship
+> it for the length of one session. `M44` then measured it on the sqlite CLI and
+> on compile time and reverted it. Read the two together: `M42` is what the suite
+> can see, `M44` is what it cannot.
+
+**VALUE.** `const_share::hoist_invariant_consts`, off since R5, turned ON here
+and back OFF by `M44`. `ZCC_HOIST` turns it on.
 
 **THE ARGUMENT IT HAD TO BEAT**, quoted from the code it lived in: EXEC about four
 tenths of a percent, "inside the run-to-run spread", bought with 2.3% of
@@ -3778,17 +3783,32 @@ comparison), three interleaved pairs over the 96-program suite:
 EXEC geomean **−0.74%**, the sign the same in all three pairs. INSN 1.0757 →
 1.0935.
 
-**WHICH STATISTIC TO BELIEVE, and this is the part worth keeping.** The ON arm's
-geomean spread is **0.0113** against the OFF arm's **0.0025** — four and a half
-times noisier, from an identical binary each run, so the difference is not in the
-compiler. Hoisting raises register pressure; a program that spills touches memory
-where it used to touch registers, and memory is sensitive to cache state in a way
-an ALU chain is not. **The row's own cost is what makes its measurement noisy.**
-The MEDIAN is therefore the reading to trust here: **1.0607 → 1.0413, −1.83%**,
-with a within-condition spread of 0.004 to 0.007, and the count of programs above
-1.1x falls from 37 to 31. A first reading of a single pair said −1.45% and was
-quoted as "ten times the spread"; it was one sample of the noisier arm, and the
-correction is the reason three pairs were run.
+**WHICH STATISTIC TO BELIEVE — and the first answer written here was WRONG, which
+is the part worth keeping.** The ON arm's geomean spread came out at **0.0113**
+against the OFF arm's **0.0025**, and this section originally explained it: the
+row raises register pressure, a program that spills touches memory where it used
+to touch registers, and memory is sensitive to cache state in a way an ALU chain
+is not — "the row's own cost is what makes its measurement noisy." It is a
+plausible mechanism and it was not the cause.
+
+**THE CAUSE WAS A STUCK MEASUREMENT.** A `callgrind` job launched two hours
+earlier had never exited: one core pegged at **99% for 93 minutes of CPU time**,
+spanning every timing in this section, in `M44`'s bisection, and in the sqlite
+pairs. Killed and re-measured on an idle machine, the SAME suite reads spreads of
+**0.0003** and **0.0016** — eight times tighter. The pressure story explained a
+number that belonged to a background process.
+
+This is Law 2's exception — *the measurement lied* — and the charter allows
+claiming it only after independent formulations converge. Two did: the container
+was observed at 99% CPU directly (`docker top`, 01:33:45 of CPU), and the spread
+collapsed by 8x the moment it was killed. **The reflex the charter warns about is
+blaming the test; the failure here was the opposite and rarer one — inventing a
+compiler-shaped mechanism for noise that was not the compiler's.** A plausible
+mechanism is not evidence for itself, and the check that would have caught it
+costs one command: look at what else is running before trusting a spread.
+
+The MEDIAN reading stands: **1.0607 → 1.0413, −1.83%**, within-condition spread
+0.004 to 0.007, and the count of programs above 1.1x falls from 37 to 31.
 
 **ON THE DETERMINISTIC AXIS**, where there is no spread at all — dynamic
 instructions from `callgrind`, against gcc -O1:
@@ -3941,6 +3961,151 @@ removes half the divides that rewrite would have targeted.
 **WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu,
 gcc 14.2.0 -O1, musl in-box; 96/96 suite programs output-matched against gcc,
 cargo 208/0.
+
+---
+
+### M44. The hoist was priced on the wrong program, and the price was 26% of compile time
+
+**WHAT HAPPENED.** `M42` turned the loop-constant hoist on by default on the
+strength of three interleaved pairs over the 96-program suite: EXEC geomean
+−0.74%, median −1.83%, sign the same in all three. Every number in it is correct
+and none of them was the right question, because **not one of them was taken on a
+real program.** Reverted the same session. `M42` is not withdrawn — it is priced.
+
+**THE TWO NUMBERS THAT SETTLED IT.**
+
+| | hoist OFF | hoist ON |
+|---|---|---|
+| suite 96, EXEC geomean | 1.0762 | **1.0682** |
+| sqlite CLI runtime, 3 interleaved pairs | 1.1847 | 1.1863 |
+| **sqlite compile, `-S`, best of 3** | **7.95 s** | **9.99 s** |
+
+**+26% of compile time for a row that is neutral on the application.** The
+bisection is unambiguous: the same binary with this seam left off returns 7.95 s
+exactly, and `ZCC_NOSHARE=1` — which disables the constant sharing but not the
+hoist — makes it worse still at 10.26 s, so the cost is this row and nothing else
+in the session.
+
+**WHY LAW 0 DOES NOT SAVE IT.** `purity ≫ exec > size > compile speed` ranks exec
+above compile time, so a real exec win could buy a compile regression. There is
+no real exec win to spend: the win is confined to 96 kernels that fit in L1i, and
+this session measured the suite at 1.057 against sqlite's 1.18 on the clock and
+1.192 on dynamic instructions. **The suite does not predict the application**, so
+a suite-only win is not an exec win, it is a suite number. Nothing sits on the
+winning side of the trade to rank against compile speed.
+
+**THE FIX THAT WAS BUILT AND MEASURED AT ZERO.** `hoist_invariant_consts` builds
+`cfg`, `DomTree` and `LoopForest` per function, and `const_share::run` — called
+immediately before it — has already built the first two. The obvious repair is to
+skip functions with no back edge, since an amalgamation has 1,260 functions and
+most are small: a depth-first grey/black cycle test, O(V+E) with one byte per
+block, ahead of the whole analysis. Built, proven byte-identical on sqlite, and
+measured at **10.36 s → 10.28 / 10.38 / 10.53 s — nothing.** An amalgamation's
+functions mostly DO have loops, so the cost is the analysis itself and not
+wasted calls. Removed under Article A(2): a mechanism measured at zero is not
+kept for its elegance.
+
+**WHAT WOULD MAKE THE ROW SHIPPABLE**, and it is now two conditions rather than
+the one `M42` thought it had met: (1) an exec win that survives on a real
+program, not only on the kernel suite, and (2) `DomTree`/`LoopForest` shared with
+whatever pass built them first, rather than rebuilt — the same shape as the
+scan-where-a-lookup-belongs family, a whole-function analysis paid per function
+with no reuse.
+
+**THE PROCESS DEFECT, which is worth more than the row.** Three rows were landed
+this session on suite EXEC before any of them was checked against `realprog.sh` or
+against compile time, and the suite was the wrong instrument for exactly the
+reason this session itself established. **A row is not measured until it is
+measured on a program someone would actually run.** `quickapp.sh` costs two
+minutes and `realprog.sh` eleven phases; neither was run until the numbers were
+already committed.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu,
+gcc 14.2.0 -O1, musl in-box; sqlite 3 amalgamation; cargo 208/0.
+
+---
+
+### M45. The two rows that survived the day buy 59 instructions of 798 million on sqlite
+
+**THE NUMBER, and it is deterministic so there is nothing to argue about.** The
+sqlite CLI, built by the session's first commit and by its last, run over the
+standard workload under `callgrind`:
+
+| build | dynamic instructions | vs gcc -O1 | binary bytes |
+|---|---|---|---|
+| gcc -O1 | 679,672,989 | 1.0000 | 1,243,888 |
+| zcc, session start (`8cfda4e`) | 797,986,364 | 1.1741 | 1,139,752 |
+| zcc, after `M40` + `M43` | 797,986,305 | **1.1741** | 1,139,752 |
+
+**−59 instructions. −0.0000074%.** The binaries are the same size. Output
+identical across all three.
+
+**AND THE SUITE, on an idle machine, two interleaved pairs:**
+
+| | EXEC | within-condition spread | INSN |
+|---|---|---|---|
+| session start | 1.0761 / 1.0758 | 0.0003 | 1.0753 |
+| after `M40` + `M43` | **1.0678 / 1.0694** | 0.0016 | 1.0751 |
+
+**ON THE CLOCK, three interleaved pairs each, idle machine:**
+
+| | `realprog` TOTAL | `quickapp` |
+|---|---|---|
+| session start | 1.154 / 1.148 / 1.153 (mean 1.1517, spread 0.006) | 1.190 / 1.205 / 1.189 (mean 1.1947, spread 0.016) |
+| after `M40` + `M43` | 1.161 / 1.160 / 1.168 (mean 1.1630, spread 0.008) | 1.167 / 1.222 / 1.202 (mean 1.1970, spread 0.055) |
+
+`realprog` says the new build is **0.98% SLOWER**, the same sign in all three
+pairs against a within-condition spread of 0.006–0.008. `quickapp` says +0.19%
+with the sign not consistent and a spread of 0.055, which swallows any effect of
+this size — it cannot arbitrate and should not be quoted as if it could.
+
+**AND THAT SLOWDOWN CANNOT BE THE ROWS.** The two builds execute 797,986,364 and
+797,986,305 instructions — the same work to within 59 — and produce byte-for-byte
+the same binary SIZE. Identical work and identical size with a 1% clock
+difference leaves one explanation: **placement**. The same bytes in a different
+order meet the instruction cache and the branch predictor differently. Three
+pairs at 3/3 agreement is p = 0.25 under a null of no effect, so the evidence is
+weak as well as unattributable; what it is NOT is a measurement of these two rows
+doing more work, because the deterministic instrument already answered that
+question exactly.
+
+**−0.74% on the suite, zero work change on the application.** Both numbers are
+real and they are answers to different questions. `M40` fires where a 33-to-128-byte aggregate
+is assigned in a hot loop, which `v3_struct_copy` does 160,000 times and sqlite
+does approximately never; `M43` fires where `a / b` and `a % b` are written on
+the same operands, which every integer formatter does and sqlite's inner loops do
+not. Neither row is wrong. **Neither row is worth anything to a user of sqlite.**
+
+**WHY THIS ENTRY EXISTS.** It would have been easy to close the day on
+"EXEC 1.0784 → 1.0678, three rows banked" — every number in that sentence is
+true. It is also the number for 96 kernels that fit in L1i, and this same session
+measured that suite at 1.057 against the application's 1.174 on the same
+compiler. A suite delta is not a project delta, and **a session that reports the
+first as if it were the second is measuring its own activity, not the compiler.**
+
+**WHAT THE DAY ACTUALLY PRODUCED**, stated so the ledger is not flattering:
+
+* one row reverted after shipping (`M44`), for +26% of compile time;
+* two rows that hold on the suite, change the application's executed instruction
+  count by 59 in 798 million, and leave a ~1% clock difference that is placement
+  rather than semantics;
+* one instrument that is new and did the real work — **dynamic instruction count**
+  — which found `M43` (9.7% faster at an IDENTICAL executed instruction count),
+  refuted three obvious hoists (`M41`), and priced `M42` off the tree;
+* the structure of sqlite's own gap, measured for the first time on the dynamic
+  axis: **126M excess instructions, of which `sqlite3VdbeExec` alone is 69.7M
+  (55%)**, and inside it reg-reg `mov` +1,084 and frame loads +969 of a +4,890
+  static excess — the register allocator, which `M38` had already shown the suite
+  cannot sample.
+
+**THE STANDING RULE THIS BUYS.** `quickapp.sh` costs two minutes and the
+deterministic Ir comparison above costs five. **A row is not landed until one of
+them has run.** The suite says whether a row fires; only a real program says
+whether it matters.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu,
+gcc 14.2.0 -O1, musl in-box, sqlite 3 amalgamation; every timing on an idle
+machine after the stuck `callgrind` job of `M42` was killed.
 
 ---
 

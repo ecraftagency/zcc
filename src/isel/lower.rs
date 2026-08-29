@@ -72,7 +72,7 @@ const INLINE_COPY_MAX: usize = 128;
 
 /// The measurement seam for the bound above — `ZCC_ICM=<bytes>` overrides it so
 /// the threshold can be re-swept without a rebuild per point, exactly as
-/// `ZCC_NOHOIST` and `ZCC_LDSTP` are the seams for their own rows.
+/// `ZCC_HOIST` and `ZCC_LDSTP` are the seams for their own rows.
 fn inline_copy_max() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();

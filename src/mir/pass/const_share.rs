@@ -277,7 +277,7 @@ fn visit(
 ///   * PRESSURE is the cost, and it is why this ships behind a toggle: a
 ///     constant hoisted out of a loop is live across the whole loop, and a
 ///     program that was one value short of spilling now spills. That is a
-///     measurement, not an argument (`ZCC_NOHOIST`, `MEASURED M42`).
+///     measurement, not an argument (`ZCC_HOIST`, `MEASURED M42`, `M44`).
 pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
     if !hoist_wanted() {
         return 0;
@@ -345,8 +345,10 @@ pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
     moved
 }
 
-/// R5's loop-constant seam. ON by default since `MEASURED M42`; `ZCC_NOHOIST`
-/// turns it off.
+/// R5's loop-constant seam. OFF by default — `ZCC_HOIST` turns it on. It shipped
+/// ON for the length of one session and was reverted by `MEASURED M44`; the
+/// measurement that put it on and the one that took it off are both below,
+/// because the second does not refute the first, it prices it.
 ///
 /// WHY IT SHIPPED OFF FOR A YEAR AND WHY THAT REASON NO LONGER HOLDS. The
 /// standing argument was: EXEC about four tenths of a percent, "inside the
@@ -387,6 +389,19 @@ pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
 ///     o2_fp_stencil     1.546 -> 1.346
 ///     w2_tagged         1.125 -> 1.063
 ///
+/// WHY IT IS OFF ANYWAY (`MEASURED M44`). Everything above is a suite number,
+/// and the suite is 96 kernels that fit in L1i. On the application the row is
+/// NEUTRAL — sqlite CLI, three interleaved pairs, 1.1863 against 1.1847, two of
+/// the three identical to three decimals — and it costs **26% of sqlite's
+/// compile time**, 7.95 s to 9.99 s, bisected to this row alone — the same
+/// binary with the seam left off returns 7.95 s exactly. `DomTree` plus `LoopForest` is a whole-function
+/// analysis and `run` above has already built the first two of the three.
+/// A cycle-test early-out was built to skip loopless functions and measured at
+/// ZERO — an amalgamation's functions mostly do have loops, so the cost is the
+/// analysis itself, not wasted calls. Law 0 ranks exec above compile speed, but
+/// the exec win here does not exist on real programs, so there is nothing on
+/// the winning side of the trade to rank.
+///
 /// THE RESIDUAL, and it is named rather than hidden (Law 3): the cost is
 /// PRESSURE. A constant hoisted out of a loop is live across it, so a function
 /// one value short of spilling now spills — `m3_dict_rehash` and
@@ -399,7 +414,7 @@ pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
 pub fn hoist_wanted() -> bool {
     HOIST.with(|c| c.get()).unwrap_or_else(|| {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENV.get_or_init(|| std::env::var_os("ZCC_NOHOIST").is_none())
+        *ENV.get_or_init(|| std::env::var_os("ZCC_HOIST").is_some())
     })
 }
 
