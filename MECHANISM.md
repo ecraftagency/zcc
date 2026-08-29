@@ -3824,6 +3824,26 @@ materialization inside the loop. The first half of that precondition is now met.
 **zcc executes FEWER instructions than gcc** — against an exec ratio of 1.388, a
 CPI ratio of 1.49, and its hot path is `u % 10` and `u /= 10` on a 64-bit value.
 
+**THE QUESTION THE SUITE COULD NOT ANSWER, ANSWERED.** The +1.65% of instructions
+is a real cost and the suite is structurally blind to what it buys or costs:
+every one of its 96 kernels fits in L1i, so instruction FOOTPRINT is free there
+and is a performance term in a 173k-instruction application with a
+10.8k-instruction interpreter loop (`quickapp.sh`'s own header). If the row were
+paying for suite time with application time, this is where it would show. Three
+interleaved pairs of the sqlite CLI, 200,000 rows, bulk insert plus a nested
+join, output-gated before any timing:
+
+| pair | hoist ON | hoist OFF |
+|---|---|---|
+| 1 | 1.191 | 1.186 |
+| 2 | 1.180 | 1.180 |
+| 3 | 1.188 | 1.188 |
+| mean | 1.1863 | 1.1847 |
+
+**+0.13%, and two of the three pairs are identical to three decimals.** The row is
+NEUTRAL on the application: it buys suite time and costs nothing where footprint
+is priced. The feared i-cache trade did not appear at this resolution.
+
 **WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu, gcc
 14.2.0 -O1, musl in-box; suite of 96; `INLINE_COPY_MAX` already at 128 (`M40`) in
 both arms. Shipped together with `M40` behind one gate: 15/0 at FUZZ_N=300
