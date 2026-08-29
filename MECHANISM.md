@@ -4460,6 +4460,62 @@ Debian 13 arm64, gcc 14.2.0 -O2, zcc native, 96-program suite.
 
 ---
 
+### M51. The worst program in the suite measures a shape no real program has
+
+**THE ROW THAT WAS NOT BUILT.** `g1_memcpy_loop` is 30.6× against `gcc -O2`, the
+largest single gap in the suite and worth about 3.6% of the geomean on its own.
+The cause is exact and the fix is a named transformation: gcc inlines
+
+    void mycopy(char *d, const char *s, int n){ for(int i=0;i<n;i++) d[i]=s[i]; }
+
+into `main`, where `d` and `s` are two distinct globals, proves they cannot
+overlap, and calls `memcpy` — sixteen bytes an instruction against zcc's one.
+Nothing about the loop itself is worse: gcc's own out-of-line `mycopy` is the
+same five-instruction byte loop zcc emits.
+
+**WHAT WAS BUILT INSTEAD, AND WHY.** A DETECTOR — read-only, no transform —
+because the rewrite is not a peephole. The loop is DEFINED when the regions
+overlap and `memcpy` is not; `memmove` does not match either, since a forward
+loop with `d > s` reads bytes it has already written and propagates them while
+`memmove` behaves as if the source were copied to a temporary. So the row needs
+either a proof of disjointness or a runtime guard and a second path — CFG
+surgery, several hundred lines. `M41` is three shapes that were obviously right
+and bought nothing; an afternoon spent detecting is cheaper than a day spent
+building.
+
+**WHAT THE CORPUS SAYS:**
+
+| corpus | candidate loops |
+|---|---|
+| 96-program suite | **3** — `mycopy` (`disjoint=false`, `const_trips=false`), and two in `main` (`disjoint=true`, `const_trips=true`) |
+| sqlite amalgamation | **0** |
+| musl, 400 source files | **0** |
+| lua, 34 source files | **0** |
+
+**The cheap version of the row — fire only where disjointness is PROVABLE — would
+have hit exactly the two `main` loops, which are initialisations that run once.**
+It would have measured zero, and it would have taken a day to find that out. The
+only site worth anything is the one that needs the guard.
+
+**AND THE REASON IS OBVIOUS IN HINDSIGHT, WHICH IS WHY IT IS WORTH WRITING DOWN.**
+Real C does not write copy loops; it calls `memcpy`. musl, lua and sqlite contain
+zero of them across 435 files. `g1_memcpy_loop` exists because the suite is built
+by SHAPE, and a shape chosen for coverage is not evidence that the shape occurs.
+
+**WHAT THIS SAYS ABOUT THE SUITE, and it is not an excuse for the number.** The
+largest single contributor to the `-O2` geomean is a program whose transformation
+no program in the corpus needs. That is a fact about the suite's
+representativeness, not a licence to discount the ratio — `M38` already measured
+that the suite under-predicts sqlite. The correct response is to note it beside
+the number and to pick the next row from shapes the corpus actually contains,
+not to drop `g1` because it is inconvenient.
+
+**WHEN / WHERE.** 2026-08-29, `main`, detector run over `tests/bench/suite`, the
+sqlite 3 amalgamation, 400 musl 1.2.5 sources and 34 lua 5.4.7 sources; the
+detector is removed under Article A(2) now that it has answered.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
