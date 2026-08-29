@@ -78,21 +78,20 @@ across a function's pass pipeline and INVALIDATED rather than rebuilt:
 invalidates. The reviewer's question for every diff: *what did this pass rebuild
 that it could have read?*
 
-**HOW IT IS PROVEN, and this is not negotiable for a re-architecture.** The
-HIR/MIR split shipped byte-identical (`refactor_gate`), and so does this: caching
-an analysis must not change one instruction. Two witnesses per Article E — all 96
-suite programs and `sqlite3.c` at 742k lines — plus the 16-stage gate NATIVELY on
-the Graviton box. **Any codegen change is a bug in the caching, not a bonus.**
+**HOW IT IS PROVEN.** The HIR/MIR split shipped byte-identical
+(`refactor_gate`), and so does this: caching an analysis must not change one
+instruction. Two witnesses per Article E — 96 suite programs and `sqlite3.c` at
+742k lines — plus the 16-stage gate NATIVELY on the Graviton box. **A codegen
+change is a bug in the caching, not a bonus** — turning on what the layer ENABLES
+is a separate, measured row with its own A/B.
 
-**THE PAYOFF, priced before the build so it can be checked after:**
-* compile time — `M44`'s +28.7% is the visible half; the invisible half is every
-  other loop pass paying the same toll. sqlite compiles in **6.77 s** today.
-* the hoist row becomes affordable again and can be re-measured on its merits
-  (it was −0.74% EXEC on the suite, neutral on the application).
-* `tailjump` reaches its target and `unroll` loses its stated limitation.
-* `ZCC_SLP` and `ZCC_TBAA` become answerable questions rather than seams nobody
-  can afford to turn on — each is one A/B on the Graviton box once the analysis
-  they need is cheap and shared.
+**THE PAYOFF, priced before the build so it can be checked after.** Compile time:
+`M44`'s +28.7% is the visible half, every other loop pass paying the same toll is
+the invisible one (sqlite compiles in **6.77 s** today). The hoist becomes
+affordable and re-measurable on its merits (−0.74% EXEC on the suite, neutral on
+the application). `tailjump` reaches its target and `unroll` loses its stated
+limitation. And `ZCC_SLP` / `ZCC_TBAA` become answerable questions rather than
+seams nobody can afford to turn on — one A/B each on the Graviton box.
 
 **WHAT IT DOES NOT DO.** It buys no exec by itself. A re-architecture is ranked
 `better ground for optimization ∧ easier proof` (Article G), and it must be
