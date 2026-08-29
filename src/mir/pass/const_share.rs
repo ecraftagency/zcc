@@ -219,7 +219,7 @@ fn visit(
 ///   * PRESSURE is the cost, and it is why this ships behind a toggle: a
 ///     constant hoisted out of a loop is live across the whole loop, and a
 ///     program that was one value short of spilling now spills. That is a
-///     measurement, not an argument (`ZCC_HOIST`).
+///     measurement, not an argument (`ZCC_NOHOIST`, `MEASURED M42`).
 pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
     if !hoist_wanted() {
         return 0;
@@ -287,32 +287,61 @@ pub fn hoist_invariant_consts(f: &mut MFunc) -> usize {
     moved
 }
 
-/// R5's loop-constant seam. OFF by default, turned on with `ZCC_HOIST`.
+/// R5's loop-constant seam. ON by default since `MEASURED M42`; `ZCC_NOHOIST`
+/// turns it off.
 ///
-/// THE MEASUREMENT IT EARNED, AND THE ONE IT DID NOT. Interleaved with `sched`
-/// and `vrp` on, it is EXEC 1.0159 -> 1.0116 and INSN 1.0662 -> 1.0894: about
-/// four tenths of a percent of time, inside the run-to-run spread, bought with
-/// 2.3% of instructions that is not. THE ULTIMATUM asks for 1x on BOTH axes, and
-/// this trades the axis zcc already wins (sqlite's binary is 0.927 of gcc's) for
-/// the one it loses. So it stays off until the allocator makes the pressure
-/// affordable, and its number is kept here rather than argued about.
+/// WHY IT SHIPPED OFF FOR A YEAR AND WHY THAT REASON NO LONGER HOLDS. The
+/// standing argument was: EXEC about four tenths of a percent, "inside the
+/// run-to-run spread", bought with 2.3% of instructions that is not — and THE
+/// ULTIMATUM asks for 1x on BOTH axes, so the row traded the axis zcc wins for
+/// the one it loses. Two things retired that argument.
 ///
-/// The original, hoist-alone reading was: interleaved A/B over the
-/// 42-program taxonomy suite, twice,
+///   * `M38` measured `corr(INSN, EXEC) = 0.196` over ninety programs. "1x on
+///     both axes" reads as one goal only while the axes are believed to track;
+///     they do not, so INSN cannot veto an EXEC row on the grounds of being the
+///     same question asked twice. Law 0 ranks `exec > size` and there is nothing
+///     left to set against it.
+///   * The old reading could not resolve four tenths of a percent because the
+///     42-program suite could not (`M38`: a suite of ~45 resolves to ±0.03 at
+///     best). The 96-program suite and a THREE-PAIR interleaved design can.
 ///
-///     off  EXEC 1.0228, 1.0182   (mean 1.0205)   INSN 1.0710
-///     on   EXEC 1.0153, 1.0137   (mean 1.0145)   INSN 1.0941
+/// THE MEASUREMENT THAT DECIDED IT (`M42`), one frozen binary, both arms from
+/// the same build so no rebuild difference enters the comparison:
 ///
-/// EXEC −0.60%, reproduced in both pairs and larger than the spread within
-/// either condition, against a deterministic +2.3% in instructions. Law 0 ranks
-/// exec above size, so it ships; the instruction cost is real and is the row's
-/// residual — a constant hoisted out of a loop is live across it, and a function
-/// one value short of spilling now spills (`k2_live_pressure` INSN 1.468 →
-/// 1.571 while its EXEC went 1.231 → 1.165).
+///     pair      OFF      ON        OFF median   ON median   >1.1x  OFF/ON
+///     1       1.0774   1.0618        1.059       1.037       34 / 34
+///     2       1.0762   1.0731        1.063       1.044       36 / 31
+///     3       1.0749   1.0696        1.060       1.043       37 / 31
+///     mean    1.0762   1.0682        1.0607      1.0413
+///
+/// EXEC geomean −0.74%, the sign the same in all three pairs. The geomean is the
+/// noisier statistic here — the ON arm's spread is 0.0113 against the OFF arm's
+/// 0.0025, because hoisting raises pressure and a program that spills is more
+/// sensitive to cache state than one that does not. **The MEDIAN is the reading
+/// to trust**: −1.83%, with a within-condition spread of 0.004 to 0.007, and the
+/// count of programs above 1.1x falls from 37 to 31.
+///
+/// ON THE DETERMINISTIC AXIS, where there is no spread at all (dynamic
+/// instructions, `callgrind` Ir, against gcc -O1):
+///
+///     k2_live_pressure  1.331 -> 1.054      m3_dict_rehash  1.161 -> 1.210
+///     v2_freelist       1.738 -> 1.266      n6_pcache_lru   1.196 -> 1.217
+///     o2_fp_stencil     1.546 -> 1.346
+///     w2_tagged         1.125 -> 1.063
+///
+/// THE RESIDUAL, and it is named rather than hidden (Law 3): the cost is
+/// PRESSURE. A constant hoisted out of a loop is live across it, so a function
+/// one value short of spilling now spills — `m3_dict_rehash` and
+/// `n6_pcache_lru` are the two programs of ninety-six that go backwards, both
+/// by that mechanism, and INSN geomean pays 1.0757 -> 1.0935. Filtering by the
+/// constant's `movz/movk` chain length was built to collect that back and was
+/// REFUTED (`M41`): it removes almost all the static cost and gives back the two
+/// largest wins, because chain length does not know what the loop is bound by.
+/// A guard that works has to read pressure, and that is the row's open frontier.
 pub fn hoist_wanted() -> bool {
     HOIST.with(|c| c.get()).unwrap_or_else(|| {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENV.get_or_init(|| std::env::var_os("ZCC_HOIST").is_some())
+        *ENV.get_or_init(|| std::env::var_os("ZCC_NOHOIST").is_none())
     })
 }
 

@@ -3658,6 +3658,180 @@ Gate 15/0 at FUZZ_N=300; cargo 208/0.
 
 ---
 
+### M41. Three shapes that were obviously right and measured at zero
+
+**WHY THESE ARE TOGETHER.** Each is a hoist — pull work out of a loop that does
+not need to repeat it — and each was read straight off the assembly beside gcc's,
+which is the method that has won four rows this month. All three bought nothing,
+and the reason they bought nothing is the same reason `M40` needed a new
+instrument: **what a loop costs is not what a loop contains.**
+
+**REFUTED 1 — hoisting a one-instruction constant out of `a2_udiv_mod`.** Its
+loop rebuilds `#7` and `#13` every iteration:
+
+    movz w10, #13 / udiv / msub / movz w11, #7 / udiv / add / add / add / cmp / b.ls
+
+Two of eleven instructions are pure repetition, and gcc hoists both. Hand-edited
+into dedicated registers in the preheader, exactly as gcc does:
+
+| variant | us | vs gcc -O1 |
+|---|---|---|
+| gcc -O1 | 3943 | 1.000 |
+| zcc | 4277 | 1.085 |
+| **+ constants hoisted** | **4289** | **1.088** |
+| + Granlund-Montgomery for `/7` and `%13` | 4085 | 1.036 |
+
+**Removing 18 % of the loop's instructions cost 12 us — that is, nothing.** The
+loop is bound by two `udiv`s, and everything issued in their shadow is free. The
+same edit is what made the division rewrite look attractive; on the whole suite
+that rewrite is worth about 0.1 %, over two programs, for a magic-number table
+and a divisor-range proof, so it stays unbought.
+
+**REFUTED 2 — the invariant load and the split latch in `z2_rle`.** Its run-count
+loop reloads `in[i]` — loop-invariant, and gcc holds it in `w3` — and its decode
+loop reloads `enc[i+1]` and spends a `mov` plus an unconditional branch on a latch
+gcc merges. Both were hand-edited to gcc's exact shape:
+
+| variant | us | vs gcc -O1 |
+|---|---|---|
+| zcc | 55963 | 1.587 |
+| + encode-loop load hoisted, `i+255` precomputed | 55895 | 1.586 |
+| + decode-loop load hoisted, latch merged | 55715 | **1.580** |
+
+**0.4 % for two instructions per iteration off the hottest loop in the program.**
+`z2_rle` is branch-bound: its run lengths are drawn from a hash precisely so the
+loop exit is unpredictable, and a mispredict costs more than the whole body. Its
+dynamic instruction ratio is 1.170 against an exec ratio of 1.626 — the program
+says, in the only two numbers that can say it, that its problem is not
+instructions. `licm` is not the row for it and neither is block layout.
+
+**REFUTED 3 — filtering the constant hoist by chain length.** Given refutation 1,
+the obvious guard for `const_share`'s loop hoist is to lift only constants whose
+`movz/movk` chain is two instructions or longer: keep `v2_freelist`'s two 64-bit
+literals, which are eight instructions of a twenty-five-instruction body, and stop
+paying a register for a lone `movz`. Built, and measured on dynamic Ir:
+
+| program | hoist off | hoist all | chain ≥ 2 | static insn, all / ≥2 |
+|---|---|---|---|---|
+| `v2_freelist` | 1.738 | **1.266** | 1.266 | +0 / +0 |
+| `o2_fp_stencil` | 1.546 | **1.346** | 1.347 | +0 / +0 |
+| `w2_tagged` | 1.125 | **1.063** | 1.125 | +0 / +0 |
+| `k2_live_pressure` | 1.331 | **1.054** | 1.251 | +21 / +0 |
+| `m3_dict_rehash` | 1.161 | 1.210 | 1.166 | +19 / +6 |
+| `n6_pcache_lru` | 1.196 | 1.217 | 1.211 | +34 / +29 |
+
+The guard does what it was built to do — it removes almost all of the static cost —
+and it **gives back the two largest wins on the list**. `k2_live_pressure` goes
+from 1.331 to 1.054 on one-instruction constants alone. So refutation 1 does not
+generalize: a lone `movz` is worthless in a loop bound by division and worth 28 %
+in a loop bound by nothing, and **chain length does not know which loop it is in.**
+A guard that works has to read pressure, not the constant. Reverted; the pass is
+back to hoisting every `MovImm` and `Adrp`.
+
+**THE COMMON SHAPE, and it is the session's finding.** All three rows were chosen
+by counting instructions in a loop body, and all three were settled by an
+instrument that measures what the loop is actually waiting for — a divider, a
+branch predictor, a register file. `M38` measured `corr(INSN, EXEC) = 0.196` and
+called static count a poor proxy; these three say what to do about it, which is to
+ask what the loop is BOUND by before counting anything in it.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu, gcc
+14.2.0 -O1; hand-edited `.s` assembled with gcc, every variant output-gated
+against gcc's; Ir from `callgrind`.
+
+---
+
+### M42. The loop-constant hoist ships, and the argument that kept it off was retired by a correlation
+
+**VALUE.** `const_share::hoist_invariant_consts` is ON by default; `ZCC_NOHOIST`
+turns it off. It was off since R5.
+
+**THE ARGUMENT IT HAD TO BEAT**, quoted from the code it lived in: EXEC about four
+tenths of a percent, "inside the run-to-run spread", bought with 2.3% of
+instructions that is not — and *THE ULTIMATUM asks for 1x on BOTH axes*, so the
+row traded the axis zcc wins for the one it loses. That is a coherent argument
+and it rested on two things that have since been measured.
+
+**WHAT RETIRED IT.**
+
+  * `M38` measured **`corr(INSN, EXEC) = 0.196`** over ninety programs. "1x on
+    both axes" reads as a single goal only while the two axes are believed to
+    track. They do not, so a static-instruction cost cannot veto an exec row on
+    the grounds of being the same question asked twice — it is a different
+    question, and Law 0 already ranks `exec > size` between them.
+  * The old reading could not resolve four tenths of a percent, because the
+    42-program suite could not: `M38`'s split-half says a suite of ~45 resolves
+    to ±0.03 at best. "Inside the run-to-run spread" was true and was a statement
+    about the instrument, not about the row.
+
+**THE MEASUREMENT.** One frozen binary, both arms from the same build (the seam
+is an environment variable precisely so no rebuild difference enters the
+comparison), three interleaved pairs over the 96-program suite:
+
+| pair | EXEC OFF | EXEC ON | median OFF | median ON | >1.1x OFF/ON |
+|---|---|---|---|---|---|
+| 1 | 1.0774 | 1.0618 | 1.059 | 1.037 | 34 / 34 |
+| 2 | 1.0762 | 1.0731 | 1.063 | 1.044 | 36 / 31 |
+| 3 | 1.0749 | 1.0696 | 1.060 | 1.043 | 37 / 31 |
+| **mean** | **1.0762** | **1.0682** | **1.0607** | **1.0413** | |
+
+EXEC geomean **−0.74%**, the sign the same in all three pairs. INSN 1.0757 →
+1.0935.
+
+**WHICH STATISTIC TO BELIEVE, and this is the part worth keeping.** The ON arm's
+geomean spread is **0.0113** against the OFF arm's **0.0025** — four and a half
+times noisier, from an identical binary each run, so the difference is not in the
+compiler. Hoisting raises register pressure; a program that spills touches memory
+where it used to touch registers, and memory is sensitive to cache state in a way
+an ALU chain is not. **The row's own cost is what makes its measurement noisy.**
+The MEDIAN is therefore the reading to trust here: **1.0607 → 1.0413, −1.83%**,
+with a within-condition spread of 0.004 to 0.007, and the count of programs above
+1.1x falls from 37 to 31. A first reading of a single pair said −1.45% and was
+quoted as "ten times the spread"; it was one sample of the noisier arm, and the
+correction is the reason three pairs were run.
+
+**ON THE DETERMINISTIC AXIS**, where there is no spread at all — dynamic
+instructions from `callgrind`, against gcc -O1:
+
+| program | hoist off | hoist on |
+|---|---|---|
+| `k2_live_pressure` | 1.331 | **1.054** |
+| `v2_freelist` | 1.738 | **1.266** |
+| `o2_fp_stencil` | 1.546 | **1.346** |
+| `w2_tagged` | 1.125 | **1.063** |
+| `m3_dict_rehash` | 1.161 | 1.210 |
+| `n6_pcache_lru` | 1.196 | 1.217 |
+
+`v2_freelist` rebuilds two 64-bit literals — eight `movz`/`movk` — inside a
+twenty-five-instruction loop body, every iteration, and gcc hoists both.
+
+**THE RESIDUAL (Law 3).** The cost is PRESSURE, and it is named rather than
+hidden: a constant hoisted out of a loop is live across it, so a function one
+value short of spilling now spills. Two programs of ninety-six go backwards,
+both by that mechanism. Filtering by the constant's `movz`/`movk` chain length
+was built to collect the cost back and was REFUTED (`M41`) — it removes almost
+all the static cost and returns the two largest wins, because chain length does
+not know what the loop is bound by. **A guard that works has to read pressure**,
+and that is this row's open frontier. Category (b), not (a): the row is not
+exhausted.
+
+**WHAT IT UNLOCKS.** `M25` removed Granlund–Montgomery division-by-constant and
+recorded the precondition for rebuilding it: *"the loop-invariant constant hoist
+must pay for itself first, and the emitted sequence must reach gcc's five
+instructions rather than nine"* — three of those nine were constant
+materialization inside the loop. The first half of that precondition is now met.
+`ab2_format` is where it would pay: its dynamic instruction ratio is 0.931 —
+**zcc executes FEWER instructions than gcc** — against an exec ratio of 1.388, a
+CPI ratio of 1.49, and its hot path is `u % 10` and `u /= 10` on a 64-bit value.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu, gcc
+14.2.0 -O1, musl in-box; suite of 96; `INLINE_COPY_MAX` already at 128 (`M40`) in
+both arms. Shipped together with `M40` behind one gate: 15/0 at FUZZ_N=300
+(determinism 187 programs, torture 1694/0, opt-parity 1552/0, csmith 254/0, musl
+479 binaries), cargo 208/0.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
