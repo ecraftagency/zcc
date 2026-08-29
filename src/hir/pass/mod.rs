@@ -18,6 +18,7 @@ pub mod gvn;
 pub mod ifconv;
 pub mod inline;
 pub mod iv;
+pub mod divmagic;
 pub mod licm;
 pub mod mem;
 pub mod purity;
@@ -152,6 +153,13 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         }
         if on("licm") {
             changed |= timed("licm", || licm::run_with(f, ro));
+        }
+        // BEFORE gvn's next turn and before dce: the sequence divmagic writes is
+        // ordinary arithmetic, so everything downstream folds, numbers and
+        // schedules it like any other. AFTER licm, so a divisor that was loop
+        // invariant has already moved and the multiply lands where the divide was.
+        if on("divmagic") {
+            changed |= timed("divmagic", || divmagic::run(f));
         }
         // AFTER licm and rotation: the loop must already be in its final shape,
         // because the recurrence this reads is a property of that shape. Before

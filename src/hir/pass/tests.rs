@@ -537,6 +537,74 @@ fn dce_drops_a_dead_block_parameter() {
     super::set_inline(false);
 }
 
+// ── divmagic ───────────────────────────────────────────────────────────────
+
+#[test]
+fn divmagic_replaces_a_constant_divide_with_a_multiply() {
+    // `d = 7` is the interesting divisor: its multiplier needs W+1 bits, so the
+    // pass takes the `add` correction path — the one whose W-bit wrap is the
+    // easiest thing in the algorithm to get wrong.
+    let src = "unsigned f(unsigned n){return n/7u + n%13u;}                                     int main(void){return (int)f(1000u);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let divs = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| {
+            matches!(
+                i,
+                Inst::Bin { op: BinOp::UDiv | BinOp::URem | BinOp::SDiv | BinOp::SRem, .. }
+            )
+        })
+        .count();
+    assert_eq!(divs, 0, "every constant division must have become a multiply");
+    // 1000/7 = 142, 1000%13 = 12
+    square(src, 154);
+}
+
+#[test]
+fn divmagic_is_right_for_signed_divisors_of_both_signs() {
+    // The signed form carries two corrections the unsigned one does not: the
+    // multiplier's sign can disagree with the divisor's, and the arithmetic shift
+    // floors where C99 6.5.5p6 truncates toward zero. A negative numerator is what
+    // separates the two.
+    let src = "int f(int n){return n/(-7) + n%3;}                                                int main(void){return f(-100)+1000;}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let divs = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| {
+            matches!(
+                i,
+                Inst::Bin { op: BinOp::SDiv | BinOp::SRem, .. }
+            )
+        })
+        .count();
+    assert_eq!(divs, 0, "signed constant division must become a multiply too");
+    // -100 / -7 = 14 (trunc toward zero), -100 % 3 = -1
+    square(src, 1013);
+}
+
+#[test]
+fn divmagic_leaves_a_variable_divisor_alone() {
+    // There is no constant to build a multiplier from; the divide must survive, or
+    // the pass is matching on something other than the immediate.
+    let src = "int f(int a,int b){return a/b;}                                                   int main(void){return f(84,2);}";
+    let after = module(src, true);
+    let f = func(&after, "f");
+    let divs = f
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter())
+        .filter(|i| matches!(i, Inst::Bin { op: BinOp::SDiv, .. }))
+        .count();
+    assert_eq!(divs, 1, "a variable divisor has no magic number");
+    square(src, 42);
+}
+
 // ── licm ───────────────────────────────────────────────────────────────────
 
 #[test]

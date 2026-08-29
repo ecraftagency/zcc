@@ -4197,6 +4197,82 @@ gcc before timing; best of 21.
 
 ---
 
+### M47. Granlund–Montgomery, rebuilt — the row `M25` deleted was deleted on one core's evidence
+
+**VALUE.** `hir/pass/divmagic.rs`. Division and remainder by a constant become a
+multiply. `ZCC_NODIVMAGIC` turns it off. **Suite 96 on Graviton4: EXEC 1.1716 →
+1.0902**, three runs at 1.0898 / 1.0899 / 1.0909.
+
+**−6.95% from one pass**, against the 0.74% a full day of grinding on the M1 Pro
+produced.
+
+| program | before | after |
+|---|---|---|
+| `a2_udiv_mod` | 5.521 | **1.192** |
+| `a3_sdiv_mod` | 2.103 | **0.512** |
+| `ab2_format` | 1.410 | **0.882** |
+| `u2_div_var` | 1.489 | 1.014 |
+| INSN geomean | 1.0751 | 1.1091 |
+
+Two programs end up FASTER than gcc -O1. `a3_sdiv_mod` at 0.512 is not claimed as
+a win until it is understood — gcc spends 9,523 us there against zcc's 4,874, and
+the reason is an open question, not a result.
+
+**WHAT `M25` GOT RIGHT AND WHY IT STILL HAD TO BE REVERSED.** `M25` built this
+row, proved it over every divisor 3..2000, measured it, and removed it on one
+sentence: *"AND THE DIVIDER ON THIS CORE IS NOT SLOW… the folklore is a
+Cortex-A53-era fact; it is not a fact about this core."* Every word is true of an
+Apple M1 Pro. `latency.sh` on Neoverse V2 measures `udiv` at **4.98 dependent
+adds** (`M46`), and the machine that runs zcc's declared target is Neoverse, not
+Apple silicon. **The theorem never changed; the machine did.**
+
+**AND M25's SECOND PRECONDITION TURNED OUT NOT TO BE ONE.** It required the
+emitted sequence to reach gcc's five instructions rather than nine, three of the
+nine being constant materialization inside the loop — making the row a dependent
+of the loop hoist that `M44` has since reverted. Measured on Neoverse V2 with the
+magic constant rebuilt EVERY ITERATION, which is exactly what this pass emits with
+no hoist: **4.455 → 1.111**. Hoisted it would be 1.011. A `udiv` is expensive
+enough that four extra one-cycle instructions do not begin to pay for it, so the
+row ships independent of `const_share`.
+
+**TWO PROOFS, AND THEY ANSWER DIFFERENT QUESTIONS.** This distinction is the
+transferable part.
+
+* The **batteries** check the CONSTANTS: `(n·M >> W) >> s` against real division
+  over a dense divisor range at the boundaries of the numerator — 40,000+ cases
+  for 32-bit unsigned and again for signed, plus 64-bit samples. That is a
+  statement about Granlund–Montgomery, not about this pass.
+* The **square** checks the PASS: `⟦f⟧ = ⟦divmagic f⟧` through the reference
+  interpreter. It is what catches a correct multiplier wired to the wrong operand,
+  and the signed case deliberately uses `n = −100, d = −7` because that is the one
+  input that forces both corrections to show — the multiplier's sign disagreeing
+  with the divisor's, and the arithmetic shift flooring where C99 6.5.5p6
+  truncates toward zero.
+
+**THE BUG THE BATTERY CAUGHT, and it would have shipped a wrong compiler.**
+Hacker's Delight computes `q2` in W-bit arithmetic, so `q2 + 1` WRAPS there.
+Carried in `u128` it does not, and `d = 7` came out as the 33-bit `0x1_2492_4925`;
+the first battery run failed on `7 / 7 = 536870913`. The missing `2^W` term is
+precisely what the `add` correction restores — which is why `add` is set on
+exactly the divisors whose multiplier overflows. Masking to W bits reproduces the
+wrap and yields `0x2492_4925`, which is gcc's constant.
+
+**THE PROCESS DEFECT, which cost a gate run.** The pass was written after the
+session's last `provenance.sh` and the gate was requested without re-running it.
+`provenance` came back RED with two findings — `pub fn run` cited no THEORY
+section and named no SQUARE — while all fourteen other stages were green,
+including 554 random differential programs through a rewritten division. Nothing
+was incorrect; the PROOF was missing, which is what Law 0 ranks above every
+number with `≫` rather than `>`.
+
+**WHEN / WHERE.** 2026-08-29, `main`, gate **15 PASS / 0 RED at FUZZ_N=300 run
+NATIVELY on the c8gd.4xlarge Graviton4 box** — the first time zcc's gate has run
+on its own target ISA without a container — torture 1694/0, opt-parity 1552/0,
+csmith 254/0, yarpgen 300/0, musl 479 binaries, determinism 187 programs; cargo
+215/0; provenance 29 passes, 50 citations.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
