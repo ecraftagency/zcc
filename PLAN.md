@@ -12,67 +12,69 @@ because it won, or written into its Part F as a refutation because it lost.
 
 ---
 
-## THE GRIND: UNROLL-AND-JAM, the transform that unlocks four lanes
+## THE GRIND: the four jammed lanes become one `mla v.4s`
 
-**WHERE THE GAP IS, measured with `perf` and not with `.s`.** zcc emits 1.0144x
-gcc -O2's STATIC instructions and executes **1.3250x** its DYNAMIC ones, at a
-BETTER average IPC. The gap is instructions EXECUTED. Of the 50 programs above
-1.1x cycles: 22 dominated by dynamic count, 15 both, 13 IPC/chains.
+**WHERE IT STANDS.** `z4_matmul_int` is 2.94x against gcc -O2 and **1.087x
+against gcc -O1** — the one place -O2's SIMD shows and the worst program left in
+the suite. `jam` and the `iv` displacement row took its inner loop from seven
+instructions per outer iteration to three; what remains is the width.
 
-**THE ONE PROGRAM THAT NAMES THE PRIZE.** `z4_matmul_int` is 3.42x against gcc
--O2 and **1.087x against gcc -O1** — it is not a regression, it is the one place
-gcc -O2's SIMD shows. gcc -O1 emits ZERO SIMD there and gcc -O2 is 3.3x faster
-than its own -O1. At TWO lanes the same gcc buys 3% and loses to zcc's scalar
-code (`tests/bench/matmul.c`, long: zcc 0.904 vs gcc -O2). **The prize is four
-lanes: elements of 32 bits.**
+**THE LOOP TODAY — twelve instructions for four values of `j`:**
 
-**THE INNER LOOP, and why it is 7 instructions for ONE value of `j`:**
+    ldr  w26, [x0, x20, lsl #2]   ; A[i][k], shared by all four lanes
+    ldp  w25, w27, [x21]          ; B[k][j+0], B[k][j+1]
+    madd w22, w26, w27, w22
+    madd w5,  w26, w25, w5
+    ldr  w27, [x21, #8]  ; add x25, x21, #800 ; ldr w21, [x21, #12]
+    madd w23, w26, w27, w23 ; madd w24, w26, w21, w24
+    add  x20, x20, #1 ; cmp x20, #200 ; b.lt
 
-    ldr  w20, [x19]              ; B[k][j]  — x19 += 800 per iteration
-    ldr  w21, [x2, x7, lsl #2]   ; A[i][k]  — unit stride in k
-    madd w6,  w21, w20, w6       ; t += A*B
-    add  x7,  x7, #1 ; add x19, x19, #800 ; cmp x7, #200 ; b.lt
+**THE ROW — seven, and every piece it needs is already in the tree:**
 
-**THE ROW: jam the `j` loop by four, scalar, in HIR.** One `A[i][k]` load serves
-four lanes; `B[k][j..j+3]` are four CONSECUTIVE words, so two `ldp`; four
-`madd`; one set of pointer updates and one compare. ≈11 instructions for four
-values of `j` — **2.75/j against 7/j, about 2.5x** — with no SIMD instruction at
-all. And it is the ENABLING transform: four jammed lanes are one `mla v.4s`
-afterwards, which is the row after this one.
+    ldr  w26, [x0, x20, lsl #2] ; dup v1.4s, w26 ; ldr q0, [x21]
+    mla  v2.4s, v0.4s, v1.4s
+    add  x21, x21, #800 ; add x20, x20, #1 ; cmp ; b.lt
 
-* Accumulator splitting is REFUTED before being built: `z4`'s IPC is **5.77**
-  against gcc's 4.38, so the `madd` chain is not the bottleneck. Only the
-  instruction COUNT is, and only a nest transform reduces it.
-* `vecmap` (shipped, default-OFF) is the single-loop case and buys **0.02%** on
-  the suite against a 0.3% noise floor. A candidate is not a hot loop.
+`VInt`, `VDup`, `VAddv` and `MemOp::Q` shipped in `ae0a721`, every form assembled
+against `as` on the box. `mla` is not among them and is `VInt::Mul` + `VInt::Add`
+until it is; that is two instructions, not one, and still five fewer than today.
 
-**SHAPE TO RECOGNIZE.** An outer counted loop `j` whose body is: a preheader, an
-inner counted loop, and a tail that STORES one value at an address affine in `j`
-with stride = the element width. `j` must appear only in addresses affine in it.
+**WHY IT MUST BE A MIR PASS.** The accumulator crosses the inner loop's back edge
+as a VECTOR. Article B puts a vector width in the ISA tables and the emitter, not
+in HIR — and MIR already carries it: `Width::Q` is a real width and a `Q` vreg is
+a legal block parameter. `IntrinKind::VecMap` cannot do this: an intrinsic has no
+value living in a register across iterations.
 
-**HOW IT IS PROVEN.** The four jammed copies are four iterations of the outer
-loop run together; each computes exactly what it computed alone, because nothing
-the outer body defines is read by another `j` (that is what makes them
-independent, and it is the same check `vecmap` makes). A runtime guard covers the
-trip count not being a multiple of four; the original nest is the tail. The
-square is `⟦f⟧ = ⟦jam f⟧` on the HIR interpreter, plus a non-vacuity assertion
-that the jammed body exists.
+**WHAT TO RECOGNIZE**, on SSA MIR before regalloc: a loop block with four
+`Load` of `W32` at one base and displacements `0,4,8,12` (some already fused into
+`ldp`), four `Alu::MAdd` each reading the SAME other operand, and four
+loop-carried block parameters they accumulate into. Replace with one `Load` of
+`MemOp::Q`, one `VDup`, one `VInt::Mul` + `VInt::Add`, and ONE `Q` parameter; the
+exit needs the four scalars back, which is `VAddv`'s sibling problem — the four
+lanes are four DIFFERENT `j`, so they are extracted, not summed. **`umov`/`mov
+Wd, Vn.S[i]` is the extract and is NOT in the tree yet: add it with the same
+assembler check the others got.**
 
-**WHAT IT DOES NOT DO.** Nothing for the 13 IPC/chain programs, and nothing for
-`m1_resp_parse`'s **124x** branch-miss ratio. Those are separate rows.
+**PRICE IT BEFORE BUILDING.** Dynamic instructions on `z4` today are **163.9M**
+against gcc's **73.7M**; the form above should reach ~95M. That is `z4` at about
+**1.4–1.5x**, not 1.0x. And on the suite geomean, `z4` alone is worth little:
 
-**THE VECTOR SURFACE IS ALREADY IN THE TREE AND IS WAITING.** `VInt`, `VDup`,
-`VAddv` in MIR, verified against the assembler, plus `MemOp::Q` which has carried
-128-bit loads since `long double`. `IntrinKind::VecMap` shows how a lane
-operation reaches the machine without a vector type in HIR.
+    z4 -> 1.45 :  1.2180 x (1.45/2.941)^(1/96) = 1.2091
+    z4 -> 1.00 :  1.2180 x (1.00/2.941)^(1/96) = 1.2044
 
-⚠️ **A vector type must NOT be added to HIR.** Article B: target knowledge lives
-in the ISA tables, the ABI automaton and the emitter. A vector WIDTH is target
-knowledge, which is why `Arr`/`VAlu`/`Width::Q` are MIR facts. The accumulator
-that must cross a back edge as a vector is a `Width::Q` vreg in a MIR block
-parameter — MIR already carries it, and HIR must not learn about it.
+**Sub-1.2 needs this row AND one more.** The next candidates, from the same
+`perf` run: `e1_recursion` 2.05x (what `tailrec` left — the non-tail call),
+`a1_int_mix` 2.79x and `e2_many_args` 2.75x (both INSN < 0.4, so gcc is inlining
+where zcc is not), `m1_resp_parse` branch-misses **124x**.
 
-**Method:** census before building (`ZCC_COPYPROBE`, `ZCC_VECPROBE`), price on
-the model before the build, and read `perf` rather than `.s` — with static INSN
-at parity the assembly listing cannot answer the question. The harness's
-same-binary noise floor is **±0.3%** EXEC geomean; nothing smaller is a result.
+⚠️ **The counters already warn about this row.** The `iv` displacement change cut
+dynamic instructions 10.4% and cycles only 2.3%: IPC fell 3.79 -> 3.47 and backend
+stalls DOUBLED, because four loads now contend on one base. A `ldr q` replaces
+those four with one, which is the right direction — but measure cycles, not
+instructions, and expect less than the count suggests.
+
+**Method that worked all session:** census before building, price on the model
+first, `perf` rather than `.s`, `md5(.s)` as the vacuity test, and a driver
+sweeping `n = 1..13` against gcc before believing any loop transform. Three of
+`jam`'s defects and `tailrec`'s only one were found that way — and `tailrec`'s
+was found by `c-testsuite/00181`, not by any unit test written for it.
