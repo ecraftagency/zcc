@@ -14,6 +14,7 @@
 pub mod cfg;
 pub mod copyidiom;
 pub mod jam;
+pub mod tailrec;
 pub mod vecmap;
 pub mod vecprobe;
 pub mod copyprobe;
@@ -228,6 +229,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // LAST of the loop rows: it duplicates blocks, so every analysis above it
         // sees the smaller CFG, and the copies it leaves are ordinary code that
         // `gvn` and `dce` clean up on the next turn.
+        if on("tailrec") {
+            if timed("tailrec", || tailrec::run(f)) {
+                changed = true;
+                a.invalidate();
+            }
+        }
         if on("jam") {
             if timed("jam", || jam::run(f, a)) {
                 changed = true;

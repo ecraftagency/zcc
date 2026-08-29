@@ -506,14 +506,17 @@ fn disjoint_objects_do_not_kill_each_other() {
 #[test]
 fn dce_removes_an_unused_computation_but_not_a_call() {
     // `g` is recursive, so the inliner never substitutes it and the call is
-    // still a call when dce runs.
-    let src = "int g(int n){if(n>0)return g(n-1);return 1;}\
+    // still a call when dce runs. The recursive call is deliberately NOT in tail
+    // position — the `+ 1` happens after it — because `tailrec` turns a tail
+    // self-call into a loop, and a `g` that is no longer recursive is one the
+    // inliner takes, which would leave this test asserting about nothing.
+    let src = "int g(int n){if(n>0)return g(n-1)+1;return 1;}\
                int main(void){int dead=7*13;int keep=g(3);return keep+41;}";
     let after = module(src, true);
     let f = func(&after, "main");
     assert_eq!(count(f, |i| matches!(i, Inst::Call { .. })), 1, "a call is never dead");
     assert_eq!(count(f, |i| matches!(i, Inst::Bin { op: BinOp::Mul, .. })), 0);
-    square(src, 42);
+    square(src, 45);
     super::set_inline(false);
 }
 
@@ -2369,4 +2372,55 @@ fn four_outer_iterations_share_one_inner_pass() {
         }
         t & 0xffff
     });
+}
+
+// ── tailrec ────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_self_call_in_tail_position_is_a_jump() {
+    // `acker_lite`'s shape, small enough to interpret: two tail self-calls and
+    // one that is NOT in tail position, so the rewrite must take exactly two and
+    // leave the third a call.
+    let src = "long ack(int a,int b){ if(a==0) return b+1;                                        \
+                 if(b==0) return ack(a-1,1);                                                      \
+                 return ack(a-1,(int)ack(a,b-1)); }                                               \
+               int main(void){ long s=0; int k; for(k=0;k<4;k++) s+=ack(2,6+k); return (int)s; }";
+    super::tailrec::set_wanted(Some(true));
+    let after = module(src, true);
+    let f = func(&after, "ack");
+    // NON-VACUITY: only the non-tail call may survive.
+    let calls = count(f, |i| matches!(i, Inst::Call { .. }));
+    assert_eq!(calls, 1, "the two tail calls were not turned into edges");
+    square(src, {
+        fn ack(a: i64, b: i64) -> i64 {
+            if a == 0 {
+                return b + 1;
+            }
+            if b == 0 {
+                return ack(a - 1, 1);
+            }
+            ack(a - 1, ack(a, b - 1) as i32 as i64)
+        }
+        let mut s = 0i64;
+        for k in 0..4 {
+            s += ack(2, 6 + k);
+        }
+        s as i32 as i64
+    });
+}
+
+#[test]
+fn a_tail_call_is_refused_when_a_frame_address_escapes() {
+    // Iteration REUSES the frame the recursion would have copied. Here the
+    // address of a local is passed down, so two activations must see two
+    // different addresses — and the rewrite must decline rather than make them
+    // one. `g` writes through the pointer it is given, which is what makes the
+    // difference observable.
+    let src = "int g(int *p,int n){ int x=n; if(n<=0){ *p=x; return 0; }                          \
+                 return g(&x,n-1)+x; }                                                            \
+               int main(void){ int z=0; return g(&z,3)+z; }";
+    // 3+2+1+0 unwound, and `z` is untouched because the innermost write lands in
+    // the n=1 activation's own `x` — which is exactly the distinction the refusal
+    // protects: one frame per activation, not one frame reused.
+    square(src, 6);
 }
