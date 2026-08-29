@@ -34,18 +34,15 @@ is already built and NOT RUNNING:
 | **tailjump**, at its target | `hir/pass/tailjump.rs` | fenced by missing SSA reconstruction (`M53`) |
 | **unroll**, past its limit | `hir/pass/unroll.rs:242` | *"SSA reconstruction this row does not do"* |
 
-**Five advanced capabilities, present, not delivering.** TBAA being off is the
-sharpest of them: every memory pass in the compiler — `mem.rs`, `licm`, and
-`loopmem` written on 2026-08-29 — runs against an oracle where everything may
-alias everything, because the field that would say otherwise is stamped `ANY`.
+**Five advanced capabilities, present, not delivering.** TBAA is the sharpest:
+every memory pass — `mem.rs`, `licm`, and the `loopmem` written the same day —
+runs against an oracle where everything may alias everything, because the field
+that would say otherwise is stamped `ANY`.
 
-The HIR/MIR split gave each half of the compiler its own theorems and its own
-passes, and the seam is why a second target adds a second MIR instead of a
-conditional. This grind is the same move one level in: every loop pass in
-`hir/pass/` privately rebuilds the same three analyses, so there is no seam, no
-sharing, and no place to put a fourth analysis when one is needed. **The structure
-is what is holding the passes down, not their absence.** Three measurements on
-2026-08-29 point at that one fact.
+The HIR/MIR split gave each half its own theorems and passes, and that seam is why
+a second target adds a second MIR instead of a conditional. This is the same move
+one level in: every loop pass in `hir/pass/` privately rebuilds the same three
+analyses. **The structure holds the passes down, not their absence.**
 
 * **`M44`** — the hoist cost **+28.7% of sqlite's compile time** because it
   rebuilds `cfg` + `DomTree` + `LoopForest` per function, after `const_share::run`
@@ -93,14 +90,12 @@ the application). `tailjump` reaches its target and `unroll` loses its stated
 limitation. And `ZCC_SLP` / `ZCC_TBAA` become answerable questions rather than
 seams nobody can afford to turn on — one A/B each on the Graviton box.
 
-**WHAT IT DOES NOT DO.** It buys no exec by itself. A re-architecture is ranked
-`better ground for optimization ∧ easier proof` (Article G), and it must be
-reported that way — no number is claimed for it beyond compile time.
+**WHAT IT DOES NOT DO.** It buys no exec by itself. Article G ranks a refactor
+`better ground for optimization ∧ easier proof`; report it that way.
 
-**FALLBACK if the factoring is hard.** "Remat, then duplicate" for `tailjump`
-alone — copy the dispatch's load into each arm that uses it, removing the
-live-out; free on the clock. Built and REVERTED 2026-08-29: the first cut deleted
-the load without placing it and `m2` hung. Idea sound, implementation was not.
+**FALLBACK if the factoring is hard:** remat-then-duplicate for `tailjump` alone,
+`M53`'s last section — built and reverted 2026-08-29, idea sound, implementation
+was not.
 
 **Method:** `M51` (census before building), `M52` (`perf` when the axes disagree),
 and read the harness's own summary line — three times in one session an instrument
