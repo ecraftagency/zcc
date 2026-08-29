@@ -13,6 +13,7 @@
 // round changes nothing or the bound is reached.
 pub mod cfg;
 pub mod copyidiom;
+pub mod jam;
 pub mod vecmap;
 pub mod vecprobe;
 pub mod copyprobe;
@@ -227,6 +228,12 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
         // LAST of the loop rows: it duplicates blocks, so every analysis above it
         // sees the smaller CFG, and the copies it leaves are ordinary code that
         // `gvn` and `dce` clean up on the next turn.
+        if on("jam") {
+            if timed("jam", || jam::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
+        }
         if on("vecmap") {
             if timed("vecmap", || vecmap::run(f, a)) {
                 changed = true;
@@ -300,6 +307,16 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     }
     if on("cfg") {
         cfg::run(f);
+    }
+    if std::env::var_os("ZCC_HIRDUMP").is_some() {
+        eprintln!("=== {} entry=b{} ===", f.name, f.entry);
+        for (b, blk) in f.blocks.iter().enumerate() {
+            eprintln!("b{} params={:?}", b, blk.params);
+            for i in &blk.insts {
+                eprintln!("    {:?}", i);
+            }
+            eprintln!("    -> {:?}", blk.term);
+        }
     }
     copyprobe::census(f, a);
     vecprobe::census(f, a);

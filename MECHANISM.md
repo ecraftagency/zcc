@@ -4687,6 +4687,31 @@ Graviton4 and the local box; scan is `tests/ubscan.sh`.
 
 ---
 
+### M55. Four is the jam factor because four is the lane count, not because it measured best
+
+**THE FACT.** `hir::pass::jam` unrolls the outer loop of a two-deep nest by
+FOUR, and the number is the lane count of a `q` register at a 32-bit element
+(DDI 0487 C1.3.2), not a tuning result.
+
+**WHY IT IS NOT A KNOB.** The row exists to make the SIMD form reachable: four
+jammed lanes are one `mla v.4s`. A jam factor that is not the vector width would
+have to be re-jammed before that could be built, so the two numbers are the same
+number and only one of them is free to move. `Arr::V4S` is where it is written
+down; this constant is that one, spelled where the loop transform needs it.
+
+**WHAT WAS MEASURED, and it is smaller than the shape promised.** On
+`z4_matmul_int`, jam alone takes 0.022 s to 0.019 s against gcc -O2's 0.007 —
+13%, not the 2.5x the instruction count suggested. The reason is visible in the
+result and is the next row: each lane gets its OWN strength-reduced pointer into
+`B`, four pointers advancing by the row stride, so the four loads are four
+addresses instead of four lanes of one. They differ by a CONSTANT — 4, 8, 12
+bytes — and sharing one pointer with an immediate displacement is what turns
+them back into one `ldr q`.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4, gcc 14.2.0 -O2.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer

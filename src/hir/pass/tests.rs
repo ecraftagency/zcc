@@ -2323,3 +2323,50 @@ fn a_map_loop_whose_streams_partly_overlap_takes_the_slow_arm() {
         t & 0xffff
     });
 }
+
+// ── jam ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn four_outer_iterations_share_one_inner_pass() {
+    // A matrix multiply, and a trip count that is NOT a multiple of the jam
+    // factor — so the scalar tail copy is exercised as well as the jammed nest.
+    let src = "static int A[64], B[64], C[64];                                                    \
+               void mm(int *c, const int *a, const int *b, int n){                                \
+                 int i,j,k;                                                                       \
+                 for(i=0;i<n;i++) for(j=0;j<n;j++){ int t=0;                                      \
+                   for(k=0;k<n;k++) t += a[i*n+k]*b[k*n+j]; c[i*n+j]=t; } }                       \
+               int main(void){ int i,t=0;                                                         \
+                 for(i=0;i<64;i++){ A[i]=(i*3+1)&15; B[i]=(i*5+2)&15; C[i]=0; }                   \
+                 mm(C,A,B,7); for(i=0;i<49;i++) t+=C[i]*(i+1); return t & 0xffff; }";
+    super::jam::set_wanted(Some(true));
+    let after = module(src, true);
+    let f = func(&after, "mm");
+    // NON-VACUITY: the jam appends parameters to the inner header, so the nest
+    // must now carry more than the two it started with.
+    let widest = f.blocks.iter().map(|b| b.params.len()).max().unwrap_or(0);
+    assert!(widest >= 4, "the nest was not jammed: widest block takes {} params", widest);
+    square(src, {
+        let mut a = [0i64; 64];
+        let mut b = [0i64; 64];
+        for i in 0..64i64 {
+            a[i as usize] = (i * 3 + 1) & 15;
+            b[i as usize] = (i * 5 + 2) & 15;
+        }
+        let n = 7i64;
+        let mut c = [0i64; 64];
+        for i in 0..n {
+            for j in 0..n {
+                let mut t = 0i64;
+                for k in 0..n {
+                    t += a[(i * n + k) as usize] * b[(k * n + j) as usize];
+                }
+                c[(i * n + j) as usize] = t;
+            }
+        }
+        let mut t = 0i64;
+        for i in 0..49 {
+            t += c[i] * (i as i64 + 1);
+        }
+        t & 0xffff
+    });
+}
