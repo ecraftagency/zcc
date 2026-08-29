@@ -53,9 +53,30 @@ enum Key {
     /// different register class's value, so the two never share.
     Fimm(u8, u64),
     Sym(Sym, bool),
+    /// A DIVIDE that isel minted, and the reason this pass numbers more than
+    /// constants. A64 has no remainder instruction, so `a % b` is expanded to a
+    /// divide plus an `msub` (C99 6.5.5p6, `isel/lower.rs`) — and a program that
+    /// also writes `a / b` gets the SAME divide twice, with no HIR value for
+    /// `hir/pass/gvn` to have numbered, because the first one only comes into
+    /// existence below isel. That pairing is not exotic: it is every integer
+    /// formatter, every base conversion, `do { d = u % 10; u /= 10; }`.
+    ///
+    /// Both operands must be virtual. A physical source is not an SSA value —
+    /// it is redefined again and again — so two divides naming the same `Reg::P`
+    /// are not the same computation.
+    Div(u8, u8, u32, u32),
 }
 
 /// THEORY A6b  SQUARE a_constant_already_materialized_is_not_materialized_again — a dominating constant
+///
+/// The square covers the divide rows too (`MEASURED M43`), and by the same
+/// argument. `MovImm`, `FMovImm` and `Adrp` are pure and constant; `udiv`/`sdiv`
+/// are pure and depend only on their two operands, which are MIR SSA values and
+/// therefore cannot have changed between the two instructions. Should the divide
+/// fault, the argument `hir/pass/gvn` already makes covers it unchanged: the
+/// DOMINATING copy executes first on every run that reaches the second, so it
+/// faults first and the run is ⊥ either way. Nothing is speculated and nothing
+/// observable moves.
 pub fn run(f: &mut MFunc) {
     // A/B while the trade is being measured: sharing buys a materialization and
     // pays in live range, and only the paired number says which wins.
@@ -141,6 +162,18 @@ pub fn run(f: &mut MFunc) {
     }
 }
 
+/// Follow `rename` to the definition that survives. Bounded: every link points
+/// at a STRICTLY dominating definition, so the chain cannot cycle.
+fn vres(mut v: u32, rename: &[Option<Reg>]) -> u32 {
+    for _ in 0..64 {
+        match rename.get(v as usize).copied().flatten() {
+            Some(Reg::V(n)) if n != v => v = n,
+            _ => return v,
+        }
+    }
+    v
+}
+
 fn visit(
     f: &mut MFunc,
     b: u32,
@@ -167,6 +200,28 @@ fn visit(
             MInst::Adrp { dst: Reg::V(d), sym, got } => {
                 (Key::Sym(sym.clone(), *got), Reg::V(*d), Width::W64)
             }
+            MInst::Alu {
+                op: op @ (AluOp::UDiv | AluOp::SDiv),
+                w,
+                dst: Reg::V(d),
+                a: Reg::V(x),
+                b: Rhs::Reg(Reg::V(y)),
+                flags: None,
+            } => {
+                // THE OPERANDS ARE READ THROUGH `rename`, and without that the
+                // divide rows fire on almost nothing. The divisor of `u % 10` is
+                // a literal, so isel mints a `MovImm` at EACH use; this pass
+                // merges those, but it applies the merge to the instruction
+                // stream only after the whole dominator walk. During the walk
+                // the two divides therefore still name two different vregs for
+                // the same ten, and two different vregs are two different keys.
+                // Resolving here costs a pointer chase and is exact: `rename`
+                // already holds the strictly-dominating definition, and it was
+                // filled in dominator order, so a divisor merged earlier is
+                // merged by the time its divide is reached.
+                let (rx, ry) = (vres(*x, rename), vres(*y, rename));
+                (Key::Div(*op as u8, *w as u8, rx, ry), Reg::V(*d), *w)
+            }
             _ => continue,
         };
         match table.get(&key) {
@@ -184,6 +239,9 @@ fn visit(
                     MInst::MovImm { w, imm, .. } => Key::Imm(*w as u8, *imm),
                     MInst::FMovImm { w, bits, .. } => Key::Fimm(*w as u8, *bits),
                     MInst::Adrp { sym, got, .. } => Key::Sym(sym.clone(), *got),
+                    MInst::Alu { op, w, a: Reg::V(x), b: Rhs::Reg(Reg::V(y)), .. } => {
+                        Key::Div(*op as u8, *w as u8, vres(*x, rename), vres(*y, rename))
+                    }
                     _ => unreachable!(),
                 }));
             }

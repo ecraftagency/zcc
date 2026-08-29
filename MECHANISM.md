@@ -3852,6 +3852,98 @@ both arms. Shipped together with `M40` behind one gate: 15/0 at FUZZ_N=300
 
 ---
 
+### M43. `a % b` and `a / b` are one divide, and no pass above isel could have seen it
+
+**VALUE.** `const_share` numbers `udiv`/`sdiv` as well as `MovImm`/`FMovImm`/`Adrp`.
+
+**THE DEFECT.** A64 has no remainder instruction, so `isel/lower.rs` expands
+`a % b` into a divide plus an `msub` (C99 6.5.5p6). A program that also writes
+`a / b` — every integer formatter, every base conversion — therefore gets the
+divide TWICE:
+
+```
+.Lmain_26:                          gcc .L3:
+  udiv x25, x21, x1     u/10          umulh x0, x22, x8
+  msub x25, x25, x1, x21  u%10        lsr   x0, x0, 3        u/10, twice
+  add  w25, w25, #48                  add   x3, x0, x0, lsl 2
+  add  w24, w23, #1                   sub   x3, x22, x3, lsl 1   u%10 FROM it
+  strb w25, [x10, w23, sxtw]          ...
+  udiv x21, x21, x1     u/10 AGAIN
+  cbnz x21, .Lmain_84
+```
+
+**WHY NO EARLIER PASS COULD FIX IT.** `hir/pass/gvn` numbers every pure
+expression against a dominating equal one, and it would have caught this
+instantly — except the first divide has no HIR value. It comes into existence
+BELOW isel, inside the rem expansion. This is the same gap `const_share` was
+built for and says so in its own header: value numbering "applied to the two
+instructions that have no HIR value to be numbered as". A divide minted by a rem
+is a third. The fix is four lines of key, not a new pass.
+
+**THE ONE THING THAT MADE IT FIRE, and without it the row is worth almost
+nothing.** The first implementation shared 5 divides on sqlite and **zero on
+`ab2_format`, the program it was built for.** The divisor of `u % 10` is a
+literal, so isel mints a `MovImm` at each use; `const_share` merges those, but it
+applies the merge to the instruction stream only AFTER the whole dominator walk.
+During the walk the two divides still name two different vregs for the same ten,
+and two different vregs are two different keys. Reading the operands through
+`rename` during the walk is exact — `rename` is filled in dominator order, so a
+divisor merged earlier is merged by the time its divide is reached — and it took
+the row from 5 shared divides to 43:
+
+| | before | after keys | after operands resolved |
+|---|---|---|---|
+| `ab2_format` `udiv` | 2 | 2 | **1** |
+| suite divides | 71 | 69 | **68** |
+| sqlite divides | 369 | 364 | **326** |
+| sqlite instructions | 177,169 | 177,164 | **177,130** |
+
+**WHAT IT BOUGHT** (interleaved, min of 21, against gcc -O1):
+
+| program | before | after |
+|---|---|---|
+| `ab2_format` | 1.389 | **1.227** |
+| `u2_div_var` | 1.096 | **0.825** |
+| `a2_udiv_mod` | 1.094 | 1.092 |
+| `a3_sdiv_mod` | 1.087 | 1.094 |
+
+Suite 96: EXEC 1.0599 → **1.0574**, median 1.042 → **1.036**, INSN 1.0935 →
+1.0929. **Both axes move the same way**, which is unusual enough to say why: this
+row deletes an instruction rather than moving one, so there is no pressure trade
+to pay for it — unlike `M42`, which buys time with size.
+
+**THE HAND-EDIT THAT AUTHORIZED THE BUILD, and it is the session's cleanest
+instance of Law 3c.** Before touching the compiler, the second `udiv` in
+`ab2_format`'s `.s` was replaced by hand with a `mov` from the first quotient:
+
+```
+Ir  gcc = 292,253,651    zcc = 254,959,510    hand-edited = 254,959,510
+    gcc -O1  17,704 us
+    zcc      24,217 us   1.368x
+    shared   21,875 us   1.236x
+```
+
+**The dynamic instruction count is IDENTICAL to the last instruction** — one
+`udiv` became one `mov` — and the program is 9.7 % faster. Count could not have
+found this row, and no count-based model can rank it. zcc already executed FEWER
+instructions than gcc here (Ir 0.931) while running 1.388× slower.
+
+**THE RESIDUAL (Law 3).** Sharing is cut at every `Call`, inherited from the
+constant rows where the trade is a materialization against one of ten
+callee-saved registers. A divide is not a constant: recomputing one costs a
+multi-cycle operation, not one instruction, so the cut is likely too
+conservative HERE and is category (b), not (a). It has not been measured
+separately. Also unclosed: gcc replaces the divide by a constant entirely
+(`umulh` + `lsr`), which `M25` built, measured and removed — `M42` has now met
+the first of the two preconditions `M25` set for rebuilding it, and this row
+removes half the divides that rewrite would have targeted.
+
+**WHEN / WHERE.** 2026-08-29, `main`, M1 Pro under Docker, aarch64-linux-gnu,
+gcc 14.2.0 -O1, musl in-box; 96/96 suite programs output-matched against gcc,
+cargo 208/0.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
