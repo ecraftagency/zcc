@@ -314,6 +314,7 @@ pub fn spill_with(
         let mut seeded = false;
         let mut nphi = 0usize;
         for round in 0..bound + f.vregs.len() + 2 {
+            SPILL_ROUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if round == bound && carry {
                 carry = false;
                 fell_back = true;
@@ -881,6 +882,12 @@ struct Res {
 /// Being derived from `wexit`, the set at a block is bounded by what a register
 /// file can hold, and mentions only values that block was live in — the
 /// bounded-height half of the termination argument in `spill_with`.
+/// THEORY A7 — instrument half. How many spiller rounds the whole translation
+/// unit ran, read with `ZCC_ACOUNT`: the spiller is the largest single phase of
+/// a compile, and the question "is it more rounds or a costlier round" is one a
+/// count answers and a stopwatch cannot.
+pub static SPILL_ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn simulate(
     f: &MFunc,
     lv: &live::Liveness,

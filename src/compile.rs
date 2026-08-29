@@ -98,10 +98,11 @@ pub fn acount() {
     use std::sync::atomic::Ordering::Relaxed;
     let b = &crate::cfg::BUILDS;
     eprintln!(
-        "[acount] cfg {} domtree {} loops {}",
+        "[acount] cfg {} domtree {} loops {} spillrounds {}",
         b[0].load(Relaxed),
         b[1].load(Relaxed),
-        b[2].load(Relaxed)
+        b[2].load(Relaxed),
+        crate::regalloc::spill::SPILL_ROUNDS.load(Relaxed)
     );
 }
 

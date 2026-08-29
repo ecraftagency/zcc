@@ -290,6 +290,23 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
     // lifted again by the enclosing loop's turn
     let mut order: Vec<usize> = (0..lf.loops.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(lf.loops[i].depth));
+    // WHICH BLOCKS EACH LOOP CONTAINS, asked once for the function instead of
+    // once per loop. The predicate is unchanged — a block belongs to `li` when
+    // `li` lies on the parent chain of the innermost loop holding it — but asked
+    // as a SCAN it cost (loops × blocks × depth), which is the defect shape
+    // `MECHANISM.md` Part G §G0 names: a whole-function walk inside a per-item
+    // loop. Inverted into an index it is one walk, O(blocks × depth). Blocks are
+    // appended in ascending order and read back in it, so the lifted constants
+    // arrive at the preheader in exactly the order the scan delivered them —
+    // byte-identical by construction rather than by measurement.
+    let mut members: Vec<Vec<MBlockId>> = vec![Vec::new(); lf.loops.len()];
+    for b in 0..f.blocks.len() {
+        let mut cur = lf.of[b];
+        while let Some(y) = cur {
+            members[y as usize].push(b as MBlockId);
+            cur = lf.loops[y as usize].parent;
+        }
+    }
     for li in order {
         let head = lf.loops[li].header;
         let inloop = |b: MBlockId| -> bool {
@@ -321,10 +338,12 @@ pub fn hoist_invariant_consts(f: &mut MFunc, a: &mut crate::mir::MAnalyses) -> u
             continue;
         }
         let mut lifted: Vec<MInst> = Vec::new();
-        for b in 0..f.blocks.len() {
-            if !inloop(b as MBlockId) || b == pre as usize {
+        for &blk in &members[li] {
+            let b = blk as usize;
+            if b == pre as usize {
                 continue;
             }
+            debug_assert!(inloop(blk), "members[] and inloop disagree at b{}", b);
             let mut keep: Vec<MInst> = Vec::with_capacity(f.blocks[b].insts.len());
             for inst in std::mem::take(&mut f.blocks[b].insts) {
                 match &inst {
