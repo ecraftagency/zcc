@@ -304,6 +304,27 @@ fn strengthen(
             if matches!(addr, Operand::Val(v) if s.ivs.contains_key(&v)) {
                 continue;
             }
+            // A CONSTANT DISPLACEMENT FROM A POINTER THAT ALREADY WALKS is the
+            // same refusal one step out, and `jam` is what made it matter: four
+            // jammed lanes read `p`, `p+4`, `p+8`, `p+12` of one row. Each is one
+            // `add` from a pointer already advancing, and isel folds a constant
+            // displacement into the load itself (`AddrMode::BaseImm`), so that
+            // add costs nothing. Giving each lane its own recurrence rebuilds
+            // four pointers where one serves and pays a register and an increment
+            // per lane — measured on `z4_matmul_int`, sixteen instructions per
+            // four outer iterations where twelve do (`MEASURED M55`).
+            if let Operand::Val(v) = addr {
+                if let Def::Inst(ab, ai) = f.values[v as usize].def {
+                    if let Some(Inst::Bin { op: BinOp::Add, a, b: Operand::Imm(_), .. }) =
+                        f.blocks[ab as usize].insts.get(ai as usize)
+                    {
+                        if matches!(a, Operand::Val(p) if s.ivs.contains_key(p)) {
+                            residual("displacement-from-an-existing-walk");
+                            continue;
+                        }
+                    }
+                }
+            }
             let (bases, off, step) = match affine(&s, f, addr) {
                 Some(a) => a,
                 None => {

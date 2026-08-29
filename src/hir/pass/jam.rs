@@ -571,9 +571,42 @@ fn jam(f: &mut Func, nst: &Nest) {
         let a = f.new_value(f.ty_of(acc), Def::Param(nst.inner, 0));
         f.blocks[inner].params.push(a);
         map.insert(acc, a);
+        // A CARRIER THAT ONLY SHIFTS BY A CONSTANT DOES NOT NEED A COPY.
+        //
+        // `z4_matmul_int`'s pointer into `B` starts at `base + (j << 2)` and
+        // advances by the row stride. Lane `l`'s copy therefore starts exactly
+        // `l << 2` bytes further on and advances by the same stride — so the four
+        // pointers stay a constant apart forever, and one pointer with a
+        // DISPLACEMENT is the same four addresses. isel folds the displacement
+        // into the load (`AddrMode::BaseImm`), so the three extra addends cost
+        // nothing and three of the four pointer updates disappear: sixteen
+        // instructions per four outer iterations become twelve.
+        //
+        // The pattern is checked, not assumed, and when it does not hold the
+        // lane gets its own parameter exactly as before — the general path is
+        // still the correct one, this is only the cheap case of it.
         let mut cp: Vec<ValueId> = Vec::new();
         for &k in &carriers {
             let old = iparams[k];
+            if std::env::var_os("ZCC_JAMDBG").is_some() {
+                let init = to_inner_args[k];
+                let d = if let Operand::Val(v) = init { format!("{:?}", f.values[v as usize].def) } else { "imm".into() };
+                eprintln!("[jam] carrier k={} init={:?} def={} j=v{} delta={:?}", k, init, d, j, lane_delta(f, init, j, l as i64));
+            }
+            if let Some(delta) = lane_delta(f, to_inner_args[k], j, l as i64) {
+                let ty = f.ty_of(old);
+                let at = f.blocks[inner].insts.len() as u32;
+                let d = f.new_value(ty, Def::Inst(nst.inner, at));
+                f.blocks[inner].insts.push(Inst::Bin {
+                    dst: d,
+                    op: BinOp::Add,
+                    ty,
+                    a: Operand::Val(old),
+                    b: Operand::Imm(delta),
+                });
+                map.insert(old, d);
+                continue;
+            }
             let np = f.new_value(f.ty_of(old), Def::Param(nst.inner, 0));
             f.blocks[inner].params.push(np);
             map.insert(old, np);
@@ -614,11 +647,17 @@ fn jam(f: &mut Func, nst: &Nest) {
         // (e) what the entry edge hands this lane, and (f) what its back edge does
         let mut init = vec![to_inner_args[nst.accp]];
         for &k in &carriers {
+            if lane_delta(f, to_inner_args[k], j, l as i64).is_some() {
+                continue;
+            }
             init.push(sub(to_inner_args[k]));
         }
         lane_init.push(init);
         let mut back = vec![sub(accnext)];
         for &k in &carriers {
+            if lane_delta(f, to_inner_args[k], j, l as i64).is_some() {
+                continue;
+            }
             back.push(sub(iback_args[k]));
         }
         lane_exit.push(back[0]);
@@ -819,6 +858,44 @@ fn jam(f: &mut Func, nst: &Nest) {
     f.blocks[nst.tail as usize].term = tt;
 
     let _ = nst.tailp;
+}
+
+/// How far lane `l`'s copy of a carrier sits from lane 0's, when that distance is
+/// a CONSTANT. The initial value must be `X + (j << k)` or `X + j` — the shapes a
+/// strength-reduced array pointer has — and then lane `l` starts `l << k` (or `l`)
+/// further on. `None` means the general path: give the lane its own parameter.
+fn lane_delta(f: &Func, init: Operand, j: ValueId, l: i64) -> Option<i64> {
+    let v = match init {
+        Operand::Val(v) => v,
+        _ => return None,
+    };
+    let (b, i) = match f.values[v as usize].def {
+        Def::Inst(b, i) => (b as usize, i as usize),
+        _ => return None,
+    };
+    let (a, bb) = match f.blocks[b].insts.get(i) {
+        Some(Inst::Bin { op: BinOp::Add, a, b, .. }) => (*a, *b),
+        _ => return None,
+    };
+    // one side invariant, the other the scaled counter
+    for (_x, y) in [(a, bb), (bb, a)] {
+        match y {
+            Operand::Val(w) if w == j => return Some(l),
+            Operand::Val(w) => {
+                if let Def::Inst(sb, si) = f.values[w as usize].def {
+                    if let Some(Inst::Bin { op: BinOp::Shl, a: sa, b: Operand::Imm(k), .. }) =
+                        f.blocks[sb as usize].insts.get(si as usize)
+                    {
+                        if *sa == Operand::Val(j) {
+                            return Some(l << *k);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Rewrite an instruction's destination. `Inst` has no setter, and the jam needs
