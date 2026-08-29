@@ -1,6 +1,6 @@
 // EXT — the home for substantial extension logic under the decoupling rule
 // THEORY II-6 — the GCC/vendor nonconforming surface
-// (CLAUDE.md): the core (parser/codegen) may only call INTO here; removing this
+// (Article D): the core (parser/codegen) may only call INTO here; removing this
 // file plus the touchpoints marked EXT(...) in the core leaves a pure C89
 // compiler. Small touchpoints (1-3 lines) stay in place with a marker; only logic
 // of sufficient bulk is moved here.

@@ -22,7 +22,10 @@
 #define DBL_MIN 2.2250738585072014e-308
 #define DBL_MAX 1.7976931348623157e+308
 /* long double: on ELF = binary128 at the ABI/memory boundary, but arithmetic
-   stays double (LDBL_MANT_DIG 53) — self-consistent under C99, see CLAUDE.md */
+   stays double, so LDBL_MANT_DIG is 53 and not 113. Conforming: C99 5.2.4.2.2
+   requires only long double >= double, and the header must describe the
+   arithmetic the compiler performs, not the storage the ABI reserves. The
+   layout stays binary128 so objects interoperate with gcc's. MECHANISM.md */
 #define LDBL_MANT_DIG 53
 #define LDBL_DIG 15
 #define LDBL_MIN_EXP (-1021)
