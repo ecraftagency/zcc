@@ -13,8 +13,26 @@ set -eu
 HERE=$(CDPATH= cd "$(dirname "$0")" && pwd)
 cd "$HERE"
 
-REGION=$(terraform output -raw region 2>/dev/null || echo "${REGION:-ap-southeast-1}")
+# THE REGION, AND WHY THIS IS NOT A ONE-LINER.
+#
+# This read `terraform output -raw region 2>/dev/null || echo ...`. After a
+# SUCCESSFUL destroy the state has no outputs left, so terraform writes a
+# multi-line warning to STDOUT, `-raw` still exits 0, and REGION became the
+# warning text. The sweep then queried a garbage region, found nothing there,
+# and printed CLEAN — at the exact moment the operator most needs the truth.
+# Observed 2026-08-29; the box was in fact clean, but the instrument could not
+# have known that.
+#
+# Fixed three ways: stdout AND stderr are discarded, the result is checked to
+# LOOK like a region, and the default is the project's own (Article: AWS is
+# us-west-2 only). A sweep that cannot name its region refuses to run.
+REGION=$(terraform output -raw region 2>/dev/null | head -1)
+case "$REGION" in
+    [a-z][a-z]-[a-z]*-[0-9]) ;;                 # looks like a region
+    *) REGION="${REGION_OVERRIDE:-us-west-2}" ;;
+esac
 export AWS_DEFAULT_REGION="$REGION"
+echo ">> region: $REGION"
 
 if [ "${1:-}" != "--verify" ]; then
     echo ">> terraform destroy (region $REGION)"
