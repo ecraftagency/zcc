@@ -4,13 +4,28 @@
 
 variable "region" {
   description = <<-EOT
-    AWS region. us-east-2 (Ohio) — cheapest c7g.8xlarge spot (measured 2026-08:
-    $0.342/hr vs $0.398 us-east-1, $0.424 us-west-2, $0.627 ap-southeast-1). The batch
-    needs no network proximity, and the key pair is uploaded fresh per-region, so cost is
-    the only criterion.
+    us-west-2 (Oregon), and this is an OPERATOR RULE with no exceptions, not a cost
+    optimization: **every AWS resource this project creates lives in us-west-2.**
+    One region means one place to audit and one place to sweep, and the incident
+    that motivates it is on record — an unqualified CLI call (the AWS default is
+    whatever the profile says, NOT this variable) reached a production account in
+    another region. Never pass a different region to `terraform apply`, and always
+    pass `--region us-west-2` to a bare `aws` call.
+
+    The earlier cost note is kept because the number is still true and someone will
+    otherwise re-derive it: us-east-2 was measured cheapest for c7g.8xlarge spot in
+    2026-08 ($0.342/hr vs $0.398 us-east-1, $0.424 us-west-2, $0.627 ap-southeast-1).
+    The rule outranks the saving.
+
+    AND THE AZ SPREAD INSIDE ONE REGION IS WIDER THAN THE REGION SPREAD, measured
+    2026-08-29 for c8gd.2xlarge in us-west-2: 2b $0.0650, 2c $0.0694, 2a $0.0911,
+    2d $0.1375 — a 2.1x range. Nothing here pins an AZ, so a run lands wherever the
+    default subnet puts it (the 2026-08-29 benchmark box landed in 2a, 40% over 2b).
+    Pin the cheap AZ with a subnet_id if the box is long-lived; under an hour the
+    difference is a few cents and not worth the coupling.
   EOT
   type    = string
-  default = "us-east-2"
+  default = "us-west-2"
 }
 
 variable "instance_type" {
@@ -26,13 +41,40 @@ variable "instance_type" {
         40k IOPS on EBS costs ~10x the box (io2 ~$3.6/hr vs spot ~$0.59/hr). The NVMe ships
         FREE, gives ~1000x the IOPS headroom, and is ephemeral (self-cleaning on terminate).
         cloud-init mounts it at /mnt/nvme; run-fuzz points target/, corpus, TMPDIR there.
-      - 64 vCPU (not 32): the 1000 CALIBRATION run must measure the SAME hardware the 10000
-        seal runs on (faithful t̄ — 64-way memory/NVMe contention included). Spot quirk: 16xl
-        is cheaper PER CORE than 8xl ($0.586/64 < $0.348/32), so 64c wins on cost AND wall.
-        The harness reads nproc; nothing else changes with size.
+    TWO SIZES, ONE FAMILY — and the family is the part that must not change, because
+    cloud-init's NVMe mount and every `/suites` path key off the ".d" instance store.
+    Only the size moves:
+
+      - `c8gd.8xlarge` (32 vCPU) — the csmith/yarpgen 10k seal. Operator-set size.
+        A per-core cost argument favours 16xl on paper (spot $0.586/64 < $0.348/32),
+        and it is recorded here so nobody re-derives it as if it were new; the
+        operator sets 8xl anyway, and a rule beats a paper saving.
+      - `c8gd.2xlarge` (8 vCPU) — the sqlite / suite EXEC measurement. This use wants
+        a QUIET core, not many of them: it is a second microarchitecture (Graviton4 =
+        Neoverse V2) standing beside the M1 Pro, and every extra vCPU is idle cost.
+        Measured 2026-08-29, us-west-2a: total $0.0944/hr = $0.00157/min (spot
+        $0.0911 + gp3 30GB $0.00329). zcc builds native there in 8.5 s — no external
+        crates, so a release build is one rustc invocation.
+
+    SPOT IS RECLAIMED, AND ON A MEASUREMENT RUN THAT COSTS MORE THAN THE SAVING.
+    Measured 2026-08-29: a c8gd.2xlarge one-time spot box in us-west-2a was
+    terminated by AWS ("Service initiated") after ~15 minutes, mid-session. For the
+    fuzz seal that is survivable — the batch is restartable and the verdict is the
+    only artefact. For BENCHMARKING it is not free: an interrupted interleaved pair
+    is not half a measurement, it is no measurement. Write the remote work as ONE
+    batch that prints each result as it finishes, so a reclaim costs the tail and
+    not the run. On-demand is ~2x spot and removes this entirely; the operator has
+    chosen spot, and this note is here so the choice stays informed.
+
+    THE NVMe IS EPHEMERAL AND THAT IS THE POINT. It costs nothing because it is
+    instance store: it is wiped on stop and gone on terminate, so ANY result left
+    only on /mnt/nvme is lost with the box. Pull verdicts and artefacts back over
+    ssh before `terraform destroy` — run-fuzz.sh's rsync-back exists for exactly
+    this. What it buys is ~1000x the IOPS headroom of the 3000-IOPS gp3 root, free;
+    provisioning that on EBS (io2 ~$3.6/hr) would cost 38x the whole box.
   EOT
   type        = string
-  default     = "c8gd.16xlarge"
+  default     = "c8gd.8xlarge"
 }
 
 # Seed count is NOT a Terraform var — it is a run-fuzz.sh argument (default 1000), so a box

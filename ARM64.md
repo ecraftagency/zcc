@@ -46,6 +46,29 @@ table to transcribe. What follows is only what has been MEASURED, with the
 program that measured it. Anything not listed here is **not known** — do not
 reason from a number that is not on this list.
 
+**AND THERE ARE NOW TWO CORES, WHICH IS THE POINT OF THE SECTION.** Every row
+below was taken on an Apple M1 Pro; on 2026-08-29 the same `latency.sh` ran on a
+Graviton4 (Neoverse V2) and two rows do not survive the crossing. The section's
+own standing caution — *a measured fact is evidence about the measuring machine
+first* — is no longer a caution, it is a measurement (`MEASURED M46`).
+
+| form, in units of a dependent `add` | M1 Pro | Neoverse V2 |
+|---|---|---|
+| `add xN, xN, wM, sxtw` | 2.00 | 2.00 |
+| `mul` | ≈1 ("about an `add`") | **2.00** |
+| `udiv` / `sdiv` | ≈2 (inferred, `M25`) | **4.98** |
+| `load` from L1 | — | 3.98 |
+| `csel`, `sxtw`, `ubfx`, `rev`, `lsl` | — | 1.00 |
+| `madd`, accumulator operand | — | 1.00 |
+| `madd`, multiplicand operand | — | 2.00 |
+
+**The divider is the row that cost a decision.** `M25` removed
+Granlund–Montgomery division-by-constant because "the divider on this core is not
+slow… the folklore is a Cortex-A53-era fact". That sentence is true of the M1 Pro
+and false of Neoverse V2 by a factor of five, and `a2_udiv_mod` runs at **4.50x**
+gcc -O1 there against 1.12x on the M1. **A row deleted on one core's evidence is a
+row deleted on one core's evidence.**
+
 | fact | measured | entry |
 |---|---|---|
 | `add xN, xN, wM, sxtw` costs **2 cycles** where `add xN, xN, xM` costs 1 | j3_prefix_sum: recurrence bound predicted 2.0 → 1.0, measured **1.940 → 1.000** (3% error) | `MEASURED M1` |

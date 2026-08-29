@@ -10,7 +10,9 @@ where a derivation lives, for a reader who wants one.
 
 **Operating:** run one thing, wait, report it — detach only on request, and say
 so. Parallel work makes it cheap to start things and expensive to stay aimed.
-**AWS: `us-east-2` only.**
+**AWS: `us-west-2` only, no exceptions** — one region to audit, one to sweep; a
+bare `aws` call takes the profile's default region, not this rule, so always pass
+`--region us-west-2`.
 
 ## Law 0 — purity is the precondition
 

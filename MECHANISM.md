@@ -4118,6 +4118,85 @@ machine after the stuck `callgrind` job of `M42` was killed.
 
 ---
 
+### M46. A second core, and two of the biggest rows in the project were invisible on the first one
+
+**WHY A SECOND CORE AT ALL.** Every performance number this project has ever
+taken was measured on an Apple M1 Pro, under Docker, on a laptop running a UI.
+`ARM64.md` §2 says so in its own standing caution — *a measured fact is evidence
+about the measuring machine first* — and until 2026-08-29 nobody had tested it.
+A Graviton4 (Neoverse V2) spot box in us-west-2 costs **$0.00157 per minute** and
+runs zcc's exact target natively, no emulation and no container.
+
+**THE CONTROL THAT MAKES THE COMPARISON WORTH ANYTHING.** Same binaries, same
+Debian 13, same gcc 14.2.0 -O1 referee, same 96 programs:
+
+| | M1 Pro | Graviton4 |
+|---|---|---|
+| **INSN geomean** | 1.0751 | **1.0751** |
+| EXEC geomean | 1.0686 | **1.1716** (three runs: 1.1712 / 1.1718 / 1.1719) |
+| programs above 1.1x | 34 | **49** |
+| worst | `z2_rle` 1.61 | **`a2_udiv_mod` 5.52** |
+
+**The instruction counts agree to four figures**, because they are the same
+binaries. So the entire EXEC difference is microarchitecture, measured rather
+than argued. And the quiet box is a better instrument than the laptop: the
+three-run spread is **0.0007**.
+
+**THE TWO ROWS, both at 4.5x, both hand-edited to parity, both invisible on the M1.**
+
+| program | M1 Pro | Graviton4 | hand-edited on Graviton4 |
+|---|---|---|---|
+| `i1_global_acc` | **0.709** (zcc BEAT gcc) | 4.507 | **1.015** |
+| `a2_udiv_mod` | 1.12 | 4.504 | **1.021** |
+
+*`i1_global_acc`* is `gsum += gtab[i&255]` in a loop, `gsum` a global. gcc loads
+it once into a register before the loop and stores once after; zcc emits `ldr` and
+`str` on the accumulator EVERY iteration, putting a memory round trip on the
+loop-carried dependence. The M1's store-to-load forwarding hides it so completely
+that zcc was 30% FASTER there. Neoverse V2 charges for it: 4.5x. The fix needs no
+alias analysis — `gsum` and `gtab` are distinct declared objects and C says they
+cannot alias — and it is Law 3c's opening rule applied to memory: *never leave a
+multi-cycle operation in front of a loop-carried value.* Hand-edited (load hoisted
+to the preheader, store sunk past the latch): **4.507 → 1.015**.
+
+*`a2_udiv_mod`* is division by a constant. `M25` built Granlund–Montgomery,
+proved it over every divisor 3..2000, measured it, and REMOVED it, on this
+reasoning: *"AND THE DIVIDER ON THIS CORE IS NOT SLOW, which is the fact the
+textbook assumes and this machine denies… The folklore is a Cortex-A53-era fact;
+it is not a fact about this core."* Every word of that is true about the M1 Pro.
+`latency.sh` on Neoverse V2 measures `udiv` at **4.98 dependent adds**, and the
+same hand-edit that bought 4.5% on the M1 buys **4.504 → 1.021** here.
+
+**THE LATENCY TABLE, second column** (`ARM64.md` §2 now carries it): `mul` is
+2.00 on V2 against "about an `add`" on the M1; `udiv`/`sdiv` 4.98 against an
+inferred ≈2; `add …, sxtw` is 2.00 on both. `nop_control` reads 0.11, so the
+harness is not measuring itself.
+
+**WHAT THIS CHANGES, and it is not a small correction.** Roughly 3.9% of the
+Graviton suite geomean sits in three programs — `i1_global_acc`, `a2_udiv_mod`,
+`a3_sdiv_mod` — against the 0.74% that a full day of grinding on the M1 produced.
+**Neither row was findable on the M1 at all**: one of them showed zcc WINNING.
+
+**THE RULE.** A row may not be deleted on one core's evidence, and a suite
+geomean may not be quoted without naming the core (Law 3c already said the second
+half). The M1 Pro is a laptop; the notional target is generic AArch64-Linux, of
+which Neoverse is far more representative. Where the two disagree, the server
+core decides — and where a row is cheap on both, it ships regardless.
+
+**COST AND OPERATIONS.** $0.00157/min all-in (spot $0.0911/hr + gp3 30 GB
+$0.0033/hr; the instance-store NVMe is free and dies with the box). A one-time
+spot box was reclaimed by AWS after ~15 minutes mid-session, which for a
+benchmark is not half a measurement but none — remote work goes in ONE batch that
+prints as it finishes. Details are commented in `tests/tf/variables.tf`, not in a
+document of their own.
+
+**WHEN / WHERE.** 2026-08-29, `main` at `rc9`, c8gd.2xlarge spot in us-west-2,
+Debian 13 trixie arm64, gcc 14.2.0 -O1, zcc built native (8.5 s, no external
+crates). Hand-edited `.s` assembled with gcc; every variant output-gated against
+gcc before timing; best of 21.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer
