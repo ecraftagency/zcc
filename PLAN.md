@@ -47,23 +47,17 @@ sharing, and no place to put a fourth analysis when one is needed. **The structu
 is what is holding the passes down, not their absence.** Three measurements on
 2026-08-29 point at that one fact.
 
-* **`M44`** — the loop-constant hoist was reverted for **+28.7% of sqlite's
-  compile time**. It builds `cfg` + `DomTree` + `LoopForest` per function, and
-  `const_share::run` immediately before it has already built the first two. A
-  cycle-test early-out was written to skip loopless functions and measured at
-  **ZERO**: an amalgamation's functions mostly DO have loops, so the cost is the
-  analysis itself and not the wasted calls.
-* **`M53` and `unroll.rs:242`** — two passes carry a comment saying they are
-  blocked by the same missing capability, SSA reconstruction. `tailjump` refuses
-  any block whose definitions are used past an immediate successor and therefore
+* **`M44`** — the hoist cost **+28.7% of sqlite's compile time** because it
+  rebuilds `cfg` + `DomTree` + `LoopForest` per function, after `const_share::run`
+  has just built the first two. A cycle-test early-out to skip loopless functions
+  measured at **ZERO**: the cost is the analysis, not the wasted calls.
+* **`M53`, `unroll.rs:242`** — both blocked by SSA reconstruction. `tailjump`
   stops at the one block worth duplicating, with `M52`'s counters saying **1.95×
   the instructions** are on the table at `m2_http_parse`.
-* **The 1.1× target** — 33 of 96 programs are above 1.3× against `gcc -O2` and
-  they are dominated by vectorization. `slp.rs` is BUILT; what it lacks is an
-  alias oracle sharp enough to prove two accesses independent (TBAA, also built,
-  also off) and a loop-level dependence test to sit beside it. Both want the same
-  substrate, and building them on per-pass rebuilds would make the compile-time
-  problem structural rather than incidental.
+* **The 1.1× target** — 33 of 96 are above 1.3× against `gcc -O2`, dominated by
+  vectorization. `slp.rs` is BUILT; it lacks an oracle sharp enough to prove two
+  accesses independent (TBAA, also built, also off) and a loop dependence test
+  beside it. Both want this substrate.
 
 **WHAT THE LAYER IS.** One owner for dominance, loops, and SSA repair, held
 across a function's pass pipeline and INVALIDATED rather than rebuilt:
@@ -77,13 +71,12 @@ across a function's pass pipeline and INVALIDATED rather than rebuilt:
      **START HERE: read `promote` and answer one question — does it factor, or is
      its pruning too tied to a `Piece`?** That answer decides whether this grind
      is small or medium, and it is one reading of one function.
-  3. **A place for dependence analysis to live**, which is what the vectorizer
-     will need and what nothing today could host.
+  3. **A place for dependence analysis to live**, beside the SLP that is already
+     written.
 
-**THE SEAM RULE, carried over from Article B.** A pass may READ the layer and must
-DECLARE what it invalidates. A pass that rebuilds an analysis privately is the
-defect this grind exists to remove, and the reviewer's question for every diff is
-"what did this pass rebuild that it could have read?"
+**THE SEAM RULE (Article B).** A pass READS the layer and DECLARES what it
+invalidates. The reviewer's question for every diff: *what did this pass rebuild
+that it could have read?*
 
 **HOW IT IS PROVEN, and this is not negotiable for a re-architecture.** The
 HIR/MIR split shipped byte-identical (`refactor_gate`), and so does this: caching
@@ -105,15 +98,11 @@ the Graviton box. **Any codegen change is a bug in the caching, not a bonus.**
 `better ground for optimization ∧ easier proof` (Article G), and it must be
 reported that way — no number is claimed for it beyond compile time.
 
-**THE FALLBACK IF THE FACTORING IS HARD.** "Remat, then duplicate" for `tailjump`
-alone: copy the dispatch's load down into each arm that uses it, removing the
-live-out. Free on the clock — every path still executes one load, only static size
-grows. Built and REVERTED on 2026-08-29 when the first cut deleted the load
-without placing it and `m2` hung. **The idea is sound and that implementation was
-not**; it starts from the failure, which was in the use-rewriting.
+**FALLBACK if the factoring is hard.** "Remat, then duplicate" for `tailjump`
+alone — copy the dispatch's load into each arm that uses it, removing the
+live-out; free on the clock. Built and REVERTED 2026-08-29: the first cut deleted
+the load without placing it and `m2` hung. Idea sound, implementation was not.
 
-**Method, unchanged and it is what found everything this month:** census the
-corpus BEFORE building (`M51`); hand-edit the `.s` and verify the output before
-touching the compiler; interleaved best-of-N on an idle box; `perf` when the axes
-disagree (`M52`). And read the harness's own summary line — three times in one
-session an instrument spoke and was not heard.
+**Method:** `M51` (census before building), `M52` (`perf` when the axes disagree),
+and read the harness's own summary line — three times in one session an instrument
+spoke and was not heard.
