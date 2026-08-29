@@ -3978,13 +3978,22 @@ real program.** Reverted the same session. `M42` is not withdrawn — it is pric
 |---|---|---|
 | suite 96, EXEC geomean | 1.0762 | **1.0682** |
 | sqlite CLI runtime, 3 interleaved pairs | 1.1847 | 1.1863 |
-| **sqlite compile, `-S`, best of 3** | **7.95 s** | **9.99 s** |
+| **sqlite compile, `-S`, best of 3, idle machine** | **6.77 s** | **8.72 s** |
 
-**+26% of compile time for a row that is neutral on the application.** The
-bisection is unambiguous: the same binary with this seam left off returns 7.95 s
-exactly, and `ZCC_NOSHARE=1` — which disables the constant sharing but not the
-hoist — makes it worse still at 10.26 s, so the cost is this row and nothing else
-in the session.
+**+28.7% of compile time for a row that is neutral on the application.** The
+bisection is unambiguous: the same binary with this seam left off returns 6.77 s,
+matching the session's first commit to 0.2%, and `ZCC_NOSHARE=1` — which disables
+the constant sharing but not the hoist — makes it worse still, so the cost is
+this row and nothing else in the session.
+
+**THE FIRST READING OF THIS ROW WAS TAKEN ON A BUSY MACHINE** — 7.95 s against
+9.99 s, +26% — while the stuck `callgrind` job of `M42` held a core. Re-taken
+idle, the absolute times fall by 15% and the RATIO grows slightly. Recorded
+because it is the useful shape of the contamination: a shared background load
+moves both arms of an interleaved pair together, so it inflates absolute times
+and leaves a large ratio roughly intact. It is fatal to a 1% question and nearly
+harmless to a 26% one — which is why `M42`'s suite pairs had to be thrown out and
+this bisection did not.
 
 **WHY LAW 0 DOES NOT SAVE IT.** `purity ≫ exec > size > compile speed` ranks exec
 above compile time, so a real exec win could buy a compile regression. There is
