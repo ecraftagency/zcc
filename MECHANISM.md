@@ -4712,6 +4712,72 @@ them back into one `ldr q`.
 
 ---
 
+### M56. The four jammed lanes became one vector multiply-accumulate, and the row landed where it was priced
+
+**THE FACT.** `mir::pass::vecmla` recognizes, on SSA MIR before register
+allocation, four unit-strided 32-bit loads at one base with displacements
+`0,4,8,12`, four `MAdd` sharing one other operand, and four loop-carried block
+parameters they accumulate into. It replaces them with one `Load` of `MemOp::Q`,
+one `VDup`, a `VInt::Mul` and a `VInt::Add` over ONE `Q` parameter, and extracts
+the four lanes at the exit edge with `VExt` — `umov`, added with the same
+assembler check the rest of the vector forms got.
+
+**THE PRICE WAS TAKEN ON THE MODEL FIRST, and it was honest.** PLAN.md predicted
+`z4_matmul_int` would reach about **1.4–1.5x**, not 1.0x, because the form still
+costs a `dup` and a `q` load per four lanes. Measured: **2.932 -> 1.370**. Suite
+EXEC geomean 1.2245 -> 1.2168 in the interleaved pair, INSN 1.0154 -> 1.0147, and
+`z4` stopped being the worst program in the suite.
+
+**THE DEFECT IT COST, and it is a Law-2 Side-I.** The first cut indexed the exit
+block's arguments with the back edge's parameter layout. A back edge and an exit
+edge do not carry the same parameters, and the pass panicked on an out-of-bounds
+index rather than producing a wrong answer — which is the shape a block-parameter
+IR gives this class of mistake, and the reason it was found in minutes.
+
+**THE UNIT TEST COULD NOT BE WRITTEN NAIVELY.** The pattern only exists after
+`jam` has run and after the `iv` displacement row has folded the four walks onto
+one base, so the battery's fixture needs the whole HIR ladder, 64-bit loop
+indices, and a non-power-of-two stride — a hand-built MIR function reaches the
+recognizer and matches nothing. Recorded because the same will be true of every
+later MIR row that consumes a HIR transform's output.
+
+**WHEN / WHERE.** 2026-08-29, `main` `dd80a8d`, c8gd.4xlarge Graviton4, gcc
+14.2.0 -O2, 96-program taxonomy suite. Gate 16/0.
+
+---
+
+### M57. The map vectorizer was built, switched on, and bought nothing — twice
+
+**THE FACT.** `hir::pass::vecmap` — four lanes at a time through a unit-stride
+map loop — has shipped default-OFF since it was written, pending its A/B. The A/B
+was run: two interleaved OFF/ON pairs over the 96-program suite.
+
+| | EXEC | INSN |
+|---|---|---|
+| OFF pass 1 | 1.2014 | 1.0147 |
+| ON  pass 1 | 1.2021 | **1.0178** |
+| OFF pass 2 | 1.2107 | 1.0147 |
+| ON  pass 2 | 1.2081 | **1.0178** |
+
+**READ THE DETERMINISTIC COLUMN.** EXEC moves by less than its own ±0.007 spread
+and changes sign between the pairs, which is the definition of no signal. INSN is
+a fold over the emitted stream with no measurement noise at all, and it is worse
+by 0.31% in both directions — the guard, the tail and the vector prologue are
+real code and nothing pays for them. The row stays off.
+
+**WHY IT MISSED, and the census said so before the clock did.** `vecprobe` finds
+59 `map` loops in the suite and 54 in sqlite, so the shape is not rare — but on
+the seven programs whose measured gap is largest, `ZCC_VECMAP=1` emits **zero**
+vector instructions. Every one of those seven carries a value across the back
+edge, which is what makes them `reduce` and not `map`. A pass can fire on a
+hundred sites and still miss the ones that are hot; a site count is demand for
+BUILDING a row and is not evidence the row will pay.
+
+**WHEN / WHERE.** 2026-08-29, `main` `dd80a8d`, c8gd.4xlarge Graviton4, gcc
+14.2.0 -O2, `ZCC_VECMAP=1`.
+
+---
+
 ---
 
 # Part G — the pipeline, layer by layer

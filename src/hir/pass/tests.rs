@@ -2374,6 +2374,46 @@ fn four_outer_iterations_share_one_inner_pass() {
     });
 }
 
+// ── redjam ────────────────────────────────────────────────────
+
+#[test]
+fn four_lanes_share_one_counted_reduction() {
+    // `a1_int_mix`'s shape at a length the interpreter can run, and a trip count
+    // that is NOT a multiple of four — so the scalar TAIL runs as well as the
+    // jammed block, and a bound below four exercises the entry guard's other arm.
+    let src = "long work(int n){ long s=0; int i;                                                 \
+                 for(i=1;i<=n;i++){ short a=(short)(i*3); char b=(char)(i&7);                     \
+                   s += (long)a - b + (i%5); }                                                    \
+                 return s; }                                                                      \
+               int main(void){ return (int)((work(23) + work(3) + work(0)) & 0xffff); }";
+    super::redjam::set_wanted(Some(true));
+    let after = module(src, true);
+    let f = func(&after, "work");
+    super::redjam::set_wanted(None);
+    // NON-VACUITY: the jammed block carries three accumulators the original loop
+    // did not, so some block must take more parameters than the loop's two.
+    let widest = f.blocks.iter().map(|b| b.params.len()).max().unwrap_or(0);
+    assert!(
+        widest >= 5,
+        "the reduction was not jammed: widest block takes {} params",
+        widest
+    );
+    square(src, {
+        let work = |n: i64| -> i64 {
+            let mut s: i64 = 0;
+            let mut i: i64 = 1;
+            while i <= n {
+                let a = ((i * 3) as i16) as i64;
+                let b = ((i & 7) as i8) as i64;
+                s += a - b + (i % 5);
+                i += 1;
+            }
+            s
+        };
+        (work(23) + work(3) + work(0)) & 0xffff
+    });
+}
+
 // ── tailrec ────────────────────────────────────────────────────────────────
 
 #[test]

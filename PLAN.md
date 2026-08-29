@@ -12,69 +12,89 @@ because it won, or written into its Part F as a refutation because it lost.
 
 ---
 
-## THE GRIND: the four jammed lanes become one `mla v.4s`
+## THE GRIND: the counted reduction, four lanes wide
 
-**WHERE IT STANDS.** `z4_matmul_int` is 2.94x against gcc -O2 and **1.087x
-against gcc -O1** — the one place -O2's SIMD shows and the worst program left in
-the suite. `jam` and the `iv` displacement row took its inner loop from seven
-instructions per outer iteration to three; what remains is the width.
+**WHAT THE COUNTERS SAY, and it decided the grind.** `perf` over the twelve worst
+programs against gcc -O2: every one is COUNT-driven, none is chain-driven. zcc's
+IPC is 4.1–6.7 and it retires 1.4x–4.6x the instructions. Seven of the twelve are
+programs gcc VECTORIZED and zcc did not; five of those seven are one shape:
 
-**THE LOOP TODAY — twelve instructions for four values of `j`:**
+    a1_int_mix  17.4 insn/elem vs 4.25    a3_sdiv_mod 17.3 vs 4.73
+    d4_goto      6.1 vs 2.84              e2_many_args 29.2 vs 6.40
+    h2_revbits 171.3 vs 51.0
 
-    ldr  w26, [x0, x20, lsl #2]   ; A[i][k], shared by all four lanes
-    ldp  w25, w27, [x21]          ; B[k][j+0], B[k][j+1]
-    madd w22, w26, w27, w22
-    madd w5,  w26, w25, w5
-    ldr  w27, [x21, #8]  ; add x25, x21, #800 ; ldr w21, [x21, #12]
-    madd w23, w26, w27, w23 ; madd w24, w26, w21, w24
-    add  x20, x20, #1 ; cmp x20, #200 ; b.lt
+A counted loop carrying a counter and ONE accumulator over a body that is
+otherwise a function of the counter. `vecprobe` finds 34 such loops in the suite
+and 11 in sqlite, and that census UNDERCOUNTS — it skips loops with no memory
+access, which is four of the five above.
 
-**THE ROW — seven, and every piece it needs is already in the tree:**
+**PRICED BEFORE BUILDING.** Assume the 4-lane form lands at 1.5x gcc's dynamic
+count (missing forms, guard and tail) and IPC falls to 3.0:
 
-    ldr  w26, [x0, x20, lsl #2] ; dup v1.4s, w26 ; ldr q0, [x21]
-    mla  v2.4s, v0.4s, v1.4s
-    add  x21, x21, #800 ; add x20, x20, #1 ; cmp ; b.lt
+    a1 2.757 -> 1.470   a3 2.667 -> 1.516   d4 2.108 -> 1.309   e2 2.752 -> 1.496
 
-`VInt`, `VDup`, `VAddv` and `MemOp::Q` shipped in `ae0a721`, every form assembled
-against `as` on the box. `mla` is not among them and is `VInt::Mul` + `VInt::Add`
-until it is; that is two instructions, not one, and still five fewer than today.
+Suite 1.2091 -> **1.176**; optimistic bound (all five at 1.000) **1.153**.
 
-**WHY IT MUST BE A MIR PASS.** The accumulator crosses the inner loop's back edge
-as a VECTOR. Article B puts a vector width in the ISA tables and the emitter, not
-in HIR — and MIR already carries it: `Width::Q` is a real width and a `Q` vreg is
-a legal block parameter. `IntrinKind::VecMap` cannot do this: an intrinsic has no
-value living in a register across iterations.
+**ROW 1 IS BUILT AND IS NOT ENOUGH — that was predicted, and it measured.**
+`hir::pass::redjam` unrolls the counted reduction by four with four partial
+accumulators, default-OFF. Correct: 4/4 targets match gcc, trip counts 0..24,
+99..101, 1000 match, the `i0+3s` overflow boundary matches, the I64 guard is
+proven load-bearing by excision (remove it and zcc loops forever), and it carries
+its square.
 
-**WHAT TO RECOGNIZE**, on SSA MIR before regalloc: a loop block with four
-`Load` of `W32` at one base and displacements `0,4,8,12` (some already fused into
-`ldp`), four `Alu::MAdd` each reading the SAME other operand, and four
-loop-carried block parameters they accumulate into. Replace with one `Load` of
-`MemOp::Q`, one `VDup`, one `VInt::Mul` + `VInt::Add`, and ONE `Q` parameter; the
-exit needs the four scalars back, which is `VAddv`'s sibling problem — the four
-lanes are four DIFFERENT `j`, so they are extracted, not summed. **`umov`/`mov
-Wd, Vn.S[i]` is the extract and is NOT in the tree yet: add it with the same
-assembler check the others got.**
+**WHAT IT BOUGHT, on the only instrument that can see it.** Six BASE readings of
+the same unchanged binary came back 1.2091, 1.2014, 1.2107, 1.2097, 1.2105,
+1.1990 — a spread of 0.012, so the suite EXEC geomean cannot resolve anything
+below about 1.5% and it buried this row entirely. `perf`'s dynamic instruction
+count is deterministic and says exactly what happened:
 
-**PRICE IT BEFORE BUILDING.** Dynamic instructions on `z4` today are **163.9M**
-against gcc's **73.7M**; the form above should reach ~95M. That is `z4` at about
-**1.4–1.5x**, not 1.0x. And on the suite geomean, `z4` alone is worth little:
+    a1 34.8M -> 29.8M (0.856)   a3 51.8M -> 46.6M (0.898)
+    d4 48.8M -> 40.8M (0.836)   e2 116.8M -> 102.9M (0.881)
 
-    z4 -> 1.45 :  1.2180 x (1.45/2.941)^(1/96) = 1.2091
-    z4 -> 1.00 :  1.2180 x (1.00/2.941)^(1/96) = 1.2044
+12-16% of the executed instructions, on every target, against gcc's 8.4M / 14.2M
+/ 22.7M / 25.7M. The row works and is three to four times short of the referee —
+which is the shape the price predicted. Static cost is INSN 1.0147 -> 1.1782, so
+it does not ship alone.
 
-**Sub-1.2 needs this row AND one more.** The next candidates, from the same
-`perf` run: `e1_recursion` 2.05x (what `tailrec` left — the non-tail call),
-`a1_int_mix` 2.79x and `e2_many_args` 2.75x (both INSN < 0.4, so gcc is inlining
-where zcc is not), `m1_resp_parse` branch-misses **124x**.
+**ROW 2 IS FOUR SLICES, NOT ONE.** The lanes must become vector arithmetic. What
+MIR already has: `VIntOp{Add,Sub,Mul,And,Or,Eor}`, `VDup`, `VExt`, `VAddv`,
+`MemOp::Q`, `Arr::V4S/V2D`. What each target still needs:
 
-⚠️ **The counters already warn about this row.** The `iv` displacement change cut
-dynamic instructions 10.4% and cycles only 2.3%: IPC fell 3.79 -> 3.47 and backend
-stalls DOUBLED, because four loads now contend on one base. A `ldr q` replaces
-those four with one, which is the right direction — but measure cycles, not
-instructions, and expect less than the count suggests.
+| slice | new ISA forms | unlocks | worth alone |
+|---|---|---|---|
+| 1 | `sshll`/`sshll2` (4x i32 -> 2x2 i64 accumulator + exit reduce), `cmeq`, `bsl` | `d4_goto` | ~ -0.5% |
+| 2 | `shl`/`sshr`/`ushr` | part of `a1`, `a3` | — |
+| 3 | `smull`/`smull2`/`smlal` | `e2_many_args` | ~ -0.5% |
+| 4 | the vector magic-division sequence | `a1`, `a3` | ~ -1.0% |
 
-**Method that worked all session:** census before building, price on the model
-first, `perf` rather than `.s`, `md5(.s)` as the vacuity test, and a driver
-sweeping `n = 1..13` against gcc before believing any loop transform. Three of
-`jam`'s defects and `tailrec`'s only one were found that way — and `tailrec`'s
-was found by `c-testsuite/00181`, not by any unit test written for it.
+**All twenty-two forms were checked against `as` on the Graviton4 box and
+assemble.** Slice 1 is first because the widening and the horizontal reduce are
+shared by every other slice.
+
+**THE MATCHER, and it is the hard half.** Larsen-Amarasinghe seeded from a known
+root: start at the four accumulator parameters `redjam` leaves, walk the four def
+chains backward in lockstep, requiring the same opcode at each step and operands
+that are either (a) one value shared by all four (a `dup`), (b) themselves an
+isomorphic four-tuple, or (c) the counters `i, i+1, i+2, i+3` (the seed vector).
+Build packs bottom-up; refuse and leave the scalar lanes wherever isomorphism
+fails. `slp.rs` is NOT this — it is FP-only and keyed on adjacent memory.
+
+**WHAT IS OUT OF REACH AND WHY.** `h2_revbits` needs its outer loop vectorized
+with `revbits` inlined, and `inline` refuses a callee containing a loop; its inner
+loop carries three values. `o1_fp_dot` and `o2_fp_stencil` are FP reductions —
+reassociation changes the value there and gcc does not do it either; gcc wins
+those by unrolling the OUTER loop, which is a different row.
+
+**REFUTED THIS GRIND, so nobody re-runs them.** `vecmap` switched on buys nothing
+(EXEC 1.2014->1.2021, 1.2107->1.2081) and costs INSN 1.0147->1.1782; it fires on
+ZERO of the seven hot programs because every one carries a value. A `smull`
+widening-multiply isel row: 10 sites in the whole suite, all in `e2` alone.
+`ZCC_HOISTMIN=1`, the seam that lifts a one-instruction constant out of a loop:
+pairs 1.2105->1.2034 and 1.1990->**1.2185**, opposite signs, against a steady INSN
+1.0147->1.0320 — noise bought with 1.7% size. `MEASURED M44`'s default stands.
+
+⚠️ **THREE MEASUREMENTS WERE LOST TO THE INSTRUMENT THIS GRIND**, all mine: two
+`exectime.sh` runs at once (it uses fixed `/tmp/g`, `/tmp/z`, so they overwrite
+each other and print DIVERGE for the UNMODIFIED compiler), a runaway test binary
+pinning a core through an A/B, and a `k=0` case whose own harness was UB. Check
+`ps` and the harness's own summary line before believing a spread.

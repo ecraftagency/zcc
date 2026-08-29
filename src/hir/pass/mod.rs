@@ -14,6 +14,7 @@
 pub mod cfg;
 pub mod copyidiom;
 pub mod jam;
+pub mod redjam;
 pub mod tailrec;
 pub mod vecmap;
 pub mod vecprobe;
@@ -241,6 +242,16 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
                 a.invalidate();
             }
         }
+        // AFTER `jam`, which claims the nested case, and after `inline` has had
+        // its rounds: `e2_many_args` is only a reduction loop once `mix` is in
+        // the body. BEFORE `vecmap`, which reads the same loops and would
+        // otherwise see four lanes where the map shape was.
+        if on("redjam") {
+            if timed("redjam", || redjam::run(f, a)) {
+                changed = true;
+                a.invalidate();
+            }
+        }
         if on("vecmap") {
             if timed("vecmap", || vecmap::run(f, a)) {
                 changed = true;
@@ -327,6 +338,7 @@ pub fn run_with(f: &mut Func, ro: &std::collections::HashSet<String>) {
     }
     copyprobe::census(f, a);
     vecprobe::census(f, a);
+    redjam::census(f, a);
     if iv::fv_wanted() {
         iv::fv_opportunity(f, a);
     }
