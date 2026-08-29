@@ -84,10 +84,50 @@ fn utf8_cp(b: &[u8], i: usize) -> (u32, usize) {
     (cp, n)
 }
 
-fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
+/// One escape sequence. Returns the value AND whether it was a UNIVERSAL
+/// CHARACTER NAME, because those two are spent differently: an ordinary escape
+/// contributes one byte to a narrow string, a UCN contributes the UTF-8 encoding
+/// of a code point and that is between one and four.
+fn escape(b: &[u8], i: &mut usize) -> Result<(u32, bool), String> {
     let c = *b.get(*i).ok_or("truncated escape sequence")?;
     *i += 1;
-    Ok(match c {
+    // C99 6.4.3 — UNIVERSAL CHARACTER NAME. `\uXXXX` is exactly four hex digits
+    // and `\UXXXXXXXX` exactly eight; a short count is a constraint violation,
+    // not a shorter number, which is what separates this from `\x`.
+    //
+    // WHY IT IS NOT AN "UNDEFINED ESCAPE". The identity rule at the bottom of
+    // this match is right for `\j`, which C89 3.1.3.4 leaves undefined — but a
+    // UCN is DEFINED, and falling through to identity turned `"Ω"` into the
+    // five characters `u2126` with no diagnostic at all. oniguruma's own test
+    // suite caught it (5 of 1,516 cases); no gate did, and neither did any
+    // benchmark, because a differential comparison only covers what its workload
+    // executes and nothing in the corpus wrote a UCN.
+    if c == b'u' || c == b'U' {
+        let n = if c == b'u' { 4 } else { 8 };
+        let mut v = 0u32;
+        for k in 0..n {
+            let d = b
+                .get(*i)
+                .and_then(|c| (*c as char).to_digit(16))
+                .ok_or_else(|| {
+                    format!(
+                        "\\{} needs {} hex digits, found {}",
+                        c as char, n, k
+                    )
+                })?;
+            v = v * 16 + d;
+            *i += 1;
+        }
+        // C99 6.4.3p2 — a UCN shall not designate a code point below 00A0 other
+        // than 0024, 0040 and 0060, nor one in the surrogate range D800..DFFF.
+        // Spelling `A` for `A` is a constraint violation rather than a
+        // stylistic choice, so it is refused rather than quietly accepted.
+        if (v < 0xA0 && v != 0x24 && v != 0x40 && v != 0x60) || (0xD800..=0xDFFF).contains(&v) {
+            return Err(format!("\\{}{:04X} is not a valid universal character name", c as char, v));
+        }
+        return Ok((v, true));
+    }
+    Ok((match c {
         b'n' => 10,
         b't' => 9,
         b'r' => 13,
@@ -121,7 +161,31 @@ fn escape(b: &[u8], i: &mut usize) -> Result<u32, String> {
         // Undefined escape: C89 3.1.3.4 leaves it undefined behavior — following
         // gcc/clang, use identity ('\j' == 'j'; chibicc test/string.c asserts this)
         _ => c as u32,
-    })
+    }, false))
+}
+
+/// The UTF-8 encoding of one code point, appended. This is the execution
+/// character set a UCN is spelled into for a NARROW string; a wide string keeps
+/// the code point itself and never calls this.
+fn utf8_push(out: &mut Vec<u8>, cp: u32) {
+    match cp {
+        0..=0x7f => out.push(cp as u8),
+        0x80..=0x7ff => {
+            out.push(0xc0 | (cp >> 6) as u8);
+            out.push(0x80 | (cp & 0x3f) as u8);
+        }
+        0x800..=0xffff => {
+            out.push(0xe0 | (cp >> 12) as u8);
+            out.push(0x80 | ((cp >> 6) & 0x3f) as u8);
+            out.push(0x80 | (cp & 0x3f) as u8);
+        }
+        _ => {
+            out.push(0xf0 | (cp >> 18) as u8);
+            out.push(0x80 | ((cp >> 12) & 0x3f) as u8);
+            out.push(0x80 | ((cp >> 6) & 0x3f) as u8);
+            out.push(0x80 | (cp & 0x3f) as u8);
+        }
+    }
 }
 
 // A numeric constant begins at i (a digit, or '.' + digit). Returns the token + new i.
@@ -387,9 +451,13 @@ pub fn lex_t(b: &[u8], char_uns: bool) -> Result<Vec<PTok>, String> {
                     b'\'' => break,
                     b'\\' => {
                         i += 1;
-                        let e = escape(b, &mut i)?;
+                        let (e, _ucn) = escape(b, &mut i)?;
                         // char is signed on Darwin, unsigned on Linux arm64;
-                        // wide preserves the value (no truncation to u8)
+                        // wide preserves the value (no truncation to u8).
+                        // A UCN in a CHARACTER constant keeps the code point for
+                        // the wide form and truncates for the narrow one, which
+                        // is what `\x` already does and what C99 6.4.4.4p10
+                        // leaves implementation-defined.
                         if wide {
                             e as i64
                         } else if char_uns {
@@ -430,8 +498,16 @@ pub fn lex_t(b: &[u8], char_uns: bool) -> Result<Vec<PTok>, String> {
                             line += 1;
                             i += 1;
                         } else {
-                            let e = escape(b, &mut i)?;
-                            bytes.push(e as u8);
+                            let (e, ucn) = escape(b, &mut i)?;
+                            // A UCN names a CODE POINT, so the narrow string
+                            // takes its UTF-8 encoding — one to four bytes —
+                            // while every other escape names one byte. The wide
+                            // string takes the code point either way.
+                            if ucn {
+                                utf8_push(&mut bytes, e);
+                            } else {
+                                bytes.push(e as u8);
+                            }
                             cps.push(e); // an escape = one wide element, NOT UTF-8-combined
                         }
                     }

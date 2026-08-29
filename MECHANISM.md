@@ -4776,51 +4776,117 @@ BUILDING a row and is not evidence the row will pay.
 **WHEN / WHERE.** 2026-08-29, `main` `dd80a8d`, c8gd.4xlarge Graviton4, gcc
 14.2.0 -O2, `ZCC_VECMAP=1`.
 
-### M58. The tag name space, and the five that are still open
+### M58. The tag name space, and the five that a real program's own test suite found
 
-**THE DEFECT, and it is a Law-2 Side-I: a misread of C99 6.2.3.** Tags occupy a
-name space of their own, so one spelling may be an enum tag AND an ordinary
-identifier at the same time. oniguruma 6.9.9 writes exactly that — `regint.h` has
-`enum SaveType { ... }` and, seventeen lines later, `typedef int SaveType;` —
-and `regparse.h:420` then declares a member with the enum:
+**THE FIRST DEFECT, a Law-2 Side-I: a misread of C99 6.2.3.** Tags occupy a name
+space of their own, so one spelling may be an enum tag AND an ordinary identifier
+at once. oniguruma 6.9.9 writes exactly that — `regint.h` has `enum SaveType
+{ ... }` and, seventeen lines later, `typedef int SaveType;`:
 
     enum SaveType { SAVE_A, SAVE_B };
     typedef int SaveType;
     struct S { enum SaveType t; };   /* zcc: expected ";" */
 
-`enum_spec` refused to take the identifier as a tag whenever `is_type_word` said
-the spelling was a typedef name. `enum SaveType` therefore yielded a bare `int`,
-the specifier loop re-read `SaveType` as a SECOND specifier, and the member name
+`enum_spec` refused the identifier as a tag whenever `is_type_word` said the
+spelling was a typedef name, so `enum SaveType` yielded a bare `int`, the
+specifier loop re-read `SaveType` as a SECOND specifier, and the member name
 arrived where a `;` was expected. It is conforming C: `gcc -std=c99
--pedantic-errors` accepts it. Fixed by taking the identifier unconditionally —
-whether the spelling also names an ordinary identifier is not that decision's
-business.
+-pedantic-errors` accepts it. Fixed by taking the identifier unconditionally.
 
-**NO GATE SAW IT, AND THE REASON IS STRUCTURAL.** torture 1694, c-testsuite 220,
-opt-parity 1552, csmith and yarpgen at 10,000 seeds each were all green through
-it. A tag that collides with a typedef is a shape neither generator emits; a
-corpus corroborates, it does not discover. Six lines reproduce it, and no amount
-of random program generation was going to write them.
+**THE SECOND, and it was five silent wrong answers.** With the parse fixed,
+oniguruma builds and runs its own suite: gcc `SUCC: 1516, FAIL: 0`, zcc `SUCC:
+1511, FAIL: 5`. All five are case-insensitive matches on `\u2126` and `\ufb00`.
 
-**AND THE FIVE THAT ARE STILL OPEN.** With the parse fixed, oniguruma builds and
-runs its own suite. gcc: `SUCC: 1516, FAIL: 0`. zcc: `SUCC: 1511, FAIL: 5`:
+**zcc HAD NO `\u` ARM IN ITS ESCAPE HANDLER AT ALL.** A universal character name
+(C99 6.4.3) fell through to the UNDEFINED-ESCAPE identity rule — which is the
+right rule for `\j`, C89 3.1.3.4 — so the backslash was dropped and `"\u2126"`
+became the five characters `u2126`. The regex under test was the literal text
+`u2126` instead of OHM SIGN. Emitted bytes, before and after:
 
-    FAIL: /(?i)\ufb00a/ 'ffa'   #1561
-    FAIL: /(?i)\u2126/  'omega' #1563
-    FAIL: /a(?i)\u2126/ 'a...'  #1564
-    FAIL: /(?i)A\u2126/  'a...'  #1565
-    FAIL: /(?i)A\u2126=/ 'a...=' #1566
+    zcc before   117 50 49 50 54 0        "u2126"
+    zcc after    226 132 166 0            E2 84 A6, and gcc agrees exactly
 
-All five are Unicode case folding — U+2126 OHM SIGN folding to omega, U+FB00
-folding to `ff`. NOT localized, and this entry deliberately claims nothing about
-where the fault lies, because two attempts to localize it were both defeated by
-the instrument: `ZCC_NOPASS=all` is a SILENT NO-OP (`all` is not a pass name, and
-`md5(.s)` was unchanged), and disabling every named pass at once makes zcc emit a
-program that dies part-way through the suite, so that reading means nothing
-either. Bisect one pass at a time.
+Fixed with a `\uXXXX`/`\UXXXXXXXX` arm that requires exactly four or eight hex
+digits (a short count is a constraint violation, not a shorter number — that is
+what separates a UCN from `\x`), enforces 6.4.3p2 (no code point below 00A0 but
+0024/0040/0060, none in D800..DFFF), and spells the result into a NARROW string
+as its UTF-8 encoding of one to four bytes while a WIDE string keeps the code
+point. oniguruma then reads `SUCC: 1516, FAIL: 0` — identical to gcc.
+Regression case: `tests/cases/ucn_string.c`.
+
+**WHY NOTHING CAUGHT EITHER, and it is structural rather than an oversight.**
+torture 1694, c-testsuite 220, opt-parity 1552, csmith and yarpgen at 10,000
+seeds each were green through both. A tag colliding with a typedef and a UCN in a
+string literal are shapes neither generator emits. **And no benchmark would have
+caught the second either** — libpng and bzip2 compare their output against gcc's
+byte for byte and agree, because neither workload contains a `\u` escape. A
+differential comparison covers only what its workload EXECUTES; an application's
+own test suite sweeps the application deliberately. That is the whole argument
+for the real-program surface, and it is why an app's test suite outranks a
+benchmark's output diff as an oracle.
+
+**THE LOCALIZATION, and two instruments lied on the way.** A link bisect — one
+translation unit compiled by zcc, the other 51 by gcc — exonerated all 52 and
+found nothing, because the harness EXCLUDED `test_utf8.c` from the unit list. The
+decisive experiment was three builds, not a bisect: (A) all 52 library units by
+zcc, test file by gcc → 0 FAIL; (B) all library units by gcc, ONLY the test file
+by zcc → 5 FAIL; (C) everything gcc, linked by the zcc driver → 0 FAIL. The regex
+engine was never miscompiled. Also: `ZCC_NOPASS=all` is a SILENT NO-OP (`all` is
+not a pass name; `md5(.s)` unchanged), and disabling every named pass at once
+makes zcc emit a program that dies part-way, so neither reading meant anything.
 
 **WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4, gcc 14.2.0,
-oniguruma 6.9.9 built from its own `./configure`. Gate 16/0 with the parse fix.
+oniguruma 6.9.9 built from its own `./configure`. Gate 16/0.
+
+---
+
+### M59. The gate spent four hours grading a compiler that did not have the fix
+
+**THE HOLE, and it is worse than either defect it hid.** `fullsuite.sh`'s in-box
+path opened with
+
+    export ZCC=/usr/local/bin/zcc
+
+unconditionally. In the docker box that path is a bind mount of the ELF just
+built on the host, so the line is right. On the Graviton box it is a SYMLINK into
+a build tree the gate does not own — `/mnt/nvme/target/release/zcc`, last written
+at 13:31 — while the tree under test carried a lexer fix built at 15:32. An
+explicitly exported `ZCC` was silently discarded. **Fifteen stages reported PASS
+about code none of them had executed.**
+
+**HOW IT SURFACED, and only by luck.** The `cases` stage went RED on the one new
+regression case, and eight manual re-runs of that same case all passed. The
+temptation at that point is to call the gate flaky and move on; the two readings
+disagreed because they were two different compilers, and the artifact said so:
+
+    gcc   1f600: F0 9F 98 80 len=4          wide: 8486 128512
+    zcc   1f600: 55 30 30 30 31 46 36 30 30 len=9   wide: 8486 85
+
+`55 30 30 ...` is the text `U0001F600`. The stale binary predated the `\u` arm
+entirely. Had the new case not existed, the run would have been a clean 16/0
+about nothing.
+
+**THE FIX IS TWO LINES AND THE SECOND ONE IS THE IMPORTANT ONE.** An explicit
+`ZCC` now wins when it exists and is executable; and the banner PRINTS the
+resolved path and the binary's mtime:
+
+    == fullsuite (ELF box aarch64 — AUTHORITATIVE, target=all) ==
+       compiler on trial: /home/admin/zcc/target/release/zcc  built 2026-08-29 15:32
+
+A gate that does not name what it gated cannot be trusted the next morning, and
+this is the fourth entry in the `trusting-trust` family — green while checking
+nothing. The others: the musl stage could pass having built no binaries, `same`
+and `equiv` had silent-trap arms, and determinism covered 91 of 187 programs.
+
+**AND THE CASE ITSELF WAS WEAK TWICE BEFORE IT WAS RIGHT.** Two drafts of
+`tests/cases/ucn_string.c` pasted the actual glyphs — `Ω` — instead of the escape
+`\u2126`. Those test that UTF-8 SOURCE BYTES survive to the output, a different
+property, and one that already worked. The two spellings are indistinguishable in
+a terminal. The final case builds its backslashes programmatically and is checked
+BOTH WAYS: it passes against the fixed compiler and fails against the stale one,
+which is the non-vacuity obligation stated as an experiment rather than a claim.
+
+**WHEN / WHERE.** 2026-08-29, `main`, c8gd.4xlarge Graviton4.
 
 ---
 

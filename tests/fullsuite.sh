@@ -28,8 +28,23 @@ SEEK="${2:-}"
 
 # ======== INSIDE THE BOX: run the target ========
 if [ "${ZCC_IN_BOX:-}" = 1 ]; then
-    export ZCC=/usr/local/bin/zcc ZCC_SUITE_CACHE=/suites SEEK
-    W=/work/zcc
+    # WHICH COMPILER IS ON TRIAL, and it is PRINTED rather than assumed.
+    #
+    # This line used to read `export ZCC=/usr/local/bin/zcc` unconditionally.
+    # That is right in the docker box, where the path is a bind mount of the ELF
+    # just built on the host. It is WRONG on the Graviton box, where it is a
+    # symlink into a build tree the gate does not own — and on 2026-08-29 it
+    # silently gated a compiler FOUR HOURS OLD while the tree under test carried
+    # a lexer fix the binary had never seen. Fifteen stages reported PASS about
+    # code none of them had run. That is the `trusting-trust` failure shape:
+    # green while checking nothing.
+    #
+    # An explicitly-set ZCC now wins, provided it exists and is executable, and
+    # the resolved path plus its mtime is printed at the top of every run so the
+    # question "what did this gate actually test" has an answer in the log.
+    if [ -n "${ZCC:-}" ] && [ -x "${ZCC:-}" ]; then :; else ZCC=/usr/local/bin/zcc; fi
+    export ZCC ZCC_SUITE_CACHE=/suites SEEK
+    W="${ZCC_WORK:-/work/zcc}"
     pass=0; fail=0; red=""
     stage() { n=$1; shift
       if "$@" >"/tmp/full-$n.log" 2>&1; then
@@ -63,6 +78,8 @@ if [ "${ZCC_IN_BOX:-}" = 1 ]; then
     run_app()    { echo "-- APP (libc = musl, real software for the minimal-distro) --"
                    stage musl sh "$W/tests/suites/musl-box.sh" ; }
     echo "== fullsuite (ELF box aarch64 — AUTHORITATIVE, target=$TARGET${SEEK:+ seek=$SEEK}) =="
+    # A gate that does not name what it gated cannot be trusted the next morning.
+    echo "   compiler on trial: $(readlink -f "$ZCC" 2>/dev/null || echo "$ZCC")  built $(date -r "$ZCC" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
     case "$TARGET" in
         all)                     run_sci; run_corpus; run_fuzz; run_app ;;
         sci)                     run_sci ;;
