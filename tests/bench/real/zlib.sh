@@ -38,11 +38,21 @@
 #
 # Run INSIDE the box, from the repo root on the host:
 #   ZCC_REL=1 sh tests/box.sh s 'sh /work/zcc/tests/bench/real/zlib.sh'
+# THE REFEREE IS `gcc -O2`, and the level is a decision rather than a default
+# (MEASURED M48). Real software is built at -O2: it is the level every
+# distribution, every `./configure` and every `Makefile` reaches for, so it is
+# the only level a claim about zcc's generated code can be read against without
+# misleading someone. This module scored against -O1 until 2026-08-29, which was
+# the fair comparison for a compiler with no loop or vector passes and answers a
+# question about the COMPILER rather than about the code a user would get.
+# `GCC_OPT=-O1 sh <this>` restores the old column — but a number taken at one
+# level does not transfer to the other, so do not read them together.
 set -u
 ZL="${ZLIB_DIR:-/suites/zlib}"
 W="${ZCC_WORK:-/work/zcc}"
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 GCC="${GCC:-gcc}"
+GCCO="${GCC_OPT:--O2}"   # MEASURED M48 — the referee level; see the header
 N="${N:-5}"            # timeit reps inside one round
 ROUNDS="${ROUNDS:-5}"  # interleaved rounds; the drift is why this is not 1
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -71,8 +81,8 @@ for f in $DRIVER $ZSRC; do srcs="$srcs $ZL/$f"; done
 
 echo "== BUILD =="
 # shellcheck disable=SC2086
-$GCC -O1 $CFLAGS -o "$T/bench_gcc" $srcs 2>"$T/gerr" || {
-    echo "gcc -O1 BUILD FAILED"; head -20 "$T/gerr"; exit 2; }
+$GCC $GCCO $CFLAGS -o "$T/bench_gcc" $srcs 2>"$T/gerr" || {
+    echo "gcc $GCCO BUILD FAILED"; head -20 "$T/gerr"; exit 2; }
 # shellcheck disable=SC2086
 $ZCC $CFLAGS -o "$T/bench_zcc" $srcs 2>"$T/zerr" || {
     echo "zcc BUILD FAILED — this is a FINDING, not a harness error:"
@@ -86,7 +96,7 @@ g_sz=$(wc -c < "$T/bench_gcc"); z_sz=$(wc -c < "$T/bench_zcc")
 # is 17% LARGER. The instruction count over the zlib units is the code-size
 # statement; this row is context.
 printf "%-10s %12s\n" compiler bytes
-printf "%-10s %12s\n" "gcc -O1" "$g_sz"
+printf "%-10s %12s\n" "gcc $GCCO" "$g_sz"
 printf "%-10s %12s\n" "zcc"     "$z_sz"
 printf "%-10s %12s\n" "RATIO"   "$(awk "BEGIN{printf \"%.3f\", $z_sz/$g_sz}")"
 echo
@@ -140,12 +150,16 @@ echo
 # the reason both are printed: fewest instructions is not fastest code, and a
 # disagreement between these two columns is the finding, not an error.
 echo "== INSN (static, from -S, ZLIB SOURCES ONLY — driver excluded) =="
-insns() { grep -cE '^[[:space:]]+[a-z]' "$1" 2>/dev/null || echo 0; }
+# `grep -c` PRINTS 0 and EXITS 1 when it matches nothing, so `|| echo 0` appends
+# a SECOND line and the caller's `$((tot+gi))` dies with "Illegal number: 0 0".
+# bzip2's `crctable.c` and `randtable.c` are pure data and have no instructions
+# at all, which is the case that found it. Take stdout, default it if empty.
+insns() { c=$(grep -cE '^[[:space:]]+[a-z]' "$1" 2>/dev/null); echo "${c:-0}"; }
 printf "%-14s %9s %9s %8s\n" unit gcc zcc ratio
 tot_g=0; tot_z=0
 for f in $ZSRC; do
     b=$(basename "$f" .c)
-    $GCC -O1 -S $CFLAGS -o "$T/g.s" "$ZL/$f" 2>/dev/null || continue
+    $GCC $GCCO -S $CFLAGS -o "$T/g.s" "$ZL/$f" 2>/dev/null || continue
     $ZCC    -S $CFLAGS -o "$T/z.s" "$ZL/$f" 2>/dev/null || {
         printf "%-14s %9s %9s %8s\n" "$b" - "ZCC -S FAIL" -; continue; }
     gi=$(insns "$T/g.s"); zi=$(insns "$T/z.s")

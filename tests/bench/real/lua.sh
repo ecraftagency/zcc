@@ -57,6 +57,15 @@
 #   mkdir -p ~/.cache/zcc-suites/lua && cd ~/.cache/zcc-suites/lua \
 #     && curl -sSLO https://www.lua.org/ftp/lua-5.4.7.tar.gz && tar xzf lua-5.4.7.tar.gz
 # The three benchmark scripts live beside it in ~/.cache/zcc-suites/lua/bench/.
+# THE REFEREE IS `gcc -O2`, and the level is a decision rather than a default
+# (MEASURED M48). Real software is built at -O2: it is the level every
+# distribution, every `./configure` and every `Makefile` reaches for, so it is
+# the only level a claim about zcc's generated code can be read against without
+# misleading someone. This module scored against -O1 until 2026-08-29, which was
+# the fair comparison for a compiler with no loop or vector passes and answers a
+# question about the COMPILER rather than about the code a user would get.
+# `GCC_OPT=-O1 sh <this>` restores the old column — but a number taken at one
+# level does not transfer to the other, so do not read them together.
 set -u
 LUA="${LUA_DIR:-/suites/lua}"
 SRC="$LUA/lua-5.4.7/src"
@@ -64,6 +73,7 @@ BENCH="${LUA_BENCH:-$LUA/bench}"
 W="${ZCC_WORK:-/work/zcc}"
 ZCC="${ZCC:-/usr/local/bin/zcc}"
 GCC="${GCC:-gcc}"
+GCCO="${GCC_OPT:--O2}"   # MEASURED M48 — the referee level; see the header
 ROUNDS="${ROUNDS:-5}"   # interleaved pairs per script
 BN="${BN:-1}"           # build repetitions — one is enough; the build is 33 files
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -109,9 +119,9 @@ build() { # name  cc  extra-cc-flags...
     echo "$best_ms $best_kb"
 }
 
-r=$(build gcc $GCC -O1 -w $D -I"$SRC" -o "$T/lua_gcc" $SRCS -lm -ldl -Wl,-E)
+r=$(build gcc $GCC $GCCO -w $D -I"$SRC" -o "$T/lua_gcc" $SRCS -lm -ldl -Wl,-E)
 g_ms=${r% *}; g_kb=${r#* }; g_sz=$(wc -c < "$T/lua_gcc")
-printf "%-10s %10s %12s %12s\n" "gcc -O1" "$g_ms" "$g_kb" "$g_sz"
+printf "%-10s %10s %12s %12s\n" "gcc $GCCO" "$g_ms" "$g_kb" "$g_sz"
 
 r=$(build zcc $ZCC -w $D -I"$SRC" -o "$T/lua_zcc" $SRCS -lm -ldl -Wl,-E)
 z_ms=${r% *}; z_kb=${r#* }; z_sz=$(wc -c < "$T/lua_zcc")
