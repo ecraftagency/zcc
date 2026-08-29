@@ -24,7 +24,7 @@ magic-number sequence four instructions longer than a `udiv`. Size is a real ter
 and it is reported, never traded away silently; but it does not veto an exec win,
 and "the binary grew" is not by itself an argument against a row. What still
 vetoes is a lost citation (Law 0's first `≫`) and a compile-time regression large
-enough to change how the compiler is used (`M44`).
+enough to change how the compiler is used.
 
 **No number is banked at the cost of a citation.** A row that reaches parity by
 removing a proof does not ship, however large the number. zcc is educational, so
@@ -103,14 +103,11 @@ one it discovers — it finds the cliffs, while real programs carry the geomean.
 **A** — (1) strict C99; extensions only when real software demands one, marked
 `EXT(...)`. (2) **Nothing is built before a real `.c` demands it** — no
 anticipatory abstraction, no feature acquired from a checklist, zero external
-crates.
+crates. **Demand is DETECTED, not assumed:** count the sites a transformation would fire
+on before writing it. A shape in the suite is not evidence the shape occurs.
 
-*There is no line-count ceiling and there never really was one: the constraint
-is DEMAND, not size.* A cap on lines cannot tell a proof from bloat, and this
-project spends most of its lines on the proofs Law 0 ranks above every number —
-so a ceiling would have to be paid for by deleting exactly what makes the
-compiler worth reading. The rule that does the work is the demand rule, and it
-is unchanged.
+*No line-count ceiling: the constraint is DEMAND, not size.* A cap cannot tell a
+proof from bloat, and this project spends most of its lines on proofs.
 
 **B** — `main.rs → lexer → parser → AST → compile.rs → HIR (target-independent
 SSA) → isel → MIR (machine SSA) → regalloc → frame/layout → emit.rs → .s`. The
@@ -133,13 +130,20 @@ cases.
 
 **E — how anything gets believed.**
 - **Differential** against an independent oracle. A diff at an undefined point is
-  meaningless: filter by spec, never by hand-waving.
+  meaningless: filter by spec, never by hand-waving. **The PROGRAM must be defined too** — a
+  benchmark with UB measures which behaviour two compilers happened to pick.
+  `tests/ubscan.sh` is a gate stage.
 - **Numeric provenance** — every number derives from a stated premise, and every
   constant answers: *the spec's number, or my convenience's?* A truncation posing
-  as a spec constant is a Law-1 violation.
+  as a spec constant is a Law-1 violation. **A ratio names its CORE and its REFEREE
+  LEVEL**; a constant swept against one does not transfer to the other.
 - **Clean input** — a green verdict needs an evidence trail, never a bare count.
+  **Read the harness's summary line before believing a number, and check what else
+  is running before believing a spread.** A silent instrument is indistinguishable
+  from a result.
 - **Byte-identical** — pure code motion holds `md5(.s)` unchanged; identical bytes
-  *are* the square. Two witnesses, because small programs cannot see a pass that
+  *are* the square. **A refactor that ENABLES something is two rows:** the restructuring ships
+  byte-identical, and turning on what it permits is a separate A/B. Two witnesses, because small programs cannot see a pass that
   scales with function size. A green is scoped to what was compiled, and a
   baseline is an artefact of the compiler being reproduced, never of an earlier
   candidate.
@@ -156,8 +160,11 @@ automaton or the emitter.
 **G** — refactor, optimize and extend all obey Laws 1–3 and none trades
 verification for a number. A **refactor** ships a byte-identical proof and is
 ranked *better ground for optimization ∧ easier proof* — never merge two
-proof-carrying passes or blur a theorem seam. An **optimization** ships both
-squares. An **extension** stays strict C99 with the deviation visible.
+proof-carrying passes or blur a theorem seam, and claim no exec for it. An
+**optimization** ships both squares. An **extension** stays strict C99 with the
+deviation visible.
+**A capability already in the tree but switched off outranks building a new one**
+— it is a cost already paid and not being collected.
 
 ## Index — five documents, and `src/` may point at no others
 
